@@ -525,6 +525,12 @@ impl SysMon {
 /// shell (a keybind running wpctl, a hardware key) reads as real time,
 /// cheap enough to keep forever: two wpctl calls and two sysfs reads.
 const FAST_INTERVAL: Duration = Duration::from_millis(500);
+/// When a poll read differs from the state and waits for the next
+/// read to confirm it (the confirm gate), the re-check rides a short
+/// timer instead of the next full tick: an outside change should not
+/// wait half a second twice. One-tick garbage reads still fail it:
+/// they last well under the gap.
+const CONFIRM_RECHECK: Duration = Duration::from_millis(120);
 /// The full pass rides every fourth tick: everything else refreshes at
 /// the old two-second pace.
 const FULL_PASS_EVERY: u32 = 4;
@@ -562,9 +568,9 @@ pub fn run(state: &Entity<SysMon>, cx: &mut App) {
                 })
                 .await;
             previous = previous_next;
-            if state
+            let Ok(quick_recheck) = state
                 .update(cx, |sysmon, cx| {
-                    if full {
+                    let moved = if full {
                         sysmon.battery = snapshot.battery;
                         sysmon.cpu = snapshot.cpu;
                         sysmon.bluetooth = snapshot.bluetooth.clone();
@@ -577,16 +583,24 @@ pub fn run(state: &Entity<SysMon>, cx: &mut App) {
                         // fast pass: the full pass doesn't get to
                         // bypass it
                         sysmon.absorb_av(&snapshot);
-                        cx.notify();
-                    } else if sysmon.absorb_av(&snapshot) {
+                        true
+                    } else {
+                        sysmon.absorb_av(&snapshot)
+                    };
+                    if moved {
                         cx.notify();
                     }
+                    // a stored confirm candidate re-checks soon
+                    sysmon.av_confirming.is_some()
                 })
-                .is_err()
-            {
+            else {
                 break;
+            };
+            if quick_recheck {
+                cx.background_executor().timer(CONFIRM_RECHECK).await;
+            } else {
+                cx.background_executor().timer(FAST_INTERVAL).await;
             }
-            cx.background_executor().timer(FAST_INTERVAL).await;
         }
     })
     .detach();
