@@ -96,20 +96,6 @@ fn main() {
         })
         .expect("failed to open layer-shell window: compositor must support wlr-layer-shell");
 
-        // TEMP DEBUG
-        if std::env::var("KUMA_DEBUG_OPEN_SETTINGS").is_ok() {
-            log::info!("debug hook registered");
-            cx.spawn(async move |cx| {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(400))
-                    .await;
-                let _ = cx.update(|cx| {
-                    kuma_shell::panel::toggle_panel(kuma_shell::panel::PanelKind::Settings, cx);
-                });
-            })
-            .detach();
-        }
-
         let (bar_toggle_tx, bar_toggle_rx) = smol::channel::unbounded::<kuma_shell::msg::Request>();
         kuma_shell::msg::spawn_listener(bar_toggle_tx);
 
@@ -122,6 +108,9 @@ fn main() {
                 let _ = cx.update(|cx| match request {
                     kuma_shell::msg::Request::Launcher => {
                         kuma_shell::panel::toggle_panel(kuma_shell::panel::PanelKind::Launcher, cx);
+                    }
+                    kuma_shell::msg::Request::Settings => {
+                        kuma_shell::panel::toggle_panel(kuma_shell::panel::PanelKind::Settings, cx);
                     }
                     kuma_shell::msg::Request::Notifications => {
                         let settings = msg_settings.clone();
@@ -232,6 +221,7 @@ fn run_cli(args: &[String]) -> i32 {
             kuma_shell::sysmon::toggle_mic,
         ),
         "launcher-toggle" => kuma_shell::msg::send(&kuma_shell::msg::Request::Launcher),
+        "settings" => kuma_shell::msg::send(&kuma_shell::msg::Request::Settings),
         "notifications-dnd" => kuma_shell::msg::send(&kuma_shell::msg::Request::Notifications),
         // the scheme handler's road: `kuma-shell msg nostr <nostrconnect://…>`,
         // the URI is argv end to end, never a shell string. Bare
@@ -290,7 +280,7 @@ fn run_cli(args: &[String]) -> i32 {
         other => {
             eprintln!("kuma-shell: unknown command {other:?}");
             eprintln!(
-                "usage: kuma-shell [msg] volume-up | volume-down | volume-mute | mute | mic-mute | launcher-toggle | notifications-dnd | nostr [uri] | media <play-pause|stop|next|previous> | brightness-up [step] | brightness-down [step] | workspace <n>"
+                "usage: kuma-shell [msg] volume-up | volume-down | volume-mute | mute | mic-mute | launcher-toggle | settings | notifications-dnd | nostr [uri] | media <play-pause|stop|next|previous> | brightness-up [step] | brightness-down [step] | workspace <n>"
             );
             return 1;
         }

@@ -24,6 +24,10 @@ pub enum Request {
     /// keybind's and the app grid's road. An offer must come with a
     /// URI; a hand coming from a keybind has none.
     NostrPanel,
+    /// The bar gear's and the settings keybind's road: toggle the
+    /// settings panel. The road out of the KUMA_DEBUG_OPEN_SETTINGS
+    /// scaffolding the panel was built behind.
+    Settings,
     /// The audio and brightness keybinds' road: applied in-process, the
     /// widgets and the OSD react at once instead of at the next poll.
     Volume(VolumeCmd),
@@ -53,6 +57,7 @@ impl Request {
             Request::Notifications => "Notifications",
             Request::Nostr(_) => "Nostr",
             Request::NostrPanel => "NostrPanel",
+            Request::Settings => "Settings",
             Request::Volume(_) => "Volume",
             Request::Brightness(_) => "Brightness",
             Request::MicMute => "Mic",
@@ -65,6 +70,7 @@ impl Request {
             Request::Notifications => "Dnd".into(),
             Request::Nostr(uri) => uri.clone(),
             Request::NostrPanel => "Open".into(),
+            Request::Settings => "Toggle".into(),
             Request::Volume(cmd) => match cmd {
                 VolumeCmd::Up => "Up".into(),
                 VolumeCmd::Down => "Down".into(),
@@ -113,6 +119,7 @@ pub fn parse(line: &str) -> Option<Request> {
         "notifications" => Some(Request::Notifications),
         "nostr" => Some(Request::Nostr(value.to_string())),
         "nostrpanel" => Some(Request::NostrPanel),
+        "settings" => Some(Request::Settings),
         "volume" => match value.to_lowercase().as_str() {
             "up" => Some(Request::Volume(VolumeCmd::Up)),
             "down" => Some(Request::Volume(VolumeCmd::Down)),
@@ -221,6 +228,16 @@ mod tests {
             Some(Request::NostrPanel)
         );
         assert_eq!(to_line(&Request::NostrPanel), "{\"NostrPanel\":\"Open\"}");
+    }
+
+    #[test]
+    fn the_settings_verb_toggles_the_panel() {
+        // launcher semantics: the same press that opened closes
+        assert_eq!(
+            parse(&to_line(&Request::Settings)),
+            Some(Request::Settings)
+        );
+        assert_eq!(to_line(&Request::Settings), "{\"Settings\":\"Toggle\"}");
     }
 
     #[test]
