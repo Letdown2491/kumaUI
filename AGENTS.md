@@ -18,15 +18,23 @@ volumes, so builds are incremental.
 
 ## Run / test
 
-- `kuma-shell.service` runs the image binary `/usr/bin/noctalia`, **not**
-  your build. To test dev changes, stop the service and run
-  `~/.local/bin/kuma-shell` in its place, because two shells fight over the layer
-  surfaces and the logind lock listener.
+- Production runs the user service `kuma-shell.service`. Its drop-in
+  (`~/.config/systemd/user/kuma-shell.service.d/override.conf`) points
+  `ExecStart` at `~/.local/bin/kuma-shell` (which build.sh installs); the
+  image's `/usr/bin/kuma-shell` stays untouched. The whole update loop is:
+
+      ./scripts/build.sh build --release && systemctl --user restart kuma-shell
+
+  Two shells cannot run at once: they fight over the layer surfaces and the
+  logind lock listener. Never launch the binary by hand while the service is
+  up; to run it by hand, stop the service first.
+- The service logs errors only (no RUST_LOG). To diagnose in place, add
+  `Environment=RUST_LOG=info` to the override and restart; the per-request
+  `msg:` lines, OSD cards, and poll snapshots appear in
+  `journalctl --user -u kuma-shell`. PAM unlock failures log at info level
+  (`unlock attempt failed: ...`).
 - Lock screen: `loginctl lock-session` to lock, password to unlock,
   `loginctl unlock-session` as a backdoor.
-- Shell logs: `journalctl --user -u kuma-shell` for the service, or the
-  terminal output of a manually run dev shell. PAM unlock failures are
-  logged at info level (`unlock attempt failed: ...`).
 
 ## Writing
 

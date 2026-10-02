@@ -26,3 +26,7 @@ The Bar never touches `SysMon.volume` directly.
   next poll reconciles any drift.
 - The GUI clamps against the possibly-stale snapshot; staleness
   self-corrects on the next poll.
+- Hardened 2026-10-02: every write serializes through one background
+  worker, mute requests carry a named target instead of a blind toggle,
+  and mute keys bounce-guard. ADR-0009 has the details and the field
+  evidence.

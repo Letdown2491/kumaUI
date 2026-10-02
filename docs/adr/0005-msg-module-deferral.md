@@ -1,6 +1,9 @@
 # ADR-0005: The MSG protocol module waits for the second socket verb
 
-Status: accepted (2026-09-30)
+Status: delivered (2026-10-02). The trigger arrived: the socket verb family
+is volume up/down/mute, mic-mute, and brightness up/down, and the module
+exists as `msg.rs` (wire types, parse, accept loop, client sender). The
+verbs' semantics live in ADR-0009.
 
 ## Context
 

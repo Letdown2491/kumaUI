@@ -22,6 +22,10 @@ functions (unit-tested) separate from the process spawns.
 
 - Three to five short-lived processes every 2s while the shell runs. Fine for
   now; measure before "optimizing".
+- Cadence update 2026-10-02: the audio/brightness trio rides a 500ms fast
+  pass (a changed widget and the OSD should not wait 2s); everything else
+  keeps the 2s full pass. ADR-0009 has the confirm gate that keeps the
+  faster poll honest.
 - When the notification daemon and system tray arrive (they need zbus
   anyway), revisit this ADR: the poll readers sit behind an adapter seam
   (`sysmon.rs` readers), so a D-Bus adapter replaces the subprocess adapter

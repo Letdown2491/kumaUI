@@ -6,9 +6,9 @@ The binary is `kuma-shell`: a top bar, an app launcher, drawer panels, and a ses
 
 ## What's in the shell
 
-- **Bar**: a top strip of widgets (workspaces, window title, cpu, volume, battery, clock, bluetooth, network). Geometry applies live; the layer surface is always a full-width transparent window.
+- **Bar**: a top strip of widgets (workspaces, window title, apps, cpu, volume, brightness, media, battery, clock, bluetooth, internet, notifications, system tray, nostr signer), each enable/disable and placeable from the settings panel. Geometry applies live; the layer surface is always a full-width transparent window.
 - **Launcher**: an app-list panel with search-as-you-type, fuzzy scoring, and most-used-first ordering from per-app usage counts.
-- **Panels**: drawer surfaces hanging flush under the bar (concave cove silhouette), opened with a scrim click-catcher; settings lives in one.
+- **Panels**: drawer surfaces hanging flush under the bar (concave cove silhouette), opened with a scrim click-catcher. Panels with tabs use the shared panel kit: an icon-only rail with hover tooltips and the tab header over the right pane; settings carries the Widgets and Ordering pages.
 - **Lock screen**: opened by logind's session `Lock` signal. Opaque wallpaper-backed surfaces on every display, exclusive keyboard, one shared password field, and PAM authentication through a service chain (`kuma-lock` → `swaylock` → `vlock`; the first installed service wins, see [ADR-0008](docs/adr/0008-pam-chain-skips-uninstalled-services.md)).
 - **System monitors**: polled snapshots (battery, volume, mic, brightness, cpu, bluetooth, network, media, power profile) behind an adapter seam, with a serialized request queue for audio and brightness changes.
 - **OSD**: a centered toast card under the bar for volume, mute, microphone, and brightness changes, whichever surface they come from (the shell, a keybind, or an outside tool like wpctl).
