@@ -1,6 +1,7 @@
 //! The OSD: a small card, centered under the bar, for the changes a
-//! user makes blind: volume, mute, mic, brightness. It watches SysMon
-//! and diffs snapshots, so both the shell's own optimistic writes and
+//! user makes blind: volume, mute, mic, brightness, the notification
+//! bell's sleep, the power profile. It watches SysMon and Settings and
+//! diffs snapshots, so both the shell's own optimistic writes and
 //! external changes (a keybind running wpctl, a hardware key) light it
 //! up, and repeated changes re-arm the one window instead of stacking.
 
@@ -14,7 +15,8 @@ use gpui::{
 };
 
 use crate::panel::PanelHost;
-use crate::sysmon::{Brightness, Mic, SysMon, Volume};
+use crate::settings::Settings;
+use crate::sysmon::{Brightness, Mic, PowerProfile, SysMon, Volume};
 use crate::theme::*;
 
 /// How long the OSD hangs after the last change.
@@ -35,27 +37,35 @@ pub struct OsdContent {
     urgent: bool,
 }
 
-/// The slice of SysMon the OSD watches: a change in any of the three
+/// The slice of session state the OSD watches: a change in any of it
 /// is a change a user made blind.
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
-struct AvSnapshot {
+struct OsdSnapshot {
     volume: Option<Volume>,
     mic: Option<Mic>,
     brightness: Option<Brightness>,
+    /// The notification bell's sleep flag; None before the settings'
+    /// first read.
+    dnd: Option<bool>,
+    profile: Option<PowerProfile>,
 }
 
-fn av_of(sysmon: &SysMon) -> AvSnapshot {
-    AvSnapshot {
+fn snapshot_of(sysmon: &SysMon, settings: &Settings) -> OsdSnapshot {
+    OsdSnapshot {
         volume: sysmon.volume,
         mic: sysmon.mic,
         brightness: sysmon.brightness,
+        dnd: Some(settings.notifications.dnd),
+        profile: sysmon.power_profile,
     }
 }
 
 /// The card for one change; None when the two snapshots agree (the
 /// full poll notifies even when nothing moved). When several changed
-/// in one tick, volume wins: it is the commonest drumbeat.
-fn content_for_change(before: AvSnapshot, after: AvSnapshot) -> Option<OsdContent> {
+/// in one tick, volume wins: it is the commonest drumbeat. The dnd
+/// and profile arms need a previous value to diff against: their
+/// first sighting is the startup fill, not a thing the user did.
+fn content_for_change(before: OsdSnapshot, after: OsdSnapshot) -> Option<OsdContent> {
     if before.volume != after.volume
         && let Some(volume) = after.volume
     {
@@ -70,6 +80,18 @@ fn content_for_change(before: AvSnapshot, after: AvSnapshot) -> Option<OsdConten
         && let Some(mic) = after.mic
     {
         return Some(mic_content(mic));
+    }
+    if before.profile != after.profile
+        && let Some(profile) = after.profile
+        && before.profile.is_some()
+    {
+        return Some(profile_content(profile));
+    }
+    if before.dnd != after.dnd
+        && let Some(dnd) = after.dnd
+        && before.dnd.is_some()
+    {
+        return Some(dnd_content(dnd));
     }
     None
 }
@@ -108,10 +130,31 @@ fn brightness_content(brightness: Brightness) -> OsdContent {
     }
 }
 
+fn profile_content(profile: PowerProfile) -> OsdContent {
+    OsdContent {
+        icon: "icons/power-profile.svg",
+        label: "Power Profile",
+        value: profile.title().into(),
+        percent: None,
+        urgent: profile == PowerProfile::Performance,
+    }
+}
+
+fn dnd_content(dnd: bool) -> OsdContent {
+    OsdContent {
+        icon: "icons/bell.svg",
+        label: "Do Not Disturb",
+        value: if dnd { "On".into() } else { "Off".into() },
+        percent: None,
+        urgent: dnd,
+    }
+}
+
 pub struct Osd {
     sysmon: Entity<SysMon>,
+    settings: Entity<Settings>,
     /// The previous snapshot: first sight records, later ones diff.
-    last: Option<AvSnapshot>,
+    last: Option<OsdSnapshot>,
     window: Option<WindowHandle<OsdView>>,
     /// Bumped on every show; the expiry timer only dismisses the
     /// generation it was armed for, so re-shows outlive stale timers.
@@ -119,23 +162,24 @@ pub struct Osd {
 }
 
 impl Osd {
-    pub fn new(sysmon: Entity<SysMon>) -> Self {
+    pub fn new(sysmon: Entity<SysMon>, settings: Entity<Settings>) -> Self {
         Osd {
             sysmon,
+            settings,
             last: None,
             window: None,
             generation: 0,
         }
     }
 
-    /// The SysMon observer's body: take the new snapshot, and a change
+    /// The observers' body: take the new snapshot, and a change
     /// (and only a change) raises the card.
     fn reconcile(&mut self, cx: &mut Context<Self>) {
-        let next = av_of(self.sysmon.read(cx));
+        let next = snapshot_of(self.sysmon.read(cx), self.settings.read(cx));
         // the all-empty snapshot is the state before the poll's first
         // confirmed read lands, not a thing that happened: recording
         // it as first sight would turn the startup fill into a toast
-        if self.last.is_none() && next == AvSnapshot::default() {
+        if self.last.is_none() && next == OsdSnapshot::default() {
             return;
         }
         match self.last.replace(next) {
@@ -208,10 +252,20 @@ impl Osd {
     }
 }
 
-/// Wire the OSD to SysMon: every notify is a chance to diff.
-pub fn run(osd: &Entity<Osd>, sysmon: &Entity<SysMon>, cx: &mut App) {
+/// Wire the OSD to its sources: every notify is a chance to diff.
+pub fn run(
+    osd: &Entity<Osd>,
+    sysmon: &Entity<SysMon>,
+    settings: &Entity<Settings>,
+    cx: &mut App,
+) {
     let watcher = osd.clone();
     cx.observe(sysmon, move |_, cx| {
+        watcher.update(cx, |osd, cx| osd.reconcile(cx));
+    })
+    .detach();
+    let watcher = osd.clone();
+    cx.observe(settings, move |_, cx| {
         watcher.update(cx, |osd, cx| osd.reconcile(cx));
     })
     .detach();
@@ -348,8 +402,8 @@ mod tests {
 
     #[test]
     fn a_change_rises_and_agreement_shows_nothing() {
-        let quiet = AvSnapshot::default();
-        let loud = AvSnapshot {
+        let quiet = OsdSnapshot::default();
+        let loud = OsdSnapshot {
             volume: Some(Volume {
                 percent: 64,
                 muted: false,
@@ -387,8 +441,8 @@ mod tests {
 
     #[test]
     fn volume_outranks_brightness_when_both_move() {
-        let before = AvSnapshot::default();
-        let after = AvSnapshot {
+        let before = OsdSnapshot::default();
+        let after = OsdSnapshot {
             volume: Some(Volume {
                 percent: 50,
                 muted: false,
@@ -400,5 +454,33 @@ mod tests {
             content_for_change(before, after).map(|content| content.label),
             Some("Volume")
         );
+    }
+
+    #[test]
+    fn dnd_and_profile_name_their_change_but_not_their_first_sighting() {
+        // the startup fill: a value arriving with no previous one is
+        // the poll finding the world, not the user pressing anything
+        let fill = OsdSnapshot {
+            profile: Some(PowerProfile::Balanced),
+            dnd: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(content_for_change(OsdSnapshot::default(), fill), None);
+
+        // a real toggle names itself
+        let on = OsdSnapshot { dnd: Some(true), ..fill };
+        let content = content_for_change(fill, on).expect("a dnd toggle yields content");
+        assert_eq!(content.label, "Do Not Disturb");
+        assert_eq!(content.value, "On");
+        assert!(content.urgent);
+
+        let fast = OsdSnapshot {
+            profile: Some(PowerProfile::Performance),
+            ..fill
+        };
+        let content = content_for_change(fill, fast).expect("a profile change yields content");
+        assert_eq!(content.label, "Power Profile");
+        assert_eq!(content.value, "Performance");
+        assert!(content.urgent);
     }
 }

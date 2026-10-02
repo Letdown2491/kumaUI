@@ -65,6 +65,15 @@ impl PowerProfile {
         }
     }
 
+    /// The display name, title case: the OSD card's value.
+    pub fn title(self) -> &'static str {
+        match self {
+            PowerProfile::Performance => "Performance",
+            PowerProfile::Balanced => "Balanced",
+            PowerProfile::PowerSaver => "Power Saver",
+        }
+    }
+
     fn parse(text: &str) -> Option<PowerProfile> {
         match text.trim() {
             "performance" => Some(PowerProfile::Performance),

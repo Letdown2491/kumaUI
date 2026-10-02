@@ -45,10 +45,11 @@ fn main() {
         let sysmon = cx.new(|_| SysMon::default());
         kuma_shell::sysmon::run(&sysmon, cx);
 
-        let osd = cx.new(|_| kuma_shell::osd::Osd::new(sysmon.clone()));
-        kuma_shell::osd::run(&osd, &sysmon, cx);
-
         let settings = cx.new(|_| Settings::load());
+
+        let osd = cx.new(|_| kuma_shell::osd::Osd::new(sysmon.clone(), settings.clone()));
+        kuma_shell::osd::run(&osd, &sysmon, &settings, cx);
+
         let notifications = kuma_shell::notifications::start(settings.clone(), cx);
         let tray = kuma_shell::tray::start(cx);
         let nostr = cx.new(|_| kuma_shell::nostr::NostrState::new(notifications.clone()));
