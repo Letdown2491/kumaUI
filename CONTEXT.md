@@ -1,0 +1,19 @@
+# kuma-shell domain glossary
+
+One line per term. These names are the seams in the code; use them in code, docs, and ADRs.
+
+- **Shell**: the whole running kuma-shell program (wallpaper, bar, and every panel). The binary `kuma-shell`; the GUI process.
+- **Bar**: the layer-shell strip at the top of the screen. Its geometry (height, offset, width fraction, corner rounding) is applied live by the bar view; the layer surface itself is always a stretched full-width transparent window.
+- **Widget**: one piece of information rendered on the Bar (workspaces, window title, cpu, volume, battery, clock, bluetooth, internet). Declared in the widget registry (`settings.rs::WIDGETS`); rendered in `bar.rs`. Data comes from the **session state** (niri) or **system monitors**.
+- **Session state**: the mirror of the niri compositor's state (workspaces, windows, focus), kept current by the niri IPC event stream. Lives in `niri.rs::NiriState`.
+- **System monitors**: polled snapshots of machine state (battery, volume, cpu, bluetooth, network, recording). Lives in `sysmon.rs::SysMon`; refreshed every 2s by subprocess/procfs reads behind an adapter seam. Volume and mute changes ride one request seam on the monitors; callers never write a snapshot directly.
+- **Panel**: a drawer surface that hangs flush under the Bar, centered, with a concave cove silhouette (`panel.rs::drawer_silhouette`). Opens with a **scrim** beneath it: a fullscreen click-catcher that dismisses the panel on outside clicks. Keyboard mode per panel: `Exclusive` (launcher) or `OnDemand` (settings).
+- **Panel host**: the gpui Global that owns the open panel's lifecycle and placement: the Bar reports its live geometry into it, and every panel receives its `PanelGeometry` from the host; views never hardcode size. `toggle_panel(kind, cx)` / `close_panels(cx)`. Free functions, because the host is borrowed from `cx` in short blocks.
+- **Panel chrome**: the host-owned wrapper every Panel wears: drawer silhouette, input region, cove padding, Esc-to-dismiss. Panel views render content only; the chrome comes from the Panel host.
+- **Lock screen**: opaque, wallpaper-backed surfaces on every display with exclusive keyboard and one shared password field, opened by logind's session `Lock` signal (`lock.rs::LockState`). The password buffer captures the typed character, never the key name (ADR-0007).
+- **PAM service chain**: the ordered services an unlock attempt tries (`kuma-lock` → `swaylock` → `vlock`); the first *installed* service wins. Missing `/etc/pam.d/<service>` files are skipped, because Linux-PAM defers reading a service's stack and answers from the `pam_deny` `other` policy when it's absent, rejecting every password exactly like a wrong one. Anything PAM wants to ask interactively is refused (password-only).
+- **Settings**: the persisted configuration (`~/.config/kuma-shell/config.toml`), loaded into an observed entity. Mutators save and notify inside the seam; callers never call notify.
+- **Usage counts**: launch counts per app, seeded from noctalia's `usage_counts.json`, stored at `~/.local/state/kuma-shell/usage.json`; drives the launcher's most-used-first ordering.
+- **Launcher**: the app-list panel (search-as-you-type, fuzzy-scored, arrow-navigated, Enter launches).
+- **MSG CLI**: `kuma-shell msg <verb>`, thin client subcommands (volume, launcher toggle) that either act locally (wpctl) or ride the IPC socket (`$XDG_RUNTIME_DIR/kuma-shell.sock`) into the running Shell. This is what niri keybinds spawn.
+- **Vendored gpui**: the gpui framework, vendored from zed main at a pinned commit (`VENDORED.md`); the crates.io release predates layer-shell.

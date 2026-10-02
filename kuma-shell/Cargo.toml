@@ -1,0 +1,28 @@
+[package]
+name = "kuma-shell"
+version = "0.1.0"
+edition = "2024"
+description = "The kumaOS desktop shell: bar, launcher, panels, and lock screen on gpui"
+license = "MIT"
+repository = "https://github.com/Letdown2491/kumaui"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+image = "0.25"
+smallvec = "1"
+gpui = { workspace = true }
+gpui_platform = { workspace = true }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smol = "2"
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+pam-client2 = "0.5.5"
+futures-lite = "2"
+ashpd = { version = "0.13", default-features = false, features = ["async-io"] }
+env_logger = "0.11"
+toml = "0.9"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+libc = "0.2"
