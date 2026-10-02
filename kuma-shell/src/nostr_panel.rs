@@ -15,13 +15,14 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::Local;
 use gpui::{
-    App, AppContext, ClickEvent, Context, Div, Entity, FontWeight, IntoElement, ObjectFit, Render,
-    SharedString, Window, div, img, prelude::*, px, rgb, rgba,
+    AppContext, ClickEvent, Context, Div, Entity, FontWeight, IntoElement, ObjectFit, Render,
+    SharedString, Window, div, img, prelude::*, px, rgb,
 };
 
 use crate::imaging::IconImage;
 use crate::nostr::{self, NostrState, PairedApp, Prompt, VaultFact};
 use crate::panel::PanelGeometry;
+use crate::panel_kit::{self as kit, ButtonVariant};
 use crate::theme::*;
 
 /// The pane's poll cadence while the panel is open: an ask arriving
@@ -379,66 +380,27 @@ impl Render for NostrSignerView {
             .children([Tab::Asks, Tab::Apps, Tab::Log, Tab::Pair].map(|tab| {
                 let active = self.tab == tab;
                 let count = (tab == Tab::Asks && !prompts.is_empty()).then_some(prompts.len());
-                div()
-                    .id(SharedString::from(format!("rail-{}", tab.key())))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_0p5()
-                    .w(px(44.))
-                    .py_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .when(active, |el| el.bg(rgb(SURFACE)))
-                    .hover(|el| el.bg(rgb(SURFACE)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                kit::rail_tab(
+                    format!("rail-{}", tab.key()),
+                    tab.icon(),
+                    tab.title(),
+                    active,
+                    count,
+                    cx.listener(move |this, _, _, cx| {
                         this.tab = tab;
                         if tab == Tab::Pair {
                             this.check_clipboard(cx);
                         }
                         this.remember_tab(cx);
-                    }))
-                    .child(
-                        gpui::svg()
-                            .path(tab.icon())
-                            .size(px(16.))
-                            .text_color(rgb(if active { ACCENT } else { TEXT_DIM })),
-                    )
-                    .children(count.map(|count| {
-                        div()
-                            .text_size(px(10.))
-                            .text_color(rgb(if active { ACCENT } else { TEXT_DIM }))
-                            .child(count.to_string())
-                    }))
+                    }),
+                )
             }));
 
         // ── the pane header: title, badge, the vault's lock state ───
         let unlocked = vault.as_ref().map(|vault| vault.unlocked);
         let badge = (self.tab == Tab::Asks && !prompts.is_empty()).then_some(prompts.len());
-        let header = div()
-            .flex()
-            .items_center()
-            .gap_2p5()
-            .child(
-                div()
-                    .flex_1()
-                    .text_size(px(17.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT))
-                    .child(self.tab.title()),
-            )
-            .children(badge.map(|badge| {
-                div()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_full()
-                    .bg(rgb(ACCENT))
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(ACCENT_TEXT))
-                    .child(badge.to_string())
-            }))
+        let header = kit::pane_header(self.tab.title())
+            .children(badge.map(kit::count_badge))
             .child(
                 gpui::svg()
                     .path(if unlocked == Some(true) {
@@ -463,25 +425,18 @@ impl Render for NostrSignerView {
         }
         .into_any_element();
 
-        let pane = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .gap_2p5()
-            .child(header)
-            .child(div().h(px(1.)).w_full().bg(rgba(DIVIDER_SOFT)))
-            .child(
-                div()
-                    .id("nostr-pane")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .gap_3()
-                    .overflow_y_scroll()
-                    .child(body),
-            );
+        let pane = kit::tabbed_pane(
+            header,
+            div()
+                .id("nostr-pane")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .gap_3()
+                .overflow_y_scroll()
+                .child(body),
+        );
 
         let content = div()
             .flex()
@@ -506,7 +461,7 @@ fn asks_pane(
     cx: &mut Context<NostrSignerView>,
 ) -> gpui::Div {
     if prompts.is_empty() {
-        return empty_state(
+        return kit::empty_state(
             "icons/check.svg",
             "Nothing is waiting on you",
             "Sign-in and signing asks land here",
@@ -546,7 +501,7 @@ fn ask_card(
         prompt.summary.clone()
     };
 
-    let mut block = card(format!("ask-{id}"))
+    let mut block = kit::card(format!("ask-{id}"))
         .child(
             div()
                 .flex()
@@ -618,7 +573,7 @@ fn ask_card(
         div()
             .flex()
             .gap_2()
-            .child(button(
+            .child(kit::button(
                 format!("approve-{id}"),
                 "Approve",
                 Some("icons/check.svg"),
@@ -632,7 +587,7 @@ fn ask_card(
                     }
                 }),
             ))
-            .child(button(
+            .child(kit::button(
                 format!("hour-{id}"),
                 "An hour",
                 None,
@@ -650,7 +605,7 @@ fn ask_card(
                     }
                 }),
             ))
-            .child(button(
+            .child(kit::button(
                 format!("deny-{id}"),
                 "Deny",
                 Some("icons/x.svg"),
@@ -683,7 +638,7 @@ fn apps_pane(
         view.selected_app = None; // the app was deleted under the open view
     }
     if apps.is_empty() {
-        return empty_state(
+        return kit::empty_state(
             "icons/apps.svg",
             "No apps paired yet",
             "Pair one from the Pair tab",
@@ -715,7 +670,7 @@ fn app_card(
     if let Some(last) = app.last_used_at {
         line2.push(format!("last {}", nostr::relative(last)));
     }
-    card(format!("app-{pubkey}"))
+    kit::card(format!("app-{pubkey}"))
         .child(
             div()
                 .flex()
@@ -814,7 +769,7 @@ fn app_detail(
                 .child("Paired apps"),
         )
         .child(
-            card("detail-head".into())
+            kit::card("detail-head")
                 .child(
                     div()
                         .flex()
@@ -853,7 +808,7 @@ fn app_detail(
                 ),
         )
         .child(
-            card("detail-level".into())
+            kit::card("detail-level")
                 .child(
                     div()
                         .text_size(px(13.))
@@ -877,7 +832,7 @@ fn app_detail(
                         let active = app.level == level;
                         // trust is the loudest thing in the layer: its
                         // pill wears the alarm whether resting or set.
-                        row = row.child(button(
+                        row = row.child(kit::button(
                             format!("level-{level}"),
                             level,
                             None,
@@ -899,7 +854,7 @@ fn app_detail(
                 }),
         )
         .children(app.perms.clone().map(|perms| {
-            card("detail-perms".into()).child(
+            kit::card("detail-perms").child(
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(TEXT_DIM))
@@ -907,7 +862,7 @@ fn app_detail(
             )
         }))
         .child(
-            card("detail-acts".into())
+            kit::card("detail-acts")
                 .child(
                     div()
                         .text_size(px(13.))
@@ -922,8 +877,8 @@ fn app_detail(
                         .child({
                             let pubkey = pubkey.clone();
                             if revoked {
-                                button(
-                                    "unrevoke".into(),
+                                kit::button(
+                                    "unrevoke",
                                     "Un-revoke",
                                     Some("icons/undo.svg"),
                                     ButtonVariant::Ghost,
@@ -935,8 +890,8 @@ fn app_detail(
                                     }),
                                 )
                             } else {
-                                button(
-                                    "revoke".into(),
+                                kit::button(
+                                    "revoke",
                                     "Revoke",
                                     Some("icons/shield-off.svg"),
                                     ButtonVariant::Ghost,
@@ -951,8 +906,8 @@ fn app_detail(
                         })
                         .child({
                             let pubkey = pubkey.clone();
-                            button(
-                                "delete".into(),
+                            kit::button(
+                                "delete",
                                 "Delete",
                                 Some("icons/trash.svg"),
                                 ButtonVariant::Destructive,
@@ -982,7 +937,7 @@ fn app_detail(
 
 fn log_pane(entries: &[nostr::LogEntry], apps: &[PairedApp]) -> gpui::Div {
     if entries.is_empty() {
-        return empty_state(
+        return kit::empty_state(
             "icons/history.svg",
             "Nothing has happened yet",
             "Asks, approvals and pairings land here as they happen",
@@ -1018,7 +973,7 @@ fn log_row(entry: &nostr::LogEntry, apps: &[PairedApp], index: usize) -> gpui::S
     let when = chrono::DateTime::from_timestamp(entry.at as i64, 0)
         .map(|t| t.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default();
-    card(format!("log-{index}-{}", entry.at))
+    kit::card(format!("log-{index}-{}", entry.at))
         .child(
             div()
                 .flex()
@@ -1131,8 +1086,8 @@ fn pair_ready(
             div()
                 .flex()
                 .gap_2()
-                .child(button(
-                    "mint-uri".into(),
+                .child(kit::button(
+                    "mint-uri",
                     "Copy fresh URI",
                     Some("icons/copy.svg"),
                     ButtonVariant::Primary,
@@ -1140,8 +1095,8 @@ fn pair_ready(
                         this.mint_uri(cx);
                     }),
                 ))
-                .child(button(
-                    "rotate".into(),
+                .child(kit::button(
+                    "rotate",
                     "Rotate",
                     Some("icons/refresh.svg"),
                     ButtonVariant::Ghost,
@@ -1187,7 +1142,7 @@ fn offer_card(uri: String, cx: &mut Context<NostrSignerView>) -> gpui::Stateful<
         .and_then(|rest| rest.split('&').next())
         .map(percent_decode);
     let id_key = uri.chars().take(24).collect::<String>();
-    card(format!("offer-{id_key}"))
+    kit::card(format!("offer-{id_key}"))
         .child(
             div()
                 .text_size(px(12.5))
@@ -1206,8 +1161,8 @@ fn offer_card(uri: String, cx: &mut Context<NostrSignerView>) -> gpui::Stateful<
             div()
                 .flex()
                 .gap_2()
-                .child(button(
-                    "offer-pair".into(),
+                .child(kit::button(
+                    "offer-pair",
                     "Pair",
                     Some("icons/check.svg"),
                     ButtonVariant::Primary,
@@ -1222,8 +1177,8 @@ fn offer_card(uri: String, cx: &mut Context<NostrSignerView>) -> gpui::Stateful<
                         }
                     }),
                 ))
-                .child(button(
-                    "offer-ignore".into(),
+                .child(kit::button(
+                    "offer-ignore",
                     "Ignore",
                     Some("icons/x.svg"),
                     ButtonVariant::Ghost,
@@ -1267,55 +1222,11 @@ fn percent_decode(text: &str) -> String {
 }
 
 // ── the small vocabulary ─────────────────────────────────────────────
-
-/// The one surface vocabulary every pane shares: a column wearing fill
-/// and radius, with an id (the reconciler's identity), so a list
-/// whose cards come and go reuses the right node.
-fn card(id: String) -> gpui::Stateful<Div> {
-    div()
-        .id(SharedString::from(id))
-        .flex()
-        .flex_col()
-        .gap_2p5()
-        .px_3p5()
-        .py_3()
-        .rounded_lg()
-        .bg(rgb(SURFACE))
-}
+// The card, the button, the empty state: they live in `panel_kit`
+// now, shared with the rest of the shell's panels.
 
 fn wrap_pane(pane: gpui::Div) -> gpui::Div {
     div().flex().flex_col().gap_3().child(pane)
-}
-
-/// An empty pane: the glyph, the title, and the sentence under it.
-fn empty_state(icon: &'static str, title: &str, subtitle: &str) -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap_2p5()
-        .flex_1()
-        .py(px(56.))
-        .child(
-            gpui::svg()
-                .path(icon)
-                .size(px(46.))
-                .text_color(rgba(0x89B4FA66)),
-        )
-        .child(
-            div()
-                .text_size(px(14.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(TEXT))
-                .child(title.to_string()),
-        )
-        .child(
-            div()
-                .text_size(px(12.))
-                .text_color(rgb(TEXT_DIM))
-                .child(subtitle.to_string()),
-        )
 }
 
 /// The level badge, the card's right edge: the standing answer, with
@@ -1339,46 +1250,4 @@ fn level_badge(level: &str) -> gpui::Div {
                 .text_color(rgb(color))
                 .child(level.to_string()),
         )
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ButtonVariant {
-    Primary,
-    Ghost,
-    Destructive,
-}
-
-/// A pill button: primary fills the accent, destructive wears the
-/// alarm, ghost is a word that hovers.
-fn button(
-    id: String,
-    label: &str,
-    icon: Option<&'static str>,
-    variant: ButtonVariant,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> gpui::Stateful<Div> {
-    let (fg, glyph) = match variant {
-        ButtonVariant::Primary => (ACCENT_TEXT, ACCENT_TEXT),
-        ButtonVariant::Ghost => (ACCENT, ACCENT),
-        ButtonVariant::Destructive => (ACCENT_TEXT, ACCENT_TEXT),
-    };
-    let base = div()
-        .id(SharedString::from(id))
-        .flex()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .text_size(px(11.))
-        .text_color(rgb(fg))
-        .cursor_pointer();
-    let base = match variant {
-        ButtonVariant::Primary => base.bg(rgb(ACCENT)),
-        ButtonVariant::Ghost => base.hover(|el| el.bg(rgb(SURFACE))),
-        ButtonVariant::Destructive => base.bg(rgb(URGENT)),
-    };
-    base.children(icon.map(|path| gpui::svg().path(path).size(px(11.)).text_color(rgb(glyph))))
-        .child(label.to_string())
-        .on_click(on_click)
 }

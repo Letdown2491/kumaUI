@@ -1,6 +1,7 @@
-use gpui::{Context, Entity, Pixels, Render, Window, div, prelude::*, px, rgb, size};
+use gpui::{Context, Entity, Pixels, Render, Window, div, prelude::*, px, size};
 
 use crate::controls::{self, TrackStash};
+use crate::panel_kit as kit;
 use crate::sysmon::SysMon;
 use crate::theme::*;
 
@@ -104,12 +105,7 @@ impl Render for SliderPanelView {
                     this.dragging = None;
                 }),
             )
-            .child(
-                div()
-                    .text_size(px(14.))
-                    .text_color(rgb(TEXT))
-                    .child(self.kind.title()),
-            )
+            .child(kit::pane_header(self.kind.title()))
             .children(percent.map(|percent| {
                 controls::slider_row(
                     kind.icon(),
@@ -141,26 +137,20 @@ impl Render for SliderPanelView {
             }))
             .when(kind == SliderKind::Volume, |el| {
                 el.when_some(volume, |el, volume| {
-                    el.child(
-                        div()
-                            .id("mute-toggle")
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .text_size(px(11.))
-                            .text_color(if volume.muted {
-                                rgb(URGENT)
-                            } else {
-                                rgb(TEXT_DIM)
-                            })
-                            .cursor_pointer()
-                            .hover(|el| el.bg(rgb(SURFACE)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sysmon
-                                    .update(cx, |sysmon, cx| sysmon.request_mute_toggle(cx));
-                            }))
-                            .child(if volume.muted { "unmute" } else { "mute" }.to_string()),
-                    )
+                    el.child(kit::button(
+                        "mute-toggle",
+                        if volume.muted { "Unmute" } else { "Mute" },
+                        Some(if volume.muted {
+                            "icons/volume.svg"
+                        } else {
+                            "icons/x.svg"
+                        }),
+                        kit::ButtonVariant::Ghost,
+                        cx.listener(|this, _, _, cx| {
+                            this.sysmon
+                                .update(cx, |sysmon, cx| sysmon.request_mute_toggle(cx));
+                        }),
+                    ))
                 })
             });
 

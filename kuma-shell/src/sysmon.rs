@@ -1,4 +1,7 @@
-use std::{process::Command, time::Duration};
+use std::{
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context as _;
 use gpui::{App, AppContext, Context, Entity};
@@ -13,6 +16,13 @@ pub struct Battery {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Volume {
     pub percent: u8,
+    pub muted: bool,
+}
+
+/// The default capture device's state: muting is all the bar and the
+/// OSD say about it; its capture gain reads as noise otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mic {
     pub muted: bool,
 }
 
@@ -129,6 +139,7 @@ struct CpuSample {
 pub struct SysMon {
     pub battery: Option<Battery>,
     pub volume: Option<Volume>,
+    pub mic: Option<Mic>,
     pub brightness: Option<Brightness>,
     pub cpu: Option<f32>,
     pub bluetooth: Option<BluetoothState>,
@@ -136,15 +147,43 @@ pub struct SysMon {
     pub power_profile: Option<PowerProfile>,
     pub media: Option<MediaState>,
     pub recording: Option<RecordingState>,
+    /// When the last audio/brightness request was stamped: the fast
+    /// poll skips those fields while one is still landing, so a
+    /// mid-flight read can't revert the optimistic value.
+    av_request_at: Option<Instant>,
+    /// When the sink mute last toggled: the mute key double-fires on
+    /// some laptops (the field one emitted pairs 14-18ms apart), and
+    /// the second event is the bounce, not a second press.
+    sink_mute_at: Option<Instant>,
+    /// When the mic mute last toggled: same bounce guard, own clock so
+    /// a sink press never eats a deliberate mic press.
+    mic_mute_at: Option<Instant>,
+    /// A poll read of the trio that differed from the state and waits
+    /// for the next read to confirm it (see `absorb_av`).
+    av_confirming: Option<AvRead>,
+    /// The serialized av worker's queue, started by the first request.
+    av_sender: Option<smol::channel::Sender<AvRequest>>,
+}
+
+/// One poll read of the audio and brightness trio: the candidate state.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct AvRead {
+    volume: Option<Volume>,
+    mic: Option<Mic>,
+    brightness: Option<Brightness>,
 }
 
 /// A volume change request: `Set` carries an already-clamped target (the GUI's
 /// optimistic path); `Change` lets wpctl read live volume first (the MSG CLI
-/// path, and the GUI's fallback before the first snapshot).
+/// path, and the GUI's fallback before the first snapshot); `Mute` carries
+/// the mute target when the shell has a belief (it names what the press
+/// meant instead of re-asking wpctl what toggle lands on), and toggles
+/// blind when there is none.
 #[derive(Clone, Copy)]
 enum VolumeRequest {
     Set(u8),
     Change(i32),
+    Mute(Option<bool>),
 }
 
 impl VolumeRequest {
@@ -152,13 +191,108 @@ impl VolumeRequest {
         match self {
             VolumeRequest::Set(percent) => set_volume(percent),
             VolumeRequest::Change(delta) => change_volume(delta),
+            VolumeRequest::Mute(Some(true)) => set_mute("1", false),
+            VolumeRequest::Mute(Some(false)) => set_mute("0", false),
+            VolumeRequest::Mute(None) => toggle_mute(),
+        }
+    }
+}
+
+/// One queued audio/brightness change: the request plus the optimistic
+/// state it replaced, for the rollback when its call fails. All of
+/// them ride one worker in submission order: each request is an
+/// absolute write, so a raced completion order would land the wrong
+/// final value under a rapid scroll or a held keybind.
+enum AvRequest {
+    Volume(VolumeRequest, Option<Volume>),
+    BrightnessDelta(i32, Option<Brightness>),
+    BrightnessAbsolute(u8, Option<Brightness>),
+    Mic(Option<Mic>),
+}
+
+impl AvRequest {
+    async fn execute(self, this: &gpui::WeakEntity<SysMon>, cx: &mut gpui::AsyncApp) {
+        match self {
+            AvRequest::Volume(request, previous) => {
+                if let Err(err) = cx.background_spawn(async move { request.execute() }).await {
+                    log::error!("volume request failed: {err:#}");
+                    let _ = this.update(cx, |sysmon, cx| {
+                        sysmon.volume = previous; // rollback; the next poll reconciles
+                        cx.notify();
+                    });
+                }
+            }
+            AvRequest::BrightnessDelta(delta, previous) => {
+                if let Err(err) = cx
+                    .background_spawn(async move { change_brightness(delta) })
+                    .await
+                {
+                    log::error!("brightness request failed: {err:#}");
+                    let _ = this.update(cx, |sysmon, cx| {
+                        sysmon.brightness = previous; // rollback; the next poll reconciles
+                        cx.notify();
+                    });
+                }
+            }
+            AvRequest::BrightnessAbsolute(percent, previous) => {
+                if let Err(err) = cx
+                    .background_spawn(async move { set_brightness(percent) })
+                    .await
+                {
+                    log::error!("brightness request failed: {err:#}");
+                    let _ = this.update(cx, |sysmon, cx| {
+                        sysmon.brightness = previous; // rollback; the next poll reconciles
+                        cx.notify();
+                    });
+                }
+            }
+            AvRequest::Mic(previous) => {
+                // the target is the optimistic flip's answer: unmute a
+                // mic the belief had muted, mute one it hadn't; a blind
+                // toggle only when there is no belief to name
+                let result = async move {
+                    match previous {
+                        Some(mic) => set_mute(if mic.muted { "0" } else { "1" }, true),
+                        None => toggle_mic(),
+                    }
+                };
+                if let Err(err) = cx.background_spawn(result).await {
+                    log::error!("mic mute toggle failed: {err:#}");
+                    let _ = this.update(cx, |sysmon, cx| {
+                        sysmon.mic = previous; // rollback; the next poll reconciles
+                        cx.notify();
+                    });
+                }
+            }
         }
     }
 }
 
 impl SysMon {
+    /// The serialized av executor's queue side: the first request
+    /// starts the one worker; every request lines up behind it.
+    fn queue(&mut self, request: AvRequest, cx: &mut Context<Self>) {
+        let sender = match &self.av_sender {
+            Some(sender) => sender.clone(),
+            None => {
+                let (sender, receiver) = smol::channel::unbounded::<AvRequest>();
+                self.av_sender = Some(sender.clone());
+                cx.spawn(async move |this, cx| {
+                    while let Ok(request) = receiver.recv().await {
+                        request.execute(&this, cx).await;
+                    }
+                })
+                .detach();
+                sender
+            }
+        };
+        if let Err(err) = sender.send_blocking(request) {
+            log::error!("queueing av request failed: {err:#}");
+        }
+    }
+
     /// One request seam for volume changes (ADR-0006): optimistic snapshot
-    /// write, spawn, rollback on error. The MSG CLI uses the cx-free
+    /// write, queue, rollback on error. The MSG CLI uses the cx-free
     /// `change_volume` instead; both share `clamp_percent`.
     pub fn request_volume(&mut self, delta: i32, cx: &mut Context<Self>) {
         let previous = self.volume;
@@ -168,41 +302,53 @@ impl SysMon {
         };
         if let (VolumeRequest::Set(percent), Some(current)) = (request, previous) {
             self.volume = Some(Volume { percent, ..current });
+            self.av_request_at = Some(Instant::now());
             cx.notify();
         }
-        cx.spawn(async move |this, cx| {
-            if let Err(err) = cx.background_spawn(async move { request.execute() }).await {
-                log::error!("volume request failed: {err:#}");
-                let _ = this.update(cx, |sysmon, cx| {
-                    sysmon.volume = previous; // rollback; the next poll reconciles
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        self.queue(AvRequest::Volume(request, previous), cx);
     }
 
-    /// One request seam for mute changes (ADR-0006).
-    /// One request seam for mute changes (ADR-0006).
+    /// One request seam for mute changes (ADR-0006): optimistic flip,
+    /// queue the named target, rollback on error. Bounce-guarded: the
+    /// mute key double-fires on some laptops.
     pub fn request_mute_toggle(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if bounced(self.sink_mute_at, now) {
+            return;
+        }
+        self.sink_mute_at = Some(now);
         let previous = self.volume;
-        if let Some(current) = previous {
-            self.volume = Some(Volume {
-                muted: !current.muted,
-                ..current
-            });
+        let target = previous.map(|volume| !volume.muted);
+        if let (Some(muted), Some(current)) = (target, previous) {
+            self.volume = Some(Volume { muted, ..current });
+            self.av_request_at = Some(Instant::now());
             cx.notify();
         }
-        cx.spawn(async move |this, cx| {
-            if let Err(err) = cx.background_spawn(async move { toggle_mute() }).await {
-                log::error!("mute toggle failed: {err:#}");
-                let _ = this.update(cx, |sysmon, cx| {
-                    sysmon.volume = previous; // rollback; the next poll reconciles
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        self.queue(AvRequest::Volume(VolumeRequest::Mute(target), previous), cx);
+    }
+
+    /// One request seam for the microphone mute (ADR-0006): optimistic
+    /// flip, queue the named target (the worker sets what the press
+    /// meant rather than re-asking wpctl what toggle lands on),
+    /// rollback on error; the standalone CLI keeps using cx-free
+    /// `toggle_mic`. No mic snapshot to flip means nothing to preview:
+    /// the fast poll brings the change within the half second.
+    /// Bounce-guarded like the sink mute.
+    pub fn request_mic_toggle(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if bounced(self.mic_mute_at, now) {
+            return;
+        }
+        self.mic_mute_at = Some(now);
+        let previous = self.mic;
+        if let Some(current) = previous {
+            self.mic = Some(Mic {
+                muted: !current.muted,
+            });
+            self.av_request_at = Some(Instant::now());
+            cx.notify();
+        }
+        self.queue(AvRequest::Mic(previous), cx);
     }
 
     /// One request seam for play/pause (ADR-0006): optimistic status flip,
@@ -249,79 +395,45 @@ impl SysMon {
     }
 
     /// Absolute volume set (the quick-settings slider path): optimistic
-    /// snapshot write, spawn, rollback on error, same ritual as
+    /// snapshot write, queue, rollback on error, same ritual as
     /// `request_volume`, minus the delta math.
     pub fn request_set_volume(&mut self, percent: u8, cx: &mut Context<Self>) {
         let previous = self.volume;
         if let Some(current) = previous {
             self.volume = Some(Volume { percent, ..current });
+            self.av_request_at = Some(Instant::now());
             cx.notify();
         }
-        cx.spawn(async move |this, cx| {
-            let request = VolumeRequest::Set(percent);
-            if let Err(err) = cx.background_spawn(async move { request.execute() }).await {
-                log::error!("volume request failed: {err:#}");
-                let _ = this.update(cx, |sysmon, cx| {
-                    sysmon.volume = previous; // rollback; the next poll reconciles
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        self.queue(
+            AvRequest::Volume(VolumeRequest::Set(percent), previous),
+            cx,
+        );
     }
 
     /// One request seam for brightness (the quick-settings slider): optimistic
-    /// snapshot write, spawn, rollback on error.
-    /// One request seam for brightness (the quick-settings slider): optimistic
-    /// snapshot write, spawn, rollback on error.
+    /// snapshot write, queue, rollback on error.
     pub fn request_set_brightness(&mut self, percent: u8, cx: &mut Context<Self>) {
         let previous = self.brightness;
         if previous.is_some() {
             self.brightness = Some(Brightness { percent });
+            self.av_request_at = Some(Instant::now());
             cx.notify();
         }
-        cx.spawn(async move |this, cx| {
-            if let Err(err) = cx
-                .background_spawn(async move { set_brightness(percent) })
-                .await
-            {
-                log::error!("brightness request failed: {err:#}");
-                let _ = this.update(cx, |sysmon, cx| {
-                    sysmon.brightness = previous; // rollback; the next poll reconciles
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        self.queue(AvRequest::BrightnessAbsolute(percent, previous), cx);
     }
 
     /// Brightness by delta (the bar widget's scroll wheel): optimistic
-    /// snapshot write, spawn, rollback on error; mirrors `request_volume`.
+    /// snapshot write, queue, rollback on error; mirrors `request_volume`.
     pub fn request_brightness(&mut self, delta: i32, cx: &mut Context<Self>) {
         let previous = self.brightness;
         if let Some(current) = previous
             && let percent = (current.percent as i32 + delta).clamp(0, 100) as u8
         {
             self.brightness = Some(Brightness { percent });
+            self.av_request_at = Some(Instant::now());
             cx.notify();
         }
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let current = read_brightness().context("no backlight found")?;
-                    let new = (current.percent as i32 + delta).clamp(0, 100) as u8;
-                    set_brightness(new)
-                })
-                .await;
-            if let Err(err) = result {
-                log::error!("brightness request failed: {err:#}");
-                let _ = this.update(cx, |sysmon, cx| {
-                    sysmon.brightness = previous; // rollback; the next poll reconciles
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        self.queue(AvRequest::BrightnessDelta(delta, previous), cx);
     }
 
     /// Toggle the Wi-Fi radio. Optimistic flip with rollback; with no
@@ -409,38 +521,72 @@ impl SysMon {
     }
 }
 
+/// The poll's base cadence: fast enough that a change made outside the
+/// shell (a keybind running wpctl, a hardware key) reads as real time,
+/// cheap enough to keep forever: two wpctl calls and two sysfs reads.
+const FAST_INTERVAL: Duration = Duration::from_millis(500);
+/// The full pass rides every fourth tick: everything else refreshes at
+/// the old two-second pace.
+const FULL_PASS_EVERY: u32 = 4;
+/// How long after a request the fast poll leaves the audio and
+/// brightness fields alone: a request's own optimistic write is the
+/// truth until its wpctl/brightnessctl call has landed.
+const REQUEST_LANDING: Duration = Duration::from_millis(250);
+
+/// The mute keys double-fire on some laptops: the mic key emitted
+/// pairs 14-18ms apart in the field. A mute toggle this soon after
+/// the last one is the bounce, not a second press.
+const MUTE_BOUNCE: Duration = Duration::from_millis(150);
+
+fn bounced(last: Option<Instant>, now: Instant) -> bool {
+    last.is_some_and(|at| now.duration_since(at) < MUTE_BOUNCE)
+}
+
 pub fn run(state: &Entity<SysMon>, cx: &mut App) {
     let state = state.downgrade();
     cx.spawn(async move |cx| {
         let mut previous: Option<CpuSample> = None;
+        let mut tick = 0u32;
         loop {
+            let full = tick % FULL_PASS_EVERY == 0;
+            tick = tick.wrapping_add(1);
             let (snapshot, previous_next) = cx
                 .background_spawn(async move {
                     let mut previous = previous;
-                    let snapshot = refresh(&mut previous);
+                    let snapshot = if full {
+                        refresh(&mut previous)
+                    } else {
+                        refresh_av()
+                    };
                     (snapshot, previous)
                 })
                 .await;
             previous = previous_next;
             if state
                 .update(cx, |sysmon, cx| {
-                    sysmon.battery = snapshot.battery;
-                    sysmon.volume = snapshot.volume;
-                    sysmon.brightness = snapshot.brightness;
-                    sysmon.cpu = snapshot.cpu;
-                    sysmon.bluetooth = snapshot.bluetooth.clone();
-                    sysmon.network = snapshot.network.clone();
-                    sysmon.power_profile = snapshot.power_profile;
-                    sysmon.media = snapshot.media.clone();
-                    sysmon.recording = snapshot.recording.clone();
-                    log::info!("sysmon snapshot: {snapshot:?}");
-                    cx.notify();
+                    if full {
+                        sysmon.battery = snapshot.battery;
+                        sysmon.cpu = snapshot.cpu;
+                        sysmon.bluetooth = snapshot.bluetooth.clone();
+                        sysmon.network = snapshot.network.clone();
+                        sysmon.power_profile = snapshot.power_profile;
+                        sysmon.media = snapshot.media.clone();
+                        sysmon.recording = snapshot.recording.clone();
+                        log::info!("sysmon snapshot: {snapshot:?}");
+                        // the trio rides the same confirm gate as the
+                        // fast pass: the full pass doesn't get to
+                        // bypass it
+                        sysmon.absorb_av(&snapshot);
+                        cx.notify();
+                    } else if sysmon.absorb_av(&snapshot) {
+                        cx.notify();
+                    }
                 })
                 .is_err()
             {
                 break;
             }
-            cx.background_executor().timer(Duration::from_secs(2)).await;
+            cx.background_executor().timer(FAST_INTERVAL).await;
         }
     })
     .detach();
@@ -450,6 +596,7 @@ pub fn run(state: &Entity<SysMon>, cx: &mut App) {
 struct Snapshot {
     battery: Option<Battery>,
     volume: Option<Volume>,
+    mic: Option<Mic>,
     brightness: Option<Brightness>,
     cpu: Option<f32>,
     bluetooth: Option<BluetoothState>,
@@ -463,6 +610,7 @@ fn refresh(previous: &mut Option<CpuSample>) -> Snapshot {
     Snapshot {
         battery: read_battery(),
         volume: read_volume(),
+        mic: read_mic(),
         brightness: read_brightness(),
         cpu: sample_cpu_usage(previous),
         bluetooth: read_bluetooth(),
@@ -470,6 +618,59 @@ fn refresh(previous: &mut Option<CpuSample>) -> Snapshot {
         power_profile: read_power_profile(),
         media: read_media(),
         recording: read_recording(),
+    }
+}
+
+/// The fast pass: only what a keybind or a hardware key changes out
+/// from under the shell. Everything else keeps the full pass's pace.
+fn refresh_av() -> Snapshot {
+    Snapshot {
+        volume: read_volume(),
+        mic: read_mic(),
+        brightness: read_brightness(),
+        ..Default::default()
+    }
+}
+
+impl SysMon {
+    /// The poll's apply for the audio and brightness trio. A read that
+    /// differs from the state must be confirmed by the next read before
+    /// it counts: around a routing change WirePlumber's defaults flap,
+    /// and one transient read showed the sink muted when only the mic
+    /// had moved, toasting the wrong card twice. Our own requests are
+    /// above this: while one is landing the trio is left alone.
+    /// Reports whether the state moved.
+    fn absorb_av(&mut self, snapshot: &Snapshot) -> bool {
+        let busy = self
+            .av_request_at
+            .map(|at| at.elapsed() < REQUEST_LANDING)
+            .unwrap_or(false);
+        if busy {
+            return false;
+        }
+        let read = AvRead {
+            volume: snapshot.volume,
+            mic: snapshot.mic,
+            brightness: snapshot.brightness,
+        };
+        let state = AvRead {
+            volume: self.volume,
+            mic: self.mic,
+            brightness: self.brightness,
+        };
+        if read == state {
+            self.av_confirming = None;
+            return false;
+        }
+        // a differing read must repeat before it applies
+        if self.av_confirming.replace(read) == Some(read) {
+            self.av_confirming = None;
+            self.volume = read.volume;
+            self.mic = read.mic;
+            self.brightness = read.brightness;
+            return true;
+        }
+        false
     }
 }
 
@@ -499,11 +700,28 @@ pub fn change_volume(percent_delta: i32) -> anyhow::Result<()> {
 }
 
 pub fn toggle_mute() -> anyhow::Result<()> {
+    set_mute("toggle", false)
+}
+
+/// Absolute mute set: the toggle verbs read live state and flip it,
+/// which races the shell's own belief under the poll's confirm gate;
+/// naming the target says what the press meant.
+fn set_mute(target: &str, source: bool) -> anyhow::Result<()> {
+    let object = if source {
+        "@DEFAULT_AUDIO_SOURCE@"
+    } else {
+        "@DEFAULT_AUDIO_SINK@"
+    };
     let output = Command::new("wpctl")
-        .args(["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+        .args(["set-mute", object, target])
         .output()?;
     anyhow::ensure!(output.status.success(), "wpctl set-mute failed");
     Ok(())
+}
+
+/// The MSG CLI's mic verb: the capture device, not the sink.
+pub fn toggle_mic() -> anyhow::Result<()> {
+    set_mute("toggle", true)
 }
 
 /// The MSG CLI path: read current brightness and step it, clamped.
@@ -775,6 +993,22 @@ fn read_volume() -> Option<Volume> {
     parse_wpctl_volume(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// The microphone rides the same parser: `wpctl` prints the identical
+/// shape for the default source, muting is the only field the shell
+/// keeps.
+fn read_mic() -> Option<Mic> {
+    let output = Command::new("wpctl")
+        .args(["get-volume", "@DEFAULT_AUDIO_SOURCE@"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_wpctl_volume(&String::from_utf8_lossy(&output.stdout)).map(|volume| Mic {
+        muted: volume.muted,
+    })
+}
+
 // `stat` is the contents of /proc/<pid>/stat: starttime is field 22
 // (1-indexed); fields after the comm parenthesis start at field 3, so it's
 // index 19 of the post-paren fields. Clock ticks are 100/sec.
@@ -980,6 +1214,18 @@ mod tests {
     }
 
     #[test]
+    fn mute_bounce_wins_the_18ms_double_fire_and_loses_a_human_press() {
+        // the field measurement: the mic key emitted pairs 14-18ms apart
+        let now = Instant::now();
+        assert!(bounced(Some(now - Duration::from_millis(14)), now));
+        assert!(bounced(Some(now - Duration::from_millis(18)), now));
+        // a deliberate second press lands well past the window
+        assert!(!bounced(Some(now - Duration::from_millis(200)), now));
+        // and no history is never a bounce
+        assert!(!bounced(None, now));
+    }
+
+    #[test]
     fn power_profile_parses_powerprofilesctl_output() {
         assert_eq!(
             PowerProfile::parse("balanced\n"),
@@ -999,5 +1245,57 @@ mod tests {
             PowerProfile::parse(PowerProfile::Performance.as_str()),
             Some(PowerProfile::Performance)
         );
+    }
+
+    #[test]
+    fn the_poll_confirms_a_change_before_it_counts() {
+        let mut sysmon = SysMon::default();
+        sysmon.volume = Some(Volume {
+            percent: 50,
+            muted: false,
+        });
+        sysmon.mic = Some(Mic { muted: true });
+        // a garbage read (the sink shows the mic's mute during a
+        // routing flap): stored, not applied
+        let garbage = Snapshot {
+            volume: Some(Volume {
+                percent: 71,
+                muted: true,
+            }),
+            mic: Some(Mic { muted: true }),
+            ..Default::default()
+        };
+        assert!(!sysmon.absorb_av(&garbage));
+        assert_eq!(
+            sysmon.volume,
+            Some(Volume {
+                percent: 50,
+                muted: false
+            })
+        );
+        // the garbage is gone on the next read: discarded quietly
+        let calm = Snapshot {
+            volume: Some(Volume {
+                percent: 50,
+                muted: false,
+            }),
+            mic: Some(Mic { muted: true }),
+            ..Default::default()
+        };
+        assert!(!sysmon.absorb_av(&calm));
+        assert_eq!(
+            sysmon.volume,
+            Some(Volume {
+                percent: 50,
+                muted: false
+            })
+        );
+        // a real change repeats and then applies
+        let mut real = calm;
+        real.mic = Some(Mic { muted: false });
+        assert!(!sysmon.absorb_av(&real));
+        assert_eq!(sysmon.mic, Some(Mic { muted: true }));
+        assert!(sysmon.absorb_av(&real));
+        assert_eq!(sysmon.mic, Some(Mic { muted: false }));
     }
 }

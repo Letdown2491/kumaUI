@@ -10,10 +10,9 @@
 //! verb → request mapping.
 
 use anyhow::Context;
-use serde::Serialize;
 
 /// What the MSG socket can ask the running shell to do.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     Launcher,
     Notifications,
@@ -25,6 +24,26 @@ pub enum Request {
     /// keybind's and the app grid's road. An offer must come with a
     /// URI; a hand coming from a keybind has none.
     NostrPanel,
+    /// The audio and brightness keybinds' road: applied in-process, the
+    /// widgets and the OSD react at once instead of at the next poll.
+    Volume(VolumeCmd),
+    Brightness(BrightnessCmd),
+    MicMute,
+}
+
+/// The volume keybind's direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VolumeCmd {
+    Up,
+    Down,
+    Mute,
+}
+
+/// The brightness keybind's direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrightnessCmd {
+    Up,
+    Down,
 }
 
 impl Request {
@@ -34,6 +53,9 @@ impl Request {
             Request::Notifications => "Notifications",
             Request::Nostr(_) => "Nostr",
             Request::NostrPanel => "NostrPanel",
+            Request::Volume(_) => "Volume",
+            Request::Brightness(_) => "Brightness",
+            Request::MicMute => "Mic",
         }
     }
 
@@ -43,6 +65,16 @@ impl Request {
             Request::Notifications => "Dnd".into(),
             Request::Nostr(uri) => uri.clone(),
             Request::NostrPanel => "Open".into(),
+            Request::Volume(cmd) => match cmd {
+                VolumeCmd::Up => "Up".into(),
+                VolumeCmd::Down => "Down".into(),
+                VolumeCmd::Mute => "Mute".into(),
+            },
+            Request::Brightness(cmd) => match cmd {
+                BrightnessCmd::Up => "Up".into(),
+                BrightnessCmd::Down => "Down".into(),
+            },
+            Request::MicMute => "Mute".into(),
         }
     }
 }
@@ -81,12 +113,27 @@ pub fn parse(line: &str) -> Option<Request> {
         "notifications" => Some(Request::Notifications),
         "nostr" => Some(Request::Nostr(value.to_string())),
         "nostrpanel" => Some(Request::NostrPanel),
+        "volume" => match value.to_lowercase().as_str() {
+            "up" => Some(Request::Volume(VolumeCmd::Up)),
+            "down" => Some(Request::Volume(VolumeCmd::Down)),
+            "mute" => Some(Request::Volume(VolumeCmd::Mute)),
+            _ => None,
+        },
+        "brightness" => match value.to_lowercase().as_str() {
+            "up" => Some(Request::Brightness(BrightnessCmd::Up)),
+            "down" => Some(Request::Brightness(BrightnessCmd::Down)),
+            _ => None,
+        },
+        "mic" => match value.to_lowercase().as_str() {
+            "mute" => Some(Request::MicMute),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-/// The client half: connect, send one line, read the reply, print it.
-pub fn send(request: &Request) -> anyhow::Result<()> {
+/// The client half: connect, send one line, read the reply.
+fn transmit(request: &Request) -> anyhow::Result<String> {
     use std::io::{BufRead, BufReader, Write};
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
     let path = std::path::PathBuf::from(runtime_dir).join("kuma-shell.sock");
@@ -98,8 +145,19 @@ pub fn send(request: &Request) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut reply_line = String::new();
     reader.read_line(&mut reply_line)?;
-    print!("{reply_line}");
+    Ok(reply_line)
+}
+
+/// Send one request and print the reply.
+pub fn send(request: &Request) -> anyhow::Result<()> {
+    print!("{}", transmit(request)?);
     Ok(())
+}
+
+/// Send one request without printing the reply: the audio and
+/// brightness verbs have no terminal to show JSON on.
+pub fn send_quiet(request: &Request) -> anyhow::Result<()> {
+    transmit(request).map(|_| ())
 }
 
 /// The server half: one thread, accept loop, parse, reply, forward.
@@ -171,5 +229,33 @@ mod tests {
         assert_eq!(parse("{\"Nostr\": 3}"), None);
         assert_eq!(parse("{\"Bogus\":\"x\"}"), None);
         assert_eq!(reply(false), "{\"Err\":\"unknown request\"}\n");
+    }
+
+    #[test]
+    fn the_audio_and_brightness_verbs_round_trip() {
+        assert_eq!(
+            parse(&to_line(&Request::Volume(VolumeCmd::Up))),
+            Some(Request::Volume(VolumeCmd::Up))
+        );
+        assert_eq!(
+            to_line(&Request::Volume(VolumeCmd::Down)),
+            "{\"Volume\":\"Down\"}"
+        );
+        assert_eq!(
+            parse(&to_line(&Request::Volume(VolumeCmd::Mute))),
+            Some(Request::Volume(VolumeCmd::Mute))
+        );
+        assert_eq!(
+            parse(&to_line(&Request::Brightness(BrightnessCmd::Up))),
+            Some(Request::Brightness(BrightnessCmd::Up))
+        );
+        assert_eq!(
+            to_line(&Request::Brightness(BrightnessCmd::Down)),
+            "{\"Brightness\":\"Down\"}"
+        );
+        assert_eq!(parse(&to_line(&Request::MicMute)), Some(Request::MicMute));
+        assert_eq!(to_line(&Request::MicMute), "{\"Mic\":\"Mute\"}");
+        // a verb with a bogus direction is not a request
+        assert_eq!(parse("{\"Volume\":\"Sideways\"}"), None);
     }
 }

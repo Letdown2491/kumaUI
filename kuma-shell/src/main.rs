@@ -11,7 +11,21 @@ use kuma_shell::settings::{BarConfig, Settings};
 use gpui_platform::application;
 
 fn main() {
-    env_logger::init();
+    // millis in the log: the difference between a key's bounce (two
+    // requests tens of ms apart) and a human's second press
+    use std::io::Write as _;
+    env_logger::Builder::from_env(env_logger::Env::default())
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{} {:<5} {}] {}",
+                buf.timestamp_millis(),
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
@@ -30,6 +44,9 @@ fn main() {
 
         let sysmon = cx.new(|_| SysMon::default());
         kuma_shell::sysmon::run(&sysmon, cx);
+
+        let osd = cx.new(|_| kuma_shell::osd::Osd::new(sysmon.clone()));
+        kuma_shell::osd::run(&osd, &sysmon, cx);
 
         let settings = cx.new(|_| Settings::load());
         let notifications = kuma_shell::notifications::start(settings.clone(), cx);
@@ -97,8 +114,10 @@ fn main() {
 
         let msg_settings = settings.clone();
         let msg_nostr = nostr.clone();
+        let msg_sysmon = sysmon.clone();
         cx.spawn(async move |cx| {
             while let Ok(request) = bar_toggle_rx.recv().await {
+                log::info!("msg: {request:?}");
                 let _ = cx.update(|cx| match request {
                     kuma_shell::msg::Request::Launcher => {
                         kuma_shell::panel::toggle_panel(kuma_shell::panel::PanelKind::Launcher, cx);
@@ -109,6 +128,24 @@ fn main() {
                             let dnd = !settings.notifications.dnd;
                             settings.set_notifications_dnd(dnd, cx);
                         });
+                    }
+                    kuma_shell::msg::Request::Volume(cmd) => {
+                        msg_sysmon.update(cx, |sysmon, cx| match cmd {
+                            kuma_shell::msg::VolumeCmd::Up => sysmon.request_volume(5, cx),
+                            kuma_shell::msg::VolumeCmd::Down => sysmon.request_volume(-5, cx),
+                            kuma_shell::msg::VolumeCmd::Mute => sysmon.request_mute_toggle(cx),
+                        });
+                    }
+                    kuma_shell::msg::Request::Brightness(cmd) => {
+                        msg_sysmon.update(cx, |sysmon, cx| match cmd {
+                            kuma_shell::msg::BrightnessCmd::Up => sysmon.request_brightness(5, cx),
+                            kuma_shell::msg::BrightnessCmd::Down => {
+                                sysmon.request_brightness(-5, cx)
+                            }
+                        });
+                    }
+                    kuma_shell::msg::Request::MicMute => {
+                        msg_sysmon.update(cx, |sysmon, cx| sysmon.request_mic_toggle(cx));
                     }
                     kuma_shell::msg::Request::Nostr(uri) => {
                         // The scheme handler's landing: the offer
@@ -177,9 +214,22 @@ fn run_cli(args: &[String]) -> i32 {
         action = iter.next().unwrap_or_default();
     }
     let result = match action {
-        "volume-up" => kuma_shell::sysmon::change_volume(5),
-        "volume-down" => kuma_shell::sysmon::change_volume(-5),
-        "volume-mute" | "mute" => kuma_shell::sysmon::toggle_mute(),
+        "volume-up" => cli_av(
+            &kuma_shell::msg::Request::Volume(kuma_shell::msg::VolumeCmd::Up),
+            || kuma_shell::sysmon::change_volume(5),
+        ),
+        "volume-down" => cli_av(
+            &kuma_shell::msg::Request::Volume(kuma_shell::msg::VolumeCmd::Down),
+            || kuma_shell::sysmon::change_volume(-5),
+        ),
+        "volume-mute" | "mute" => cli_av(
+            &kuma_shell::msg::Request::Volume(kuma_shell::msg::VolumeCmd::Mute),
+            kuma_shell::sysmon::toggle_mute,
+        ),
+        "mic-mute" => cli_av(
+            &kuma_shell::msg::Request::MicMute,
+            kuma_shell::sysmon::toggle_mic,
+        ),
         "launcher-toggle" => kuma_shell::msg::send(&kuma_shell::msg::Request::Launcher),
         "notifications-dnd" => kuma_shell::msg::send(&kuma_shell::msg::Request::Notifications),
         // the scheme handler's road: `kuma-shell msg nostr <nostrconnect://…>`,
@@ -207,11 +257,27 @@ fn run_cli(args: &[String]) -> i32 {
         // optional step: `msg brightness-up 10` (default 5)
         "brightness-up" => {
             let step = iter.next().and_then(|step| step.parse().ok()).unwrap_or(5);
-            kuma_shell::sysmon::change_brightness(step)
+            // the wire's Up steps by the shell's own five; a custom
+            // step stays standalone, which steps exactly
+            if step == 5 {
+                cli_av(
+                    &kuma_shell::msg::Request::Brightness(kuma_shell::msg::BrightnessCmd::Up),
+                    move || kuma_shell::sysmon::change_brightness(step),
+                )
+            } else {
+                kuma_shell::sysmon::change_brightness(step)
+            }
         }
         "brightness-down" => {
             let step = iter.next().and_then(|step| step.parse().ok()).unwrap_or(5);
-            kuma_shell::sysmon::change_brightness(-step)
+            if step == 5 {
+                cli_av(
+                    &kuma_shell::msg::Request::Brightness(kuma_shell::msg::BrightnessCmd::Down),
+                    move || kuma_shell::sysmon::change_brightness(-step),
+                )
+            } else {
+                kuma_shell::sysmon::change_brightness(-step)
+            }
         }
         "workspace" => {
             let Some(number) = iter.next().and_then(|n| n.parse().ok()) else {
@@ -223,7 +289,7 @@ fn run_cli(args: &[String]) -> i32 {
         other => {
             eprintln!("kuma-shell: unknown command {other:?}");
             eprintln!(
-                "usage: kuma-shell [msg] volume-up | volume-down | volume-mute | mute | launcher-toggle | notifications-dnd | nostr [uri] | media <play-pause|stop|next|previous> | brightness-up [step] | brightness-down [step] | workspace <n>"
+                "usage: kuma-shell [msg] volume-up | volume-down | volume-mute | mute | mic-mute | launcher-toggle | notifications-dnd | nostr [uri] | media <play-pause|stop|next|previous> | brightness-up [step] | brightness-down [step] | workspace <n>"
             );
             return 1;
         }
@@ -233,6 +299,20 @@ fn run_cli(args: &[String]) -> i32 {
         return 1;
     }
     0
+}
+
+/// The audio and brightness verbs prefer the running shell: applied
+/// in-process, the widgets and the OSD react at once, with no second
+/// wpctl round trip racing the shell's. With no shell listening, the
+/// request errors and the standalone path runs instead.
+fn cli_av(
+    request: &kuma_shell::msg::Request,
+    standalone: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if kuma_shell::msg::send_quiet(request).is_ok() {
+        return Ok(());
+    }
+    standalone()
 }
 
 fn bar_window_options(config: &BarConfig) -> WindowOptions {

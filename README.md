@@ -10,8 +10,9 @@ The binary is `kuma-shell`: a top bar, an app launcher, drawer panels, and a ses
 - **Launcher**: an app-list panel with search-as-you-type, fuzzy scoring, and most-used-first ordering from per-app usage counts.
 - **Panels**: drawer surfaces hanging flush under the bar (concave cove silhouette), opened with a scrim click-catcher; settings lives in one.
 - **Lock screen**: opened by logind's session `Lock` signal. Opaque wallpaper-backed surfaces on every display, exclusive keyboard, one shared password field, and PAM authentication through a service chain (`kuma-lock` → `swaylock` → `vlock`; the first installed service wins, see [ADR-0008](docs/adr/0008-pam-chain-skips-uninstalled-services.md)).
-- **System monitors**: polled snapshots (battery, volume, cpu, bluetooth, network, recording) behind an adapter seam.
-- **msg CLI**: `kuma-shell msg <verb>`, thin client subcommands (volume, launcher toggle) that niri keybinds spawn, riding a unix socket into the running shell.
+- **System monitors**: polled snapshots (battery, volume, mic, brightness, cpu, bluetooth, network, media, power profile) behind an adapter seam, with a serialized request queue for audio and brightness changes.
+- **OSD**: a centered toast card under the bar for volume, mute, microphone, and brightness changes, whichever surface they come from (the shell, a keybind, or an outside tool like wpctl).
+- **msg CLI**: `kuma-shell msg <verb>`, thin client subcommands (volume up/down/mute, mic-mute, brightness up/down, media, launcher, notifications, nostr) that niri keybinds spawn, riding a unix socket into the running shell. Audio and brightness verbs prefer the socket and fall back to standalone `wpctl`/`brightnessctl` when no shell is running.
 
 ## Building
 

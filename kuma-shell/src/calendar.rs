@@ -1,6 +1,7 @@
 use chrono::{Datelike, Local, NaiveDate};
 use gpui::{App, Context, Div, Render, SharedString, Window, div, prelude::*, px, rgb, size};
 
+use crate::panel_kit as kit;
 use crate::theme::*;
 
 /// A month view. `month_offset` navigates away from the month containing
@@ -73,23 +74,19 @@ impl Render for CalendarView {
             .pb(px(14.))
             .gap_2()
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().text_size(px(14.)).text_color(rgb(TEXT)).child(header))
+                kit::pane_header(&header)
                     .child(
                         div()
                             .flex()
                             .gap_1()
                             .child(nav_button(
                                 "cal-prev",
-                                "‹",
+                                "icons/chevron-left.svg",
                                 cx.listener(|this, _, _, cx| this.step(-1, cx)),
                             ))
                             .child(nav_button(
                                 "cal-next",
-                                "›",
+                                "icons/chevron-right.svg",
                                 cx.listener(|this, _, _, cx| this.step(1, cx)),
                             )),
                     ),
@@ -148,9 +145,11 @@ fn month_name(month: u32) -> &'static str {
     }
 }
 
+/// One month-step button: a chevron glyph that hovers, the kit's ghost
+/// affordance in a size the header can wear.
 fn nav_button(
     id: &str,
-    glyph: &str,
+    icon: &'static str,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<Div> {
     div()
@@ -158,12 +157,15 @@ fn nav_button(
         .px_2()
         .py_0p5()
         .rounded_sm()
-        .text_size(px(14.))
-        .text_color(rgb(TEXT_DIM))
         .cursor_pointer()
-        .hover(|el| el.bg(rgb(SURFACE)).text_color(rgb(TEXT)))
+        .hover(|el| el.bg(rgb(SURFACE)))
         .on_click(on_click)
-        .child(glyph.to_string())
+        .child(
+            gpui::svg()
+                .path(icon)
+                .size(px(14.))
+                .text_color(rgb(TEXT_DIM)),
+        )
 }
 
 fn weekday_row() -> Div {

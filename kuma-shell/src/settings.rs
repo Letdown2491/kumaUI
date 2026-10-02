@@ -589,46 +589,40 @@ impl Settings {
         self.commit(cx);
     }
 
-    pub fn cycle_position(&mut self, section: Section, index: usize, cx: &mut Context<Self>) {
-        if self.cycle_position_impl(section, index) {
-            self.commit(cx);
-        }
-    }
-
-    fn cycle_position_impl(&mut self, section: Section, index: usize) -> bool {
-        let target = match section {
-            Section::Left => Section::Center,
-            Section::Center => Section::Right,
-            Section::Right => Section::Left,
-        };
-        if index < self.widgets(section).len() {
-            let widget = self.widgets_mut(section).remove(index);
-            self.widgets_mut(target).push(widget);
-            return true;
-        }
-        false
-    }
-
-    pub fn reorder(
+    /// Move a widget between (or within) sections: the drag-and-drop
+    /// seam. `to_index` is insert-before semantics: dropping onto a
+    /// chip lands the dragged widget at that chip's position.
+    pub fn move_widget(
         &mut self,
-        section: Section,
+        from: Section,
         index: usize,
-        delta: isize,
+        to: Section,
+        to_index: usize,
         cx: &mut Context<Self>,
     ) {
-        if self.reorder_impl(section, index, delta) {
+        if self.move_widget_impl(from, index, to, to_index) {
             self.commit(cx);
         }
     }
 
-    fn reorder_impl(&mut self, section: Section, index: usize, delta: isize) -> bool {
-        let count = self.widgets(section).len();
-        let target = index as isize + delta;
-        if index < count && target >= 0 && (target as usize) < count {
-            self.widgets_mut(section).swap(index, target as usize);
-            return true;
+    fn move_widget_impl(&mut self, from: Section, index: usize, to: Section, to_index: usize) -> bool {
+        if index >= self.widgets(from).len() {
+            return false;
         }
-        false
+        // dropping on yourself, or just after yourself, is no move
+        if from == to && (index == to_index || index + 1 == to_index) {
+            return false;
+        }
+        let widget = self.widgets_mut(from).remove(index);
+        // the removal slides same-section insertions left by one
+        let to_index = if from == to && index < to_index {
+            to_index - 1
+        } else {
+            to_index
+        };
+        let target = self.widgets_mut(to);
+        target.insert(to_index.min(target.len()), widget);
+        true
     }
 
     pub fn remove(&mut self, section: Section, index: usize, cx: &mut Context<Self>) {
@@ -676,6 +670,17 @@ impl Settings {
             .map(|spec| spec.kind)
             .filter(|kind| !self.is_present(*kind))
             .collect()
+    }
+
+    /// Where a kind sits on the bar, if it does: the widgets page's
+    /// enabled rows consult this for their mode control.
+    pub fn position(&self, kind: WidgetKind) -> Option<(Section, usize)> {
+        SECTIONS.iter().find_map(|&section| {
+            self.widgets(section)
+                .iter()
+                .position(|widget| widget.kind == kind)
+                .map(|index| (section, index))
+        })
     }
     pub fn set_height(&mut self, height: f32, cx: &mut Context<Self>) {
         self.bar.height = height;
@@ -802,34 +807,39 @@ mod tests {
     }
 
     #[test]
-    fn cycle_position_rotates_left_center_right() {
+    fn move_widget_crosses_sections_and_reorders() {
         let mut settings = Settings::default();
-        assert!(settings.cycle_position_impl(Section::Left, 0));
+        // left: [Workspaces, ...]; right: [Cpu, Volume, Battery, Clock]
+        assert!(settings.move_widget_impl(Section::Left, 0, Section::Center, 0));
         assert!(settings.widgets(Section::Left).is_empty());
-        // moved widgets append to the target section
         assert_eq!(
-            settings.widgets(Section::Center).last().unwrap().kind,
+            settings.widgets(Section::Center)[0].kind,
             WidgetKind::Workspaces
         );
 
-        assert!(settings.cycle_position_impl(Section::Center, 1));
-        assert_eq!(
-            settings.widgets(Section::Right).last().unwrap().kind,
-            WidgetKind::Workspaces
-        );
+        // within a section: dropping two chips down moves past one;
+        // dropping on the immediately next chip would be a no-op
+        assert!(!settings.move_widget_impl(Section::Right, 0, Section::Right, 1));
+        assert!(settings.move_widget_impl(Section::Right, 0, Section::Right, 2));
+        assert_eq!(settings.widgets(Section::Right)[0].kind, WidgetKind::Volume);
+        assert_eq!(settings.widgets(Section::Right)[1].kind, WidgetKind::Cpu);
 
-        // out-of-bounds index does nothing
-        assert!(!settings.cycle_position_impl(Section::Left, 5));
+        // out-of-bounds source does nothing
+        assert!(!settings.move_widget_impl(Section::Left, 5, Section::Right, 0));
     }
 
     #[test]
-    fn reorder_swaps_within_bounds_only() {
+    fn move_widget_self_drops_are_no_ops() {
         let mut settings = Settings::default();
-        // right: [Cpu, Volume, Battery, Clock]
-        assert!(settings.reorder_impl(Section::Right, 0, 1));
-        assert_eq!(settings.widgets(Section::Right)[0].kind, WidgetKind::Volume);
-        assert!(!settings.reorder_impl(Section::Right, 0, -1));
-        assert!(!settings.reorder_impl(Section::Right, 0, 10));
+        // dropping on yourself, or just after yourself, changes nothing
+        assert!(!settings.move_widget_impl(Section::Right, 1, Section::Right, 1));
+        assert!(!settings.move_widget_impl(Section::Right, 1, Section::Right, 2));
+        // a real same-section move still works
+        assert!(settings.move_widget_impl(Section::Right, 0, Section::Right, 3));
+        assert_eq!(
+            settings.widgets(Section::Right)[2].kind,
+            WidgetKind::Cpu
+        );
     }
 
     #[test]

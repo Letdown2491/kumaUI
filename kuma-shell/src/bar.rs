@@ -295,23 +295,6 @@ fn self_corner(
     if corners.bottom_right { br(el) } else { el }
 }
 
-struct TooltipView {
-    text: SharedString,
-}
-
-impl Render for TooltipView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px_2()
-            .py_1()
-            .rounded_sm()
-            .bg(rgb(0x11111B))
-            .text_size(px(12.))
-            .text_color(rgb(TEXT))
-            .child(self.text.clone())
-    }
-}
-
 /// A tooltip that reads its text fresh from SysMon every render, so the value
 /// updates while it hangs there, not just when it first appears.
 struct SysmonTooltip {
@@ -354,9 +337,7 @@ fn sysmon_tooltip(
     }
 }
 
-pub fn text_tooltip(text: SharedString) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-    move |_, cx| cx.new(|_| TooltipView { text: text.clone() }).into()
-}
+pub use crate::panel_kit::text_tooltip;
 
 impl ShellBar {
     fn render_section(&self, section: Section, cx: &mut Context<Self>, tooltips_on: bool) -> Div {

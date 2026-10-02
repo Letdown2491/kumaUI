@@ -7,6 +7,7 @@ use gpui::{
 };
 
 use crate::imaging::{IconImage, decode_icon_file, icon_roots};
+use crate::panel_kit as kit;
 use crate::theme::*;
 
 #[derive(Clone, Debug)]
@@ -412,11 +413,10 @@ impl Render for LauncherView {
                         .border_1()
                         .border_color(rgb(DIVIDER))
                         .child(
-                            div()
-                                .size(px(12.))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(rgb(TEXT_DIM)),
+                            gpui::svg()
+                                .path("icons/search.svg")
+                                .size(px(13.))
+                                .text_color(rgb(TEXT_DIM)),
                         )
                         .child(if query.is_empty() {
                             div()
@@ -440,13 +440,11 @@ impl Render for LauncherView {
                         .overflow_y_scroll()
                         .track_scroll(&self.results_scroll)
                         .when(filtered.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .py_4()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(TEXT_DIM))
-                                    .child("no apps match"),
-                            )
+                            el.child(kit::empty_state(
+                                "icons/search.svg",
+                                "No apps match",
+                                "Try a shorter or looser name",
+                            ))
                         })
                         .children(
                             filtered
@@ -515,6 +513,11 @@ fn app_row(
                 .flex_1()
                 .min_w_0()
                 .text_size(px(12.5))
+                .font_weight(if is_selected {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::NORMAL
+                })
                 .text_color(rgb(if is_selected { TEXT } else { TEXT_DIM }))
                 .truncate()
                 .child(app.name.clone()),

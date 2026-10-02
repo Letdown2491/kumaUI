@@ -15,6 +15,7 @@ use gpui::{
 use crate::imaging::IconImage;
 use crate::notifications::{Notification, NotificationState, time_ago};
 use crate::panel::PanelGeometry;
+use crate::panel_kit as kit;
 use crate::settings::Settings;
 use crate::theme::*;
 
@@ -292,12 +293,12 @@ impl Render for NotificationsView {
         let notifications: Vec<Notification> = self.state.read(cx).notifications.clone();
         let dnd = self.state.read(cx).dnd;
         let list = if notifications.is_empty() {
-            div()
-                .py_4()
-                .text_size(px(12.))
-                .text_color(rgb(TEXT_DIM))
-                .child("no notifications")
-                .into_any_element()
+            kit::empty_state(
+                "icons/bell.svg",
+                "Nothing has arrived",
+                "Notifications land here as they come",
+            )
+            .into_any_element()
         } else {
             div()
                 .id("notification-list")
@@ -313,34 +314,17 @@ impl Render for NotificationsView {
                 .into_any_element()
         };
 
-        let header = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(
-                div()
-                    .text_size(px(13.))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(TEXT))
-                    .child("Notifications"),
-            )
-            .when(!notifications.is_empty(), |el| {
-                el.child(
-                    div()
-                        .id("clear-all")
-                        .px_2()
-                        .py_0p5()
-                        .rounded_sm()
-                        .text_size(px(11.))
-                        .text_color(rgb(TEXT_DIM))
-                        .cursor_pointer()
-                        .hover(|el| el.bg(rgb(SURFACE)))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.state.update(cx, |state, cx| state.clear(cx));
-                        }))
-                        .child("clear all"),
-                )
-            });
+        let header = kit::pane_header("Notifications").when(!notifications.is_empty(), |el| {
+            el.child(kit::button(
+                "clear-all",
+                "Clear all",
+                Some("icons/trash.svg"),
+                kit::ButtonVariant::Ghost,
+                cx.listener(|this, _, _, cx| {
+                    this.state.update(cx, |state, cx| state.clear(cx));
+                }),
+            ))
+        });
 
         let content = div()
             .flex()
@@ -351,43 +335,15 @@ impl Render for NotificationsView {
             .gap_2()
             .size_full()
             .child(header)
-            .child(
-                div()
-                    .id("dnd-toggle")
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(rgb(SURFACE))
-                    .cursor_pointer()
-                    .hover(|el| el.bg(rgb(SURFACE_HOVER)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.update(cx, |state, cx| state.toggle_dnd(cx));
-                    }))
-                    .child(
-                        gpui::svg()
-                            .path("icons/bell.svg")
-                            .size(px(16.))
-                            .text_color(rgb(if dnd { TEXT_DIM } else { TEXT })),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(12.))
-                            .text_color(rgb(if dnd { TEXT_DIM } else { TEXT }))
-                            .child(
-                                if dnd {
-                                    "Do not disturb: on"
-                                } else {
-                                    "Do not disturb: off"
-                                }
-                                .to_string(),
-                            ),
-                    )
-                    .child(crate::controls::toggle_switch(dnd)),
-            )
+            .child(crate::controls::toggle_row(
+                "dnd-toggle",
+                "icons/bell.svg",
+                "Do not disturb",
+                dnd,
+                cx.listener(|this, _, _, cx| {
+                    this.state.update(cx, |state, cx| state.toggle_dnd(cx));
+                }),
+            ))
             .child(list);
 
         crate::panel::chrome(self.geometry, window, content)
@@ -406,15 +362,7 @@ fn notification_card(
     let when = time_ago(notification.received_at);
     let actions = notification.actions.clone();
 
-    div()
-        .id(SharedString::from(format!("notification-{id}")))
-        .flex()
-        .flex_col()
-        .gap_1()
-        .px_3()
-        .py_2()
-        .rounded_md()
-        .bg(rgb(SURFACE))
+    kit::card(SharedString::from(format!("notification-{id}")))
         .cursor_pointer()
         .hover(|el| el.bg(rgb(SURFACE_HOVER)))
         .on_click(cx.listener(move |this, _, _, cx| {
@@ -468,23 +416,20 @@ fn notification_card(
             el.child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_1()
                     .children(actions.into_iter().map(|(key, label)| {
                         let key = key.clone();
-                        div()
-                            .id(SharedString::from(format!("action-{id}-{key}")))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_sm()
-                            .text_size(px(11.))
-                            .text_color(rgb(ACCENT))
-                            .cursor_pointer()
-                            .hover(|el| el.bg(rgb(SURFACE)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                        kit::button(
+                            SharedString::from(format!("action-{id}-{key}")),
+                            &label,
+                            None,
+                            kit::ButtonVariant::Ghost,
+                            cx.listener(move |this, _, _, cx| {
                                 this.state
                                     .update(cx, |state, cx| state.invoke(id, key.clone(), cx));
-                            }))
-                            .child(label)
+                            }),
+                        )
                     })),
             )
         })

@@ -1,11 +1,12 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use gpui::{
-    Context, Div, Entity, FocusHandle, ObjectFit, Render, RenderImage, SharedString, Window, div,
-    img, prelude::*, px, rgb, rgba,
+    Context, Div, DragMoveEvent, Entity, FocusHandle, ObjectFit, Render, RenderImage, SharedString,
+    Window, div, img, prelude::*, px, rgb, rgba,
 };
 
 use crate::panel::PanelGeometry;
+use crate::panel_kit::{self as kit, ButtonVariant};
 use crate::settings::{
     BarAlign, BarRadius, BarWidth, Corner, SECTIONS, Section, Settings, WidgetMode,
 };
@@ -78,6 +79,7 @@ enum Page {
     Quick,
     Bar,
     Widgets,
+    Ordering,
     Dock,
     Backgrounds,
 }
@@ -85,9 +87,10 @@ enum Page {
 impl Page {
     fn label(self) -> &'static str {
         match self {
-            Page::Quick => "Quick",
+            Page::Quick => "Quick Settings",
             Page::Bar => "Bar",
             Page::Widgets => "Widgets",
+            Page::Ordering => "Ordering",
             Page::Dock => "Dock",
             Page::Backgrounds => "Backgrounds",
         }
@@ -98,18 +101,52 @@ impl Page {
             Page::Quick => "icons/sliders.svg",
             Page::Bar => "icons/bar.svg",
             Page::Widgets => "icons/widgets.svg",
+            Page::Ordering => "icons/order.svg",
             Page::Dock => "icons/dock.svg",
             Page::Backgrounds => "icons/image.svg",
         }
     }
 
-    const ALL: [Page; 5] = [
+    const ALL: [Page; 6] = [
         Page::Quick,
         Page::Bar,
         Page::Widgets,
+        Page::Ordering,
         Page::Dock,
         Page::Backgrounds,
     ];
+}
+
+/// Where a widget drag would land: before the given index in a section.
+type DropTarget = (Section, usize);
+
+/// The drag payload between widget chips: which widget moves, and
+/// where it came from.
+#[derive(Clone)]
+struct WidgetDrag {
+    kind: crate::settings::WidgetKind,
+    from: Section,
+    index: usize,
+}
+
+/// What follows the cursor during a widget drag: the widget's name.
+struct WidgetDragGhost {
+    label: String,
+}
+
+impl Render for WidgetDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgba(PANEL_BG))
+            .border_1()
+            .border_color(rgb(DIVIDER))
+            .text_size(px(11.))
+            .text_color(rgb(TEXT))
+            .child(self.label.clone())
+    }
 }
 
 /// Which slider the quick page is dragging, and its track stash.
@@ -131,6 +168,8 @@ pub struct SettingsView {
     geometry: PanelGeometry,
     page: Page,
     dragging: Option<DragState>,
+    /// where a widget drag would land right now, for the insertion line
+    drop_preview: Option<DropTarget>,
     thumbs: HashMap<PathBuf, Option<Arc<RenderImage>>>,
 }
 
@@ -154,6 +193,7 @@ impl SettingsView {
             // the gear leads with the quick page
             page: Page::Quick,
             dragging: None,
+            drop_preview: None,
             thumbs: HashMap::new(),
         }
     }
@@ -197,82 +237,6 @@ impl SettingsView {
                     }))
                     .child(label_of(option))
             }))
-    }
-
-    fn icon_button(
-        &self,
-        id: impl Into<SharedString>,
-        label: &str,
-        danger: bool,
-    ) -> gpui::Stateful<Div> {
-        div()
-            .id(id.into())
-            .size(px(22.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_sm()
-            .text_size(px(12.))
-            .cursor_pointer()
-            .bg(rgb(INSET))
-            .text_color(rgb(if danger { URGENT } else { TEXT_DIM }))
-            .hover(|style| {
-                style
-                    .bg(rgb(SURFACE_HOVER))
-                    .text_color(rgb(if danger { URGENT } else { TEXT }))
-            })
-            .child(label.to_string())
-    }
-
-    fn group(&self, label: &str, control: impl IntoElement) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(TEXT_DIM))
-                    .child(label.to_uppercase()),
-            )
-            .child(control)
-    }
-
-    fn divider(&self) -> Div {
-        div().w_full().h(px(1.)).bg(rgba(theme::SOFT_DIVIDER))
-    }
-
-    fn nav_item(&self, page: Page, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
-        let active = self.page == page;
-        div()
-            .id(SharedString::from(format!("nav-{}", format!("{page:?}"))))
-            .w_full()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_1p5()
-            .rounded_md()
-            .cursor_pointer()
-            .bg(rgb(if active { SURFACE } else { 0x00000000 }))
-            .hover(|style| style.bg(rgb(if active { SURFACE } else { 0x31324440 })))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.page = page;
-                cx.notify();
-            }))
-            .child(
-                gpui::svg()
-                    .path(page.icon())
-                    .size(px(14.))
-                    .text_color(rgb(if active { ACCENT } else { TEXT_DIM })),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(rgb(if active { TEXT } else { TEXT_DIM }))
-                    .child(page.label()),
-            )
     }
 
     /// The quick page: sliders and toggles that ride the SysMon request
@@ -337,22 +301,29 @@ impl SettingsView {
                     }
                 }),
             )
-            .child(
-                div()
-                    .id("mute-toggle")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .text_size(px(11.))
-                    .text_color(if muted { rgb(URGENT) } else { rgb(TEXT_DIM) })
-                    .cursor_pointer()
-                    .hover(|el| el.bg(rgb(SURFACE)))
-                    .on_click(cx.listener(|this, _, _, cx| {
+            .child(if muted {
+                kit::button(
+                    "mute-toggle",
+                    "Unmute",
+                    Some("icons/volume.svg"),
+                    ButtonVariant::Ghost,
+                    cx.listener(|this, _, _, cx| {
                         this.sysmon
                             .update(cx, |sysmon, cx| sysmon.request_mute_toggle(cx));
-                    }))
-                    .child(if muted { "unmute" } else { "mute" }.to_string()),
-            )
+                    }),
+                )
+            } else {
+                kit::button(
+                    "mute-toggle",
+                    "Mute",
+                    Some("icons/x.svg"),
+                    ButtonVariant::Ghost,
+                    cx.listener(|this, _, _, cx| {
+                        this.sysmon
+                            .update(cx, |sysmon, cx| sysmon.request_mute_toggle(cx));
+                    }),
+                )
+            })
         });
 
         let profile_segmented = self.segmented(
@@ -395,8 +366,16 @@ impl SettingsView {
                     this.dragging = None;
                 }),
             )
-            .when_some(brightness_row, |el, row| el.child(row))
-            .when_some(volume_row, |el, row| el.child(row))
+            .when(brightness.is_some() || volume.is_some(), |el| {
+                el.child(
+                    // the sliders live in one card so the quick page reads
+                    // as a stack of cards, the toggles are cards of their
+                    // own; skipped outright when there is nothing to slide
+                    kit::card("quick-sliders")
+                        .when_some(brightness_row, |el, row| el.child(row))
+                        .when_some(volume_row, |el, row| el.child(row)),
+                )
+            })
             .when_some(wifi, |el, enabled| {
                 el.child(crate::controls::toggle_row(
                     "toggle-wifi",
@@ -438,19 +417,7 @@ impl SettingsView {
                 )
             })
             .when_some(profile, |el, _| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1p5()
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(TEXT_DIM))
-                                .child("Power profile"),
-                        )
-                        .child(profile_segmented),
-                )
+                el.child(kit::setting_row("Power profile", profile_segmented))
             })
     }
 
@@ -463,7 +430,7 @@ impl SettingsView {
             .flex_col()
             .gap_3()
             .overflow_y_scroll()
-            .child(self.group(
+            .child(kit::setting_row(
                 "Height",
                 self.segmented(
                     "height",
@@ -474,7 +441,7 @@ impl SettingsView {
                     cx,
                 ),
             ))
-            .child(self.group(
+            .child(kit::setting_row(
                 "Top offset",
                 self.segmented(
                     "offset",
@@ -485,7 +452,7 @@ impl SettingsView {
                     cx,
                 ),
             ))
-            .child(self.group(
+            .child(kit::setting_row(
                 "Width",
                 self.segmented(
                     "width",
@@ -497,7 +464,7 @@ impl SettingsView {
                 ),
             ))
             .when(bar.width != BarWidth::Full, |el| {
-                el.child(self.group(
+                el.child(kit::setting_row(
                     "Align",
                     self.segmented(
                         "align",
@@ -509,7 +476,7 @@ impl SettingsView {
                     ),
                 ))
             })
-            .child(self.group(
+            .child(kit::setting_row(
                 "Corner radius",
                 self.segmented(
                     "radius",
@@ -520,7 +487,7 @@ impl SettingsView {
                     cx,
                 ),
             ))
-            .child(self.group("Rounded corners", self.corner_toggles(cx)))
+            .child(kit::setting_row("Rounded corners", self.corner_toggles(cx)))
     }
 
     fn corner_toggles(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
@@ -531,25 +498,33 @@ impl SettingsView {
             ("BL", Corner::BottomLeft, bar.corners.bottom_left),
             ("BR", Corner::BottomRight, bar.corners.bottom_right),
         ];
+        // the segmented control's idiom: an inset tray, the active
+        // answer fills the accent
         div()
             .id("corner-toggles")
             .flex()
-            .gap_1()
+            .gap_0p5()
+            .p_0p5()
+            .rounded_md()
+            .bg(rgb(INSET))
             .children(corners.iter().map(|&(label, corner, active)| {
                 div()
                     .id(SharedString::from(format!(
                         "corner-{}",
                         format!("{corner:?}")
                     )))
-                    .px_2p5()
+                    .px_2()
                     .py_1()
                     .rounded_sm()
                     .text_size(px(11.))
                     .cursor_pointer()
-                    .border_1()
-                    .border_color(rgb(if active { ACCENT } else { DIVIDER }))
-                    .text_color(rgb(if active { ACCENT } else { TEXT_DIM }))
-                    .hover(|style| style.text_color(rgb(TEXT)))
+                    .bg(rgb(if active { ACCENT } else { INSET }))
+                    .text_color(rgb(if active { ACCENT_TEXT } else { TEXT_DIM }))
+                    .hover(|style| {
+                        style
+                            .bg(rgb(if active { ACCENT } else { SURFACE }))
+                            .text_color(rgb(if active { ACCENT_TEXT } else { TEXT }))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings
                             .update(cx, |settings, cx| settings.toggle_corner(corner, cx));
@@ -601,19 +576,7 @@ impl SettingsView {
                     });
                 },
             ))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(TEXT_DIM))
-                            .child("Position"),
-                    )
-                    .child(position_segmented),
-            )
+            .child(kit::setting_row("Position", position_segmented))
             .child(
                 div()
                     .text_size(px(11.))
@@ -622,20 +585,121 @@ impl SettingsView {
             )
     }
 
+    /// The widgets page: every registered kind, one row each in
+    /// alphabetical order. The switch is the bar: on means it renders,
+    /// off means it waits in reserve; the mode pills choose how an
+    /// enabled one presents.
     fn widgets_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let mut kinds: Vec<crate::settings::WidgetKind> =
+            crate::settings::WIDGETS.iter().map(|spec| spec.kind).collect();
+        kinds.sort_by_key(|kind| kind.label().to_lowercase());
         div()
             .id("page-widgets")
             .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .overflow_y_scroll()
+            .children(kinds.iter().map(|&kind| self.widget_row(kind, cx)))
+    }
+
+    fn widget_row(
+        &self,
+        kind: crate::settings::WidgetKind,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let position = self.settings.read(cx).position(kind);
+        let enabled = position.is_some();
+        let mode = position.map(|(section, index)| {
+            (
+                section,
+                index,
+                self.settings.read(cx).widgets(section)[index].mode,
+            )
+        });
+        div()
+            .id(SharedString::from(format!("widget-row-{kind:?}")))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3p5()
+            .py_2()
+            .rounded_lg()
+            .bg(rgb(SURFACE))
+            .child(
+                gpui::svg()
+                    .path(match kind.icon_spec() {
+                        Some(crate::settings::WidgetIconSpec::Path(path)) => path,
+                        _ => "icons/puzzle.svg",
+                    })
+                    .size(px(16.))
+                    .text_color(rgb(if enabled { TEXT } else { TEXT_DIM })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(rgb(if enabled { TEXT } else { TEXT_DIM }))
+                    .truncate()
+                    .child(kind.label()),
+            )
+            .children(mode.map(|(section, index, mode)| {
+                self.mode_segmented(
+                    &format!("mode-{kind:?}"),
+                    kind,
+                    mode,
+                    section,
+                    index,
+                    cx,
+                )
+            }))
+            .child(
+                div()
+                    .id(SharedString::from(format!("widget-toggle-{kind:?}")))
+                    .p_1()
+                    .cursor_pointer()
+                    .child(crate::controls::toggle_switch(enabled))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.update(cx, |settings, cx| match settings.position(kind) {
+                            Some((section, index)) => settings.remove(section, index, cx),
+                            None => settings.add(kind, cx),
+                        });
+                    })),
+            )
+    }
+
+    /// The ordering page: the bar mirrored as three columns of chips.
+    /// Placement and order are drag and drop: a chip dropped on another
+    /// takes its place (its lower half lands after it), a chip dropped
+    /// on a column's empty stretch appends.
+    fn ordering_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        div()
+            .id("page-ordering")
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .gap_3()
             .overflow_y_scroll()
-            .children(
-                SECTIONS
-                    .iter()
-                    .map(|&section| self.section_list(section, cx)),
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.drop_preview = None),
             )
-            .child(self.add_row(cx))
+            .child(
+                div().id("widget-columns").flex().gap_2().children(
+                    SECTIONS
+                        .iter()
+                        .map(|&section| self.section_list(section, cx)),
+                ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(TEXT_DIM))
+                    .child("Drag between sections to place them; drop on a chip to slot it before."),
+            )
     }
 
     fn section_header(&self, label: String) -> Div {
@@ -653,154 +717,188 @@ impl SettingsView {
             .child(div().flex_1().h(px(1.)).bg(rgba(theme::SOFT_DIVIDER)))
     }
 
+    /// The insertion indicator: the accent line a drag leaves between
+    /// chips, saying where the widget will land.
+    fn drop_line(&self) -> Div {
+        div().w_full().h(px(2.)).rounded_full().bg(rgb(ACCENT))
+    }
+
     fn section_list(&self, section: Section, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let settings = self.settings.read(cx).clone();
+        let count = settings.widgets(section).len();
+        let dragging = cx.has_active_drag();
+        let preview = self.drop_preview;
         div()
             .id(SharedString::from(format!("section-{section:?}")))
             .flex()
             .flex_col()
             .gap_1p5()
+            .flex_1()
+            .min_w_0()
+            .min_h(px(64.))
             .child(self.section_header(format!("{section:?}")))
+            .children(settings.widgets(section).iter().enumerate().flat_map(
+                |(index, widget)| {
+                    let mut items: Vec<gpui::AnyElement> = Vec::new();
+                    if dragging && preview == Some((section, index)) {
+                        items.push(self.drop_line().into_any_element());
+                    }
+                    items.push(
+                        self.widget_chip(section, index, widget.kind, cx)
+                            .into_any_element(),
+                    );
+                    items
+                },
+            ))
+            .when(
+                dragging && preview == Some((section, count)),
+                |el| el.child(self.drop_line()),
+            )
             .when(settings.widgets(section).is_empty(), |el| {
                 el.child(
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(TEXT_DIM))
-                        .child("no widgets"),
+                        .child("no widgets: drop one here"),
                 )
             })
-            .children(
-                settings
-                    .widgets(section)
-                    .iter()
-                    .enumerate()
-                    .map(|(index, widget)| self.row(section, index, widget.kind, widget.mode, cx)),
-            )
+            // the column's own stretch appends at the end; its capture
+            // listener fires before the chips', so a chip overwrites it
+            .on_drag_move(cx.listener(move |this, _: &DragMoveEvent<WidgetDrag>, _, cx| {
+                this.drop_preview = Some((section, count));
+                cx.notify();
+            }))
+            .on_drop(cx.listener(move |this, drag: &WidgetDrag, _, cx| {
+                this.settings.update(cx, |settings, cx| {
+                    settings.move_widget(drag.from, drag.index, section, count, cx);
+                });
+                this.drop_preview = None;
+            }))
     }
 
-    fn row(
+    fn widget_chip(
         &self,
         section: Section,
         index: usize,
         kind: crate::settings::WidgetKind,
-        mode: WidgetMode,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
-        let (section, index) = (section, index); // Copy
         let tag = |name: &str| format!("{name}-{section:?}-{index}");
-        div()
-            .id(tag("row"))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_2()
-            .rounded_md()
-            .bg(rgba(0x31324440))
+        kit::card(tag("chip"))
+            .px_2()
+            .py_1p5()
+            .cursor_pointer()
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(12.))
-                            .text_color(rgb(TEXT))
-                            .child(kind.label()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                self.icon_button(tag("up"), "↑", false)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.settings.update(cx, |settings, cx| {
-                                            settings.reorder(section, index, -1, cx);
-                                        });
-                                    })),
-                            )
-                            .child(
-                                self.icon_button(tag("down"), "↓", false)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.settings.update(cx, |settings, cx| {
-                                            settings.reorder(section, index, 1, cx);
-                                        });
-                                    })),
-                            )
-                            .child(self.icon_button(tag("remove"), "×", true).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.settings.update(cx, |settings, cx| {
-                                        settings.remove(section, index, cx)
-                                    });
-                                }),
-                            )),
-                    ),
+                    .text_size(px(11.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .truncate()
+                    .child(kind.label()),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_2()
-                    .child(self.segmented(
-                        &tag("pos"),
-                        &SECTIONS,
-                        section,
-                        |s| format!("{s:?}").to_lowercase(),
-                        move |settings, _value, cx| settings.cycle_position(section, index, cx),
-                        cx,
-                    ))
-                    .when(kind.supports_mode(), |el| {
-                        el.child(self.segmented(
-                            &tag("mode"),
-                            &[WidgetMode::Icon, WidgetMode::IconText, WidgetMode::Text],
-                            mode,
-                            |m| m.label().to_string(),
-                            move |settings, value, cx| settings.set_mode(section, index, value, cx),
-                            cx,
-                        ))
-                    }),
+            .on_drag(
+                WidgetDrag {
+                    kind,
+                    from: section,
+                    index,
+                },
+                |drag, _, _, cx| {
+                    cx.new(|_| WidgetDragGhost {
+                        label: drag.kind.label().to_string(),
+                    })
+                },
             )
+            .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<WidgetDrag>, _, cx| {
+                // the chip's lower half means "land after it"
+                let midline = event.bounds.origin.y + event.bounds.size.height / 2.;
+                let after = event.event.position.y > midline;
+                this.drop_preview = Some((section, index + usize::from(after)));
+                cx.notify();
+            }))
+            // a drop on a chip applies the standing preview: this chip's
+            // place, or the line under its lower half
+            .on_drop(cx.listener(move |this, drag: &WidgetDrag, _, cx| {
+                if let Some(to) = this.drop_preview.take() {
+                    this.settings.update(cx, |settings, cx| {
+                        settings.move_widget(drag.from, drag.index, to.0, to.1, cx);
+                    });
+                }
+            }))
     }
 
-    fn add_row(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
-        let missing = self.settings.read(cx).missing_kinds();
+    /// The mode control: three glyph buttons, the active mode lit.
+    /// Icons instead of the text pills: a column chip has no width to
+    /// spare, and the glyphs read at a glance. Hover names them.
+    /// The mode control: three pills that preview the answer instead
+    /// of naming it. Icon shows the widget's own glyph, icon+text adds
+    /// "Aa" beside it, text is "Aa" alone; what you click is what the
+    /// widget renders.
+    fn mode_segmented(
+        &self,
+        id: &str,
+        kind: crate::settings::WidgetKind,
+        current: WidgetMode,
+        section: Section,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let icon_path = match kind.icon_spec() {
+            Some(crate::settings::WidgetIconSpec::Path(path)) => path,
+            _ => "icons/puzzle.svg",
+        };
         div()
-            .id("add-row")
+            .id(SharedString::from(format!("mode-{id}")))
             .flex()
-            .flex_col()
-            .gap_1p5()
-            .child(self.section_header("Add widget".to_string()))
-            .child(
+            .gap_0p5()
+            .p_0p5()
+            .rounded_sm()
+            .bg(rgb(INSET))
+            .children([WidgetMode::Icon, WidgetMode::IconText, WidgetMode::Text].map(|mode| {
+                let active = mode == current;
                 div()
+                    .id(SharedString::from(format!("mode-{id}-{mode:?}")))
                     .flex()
-                    .flex_wrap()
+                    .items_center()
                     .gap_1()
-                    .children(missing.iter().map(|kind| {
-                        let kind = *kind;
-                        div()
-                            .id(SharedString::from(format!("add-{}", format!("{kind:?}"))))
-                            .px_2p5()
-                            .py_1()
-                            .rounded_sm()
-                            .text_size(px(11.))
-                            .cursor_pointer()
-                            .bg(rgb(INSET))
-                            .border_1()
-                            .border_color(rgb(DIVIDER))
-                            .text_color(rgb(TEXT_DIM))
-                            .hover(|style| style.bg(rgb(SURFACE)).text_color(rgb(TEXT)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.settings
-                                    .update(cx, |settings, cx| settings.add(kind, cx));
-                            }))
-                            .child(kind.label().to_string())
-                    })),
-            )
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(rgb(if active { ACCENT } else { INSET }))
+                    .hover(|style| style.bg(rgb(if active { ACCENT } else { SURFACE })))
+                    .tooltip(kit::text_tooltip(mode.label().into()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.update(cx, |settings, cx| {
+                            settings.set_mode(section, index, mode, cx)
+                        });
+                    }))
+                    .when(mode != WidgetMode::Text, |el| {
+                        el.child(
+                            gpui::svg()
+                                .path(icon_path)
+                                .size(px(12.))
+                                .text_color(rgb(if active {
+                                    ACCENT_TEXT
+                                } else {
+                                    TEXT_DIM
+                                })),
+                        )
+                    })
+                    .when(mode != WidgetMode::Icon, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(10.))
+                                .line_height(px(12.))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgb(if active {
+                                    ACCENT_TEXT
+                                } else {
+                                    TEXT_DIM
+                                }))
+                                .child("Aa"),
+                        )
+                    })
+            }))
     }
 
     fn backgrounds_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
@@ -836,29 +934,69 @@ impl SettingsView {
             .flex_col()
             .gap_3()
             .overflow_y_scroll()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(11.))
-                            .text_color(rgb(TEXT_DIM))
-                            .truncate()
-                            .child(format!("Folder: {}", background.folder.display())),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1p5()
-                            .child(self.button_portal("pick-folder", "Choose folder…", cx))
-                            .child(self.button_portal("reload-config", "Reload config", cx)),
-                    ),
-            )
+            .child(kit::card("backgrounds-folder")
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(11.))
+                                .text_color(rgb(TEXT_DIM))
+                                .truncate()
+                                .child(format!("Folder: {}", background.folder.display())),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(kit::button(
+                                    "pick-folder",
+                                    "Choose folder",
+                                    Some("icons/image.svg"),
+                                    ButtonVariant::Primary,
+                                    cx.listener(|this, _, _, cx| {
+                                        let settings = this.settings.clone();
+                                        cx.spawn(async move |this, cx| {
+                                            let picked = cx
+                                                .background_spawn(async move { pick_folder().await })
+                                                .await;
+                                            match picked {
+                                                Ok(Some(folder)) => {
+                                                    settings.update(cx, |settings, cx| {
+                                                        settings.set_background_folder(folder, cx)
+                                                    });
+                                                    this.update(cx, |this, cx| {
+                                                        this.thumbs.clear();
+                                                        cx.notify();
+                                                    })
+                                                    .ok();
+                                                }
+                                                Ok(None) => {}
+                                                Err(err) => {
+                                                    log::error!("folder picker failed: {err:#}")
+                                                }
+                                            }
+                                        })
+                                        .detach();
+                                    }),
+                                ))
+                                .child(kit::button(
+                                    "reload-config",
+                                    "Reload config",
+                                    Some("icons/refresh.svg"),
+                                    ButtonVariant::Ghost,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.thumbs.clear();
+                                        this.settings.update(cx, |settings, cx| settings.reload(cx));
+                                    }),
+                                )),
+                        ),
+                ),)
             .child(
                 div().id("gallery").grid().grid_cols(3).gap_2().children(
                     entries
@@ -866,57 +1004,6 @@ impl SettingsView {
                         .map(|(name, path)| self.background_tile(name, path, cx)),
                 ),
             )
-    }
-
-    fn button_portal(&self, id: &str, label: &str, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
-        let is_pick = id == "pick-folder";
-        let is_reload = id == "reload-config";
-        let id = SharedString::from(id.to_string());
-        let label = label.to_string();
-        div()
-            .id(id)
-            .px_2p5()
-            .py_1p5()
-            .rounded_sm()
-            .text_size(px(11.))
-            .cursor_pointer()
-            .bg(rgb(INSET))
-            .border_1()
-            .border_color(rgb(DIVIDER))
-            .text_color(rgb(TEXT_DIM))
-            .hover(|style| style.bg(rgb(SURFACE)).text_color(rgb(TEXT)))
-            .when(is_pick, |el| {
-                el.on_click(cx.listener(|this, _, _, cx| {
-                    let settings = this.settings.clone();
-                    cx.spawn(async move |this, cx| {
-                        let picked = cx
-                            .background_spawn(async move { pick_folder().await })
-                            .await;
-                        match picked {
-                            Ok(Some(folder)) => {
-                                settings.update(cx, |settings, cx| {
-                                    settings.set_background_folder(folder, cx)
-                                });
-                                this.update(cx, |this, cx| {
-                                    this.thumbs.clear();
-                                    cx.notify();
-                                })
-                                .ok();
-                            }
-                            Ok(None) => {}
-                            Err(err) => log::error!("folder picker failed: {err:#}"),
-                        }
-                    })
-                    .detach();
-                }))
-            })
-            .when(is_reload, |el| {
-                el.on_click(cx.listener(|this, _, _, cx| {
-                    this.thumbs.clear();
-                    this.settings.update(cx, |settings, cx| settings.reload(cx));
-                }))
-            })
-            .child(label)
     }
 
     fn ensure_thumb(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -996,48 +1083,54 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let header = div().id("header").flex().items_center().child(
-            div()
-                .text_size(px(13.))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(rgb(TEXT))
-                .child("Settings"),
-        );
+        // the pane header names the page and rides above the pane body
+        // alone, never above the sidebar: the nostr panel's arrangement,
+        // kit::tabbed_pane's default for every panel with tabs. The
+        // sidebar holds the identity (Settings), the pane says where
+        // in it you are
+        let header = kit::pane_header(self.page.label());
 
-        let body = div()
-            .id("body")
+        let sidebar = div()
+            .id("sidebar")
+            .w(px(48.))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(Page::ALL.iter().map(|&page| {
+                kit::rail_tab(
+                    format!("nav-{page:?}"),
+                    page.icon(),
+                    page.label(),
+                    self.page == page,
+                    None,
+                    cx.listener(move |this, _, _, cx| {
+                        this.page = page;
+                        cx.notify();
+                    }),
+                )
+            }));
+
+        let content = div()
+            .id("content")
             .flex_1()
+            .min_h_0()
+            .min_w_0()
             .overflow_hidden()
             .flex()
-            .gap_3()
-            .child(
-                div()
-                    .id("sidebar")
-                    .w(px(116.))
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .children(Page::ALL.iter().map(|&page| self.nav_item(page, cx))),
-            )
-            .child(div().w(px(1.)).bg(rgba(theme::SOFT_DIVIDER)))
-            .child(
-                div()
-                    .id("content")
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .flex()
-                    .flex_col()
-                    .when(self.page == Page::Quick, |el| el.child(self.quick_page(cx)))
-                    .when(self.page == Page::Bar, |el| el.child(self.bar_page(cx)))
-                    .when(self.page == Page::Widgets, |el| {
-                        el.child(self.widgets_page(cx))
-                    })
-                    .when(self.page == Page::Dock, |el| el.child(self.dock_page(cx)))
-                    .when(self.page == Page::Backgrounds, |el| {
-                        el.child(self.backgrounds_page(cx))
-                    }),
-            );
+            .flex_col()
+            .when(self.page == Page::Quick, |el| el.child(self.quick_page(cx)))
+            .when(self.page == Page::Bar, |el| el.child(self.bar_page(cx)))
+            .when(self.page == Page::Widgets, |el| {
+                el.child(self.widgets_page(cx))
+            })
+            .when(self.page == Page::Ordering, |el| {
+                el.child(self.ordering_page(cx))
+            })
+            .when(self.page == Page::Dock, |el| el.child(self.dock_page(cx)))
+            .when(self.page == Page::Backgrounds, |el| {
+                el.child(self.backgrounds_page(cx))
+            });
 
         crate::panel::chrome(
             self.geometry,
@@ -1046,15 +1139,15 @@ impl Render for SettingsView {
                 .id("settings-panel")
                 .size_full()
                 .flex()
-                .flex_col()
+                .flex_row()
                 .gap_3()
                 .px(px(12.))
                 .pt(px(10.))
                 .pb(px(12.))
                 .track_focus(&self.focus_handle)
-                .child(header)
-                .child(self.divider())
-                .child(body),
+                .child(sidebar)
+                .child(div().w(px(1.)).bg(rgba(theme::SOFT_DIVIDER)))
+                .child(kit::tabbed_pane(header, content)),
         )
     }
 }

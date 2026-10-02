@@ -618,7 +618,7 @@ fn dock_icon(
         .cursor_pointer()
         .hover(|el| el.bg(rgb(SURFACE_HOVER)))
         .when(focused, |el| el.bg(rgb(SURFACE)))
-        .tooltip(crate::bar::text_tooltip(tooltip.into()))
+        .tooltip(crate::panel_kit::text_tooltip(tooltip.into()))
         .on_click(cx.listener(move |_, _, _, cx| {
             if is_fixture {
                 crate::panel::toggle_panel(crate::panel::PanelKind::Launcher, cx);

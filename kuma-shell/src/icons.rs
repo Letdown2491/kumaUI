@@ -42,6 +42,8 @@ impl AssetSource for KumaAssets {
             "icons/history.svg" => Some(include_bytes!("../icons/history.svg").as_slice()),
             "icons/link.svg" => Some(include_bytes!("../icons/link.svg").as_slice()),
             "icons/puzzle.svg" => Some(include_bytes!("../icons/puzzle.svg").as_slice()),
+            "icons/order.svg" => Some(include_bytes!("../icons/order.svg").as_slice()),
+            "icons/mic.svg" => Some(include_bytes!("../icons/mic.svg").as_slice()),
             "icons/trash.svg" => Some(include_bytes!("../icons/trash.svg").as_slice()),
             "icons/undo.svg" => Some(include_bytes!("../icons/undo.svg").as_slice()),
             "icons/copy.svg" => Some(include_bytes!("../icons/copy.svg").as_slice()),
