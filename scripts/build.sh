@@ -31,5 +31,7 @@ podman run --rm \
 # keep the binary niri's `spawn` finds fresh
 if [ "${1:-}" = "build" ]; then
   mkdir -p ~/.local/bin
-  cp target/release/kuma-shell ~/.local/bin/kuma-shell
+  # rename(2) over a running binary works where cp fails with Text file busy
+  cp target/release/kuma-shell ~/.local/bin/kuma-shell.new
+  mv -f ~/.local/bin/kuma-shell.new ~/.local/bin/kuma-shell
 fi
