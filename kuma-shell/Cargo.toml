@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "The kumaOS desktop shell: bar, launcher, panels, and lock screen on gpui"
 license = "MIT"
-repository = "https://github.com/Letdown2491/kumaui"
+repository = "https://github.com/Letdown2491/kumaUI"
 
 [dependencies]
 anyhow = "1"

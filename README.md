@@ -1,10 +1,10 @@
-# kumaui
+# kumaUI
 
 A Wayland desktop shell built on [gpui](https://github.com/zed-industries/zed) (Zed's GPU-accelerated UI framework), written for kumaOS, an atomic Fedora-based system running the [niri](https://github.com/YaLTeR/niri) compositor.
 
 The binary is `kuma-shell`: a top bar, an app launcher, drawer panels, and a session lock screen, all of them layer-shell surfaces rendered by gpui.
 
-![The kuma-shell bar (workspaces, clock, widget cluster) and the app dock over the wallpaper](docs/kumaui.png)
+![The kuma-shell bar (workspaces, clock, widget cluster) and the app dock over the wallpaper](docs/kumaUI.png)
 
 ## What's in the shell
 

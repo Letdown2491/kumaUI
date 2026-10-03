@@ -20,7 +20,7 @@ bite us.
 Pinned commit: `40180d9c40e2d20eb63d388bff920818f2910b53` (zed main, 2026-09-30)
 
 Note: `vendor/zed/AGENTS.md` belongs to the zed repo; its rules apply to upstream
-PRs, not to kumaui development. Treat the vendored tree as read-only except for
+PRs, not to kumaUI development. Treat the vendored tree as read-only except for
 local patches, which should be recorded here.
 
 ## Local patches
