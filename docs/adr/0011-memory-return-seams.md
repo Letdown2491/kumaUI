@@ -33,7 +33,10 @@ Memory is returned at two seams, both inside kuma-shell, no vendor patch:
 - **A 30 s background trim.** A detached task calls `malloc_trim(0)`,
   which walks every glibc arena and madvises the free pages away. It is
   cheap when there is nothing to release, and it uses the background
-  executor's own timer, the same driver as the bar clock.
+  executor's own timer, the same driver as the bar clock. This is the
+  Shell's one deliberate force: glibc will not shrink an arena on
+  request, so a recurring rake is the measured price of a working-set
+  footprint.
 
 ## Consequences
 

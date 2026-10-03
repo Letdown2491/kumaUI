@@ -21,3 +21,33 @@ One line per term. These names are the seams in the code; use them in code, docs
 - **MSG CLI**: `kuma-shell msg <verb>`, thin client subcommands (volume up/down/mute, mic-mute, brightness up/down, media, launcher, settings, notifications, nostr) that ride the IPC socket (`$XDG_RUNTIME_DIR/kuma-shell.sock`) into the running Shell, falling back to standalone `wpctl`/`brightnessctl` when no Shell listens. This is what niri keybinds spawn.
 - **Memory return**: the two seams that keep the Shell's footprint at its working set over weeks: notification icons' atlas tiles drop when their entries leave the history (`notifications.rs::drop_icon`; the `img` element never drops the tile it paints), and a 30 s background `malloc_trim(0)` madvises glibc's freed arena pages back to the OS (`main.rs`, ADR-0011). The memory probe (`scripts/memory-probe.sh`) runs the Shell under scripted load in the test container and reads the per-phase deltas.
 - **Vendored gpui**: the gpui framework, vendored from zed main at a pinned commit (`VENDORED.md`); the crates.io release predates layer-shell.
+
+## Ethos
+
+Four rules the code already lives by. They exist so the next decision
+has somewhere to start; when practice drifts from this section, fix
+the practice or amend the section, never let it lie.
+
+- **Ask, don't assume** (the HATEOAS instinct): state is discovered
+  from the environment at the moment it matters, never cached across
+  the boundary that owns it. Adapters are detected by which IPC socket
+  exists, commands re-probe at call time, the mirror refetches when
+  the compositor's flags disagree with it, and surface liveness is
+  probed from the handle, not tracked in a ledger. A source that
+  cannot answer yields an empty render, not a stale guess (ADR-0012,
+  ADR-0003).
+- **Hold nothing** (non-attachment): an allocation that outlives its
+  reason is a bug. An object leaving a collection takes its pixels
+  with it, and the footprint tracks the working set, not the lifetime
+  high-water (ADR-0011). Measurements, not intentions, decide:
+  mimalloc was tried, did not win, and left no trace.
+- **Yield** (wu wei): the Shell contends for nothing. No sleep
+  inhibitor, no session lock, no fight against session end. The mirror
+  observes and never writes back; commanding the compositor is a
+  separate, user-initiated act (a click, a keybind). The watch acts
+  only when conditions change and logs nothing when all is well.
+- **Own your wires** (cypherpunk): keys never enter this process (the
+  nostr daemon is the policy, the CLI the transport), the trust
+  boundary is the user account and nothing inside it needs to prove
+  itself, every protocol is hand-rolled enough to read (ADR-0003), and
+  the msg CLI is the user's road in and out.
