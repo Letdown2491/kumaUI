@@ -528,22 +528,6 @@ impl SettingsView {
                     }),
                 ))
             })
-            .child({
-                let dnd = self.settings.read(cx).notifications.dnd;
-                let settings = self.settings.clone();
-                crate::controls::toggle_row(
-                    "toggle-dnd",
-                    "icons/bell.svg",
-                    "Do not disturb",
-                    dnd,
-                    move |_, _, cx| {
-                        settings.update(cx, |settings, cx| {
-                            let dnd = !settings.notifications.dnd;
-                            settings.set_notifications_dnd(dnd, cx);
-                        });
-                    },
-                )
-            })
             .when_some(profile, |el, _| {
                 el.child(kit::setting_row("Power profile", profile_segmented))
             })
@@ -551,15 +535,17 @@ impl SettingsView {
             .child(self.power_section(cx))
     }
 
-    /// The DND card: the manual toggle, and the quiet-hours schedule
-    /// tucked beneath it (a schedule toggle that seeds 22 to 7 on
-    /// first switch-on, the two end fields, and the urgent
-    /// pass-through). The fields reuse the numeric-edit machinery,
-    /// committed by Enter or a click anywhere.
+    /// The DND section: the manual toggle, and the quiet-hours
+    /// schedule revealed beneath it (the schedule toggle appears when
+    /// DND is on, the two end fields and the urgent pass-through when
+    /// the schedule is on; first switch-on seeds 22 to 7). The fields
+    /// reuse the numeric-edit machinery, committed by Enter or a
+    /// click anywhere.
     fn dnd_section(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let notifications = self.settings.read(cx).notifications;
         let dnd = notifications.dnd;
-        let enabled = notifications.quiet_from.is_some() && notifications.quiet_to.is_some();
+        let enabled =
+            notifications.quiet_from.is_some() && notifications.quiet_to.is_some();
         let from_row = self.quiet_time_row(
             "quiet-from",
             "From",
@@ -588,28 +574,30 @@ impl SettingsView {
                     });
                 },
             ))
-            .child({
-                let settings = self.settings.clone();
-                crate::controls::toggle_row(
-                    "toggle-quiet",
-                    "icons/moon.svg",
-                    "Schedule quiet hours",
-                    enabled,
-                    move |_, _, cx| {
-                        settings.update(cx, |settings, cx| {
-                            let on = !(settings.notifications.quiet_from.is_some()
-                                && settings.notifications.quiet_to.is_some());
-                            let (from, to) = if on {
-                                (Some(22), Some(7))
-                            } else {
-                                (None, None)
-                            };
-                            settings.set_quiet_hours(from, to, cx);
-                        });
-                    },
-                )
+            .when(dnd, |el| {
+                el.child({
+                    let settings = self.settings.clone();
+                    crate::controls::toggle_row(
+                        "toggle-quiet",
+                        "icons/moon.svg",
+                        "Schedule quiet hours",
+                        enabled,
+                        move |_, _, cx| {
+                            settings.update(cx, |settings, cx| {
+                                let on = !(settings.notifications.quiet_from.is_some()
+                                    && settings.notifications.quiet_to.is_some());
+                                let (from, to) = if on {
+                                    (Some(22), Some(7))
+                                } else {
+                                    (None, None)
+                                };
+                                settings.set_quiet_hours(from, to, cx);
+                            });
+                        },
+                    )
+                })
             })
-            .when(enabled, |el| {
+            .when(dnd && enabled, |el| {
                 el.child(from_row)
                     .child(to_row)
                     .child({
