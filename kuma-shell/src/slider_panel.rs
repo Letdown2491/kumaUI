@@ -6,11 +6,13 @@ use crate::sysmon::SysMon;
 use crate::theme::*;
 
 /// One widget, one control: the mini panel a value widget opens under
-/// itself. Volume adds a mute toggle; brightness is just its slider.
+/// itself. Volume adds a mute toggle; the microphone is the capture
+/// gain plus its mute; brightness is just its slider.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SliderKind {
     Volume,
     Brightness,
+    Mic,
 }
 
 impl SliderKind {
@@ -18,6 +20,7 @@ impl SliderKind {
         match self {
             SliderKind::Volume => "Volume",
             SliderKind::Brightness => "Brightness",
+            SliderKind::Mic => "Microphone",
         }
     }
 
@@ -25,6 +28,7 @@ impl SliderKind {
         match self {
             SliderKind::Volume => "icons/volume.svg",
             SliderKind::Brightness => "icons/brightness.svg",
+            SliderKind::Mic => "icons/mic.svg",
         }
     }
 
@@ -32,6 +36,7 @@ impl SliderKind {
         match self {
             SliderKind::Volume => sysmon.volume.map(|volume| volume.percent),
             SliderKind::Brightness => sysmon.brightness.map(|b| b.percent),
+            SliderKind::Mic => sysmon.mic.map(|mic| mic.percent),
         }
     }
 }
@@ -73,6 +78,7 @@ impl SliderPanelView {
         self.sysmon.update(cx, |sysmon, cx| match self.kind {
             SliderKind::Volume => sysmon.request_set_volume(percent, cx),
             SliderKind::Brightness => sysmon.request_set_brightness(percent, cx),
+            SliderKind::Mic => sysmon.request_set_mic_volume(percent, cx),
         });
     }
 }
@@ -82,7 +88,11 @@ impl Render for SliderPanelView {
         let sysmon = self.sysmon.read(cx);
         let volume = sysmon.volume;
         let percent = self.kind.percent(sysmon);
-        let muted = volume.is_some_and(|volume| volume.muted);
+        let muted = match self.kind {
+            SliderKind::Volume => volume.is_some_and(|volume| volume.muted),
+            SliderKind::Mic => sysmon.mic.is_some_and(|mic| mic.muted),
+            SliderKind::Brightness => false,
+        };
 
         let stash = controls::track_stash();
         let kind = self.kind;
@@ -109,7 +119,7 @@ impl Render for SliderPanelView {
             .children(percent.map(|percent| {
                 controls::slider_row(
                     kind.icon(),
-                    if kind == SliderKind::Volume && muted {
+                    if muted && kind != SliderKind::Brightness {
                         URGENT
                     } else {
                         TEXT
@@ -130,28 +140,34 @@ impl Render for SliderPanelView {
                                 SliderKind::Brightness => {
                                     sysmon.request_set_brightness(percent, cx)
                                 }
+                                SliderKind::Mic => sysmon.request_set_mic_volume(percent, cx),
                             });
                         }
                     }),
                 )
             }))
-            .when(kind == SliderKind::Volume, |el| {
-                el.when_some(volume, |el, volume| {
-                    el.child(kit::button(
-                        "mute-toggle",
-                        if volume.muted { "Unmute" } else { "Mute" },
-                        Some(if volume.muted {
-                            "icons/volume.svg"
-                        } else {
-                            "icons/x.svg"
-                        }),
-                        kit::ButtonVariant::Ghost,
-                        cx.listener(|this, _, _, cx| {
+            .when(percent.is_some() && kind != SliderKind::Brightness, |el| {
+                let muted_icon = match kind {
+                    SliderKind::Volume => "icons/volume.svg",
+                    _ => "icons/mic.svg",
+                };
+                el.child(kit::button(
+                    "mute-toggle",
+                    if muted { "Unmute" } else { "Mute" },
+                    Some(if muted { "icons/x.svg" } else { muted_icon }),
+                    kit::ButtonVariant::Ghost,
+                    cx.listener(|this, _, _, cx| match this.kind {
+                        SliderKind::Volume => {
                             this.sysmon
                                 .update(cx, |sysmon, cx| sysmon.request_mute_toggle(cx));
-                        }),
-                    ))
-                })
+                        }
+                        SliderKind::Mic => {
+                            this.sysmon
+                                .update(cx, |sysmon, cx| sysmon.request_mic_toggle(cx));
+                        }
+                        SliderKind::Brightness => {}
+                    }),
+                ))
             });
 
         // measured-panel flow: the content height refines the panel height

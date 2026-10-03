@@ -172,6 +172,7 @@ pub enum PanelKind {
     Notifications,
     Volume,
     Brightness,
+    Mic,
     PowerProfile,
     DockMenu,
     Nostr,
@@ -187,6 +188,7 @@ impl PanelKind {
             PanelKind::Notifications => (560., 520., KeyboardInteractivity::OnDemand),
             PanelKind::Volume => (360., 150., KeyboardInteractivity::OnDemand),
             PanelKind::Brightness => (360., 150., KeyboardInteractivity::OnDemand),
+            PanelKind::Mic => (360., 150., KeyboardInteractivity::OnDemand),
             PanelKind::PowerProfile => (280., 170., KeyboardInteractivity::OnDemand),
             PanelKind::DockMenu => (180., 96., KeyboardInteractivity::OnDemand),
             PanelKind::Nostr => (560., 520., KeyboardInteractivity::OnDemand),
@@ -201,6 +203,7 @@ impl PanelKind {
             PanelKind::Notifications => "notifications",
             PanelKind::Volume => "volume",
             PanelKind::Brightness => "brightness",
+            PanelKind::Mic => "mic",
             PanelKind::PowerProfile => "power-profile",
             PanelKind::DockMenu => "dock-menu",
             PanelKind::Nostr => "nostr",
@@ -269,6 +272,17 @@ impl PanelKind {
                 .new(|cx| {
                     crate::slider_panel::SliderPanelView::new(
                         crate::slider_panel::SliderKind::Brightness,
+                        sysmon,
+                        window,
+                        cx,
+                        geometry,
+                    )
+                })
+                .into(),
+            PanelKind::Mic => cx
+                .new(|cx| {
+                    crate::slider_panel::SliderPanelView::new(
+                        crate::slider_panel::SliderKind::Mic,
                         sysmon,
                         window,
                         cx,

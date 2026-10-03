@@ -19,11 +19,12 @@ pub struct Volume {
     pub muted: bool,
 }
 
-/// The default capture device's state: muting is all the bar and the
-/// OSD say about it; its capture gain reads as noise otherwise.
+/// The default capture device's state: mute and capture gain, the
+/// gain only reaching the UI when the mic widget's panel asks for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mic {
     pub muted: bool,
+    pub percent: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +218,7 @@ enum AvRequest {
     BrightnessDelta(i32, Option<Brightness>),
     BrightnessAbsolute(u8, Option<Brightness>),
     Mic(Option<Mic>),
+    MicVolume(u8, Option<Mic>),
 }
 
 impl AvRequest {
@@ -267,6 +269,18 @@ impl AvRequest {
                 };
                 if let Err(err) = cx.background_spawn(result).await {
                     log::error!("mic mute toggle failed: {err:#}");
+                    let _ = this.update(cx, |sysmon, cx| {
+                        sysmon.mic = previous; // rollback; the next poll reconciles
+                        cx.notify();
+                    });
+                }
+            }
+            AvRequest::MicVolume(percent, previous) => {
+                if let Err(err) = cx
+                    .background_spawn(async move { set_mic_volume(percent) })
+                    .await
+                {
+                    log::error!("mic volume request failed: {err:#}");
                     let _ = this.update(cx, |sysmon, cx| {
                         sysmon.mic = previous; // rollback; the next poll reconciles
                         cx.notify();
@@ -353,11 +367,28 @@ impl SysMon {
         if let Some(current) = previous {
             self.mic = Some(Mic {
                 muted: !current.muted,
+                percent: current.percent,
             });
             self.av_request_at = Some(Instant::now());
             cx.notify();
         }
         self.queue(AvRequest::Mic(previous), cx);
+    }
+
+    /// One request seam for the capture gain (ADR-0006): optimistic
+    /// write, queue, rollback on error. The gain rides the same
+    /// absolute-write serialization as the sink's volume.
+    pub fn request_set_mic_volume(&mut self, percent: u8, cx: &mut Context<Self>) {
+        let previous = self.mic;
+        if let Some(current) = previous {
+            self.mic = Some(Mic {
+                percent,
+                ..current
+            });
+            self.av_request_at = Some(Instant::now());
+            cx.notify();
+        }
+        self.queue(AvRequest::MicVolume(percent, previous), cx);
     }
 
     /// One request seam for play/pause (ADR-0006): optimistic status flip,
@@ -742,6 +773,15 @@ pub fn toggle_mic() -> anyhow::Result<()> {
     set_mute("toggle", true)
 }
 
+/// Absolute capture-gain set, the sink's `set_volume` for the source.
+pub fn set_mic_volume(percent: u8) -> anyhow::Result<()> {
+    let output = Command::new("wpctl")
+        .args(["set-volume", "@DEFAULT_AUDIO_SOURCE@", &format!("{percent}%")])
+        .output()?;
+    anyhow::ensure!(output.status.success(), "wpctl set-volume failed");
+    Ok(())
+}
+
 /// The MSG CLI path: read current brightness and step it, clamped.
 pub fn change_brightness(percent_delta: i32) -> anyhow::Result<()> {
     let current = read_brightness().context("no backlight found")?;
@@ -1024,6 +1064,7 @@ fn read_mic() -> Option<Mic> {
     }
     parse_wpctl_volume(&String::from_utf8_lossy(&output.stdout)).map(|volume| Mic {
         muted: volume.muted,
+        percent: volume.percent,
     })
 }
 
@@ -1272,7 +1313,7 @@ mod tests {
             percent: 50,
             muted: false,
         });
-        sysmon.mic = Some(Mic { muted: true });
+        sysmon.mic = Some(Mic { muted: true, percent: 42 });
         // a garbage read (the sink shows the mic's mute during a
         // routing flap): stored, not applied
         let garbage = Snapshot {
@@ -1280,7 +1321,7 @@ mod tests {
                 percent: 71,
                 muted: true,
             }),
-            mic: Some(Mic { muted: true }),
+            mic: Some(Mic { muted: true, percent: 42 }),
             ..Default::default()
         };
         assert!(!sysmon.absorb_av(&garbage));
@@ -1297,7 +1338,7 @@ mod tests {
                 percent: 50,
                 muted: false,
             }),
-            mic: Some(Mic { muted: true }),
+            mic: Some(Mic { muted: true, percent: 42 }),
             ..Default::default()
         };
         assert!(!sysmon.absorb_av(&calm));
@@ -1310,10 +1351,10 @@ mod tests {
         );
         // a real change repeats and then applies
         let mut real = calm;
-        real.mic = Some(Mic { muted: false });
+        real.mic = Some(Mic { muted: false, percent: 42 });
         assert!(!sysmon.absorb_av(&real));
-        assert_eq!(sysmon.mic, Some(Mic { muted: true }));
+        assert_eq!(sysmon.mic, Some(Mic { muted: true, percent: 42 }));
         assert!(sysmon.absorb_av(&real));
-        assert_eq!(sysmon.mic, Some(Mic { muted: false }));
+        assert_eq!(sysmon.mic, Some(Mic { muted: false, percent: 42 }));
     }
 }

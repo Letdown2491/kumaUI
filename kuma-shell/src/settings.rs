@@ -21,6 +21,7 @@ pub enum WidgetKind {
     Apps,
     Cpu,
     Volume,
+    Mic,
     Brightness,
     PowerProfile,
     Media,
@@ -75,6 +76,11 @@ pub const WIDGETS: &[WidgetSpec] = &[
         kind: WidgetKind::Volume,
         label: "Volume",
         icon: Some(WidgetIconSpec::Path("icons/volume.svg")),
+    },
+    WidgetSpec {
+        kind: WidgetKind::Mic,
+        label: "Microphone",
+        icon: Some(WidgetIconSpec::Path("icons/mic.svg")),
     },
     WidgetSpec {
         kind: WidgetKind::Brightness,
@@ -941,7 +947,7 @@ mod tests {
             WidgetKind::Cpu.icon_spec(),
             Some(WidgetIconSpec::Path("icons/cpu.svg"))
         );
-        assert_eq!(WIDGETS.len(), 15);
+        assert_eq!(WIDGETS.len(), 16);
     }
 
     #[test]

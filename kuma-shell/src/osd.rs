@@ -449,11 +449,11 @@ mod tests {
 
     #[test]
     fn the_microphone_has_no_bar_but_names_its_state() {
-        let muted = mic_content(Mic { muted: true });
+        let muted = mic_content(Mic { muted: true, percent: 42 });
         assert_eq!(muted.value, "Muted");
         assert!(muted.urgent);
         assert_eq!(muted.percent, None);
-        let on = mic_content(Mic { muted: false });
+        let on = mic_content(Mic { muted: false, percent: 42 });
         assert_eq!(on.value, "On");
         assert!(!on.urgent);
     }
@@ -502,7 +502,7 @@ mod tests {
                 percent: 64,
                 muted: false,
             }),
-            mic: Some(Mic { muted: false }),
+            mic: Some(Mic { muted: false, percent: 42 }),
             brightness: Some(Brightness { percent: 80 }),
             ..Default::default()
         };

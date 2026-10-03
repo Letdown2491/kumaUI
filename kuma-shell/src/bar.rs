@@ -496,6 +496,34 @@ impl ShellBar {
                 }))
                 .into_any_element()
             }),
+            WidgetKind::Mic => sysmon.mic.map(|mic| {
+                let muted = mic.muted;
+                let text = if muted {
+                    "MUTED".to_string()
+                } else {
+                    format!("{}%", mic.percent)
+                };
+                sys_widget(
+                    widget.kind,
+                    widget.mode,
+                    Some(text),
+                    if muted { URGENT } else { TEXT },
+                    move |sysmon: &SysMon, _| match sysmon.mic {
+                        Some(mic) if mic.muted => "Microphone muted".into(),
+                        Some(mic) => format!("Microphone: {}%", mic.percent).into(),
+                        None => "Microphone unknown".into(),
+                    },
+                    widget_icon(widget.kind),
+                    tooltips_on,
+                    self.sysmon.clone(),
+                )
+                .cursor_pointer()
+                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    let anchor = f32::from(event.position().x);
+                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Mic, anchor, cx)
+                }))
+                .into_any_element()
+            }),
             WidgetKind::PowerProfile => sysmon.power_profile.map(|profile| {
                 let label = profile.title();
                 sys_widget(
