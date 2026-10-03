@@ -7,8 +7,9 @@
 //! surface the moment its last output goes away (a dock unplug on an
 //! external-monitor laptop, the CI smoke's output-less qemu), and the
 //! shell answers by idling with zero windows, still holding its DBus
-//! names and its logind sleep inhibitor, then bringing the surfaces
-//! back when outputs return. The process exits only when the
+//! names (org.freedesktop.Notifications) and deliberately taking no
+//! part in the suspend path, then bringing the surfaces back when
+//! outputs return. The process exits only when the
 //! compositor's connection itself breaks, which is session end.
 //!
 //! Output visibility needs no window: gpui binds `wl_output` globals as

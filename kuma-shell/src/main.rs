@@ -81,7 +81,8 @@ fn main() {
             // windows close: gpui's default quit mode exits on the last
             // window close (QuitMode::Default on non-macOS, set above), so
             // the builder pins QuitMode::Explicit and the shell idles
-            // displayless (bus names held, the logind sleep inhibitor held)
+            // displayless (bus names held, and no logind sleep inhibitor:
+            // the shell deliberately takes no part in the suspend path)
             // while the watch brings the surfaces back when outputs do.
             // Exit is the compositor's death, which is session end.
             kuma_shell::surfaces::init(
