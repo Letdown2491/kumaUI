@@ -178,21 +178,19 @@ enum Drag {
     Volume,
 }
 
-/// Which idle slider the idle page is dragging. The slider works in
-/// minutes (its percent is the minutes); seconds only exist at the
-/// settings seam.
+/// Which idle field the idle page is editing.
 #[derive(Clone, Copy, PartialEq)]
 enum IdleSlider {
     Lock,
     ScreenOff,
 }
 
-/// An in-flight idle drag: the live minutes, held here so the TOML
-/// write lands once, on release, not on every mouse move.
-struct IdleDrag {
+/// An open idle edit: the digits typed so far and the field's focus.
+/// Nothing is written until Enter commits the whole number.
+struct IdleEdit {
     which: IdleSlider,
-    track: crate::controls::TrackStash,
-    preview: u8,
+    text: String,
+    focus: FocusHandle,
 }
 
 /// The display name for an idle timeout: Off at zero, minutes to the
@@ -222,8 +220,8 @@ pub struct SettingsView {
     /// own view, and a view recreated per render would forget its arm
     /// between SysMon's polls
     power_row: Entity<kit::ConfirmActions>,
-    /// the idle slider being dragged, with its live preview
-    idle_drag: Option<IdleDrag>,
+    /// the idle field being edited, if any
+    idle_edit: Option<IdleEdit>,
 }
 
 impl SettingsView {
@@ -275,7 +273,7 @@ impl SettingsView {
             drop_preview: None,
             thumbs: HashMap::new(),
             power_row,
-            idle_drag: None,
+            idle_edit: None,
         }
     }
 
@@ -683,37 +681,27 @@ impl SettingsView {
     }
 
     /// The idle page: the three clauses of the idle contract, in
-    /// execution order. The sliders work in minutes (0 is Off); the
-    /// clocks are independent, never clamped, and a dim note says when
-    /// the order would surprise. Drags preview live and commit once,
-    /// on release.
-    fn idle_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+    /// execution order. The timeouts are entered as minutes in a
+    /// click-to-edit field (0 is Off); Enter commits the whole number,
+    /// nothing is written per keystroke. The clocks are independent,
+    /// never clamped, and a dim note says when the order would
+    /// surprise.
+    fn idle_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let idle = self.settings.read(cx).idle;
-        let lock_minutes = ((idle.lock_timeout / 60) as u8).min(100);
-        let screen_minutes = ((idle.screen_off_timeout / 60) as u8).min(100);
-        let lock = match &self.idle_drag {
-            Some(drag) if drag.which == IdleSlider::Lock => drag.preview,
-            _ => lock_minutes,
-        };
-        let screen = match &self.idle_drag {
-            Some(drag) if drag.which == IdleSlider::ScreenOff => drag.preview,
-            _ => screen_minutes,
-        };
-
-        let lock_row = self.idle_slider_row(
+        let lock_row = self.idle_number_row(
             "idle-lock",
             "icons/lock.svg",
             "Lock after",
             IdleSlider::Lock,
-            lock,
+            idle.lock_timeout,
             cx,
         );
-        let screen_row = self.idle_slider_row(
+        let screen_row = self.idle_number_row(
             "idle-screen-off",
             "icons/brightness.svg",
             "Screens off after",
             IdleSlider::ScreenOff,
-            screen,
+            idle.screen_off_timeout,
             cx,
         );
 
@@ -725,35 +713,18 @@ impl SettingsView {
             .flex_col()
             .gap_3()
             .overflow_y_scroll()
-            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                if let Some(drag) = &mut this.idle_drag
-                    && let Some(minutes) = drag
-                        .track
-                        .get()
-                        .and_then(|bounds| crate::controls::value_at(event.position.x, bounds))
-                {
-                    drag.preview = minutes;
-                    cx.notify();
-                }
-            }))
-            .on_mouse_up(
-                gpui::MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    if let Some(drag) = this.idle_drag.take() {
-                        let seconds = u64::from(drag.preview) * 60;
-                        this.settings.update(cx, |settings, cx| match drag.which {
-                            IdleSlider::Lock => settings.set_idle_lock_timeout(seconds, cx),
-                            IdleSlider::ScreenOff => {
-                                settings.set_idle_screen_off_timeout(seconds, cx)
-                            }
-                        });
-                    }
-                }),
-            )
             .child(
                 kit::card("idle-timeouts")
                     .child(lock_row)
-                    .child(screen_row),
+                    .child(screen_row)
+                    .when(self.idle_edit.is_some(), |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(TEXT_DIM))
+                                .child("Press Enter to apply."),
+                        )
+                    }),
             )
             .child(crate::controls::toggle_row(
                 "idle-lock-before-suspend",
@@ -784,18 +755,24 @@ impl SettingsView {
             )
     }
 
-    /// One idle slider row: icon, name, track, and the live value. The
-    /// slider's percent is minutes, 0 meaning Off.
-    fn idle_slider_row(
-        &self,
+    /// One idle row: icon, name, the minute field, and the committed
+    /// value spelled out. Click the field to edit; Enter applies.
+    fn idle_number_row(
+        &mut self,
         id: &str,
         icon: &'static str,
         name: &str,
         which: IdleSlider,
-        minutes: u8,
+        seconds: u64,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
-        let track = crate::controls::track_stash();
+        let editing = self
+            .idle_edit
+            .as_ref()
+            .filter(|edit| edit.which == which);
+        let text = editing
+            .map(|edit| edit.text.clone())
+            .unwrap_or_else(|| (seconds / 60).to_string());
         div()
             .id(SharedString::from(id))
             .flex()
@@ -805,35 +782,112 @@ impl SettingsView {
             .child(gpui::svg().path(icon).size(px(16.)).text_color(rgb(TEXT)))
             .child(
                 div()
-                    .w(px(96.))
+                    .flex_1()
                     .text_size(px(12.))
                     .text_color(rgb(TEXT))
                     .child(name.to_string()),
             )
-            .child(crate::controls::slider_track(minutes, track.clone()))
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-field")))
+                    .when_some(editing.map(|edit| edit.focus.clone()), |el, focus| {
+                        el.track_focus(&focus)
+                            .on_key_down(cx.listener(Self::idle_edit_key))
+                    })
+                    .w(px(72.))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(INSET))
+                    .border_1()
+                    .border_color(rgb(if editing.is_some() { ACCENT } else { DIVIDER }))
+                    .cursor_text()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.idle_edit.as_ref().is_some_and(|edit| edit.which == which) {
+                            return;
+                        }
+                        // switching fields commits the open one first
+                        this.commit_idle_edit(cx);
+                        let focus = cx.focus_handle();
+                        focus.focus(window, cx);
+                        this.idle_edit = Some(IdleEdit {
+                            which,
+                            text: String::new(),
+                            focus,
+                        });
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(if editing.is_some() { TEXT } else { TEXT_DIM }))
+                            .text_align(gpui::TextAlign::Right)
+                            .when(editing.is_none(), |el| {
+                                el.child(if seconds == 0 {
+                                    "Off".to_string()
+                                } else {
+                                    format!("{} min", seconds / 60)
+                                })
+                            })
+                            .when(editing.is_some(), |el| el.child(text.clone())),
+                    ),
+            )
             .child(
                 div()
                     .w(px(48.))
                     .text_size(px(11.))
                     .text_color(rgb(TEXT_DIM))
                     .text_align(gpui::TextAlign::Right)
-                    .child(idle_label(u64::from(minutes) * 60)),
+                    .child(idle_label(seconds)),
             )
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                    if let Some(minutes) = track
-                        .get()
-                        .and_then(|bounds| crate::controls::value_at(event.position.x, bounds))
-                    {
-                        this.idle_drag = Some(IdleDrag {
-                            which,
-                            track: track.clone(),
-                            preview: minutes,
-                        });
+    }
+
+    /// Commit the open idle edit, if any: the digits are minutes, the
+    /// settings seam gets seconds. An unparsable field reverts.
+    fn commit_idle_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.idle_edit.take() else {
+            return;
+        };
+        let Ok(minutes) = edit.text.trim().parse::<u64>() else {
+            cx.notify();
+            return;
+        };
+        let seconds = minutes * 60;
+        let which = edit.which;
+        self.settings.update(cx, |settings, cx| match which {
+            IdleSlider::Lock => settings.set_idle_lock_timeout(seconds, cx),
+            IdleSlider::ScreenOff => settings.set_idle_screen_off_timeout(seconds, cx),
+        });
+    }
+
+    /// Keys for an open idle edit: digits build the number, Enter
+    /// commits, and anything else is ignored while typing.
+    fn idle_edit_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if key == "enter" {
+            self.commit_idle_edit(cx);
+            return;
+        }
+        if let Some(edit) = &mut self.idle_edit {
+            match key {
+                "backspace" => {
+                    edit.text.pop();
+                    cx.notify();
+                }
+                digit if digit.chars().count() == 1 && digit.as_bytes()[0].is_ascii_digit() && !event.keystroke.modifiers.modified() => {
+                    if edit.text.len() < 5 {
+                        edit.text.push_str(digit);
+                        cx.notify();
                     }
-                }),
-            )
+                }
+                _ => {}
+            }
+        }
     }
 
     /// The widgets page: every registered kind, one row each in
