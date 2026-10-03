@@ -16,6 +16,7 @@ pub mod notifications_view;
 pub mod osd;
 pub mod panel;
 pub mod panel_kit;
+pub mod session;
 pub mod settings;
 pub mod settings_view;
 pub mod slider_panel;

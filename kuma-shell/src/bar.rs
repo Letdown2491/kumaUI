@@ -8,7 +8,7 @@ use gpui::{
 };
 use log::error;
 
-use crate::niri::NiriState;
+use crate::session::SessionState;
 use crate::settings::{
     BarAlign, BarRadius, CornerRounding, Section, Settings, WidgetConfig, WidgetIconSpec,
     WidgetKind, WidgetMode,
@@ -29,7 +29,7 @@ struct WorkspaceItem {
 }
 
 pub struct ShellBar {
-    niri: Entity<NiriState>,
+    niri: Entity<SessionState>,
     sysmon: Entity<SysMon>,
     settings: Entity<Settings>,
     notifications: Entity<crate::notifications::NotificationState>,
@@ -50,7 +50,7 @@ pub struct ShellBar {
 
 impl ShellBar {
     pub fn new(
-        niri: Entity<NiriState>,
+        niri: Entity<SessionState>,
         sysmon: Entity<SysMon>,
         settings: Entity<Settings>,
         notifications: Entity<crate::notifications::NotificationState>,
@@ -923,7 +923,7 @@ fn workspaces_widget(
                 .px_1()
                 .on_click(cx.listener(move |_, _, _, cx| {
                     cx.background_spawn(async move {
-                        if let Err(err) = crate::niri::focus_workspace(workspace_id) {
+                        if let Err(err) = crate::session::focus_workspace(workspace_id) {
                             error!("focus-workspace failed: {err:#}");
                         }
                     })

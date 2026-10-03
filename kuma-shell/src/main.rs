@@ -1,4 +1,4 @@
-use kuma_shell::{icons::KumaAssets, niri::NiriState, sysmon::SysMon};
+use kuma_shell::{icons::KumaAssets, session::SessionState, sysmon::SysMon};
 
 use gpui::{App, AppContext, QuitMode};
 
@@ -38,8 +38,8 @@ fn main() {
         .with_quit_mode(QuitMode::Explicit)
         .with_assets(KumaAssets)
         .run(|cx: &mut App| {
-            let niri = cx.new(|_| NiriState::default());
-            kuma_shell::niri::connect(&niri, cx);
+            let niri = cx.new(|_| SessionState::default());
+            kuma_shell::session::connect(&niri, cx);
 
             let sysmon = cx.new(|_| SysMon::default());
             kuma_shell::sysmon::run(&sysmon, cx);

@@ -28,7 +28,7 @@ use gpui::{
 
 use crate::bar::ShellBar;
 use crate::lock;
-use crate::niri::NiriState;
+use crate::session::SessionState;
 use crate::nostr::NostrState;
 use crate::notifications::NotificationState;
 use crate::settings::{BarConfig, Settings};
@@ -43,7 +43,7 @@ const WATCH_TICK: Duration = Duration::from_secs(2);
 /// The entities the persistent surfaces render from, held so the watch
 /// can rebuild any of them long after startup ran.
 pub struct SurfaceDeps {
-    pub niri: Entity<NiriState>,
+    pub niri: Entity<SessionState>,
     pub sysmon: Entity<SysMon>,
     pub settings: Entity<Settings>,
     pub notifications: Entity<NotificationState>,

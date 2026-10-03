@@ -17,7 +17,7 @@ use gpui::{
 
 use crate::imaging::IconImage;
 use crate::launcher::{AppEntry, launch, load_apps};
-use crate::niri::{NiriState, NiriWindow};
+use crate::session::{SessionState, SessionWindow};
 use crate::settings::{DockPosition, Settings};
 use crate::theme::*;
 
@@ -119,7 +119,7 @@ fn cycle_target(windows: &[u64], focused: Option<u64>) -> Option<u64> {
 /// Pure: the surface renders it, the tests pin it down.
 pub fn dock_entries(
     apps: &[AppEntry],
-    windows: &[&NiriWindow],
+    windows: &[&SessionWindow],
     focused_window: Option<u64>,
     pinned: &[String],
 ) -> Vec<DockEntry> {
@@ -239,7 +239,7 @@ pub struct DockHost {
 impl DockHost {
     fn sync(
         &mut self,
-        niri: &Entity<NiriState>,
+        niri: &Entity<SessionState>,
         settings: &Entity<Settings>,
         cx: &mut Context<Self>,
     ) {
@@ -302,7 +302,7 @@ impl DockHost {
 struct DockHostGlobal(#[allow(dead_code)] Entity<DockHost>);
 impl gpui::Global for DockHostGlobal {}
 /// Start the dock: one host entity observing settings, syncing the window.
-pub fn run(niri: Entity<NiriState>, settings: Entity<Settings>, cx: &mut App) {
+pub fn run(niri: Entity<SessionState>, settings: Entity<Settings>, cx: &mut App) {
     let observer_niri = niri.clone();
     let host = cx.new(|cx| {
         cx.observe(
@@ -323,7 +323,7 @@ pub fn run(niri: Entity<NiriState>, settings: Entity<Settings>, cx: &mut App) {
 
 /// The surfaces watch's dock arm: re-run the sync, which no-ops while
 /// the window is alive and recreates it when it died with its output.
-pub fn ensure(niri: &Entity<NiriState>, settings: &Entity<Settings>, cx: &mut App) {
+pub fn ensure(niri: &Entity<SessionState>, settings: &Entity<Settings>, cx: &mut App) {
     let Some(host) = cx
         .try_global::<DockHostGlobal>()
         .map(|global| global.0.clone())
@@ -336,7 +336,7 @@ pub fn ensure(niri: &Entity<NiriState>, settings: &Entity<Settings>, cx: &mut Ap
 /// The dock surface: a rounded card of entries centered on a stretched,
 /// otherwise transparent strip at the screen edge.
 pub struct DockView {
-    niri: Entity<NiriState>,
+    niri: Entity<SessionState>,
     settings: Entity<Settings>,
     apps: Vec<AppEntry>,
     icons: HashMap<String, Option<IconImage>>,
@@ -347,7 +347,7 @@ pub struct DockView {
 
 impl DockView {
     pub fn new(
-        niri: Entity<NiriState>,
+        niri: Entity<SessionState>,
         settings: Entity<Settings>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -652,7 +652,7 @@ fn dock_icon(
                 crate::panel::toggle_panel(crate::panel::PanelKind::Launcher, cx);
             } else if let Some(target) = cycle_target(&click_windows, click_focused) {
                 cx.background_spawn(async move {
-                    if let Err(err) = crate::niri::focus_window(target) {
+                    if let Err(err) = crate::session::focus_window(target) {
                         log::error!("focus-window failed: {err:#}");
                     }
                 })
@@ -744,8 +744,8 @@ mod tests {
         }
     }
 
-    fn window(id: u64, app_id: Option<&str>, focused: bool) -> NiriWindow {
-        NiriWindow {
+    fn window(id: u64, app_id: Option<&str>, focused: bool) -> SessionWindow {
+        SessionWindow {
             id,
             title: Some(format!("win-{id}")),
             app_id: app_id.map(String::from),
@@ -797,7 +797,7 @@ mod tests {
             window(1, Some("org.gnome.Nautilus"), false),
             window(2, Some("kitty"), true),
         ];
-        let windows: Vec<&NiriWindow> = raw_windows.iter().collect();
+        let windows: Vec<&SessionWindow> = raw_windows.iter().collect();
         let entries = dock_entries(&apps, &windows, Some(2), &[]);
         assert_eq!(entries.len(), 2);
         let nautilus = entries.iter().find(|e| e.label == "Files").unwrap();
@@ -814,7 +814,7 @@ mod tests {
             window(4, Some("mystery"), false),
             window(5, None, false),
         ];
-        let windows: Vec<&NiriWindow> = raw_windows.iter().collect();
+        let windows: Vec<&SessionWindow> = raw_windows.iter().collect();
         let entries = dock_entries(&[], &windows, None, &[]);
         assert_eq!(entries.len(), 2);
         let mystery = entries.iter().find(|e| e.key == "mystery").unwrap();
