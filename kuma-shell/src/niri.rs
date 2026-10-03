@@ -9,11 +9,10 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use gpui::{App, AppContext, Entity};
-use log::error;
+use gpui::{App, Entity};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use smol::channel::{Sender, unbounded};
+use smol::channel::Sender;
 
 use crate::session::{SessionEvent, SessionState};
 
@@ -34,30 +33,7 @@ struct WindowFocusChangedEvent {
 }
 
 pub fn connect(state: &Entity<SessionState>, cx: &mut App) {
-    let state = state.downgrade();
-    let (event_tx, event_rx) = unbounded::<SessionEvent>();
-
-    cx.background_spawn(async move {
-        if let Err(err) = run_event_stream(event_tx).await {
-            error!("niri event stream terminated: {err:#}");
-        }
-    })
-    .detach();
-
-    cx.spawn(async move |cx| {
-        while let Ok(event) = event_rx.recv().await {
-            if state
-                .update(cx, |state, cx| {
-                    state.apply(event);
-                    cx.notify();
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    })
-    .detach();
+    crate::session::mirror(state, "niri", cx, run_event_stream);
 }
 
 pub(crate) fn socket_path() -> Result<PathBuf> {

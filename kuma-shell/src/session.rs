@@ -4,12 +4,13 @@
 //! is the first adapter, and sway and hyprland slot in beside it (the
 //! adapters are picked at startup by which IPC socket exists).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, future::Future};
 
 use anyhow::Result;
-use gpui::{App, Entity};
-use log::debug;
+use gpui::{App, AppContext, Entity};
+use log::{debug, error};
 use serde::Deserialize;
+use smol::channel::{Sender, unbounded};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Workspace {
@@ -189,32 +190,84 @@ pub fn connect(state: &Entity<SessionState>, cx: &mut App) {
     }
 }
 
+/// Spawn an adapter's event stream and apply what it reports to the
+/// mirror. Both halves of the plumbing live here; only the stream
+/// function is the adapter's own. `name` is what a broken stream gets
+/// to be called in the log.
+pub(crate) fn mirror<Stream, Fut>(
+    state: &Entity<SessionState>,
+    name: &'static str,
+    cx: &mut App,
+    stream: Stream,
+) where
+    Stream: FnOnce(Sender<SessionEvent>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let state = state.downgrade();
+    let (event_tx, event_rx) = unbounded::<SessionEvent>();
+
+    cx.background_spawn(async move {
+        if let Err(err) = stream(event_tx).await {
+            error!("{name} event stream terminated: {err:#}");
+        }
+    })
+    .detach();
+
+    cx.spawn(async move |cx| {
+        while let Ok(event) = event_rx.recv().await {
+            if state
+                .update(cx, |state, cx| {
+                    state.apply(event);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
+/// Route a command to whichever adapter's socket exists right now. The
+/// probe happens at call time on purpose: the environment owns this
+/// fact, and asking is cheaper than caching it wrong. niri first is a
+/// target-platform preference, not semantics; the two sockets never
+/// coexist in a real session.
+fn with_adapter<T>(
+    niri: impl FnOnce() -> Result<T>,
+    sway: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if crate::niri::socket_path().is_ok() {
+        niri()
+    } else {
+        sway()
+    }
+}
+
 /// Focus a workspace by its internal id: the bar's click action.
 pub fn focus_workspace(id: u64) -> Result<()> {
-    if crate::niri::socket_path().is_ok() {
-        crate::niri::focus_workspace(id)
-    } else {
-        crate::sway::focus_workspace(id)
-    }
+    with_adapter(
+        || crate::niri::focus_workspace(id),
+        || crate::sway::focus_workspace(id),
+    )
 }
 
 /// Focus a workspace by its 1-based number: the MSG CLI path, where the
 /// human (or keybind) speaks in workspace numbers, not internal ids.
 pub fn focus_workspace_index(index: u32) -> Result<()> {
-    if crate::niri::socket_path().is_ok() {
-        crate::niri::focus_workspace_index(index)
-    } else {
-        crate::sway::focus_workspace_index(index)
-    }
+    with_adapter(
+        || crate::niri::focus_workspace_index(index),
+        || crate::sway::focus_workspace_index(index),
+    )
 }
 
 /// Focus one window: the dock's click action.
 pub fn focus_window(id: u64) -> Result<()> {
-    if crate::niri::socket_path().is_ok() {
-        crate::niri::focus_window(id)
-    } else {
-        crate::sway::focus_window(id)
-    }
+    with_adapter(
+        || crate::niri::focus_window(id),
+        || crate::sway::focus_window(id),
+    )
 }
 
 #[cfg(test)]
