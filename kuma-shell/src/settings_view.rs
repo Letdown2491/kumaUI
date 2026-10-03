@@ -193,19 +193,6 @@ struct IdleEdit {
     focus: FocusHandle,
 }
 
-/// The display name for an idle timeout: Off at zero, minutes to the
-/// hour, hours and minutes past it.
-fn idle_label(seconds: u64) -> String {
-    if seconds == 0 {
-        return "Off".to_string();
-    }
-    let minutes = seconds / 60;
-    if minutes < 60 {
-        return format!("{minutes} min");
-    }
-    format!("{}h {:02}", minutes / 60, minutes % 60)
-}
-
 pub struct SettingsView {
     settings: Entity<Settings>,
     sysmon: Entity<crate::sysmon::SysMon>,
@@ -831,14 +818,6 @@ impl SettingsView {
                             })
                             .when(editing.is_some(), |el| el.child(text.clone())),
                     ),
-            )
-            .child(
-                div()
-                    .w(px(48.))
-                    .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
-                    .text_align(gpui::TextAlign::Right)
-                    .child(idle_label(seconds)),
             )
     }
 
@@ -1476,13 +1455,5 @@ mod tests {
             percent_decode_path("file:///truncated%2"),
             PathBuf::from("/truncated%2")
         );
-    }
-
-    #[test]
-    fn idle_labels_name_the_timeout() {
-        assert_eq!(idle_label(0), "Off");
-        assert_eq!(idle_label(900), "15 min");
-        assert_eq!(idle_label(960), "16 min");
-        assert_eq!(idle_label(5400), "1h 30");
     }
 }
