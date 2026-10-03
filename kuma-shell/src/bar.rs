@@ -496,6 +496,27 @@ impl ShellBar {
                 }))
                 .into_any_element()
             }),
+            WidgetKind::Ram => sysmon.ram.map(|ram| {
+                sys_widget(
+                    widget.kind,
+                    widget.mode,
+                    Some(format!("RAM {}%", ram.percent)),
+                    TEXT,
+                    move |sysmon: &SysMon, _| match sysmon.ram {
+                        Some(ram) => format!(
+                            "Memory: {:.1} GiB of {:.1} GiB",
+                            ram.used_mib as f32 / 1024.,
+                            ram.total_mib as f32 / 1024.
+                        )
+                        .into(),
+                        None => "Memory unknown".into(),
+                    },
+                    widget_icon(widget.kind),
+                    tooltips_on,
+                    self.sysmon.clone(),
+                )
+                .into_any_element()
+            }),
             WidgetKind::Mic => sysmon.mic.map(|mic| {
                 let muted = mic.muted;
                 let text = if muted {

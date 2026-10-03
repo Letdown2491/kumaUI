@@ -32,6 +32,17 @@ pub struct Brightness {
     pub percent: u8,
 }
 
+/// The machine's memory state: usage percent for the widget's text,
+/// the absolute pair for its tooltip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ram {
+    pub percent: u8,
+    /// Mebibytes: meminfo speaks kB, the struct speaks MiB to keep the
+    /// arithmetic integral.
+    pub used_mib: u64,
+    pub total_mib: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BluetoothState {
     pub enabled: bool,
@@ -152,6 +163,7 @@ pub struct SysMon {
     pub mic: Option<Mic>,
     pub brightness: Option<Brightness>,
     pub cpu: Option<f32>,
+    pub ram: Option<Ram>,
     pub bluetooth: Option<BluetoothState>,
     pub network: Option<NetworkState>,
     pub power_profile: Option<PowerProfile>,
@@ -609,6 +621,7 @@ pub fn run(state: &Entity<SysMon>, cx: &mut App) {
                 let moved = if full {
                     sysmon.battery = snapshot.battery;
                     sysmon.cpu = snapshot.cpu;
+                    sysmon.ram = snapshot.ram;
                     sysmon.bluetooth = snapshot.bluetooth.clone();
                     sysmon.network = snapshot.network.clone();
                     sysmon.power_profile = snapshot.power_profile;
@@ -648,6 +661,7 @@ struct Snapshot {
     mic: Option<Mic>,
     brightness: Option<Brightness>,
     cpu: Option<f32>,
+    ram: Option<Ram>,
     bluetooth: Option<BluetoothState>,
     network: Option<NetworkState>,
     power_profile: Option<PowerProfile>,
@@ -662,6 +676,7 @@ fn refresh(previous: &mut Option<CpuSample>) -> Snapshot {
         mic: read_mic(),
         brightness: read_brightness(),
         cpu: sample_cpu_usage(previous),
+        ram: read_ram(),
         bluetooth: read_bluetooth(),
         network: read_network(),
         power_profile: read_power_profile(),
@@ -1068,6 +1083,36 @@ fn read_mic() -> Option<Mic> {
     })
 }
 
+/// Memory pressure from /proc/meminfo: in use is total minus
+/// MemAvailable (available is what the kernel could hand out before
+/// swapping, the honest "free" for a machine with page cache).
+fn read_ram() -> Option<Ram> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_meminfo(&text)
+}
+
+fn parse_meminfo(text: &str) -> Option<Ram> {
+    let field = |name: &str| -> Option<u64> {
+        text.lines().find_map(|line| {
+            let value = line.strip_prefix(name)?;
+            let value = value.trim().trim_end_matches(" kB").trim();
+            value.parse::<u64>().ok()
+        })
+    };
+    // meminfo reports kB; MiB keeps the numbers in widget range
+    let total_mib = field("MemTotal:")? / 1024;
+    let available_mib = field("MemAvailable:")? / 1024;
+    if total_mib == 0 {
+        return None;
+    }
+    let used_mib = total_mib.saturating_sub(available_mib);
+    Some(Ram {
+        percent: ((used_mib * 100) / total_mib) as u8,
+        used_mib,
+        total_mib,
+    })
+}
+
 // `stat` is the contents of /proc/<pid>/stat: starttime is field 22
 // (1-indexed); fields after the comm parenthesis start at field 3, so it's
 // index 19 of the post-paren fields. Clock ticks are 100/sec.
@@ -1147,6 +1192,21 @@ mod tests {
             99106 + 646 + 27178 + 5737528 + 25604 + 0 + 9318 + 0 + 0 + 0
         );
         assert!(parse_cpu_stat("garbage").is_none());
+    }
+
+    #[test]
+    fn meminfo_line_parses_to_ram() {
+        let text = "MemTotal:       16384000 kB\nMemFree:         1024000 kB\n\
+                    MemAvailable:    8192000 kB\nCached:          2048000 kB\n";
+        let ram = parse_meminfo(text).unwrap();
+        // 16384000 kB = 16000 MiB total, 8000 MiB available, half in use
+        assert_eq!(ram.total_mib, 16000);
+        assert_eq!(ram.used_mib, 8000);
+        assert_eq!(ram.percent, 50);
+        // a total of zero is no machine at all
+        assert!(parse_meminfo("MemTotal:          0 kB\nMemAvailable:      0 kB\n").is_none());
+        // missing fields are None, not a panic
+        assert!(parse_meminfo("MemTotal:       16384000 kB\n").is_none());
     }
 
     #[test]

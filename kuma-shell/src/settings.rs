@@ -20,6 +20,7 @@ pub enum WidgetKind {
     WindowTitle,
     Apps,
     Cpu,
+    Ram,
     Volume,
     Mic,
     Brightness,
@@ -71,6 +72,11 @@ pub const WIDGETS: &[WidgetSpec] = &[
         kind: WidgetKind::Cpu,
         label: "CPU",
         icon: Some(WidgetIconSpec::Path("icons/cpu.svg")),
+    },
+    WidgetSpec {
+        kind: WidgetKind::Ram,
+        label: "Memory",
+        icon: Some(WidgetIconSpec::Path("icons/memory.svg")),
     },
     WidgetSpec {
         kind: WidgetKind::Volume,
@@ -947,7 +953,7 @@ mod tests {
             WidgetKind::Cpu.icon_spec(),
             Some(WidgetIconSpec::Path("icons/cpu.svg"))
         );
-        assert_eq!(WIDGETS.len(), 16);
+        assert_eq!(WIDGETS.len(), 17);
     }
 
     #[test]
