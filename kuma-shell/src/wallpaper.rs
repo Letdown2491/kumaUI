@@ -33,21 +33,25 @@ impl WallpaperView {
 pub fn run(settings: &Entity<Settings>, cx: &mut App) {
     let settings = settings.clone();
     cx.spawn(async move |cx| {
-        let mut last_rotate: Option<Instant> = None;
+        // the interval's clock starts when rotation turns on, not when
+        // the shell does: the first change waits a full interval
+        let mut armed_since: Option<Instant> = None;
         loop {
             cx.background_executor().timer(Duration::from_secs(30)).await;
             let minutes = cx.update(|cx| settings.read(cx).background.rotate_minutes);
             let Some(minutes) = u64::from(minutes).checked_sub(1) else {
-                // off: a fresh interval starts from the next tick
+                // off: the clock disarms, the next on starts it fresh
+                armed_since = None;
                 continue;
             };
-            let due = last_rotate
-                .map(|at| at.elapsed() >= Duration::from_secs((minutes + 1) * 60))
-                .unwrap_or(true);
-            if !due {
+            let Some(since) = armed_since else {
+                armed_since = Some(Instant::now());
+                continue;
+            };
+            if since.elapsed() < Duration::from_secs((minutes + 1) * 60) {
                 continue;
             }
-            last_rotate = Some(Instant::now());
+            armed_since = Some(Instant::now());
             let next = cx.update(|cx| {
                 settings.update(cx, |settings, _| {
                     let entries = background_images(&settings.background.folder);
