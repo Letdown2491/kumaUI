@@ -184,6 +184,10 @@ pub struct SettingsView {
     /// where a widget drag would land right now, for the insertion line
     drop_preview: Option<DropTarget>,
     thumbs: HashMap<PathBuf, Option<Arc<RenderImage>>>,
+    /// the power buttons, minted once: the armed state lives in each
+    /// button's own view, and a view recreated per render would forget
+    /// its arm between SysMon's polls
+    power_buttons: Vec<Entity<kit::ConfirmButton>>,
 }
 
 impl SettingsView {
@@ -198,6 +202,32 @@ impl SettingsView {
         cx.observe(&sysmon, |_, _, cx| cx.notify()).detach();
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
+        let power_buttons = vec![
+            kit::confirm_button(
+                "power-logout",
+                "Log out",
+                "Log out, end the session?",
+                Some("icons/logout.svg"),
+                power_action("niri", &["msg", "action", "quit"]),
+                cx,
+            ),
+            kit::confirm_button(
+                "power-reboot",
+                "Reboot",
+                "Reboot, confirm?",
+                Some("icons/power.svg"),
+                power_action("systemctl", &["reboot"]),
+                cx,
+            ),
+            kit::confirm_button(
+                "power-poweroff",
+                "Power off",
+                "Power off, confirm?",
+                Some("icons/power.svg"),
+                power_action("systemctl", &["poweroff"]),
+                cx,
+            ),
+        ];
         Self {
             settings,
             sysmon,
@@ -208,6 +238,7 @@ impl SettingsView {
             dragging: None,
             drop_preview: None,
             thumbs: HashMap::new(),
+            power_buttons,
         }
     }
 
@@ -436,46 +467,20 @@ impl SettingsView {
     }
 
     /// The power row: logout, reboot, poweroff, each behind the kit's
-    /// arm-then-confirm button. The commands spawn exactly the way
-    /// idle.rs powers off monitors: fire, log nothing, the spawn is the
-    /// whole conversation. Logind's shipped policy permits the active
-    /// seat user; no polkit rules, no helper units.
-    fn power_section(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+    /// arm-then-confirm button (held as fields, minted once in `new`).
+    /// The commands spawn exactly the way idle.rs powers off monitors:
+    /// fire, log nothing, the spawn is the whole conversation. Logind's
+    /// shipped policy permits the active seat user; no polkit rules, no
+    /// helper units.
+    fn power_section(&self, _cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         kit::card("quick-power")
             .child(kit::card_title("Power"))
             .child(kit::card_note(
                 "Ends the session. Each button asks twice.",
             ))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(kit::confirm_button(
-                        "power-logout",
-                        "Log out",
-                        "Log out, end the session?",
-                        Some("icons/logout.svg"),
-                        power_action("niri", &["msg", "action", "quit"]),
-                        cx,
-                    ))
-                    .child(kit::confirm_button(
-                        "power-reboot",
-                        "Reboot",
-                        "Reboot, confirm?",
-                        Some("icons/power.svg"),
-                        power_action("systemctl", &["reboot"]),
-                        cx,
-                    ))
-                    .child(kit::confirm_button(
-                        "power-poweroff",
-                        "Power off",
-                        "Power off, confirm?",
-                        Some("icons/power.svg"),
-                        power_action("systemctl", &["poweroff"]),
-                        cx,
-                    )),
-            )
+            .child(div().flex().flex_wrap().gap_2().children(
+                self.power_buttons.iter().map(|button| button.clone()),
+            ))
     }
 
     fn bar_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
