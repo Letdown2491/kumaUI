@@ -4,10 +4,13 @@
 //! column of cards; the pieces here are the card, the button, the
 //! empty state, and the header, so no panel grows its own dialect.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use gpui::prelude::*;
 use gpui::{
-    AnyView, App, ClickEvent, Div, FontWeight, IntoElement, ParentElement, SharedString, Window,
-    div, px, rgb, rgba,
+    AnyView, App, ClickEvent, Context, Div, Entity, FontWeight, IntoElement, ParentElement,
+    Render, SharedString, Window, div, px, rgb, rgba,
 };
 
 use crate::theme::*;
@@ -293,4 +296,93 @@ pub fn icon_button(
         .hover(move |el| el.bg(rgb(SURFACE)).text_color(rgb(hover)))
         .child(gpui::svg().path(icon).size(px(13.)).text_color(rgb(rest)))
         .on_click(on_click)
+}
+
+/// How long an armed confirm button waits before it disarms itself.
+const CONFIRM_DISARM: Duration = Duration::from_secs(3);
+
+/// The arm-then-confirm button: the first click arms it (the label
+/// becomes the confirm phrase), the second click fires, and an armed
+/// button disarms itself after ~3s. Destructive always: this kit piece
+/// exists for the acts that end something.
+///
+/// The armed state lives in the button's own view, so it dies with the
+/// panel: closing the panel (or Esc, which closes it) disarms for
+/// free, no listener wiring on the host.
+pub struct ConfirmButton {
+    id: SharedString,
+    label: SharedString,
+    confirm_label: SharedString,
+    icon: Option<&'static str>,
+    armed: bool,
+    /// Bumped on every arm; a pending timer only disarms the arm it
+    /// was minted for, so re-arming outlives the stale wake.
+    arm: u64,
+    on_confirm: Arc<dyn Fn(&mut App) + 'static>,
+}
+
+/// The arm-then-confirm button, minted as its own view. `on_confirm`
+/// runs only on the second click, with the App.
+pub fn confirm_button(
+    id: impl Into<SharedString>,
+    label: &str,
+    confirm_label: &str,
+    icon: Option<&'static str>,
+    on_confirm: impl Fn(&mut App) + 'static,
+    cx: &mut App,
+) -> Entity<ConfirmButton> {
+    cx.new(|_| ConfirmButton {
+        id: id.into(),
+        label: label.into(),
+        confirm_label: confirm_label.into(),
+        icon,
+        armed: false,
+        arm: 0,
+        on_confirm: Arc::new(on_confirm),
+    })
+}
+
+impl ConfirmButton {
+    fn arm(&mut self, cx: &mut Context<Self>) {
+        self.armed = true;
+        self.arm += 1;
+        let stamp = self.arm;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONFIRM_DISARM).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.armed && this.arm == stamp {
+                    this.armed = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+}
+
+impl Render for ConfirmButton {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = if self.armed {
+            self.confirm_label.clone()
+        } else {
+            self.label.clone()
+        };
+        button(self.id.clone(), &label, self.icon, ButtonVariant::Destructive, {
+            cx.listener(move |this, _, _, cx| {
+                if this.armed {
+                    this.armed = false;
+                    (this.on_confirm.clone())(cx);
+                    cx.notify();
+                } else {
+                    this.arm(cx);
+                }
+            })
+        })
+        .when(!self.armed, |el| {
+            // at rest it hovers like a ghost: the alarm only fills
+            // once the act is armed
+            el.hover(|style| style.bg(rgb(SURFACE)))
+        })
+    }
 }

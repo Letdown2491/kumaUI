@@ -72,6 +72,19 @@ fn load_thumb(path: PathBuf) -> Option<Arc<RenderImage>> {
     crate::imaging::decode_thumbnail(&path, 240, 160).map(Arc::new)
 }
 
+/// Spawn one power command: the idle.rs pattern, fire and forget.
+fn power_action(
+    command: &'static str,
+    args: &'static [&'static str],
+) -> impl Fn(&mut gpui::App) + 'static {
+    move |cx: &mut gpui::App| {
+        cx.background_spawn(async move {
+            let _ = std::process::Command::new(command).args(args).output();
+        })
+        .detach();
+    }
+}
+
 /// One continuous drawer silhouette: concave coves flaring out to the bar at
 /// the top, straight sides, convex rounded bottom corners.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -419,6 +432,50 @@ impl SettingsView {
             .when_some(profile, |el, _| {
                 el.child(kit::setting_row("Power profile", profile_segmented))
             })
+            .child(self.power_section(cx))
+    }
+
+    /// The power row: logout, reboot, poweroff, each behind the kit's
+    /// arm-then-confirm button. The commands spawn exactly the way
+    /// idle.rs powers off monitors: fire, log nothing, the spawn is the
+    /// whole conversation. Logind's shipped policy permits the active
+    /// seat user; no polkit rules, no helper units.
+    fn power_section(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        kit::card("quick-power")
+            .child(kit::card_title("Power"))
+            .child(kit::card_note(
+                "Ends the session. Each button asks twice.",
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(kit::confirm_button(
+                        "power-logout",
+                        "Log out",
+                        "Log out, end the session?",
+                        Some("icons/logout.svg"),
+                        power_action("niri", &["msg", "action", "quit"]),
+                        cx,
+                    ))
+                    .child(kit::confirm_button(
+                        "power-reboot",
+                        "Reboot",
+                        "Reboot, confirm?",
+                        Some("icons/power.svg"),
+                        power_action("systemctl", &["reboot"]),
+                        cx,
+                    ))
+                    .child(kit::confirm_button(
+                        "power-poweroff",
+                        "Power off",
+                        "Power off, confirm?",
+                        Some("icons/power.svg"),
+                        power_action("systemctl", &["poweroff"]),
+                        cx,
+                    )),
+            )
     }
 
     fn bar_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
