@@ -4,11 +4,11 @@
 //! column of cards; the pieces here are the card, the button, the
 //! empty state, and the header, so no panel grows its own dialect.
 
+use gpui::prelude::*;
 use gpui::{
-    App, AnyView, ClickEvent, Div, FontWeight, IntoElement, ParentElement, SharedString, Window,
+    AnyView, App, ClickEvent, Div, FontWeight, IntoElement, ParentElement, SharedString, Window,
     div, px, rgb, rgba,
 };
-use gpui::prelude::*;
 
 use crate::theme::*;
 
@@ -81,20 +81,16 @@ pub fn setting_row(label: &str, control: impl IntoElement) -> gpui::Stateful<Div
 /// lock glyph, nav arrows) onto the returned row; the title takes the
 /// flex and the rest rides the right edge.
 pub fn pane_header(title: &str) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .gap_2p5()
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_size(px(17.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(TEXT))
-                .truncate()
-                .child(title.to_string()),
-        )
+    div().flex().items_center().gap_2p5().child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .text_size(px(17.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(TEXT))
+            .truncate()
+            .child(title.to_string()),
+    )
 }
 
 /// The pane of a tabbed panel: the header that names the open tab sits
@@ -266,14 +262,9 @@ pub fn button(
         ButtonVariant::Ghost => base.hover(|el| el.bg(rgb(SURFACE))),
         ButtonVariant::Destructive => base.bg(rgb(URGENT)),
     };
-    base.children(icon.map(|path| {
-        gpui::svg()
-            .path(path)
-            .size(px(11.))
-            .text_color(rgb(glyph))
-    }))
-    .child(label.to_string())
-    .on_click(on_click)
+    base.children(icon.map(|path| gpui::svg().path(path).size(px(11.)).text_color(rgb(glyph))))
+        .child(label.to_string())
+        .on_click(on_click)
 }
 
 /// The icon-only button: a quiet glyph for row actions (reorder,

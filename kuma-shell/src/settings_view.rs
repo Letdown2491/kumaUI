@@ -590,8 +590,10 @@ impl SettingsView {
     /// off means it waits in reserve; the mode pills choose how an
     /// enabled one presents.
     fn widgets_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
-        let mut kinds: Vec<crate::settings::WidgetKind> =
-            crate::settings::WIDGETS.iter().map(|spec| spec.kind).collect();
+        let mut kinds: Vec<crate::settings::WidgetKind> = crate::settings::WIDGETS
+            .iter()
+            .map(|spec| spec.kind)
+            .collect();
         kinds.sort_by_key(|kind| kind.label().to_lowercase());
         div()
             .id("page-widgets")
@@ -646,14 +648,7 @@ impl SettingsView {
                     .child(kind.label()),
             )
             .children(mode.map(|(section, index, mode)| {
-                self.mode_segmented(
-                    &format!("mode-{kind:?}"),
-                    kind,
-                    mode,
-                    section,
-                    index,
-                    cx,
-                )
+                self.mode_segmented(&format!("mode-{kind:?}"), kind, mode, section, index, cx)
             }))
             .child(
                 div()
@@ -662,10 +657,11 @@ impl SettingsView {
                     .cursor_pointer()
                     .child(crate::controls::toggle_switch(enabled))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings.update(cx, |settings, cx| match settings.position(kind) {
-                            Some((section, index)) => settings.remove(section, index, cx),
-                            None => settings.add(kind, cx),
-                        });
+                        this.settings
+                            .update(cx, |settings, cx| match settings.position(kind) {
+                                Some((section, index)) => settings.remove(section, index, cx),
+                                None => settings.add(kind, cx),
+                            });
                     })),
             )
     }
@@ -695,10 +691,9 @@ impl SettingsView {
                 ),
             )
             .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
-                    .child("Drag between sections to place them; drop on a chip to slot it before."),
+                div().text_size(px(11.)).text_color(rgb(TEXT_DIM)).child(
+                    "Drag between sections to place them; drop on a chip to slot it before.",
+                ),
             )
     }
 
@@ -737,23 +732,26 @@ impl SettingsView {
             .min_w_0()
             .min_h(px(64.))
             .child(self.section_header(format!("{section:?}")))
-            .children(settings.widgets(section).iter().enumerate().flat_map(
-                |(index, widget)| {
-                    let mut items: Vec<gpui::AnyElement> = Vec::new();
-                    if dragging && preview == Some((section, index)) {
-                        items.push(self.drop_line().into_any_element());
-                    }
-                    items.push(
-                        self.widget_chip(section, index, widget.kind, cx)
-                            .into_any_element(),
-                    );
-                    items
-                },
-            ))
-            .when(
-                dragging && preview == Some((section, count)),
-                |el| el.child(self.drop_line()),
+            .children(
+                settings
+                    .widgets(section)
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, widget)| {
+                        let mut items: Vec<gpui::AnyElement> = Vec::new();
+                        if dragging && preview == Some((section, index)) {
+                            items.push(self.drop_line().into_any_element());
+                        }
+                        items.push(
+                            self.widget_chip(section, index, widget.kind, cx)
+                                .into_any_element(),
+                        );
+                        items
+                    }),
             )
+            .when(dragging && preview == Some((section, count)), |el| {
+                el.child(self.drop_line())
+            })
             .when(settings.widgets(section).is_empty(), |el| {
                 el.child(
                     div()
@@ -764,10 +762,12 @@ impl SettingsView {
             })
             // the column's own stretch appends at the end; its capture
             // listener fires before the chips', so a chip overwrites it
-            .on_drag_move(cx.listener(move |this, _: &DragMoveEvent<WidgetDrag>, _, cx| {
-                this.drop_preview = Some((section, count));
-                cx.notify();
-            }))
+            .on_drag_move(
+                cx.listener(move |this, _: &DragMoveEvent<WidgetDrag>, _, cx| {
+                    this.drop_preview = Some((section, count));
+                    cx.notify();
+                }),
+            )
             .on_drop(cx.listener(move |this, drag: &WidgetDrag, _, cx| {
                 this.settings.update(cx, |settings, cx| {
                     settings.move_widget(drag.from, drag.index, section, count, cx);
@@ -808,13 +808,15 @@ impl SettingsView {
                     })
                 },
             )
-            .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<WidgetDrag>, _, cx| {
-                // the chip's lower half means "land after it"
-                let midline = event.bounds.origin.y + event.bounds.size.height / 2.;
-                let after = event.event.position.y > midline;
-                this.drop_preview = Some((section, index + usize::from(after)));
-                cx.notify();
-            }))
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<WidgetDrag>, _, cx| {
+                    // the chip's lower half means "land after it"
+                    let midline = event.bounds.origin.y + event.bounds.size.height / 2.;
+                    let after = event.event.position.y > midline;
+                    this.drop_preview = Some((section, index + usize::from(after)));
+                    cx.notify();
+                }),
+            )
             // a drop on a chip applies the standing preview: this chip's
             // place, or the line under its lower half
             .on_drop(cx.listener(move |this, drag: &WidgetDrag, _, cx| {
@@ -853,52 +855,46 @@ impl SettingsView {
             .p_0p5()
             .rounded_sm()
             .bg(rgb(INSET))
-            .children([WidgetMode::Icon, WidgetMode::IconText, WidgetMode::Text].map(|mode| {
-                let active = mode == current;
-                div()
-                    .id(SharedString::from(format!("mode-{id}-{mode:?}")))
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .bg(rgb(if active { ACCENT } else { INSET }))
-                    .hover(|style| style.bg(rgb(if active { ACCENT } else { SURFACE })))
-                    .tooltip(kit::text_tooltip(mode.label().into()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings.update(cx, |settings, cx| {
-                            settings.set_mode(section, index, mode, cx)
-                        });
-                    }))
-                    .when(mode != WidgetMode::Text, |el| {
-                        el.child(
-                            gpui::svg()
-                                .path(icon_path)
-                                .size(px(12.))
-                                .text_color(rgb(if active {
-                                    ACCENT_TEXT
-                                } else {
-                                    TEXT_DIM
-                                })),
-                        )
-                    })
-                    .when(mode != WidgetMode::Icon, |el| {
-                        el.child(
-                            div()
-                                .text_size(px(10.))
-                                .line_height(px(12.))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(rgb(if active {
-                                    ACCENT_TEXT
-                                } else {
-                                    TEXT_DIM
-                                }))
-                                .child("Aa"),
-                        )
-                    })
-            }))
+            .children(
+                [WidgetMode::Icon, WidgetMode::IconText, WidgetMode::Text].map(|mode| {
+                    let active = mode == current;
+                    div()
+                        .id(SharedString::from(format!("mode-{id}-{mode:?}")))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(rgb(if active { ACCENT } else { INSET }))
+                        .hover(|style| style.bg(rgb(if active { ACCENT } else { SURFACE })))
+                        .tooltip(kit::text_tooltip(mode.label().into()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.settings.update(cx, |settings, cx| {
+                                settings.set_mode(section, index, mode, cx)
+                            });
+                        }))
+                        .when(mode != WidgetMode::Text, |el| {
+                            el.child(
+                                gpui::svg()
+                                    .path(icon_path)
+                                    .size(px(12.))
+                                    .text_color(rgb(if active { ACCENT_TEXT } else { TEXT_DIM })),
+                            )
+                        })
+                        .when(mode != WidgetMode::Icon, |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(10.))
+                                    .line_height(px(12.))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(if active { ACCENT_TEXT } else { TEXT_DIM }))
+                                    .child("Aa"),
+                            )
+                        })
+                }),
+            )
     }
 
     fn backgrounds_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
@@ -934,8 +930,8 @@ impl SettingsView {
             .flex_col()
             .gap_3()
             .overflow_y_scroll()
-            .child(kit::card("backgrounds-folder")
-                .child(
+            .child(
+                kit::card("backgrounds-folder").child(
                     div()
                         .flex()
                         .items_center()
@@ -963,7 +959,9 @@ impl SettingsView {
                                         let settings = this.settings.clone();
                                         cx.spawn(async move |this, cx| {
                                             let picked = cx
-                                                .background_spawn(async move { pick_folder().await })
+                                                .background_spawn(
+                                                    async move { pick_folder().await },
+                                                )
                                                 .await;
                                             match picked {
                                                 Ok(Some(folder)) => {
@@ -992,11 +990,13 @@ impl SettingsView {
                                     ButtonVariant::Ghost,
                                     cx.listener(|this, _, _, cx| {
                                         this.thumbs.clear();
-                                        this.settings.update(cx, |settings, cx| settings.reload(cx));
+                                        this.settings
+                                            .update(cx, |settings, cx| settings.reload(cx));
                                     }),
                                 )),
                         ),
-                ),)
+                ),
+            )
             .child(
                 div().id("gallery").grid().grid_cols(3).gap_2().children(
                     entries

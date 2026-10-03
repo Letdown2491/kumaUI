@@ -1,12 +1,8 @@
-use kuma_shell::{bar::ShellBar, icons::KumaAssets, niri::NiriState, sysmon::SysMon};
+use kuma_shell::{icons::KumaAssets, niri::NiriState, sysmon::SysMon};
 
-use gpui::{
-    App, AppContext, Bounds, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
-    layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
-    point, px, size,
-};
+use gpui::{App, AppContext, QuitMode};
 
-use kuma_shell::settings::{BarConfig, Settings};
+use kuma_shell::settings::Settings;
 
 use gpui_platform::application;
 
@@ -38,162 +34,152 @@ fn main() {
         std::process::exit(1);
     }
 
-    application().with_assets(KumaAssets).run(|cx: &mut App| {
-        let niri = cx.new(|_| NiriState::default());
-        kuma_shell::niri::connect(&niri, cx);
+    application()
+        .with_quit_mode(QuitMode::Explicit)
+        .with_assets(KumaAssets)
+        .run(|cx: &mut App| {
+            let niri = cx.new(|_| NiriState::default());
+            kuma_shell::niri::connect(&niri, cx);
 
-        let sysmon = cx.new(|_| SysMon::default());
-        kuma_shell::sysmon::run(&sysmon, cx);
+            let sysmon = cx.new(|_| SysMon::default());
+            kuma_shell::sysmon::run(&sysmon, cx);
 
-        let settings = cx.new(|_| Settings::load());
+            let settings = cx.new(|_| Settings::load());
 
-        let osd = cx.new(|_| kuma_shell::osd::Osd::new(sysmon.clone(), settings.clone()));
-        kuma_shell::osd::run(&osd, &sysmon, &settings, cx);
+            let osd = cx.new(|_| kuma_shell::osd::Osd::new(sysmon.clone(), settings.clone()));
+            kuma_shell::osd::run(&osd, &sysmon, &settings, cx);
 
-        let notifications = kuma_shell::notifications::start(settings.clone(), cx);
-        let tray = kuma_shell::tray::start(cx);
-        let nostr = cx.new(|_| kuma_shell::nostr::NostrState::new(notifications.clone()));
-        kuma_shell::nostr::run(&nostr, cx);
-        let lock = cx.new(|_| kuma_shell::lock::LockState::new(settings.clone()));
-        kuma_shell::lock::connect(&lock, cx);
-        kuma_shell::idle::run(&settings, &lock, cx);
-        cx.set_global(kuma_shell::panel::PanelHost::new(
-            settings.clone(),
-            sysmon.clone(),
-            notifications.clone(),
-            nostr.clone(),
-        ));
+            let notifications = kuma_shell::notifications::start(settings.clone(), cx);
+            let tray = kuma_shell::tray::start(cx);
+            let nostr = cx.new(|_| kuma_shell::nostr::NostrState::new(notifications.clone()));
+            kuma_shell::nostr::run(&nostr, cx);
+            let lock = cx.new(|_| kuma_shell::lock::LockState::new(settings.clone()));
+            kuma_shell::lock::connect(&lock, cx);
+            kuma_shell::idle::run(&settings, &lock, cx);
+            cx.set_global(kuma_shell::panel::PanelHost::new(
+                settings.clone(),
+                sysmon.clone(),
+                notifications.clone(),
+                nostr.clone(),
+            ));
 
-        // the dock: its own layer-shell surface, synced to the dock settings
-        kuma_shell::dock::run(niri.clone(), settings.clone(), cx);
+            // the dock: its own layer-shell surface, synced to the dock settings
+            kuma_shell::dock::run(niri.clone(), settings.clone(), cx);
 
-        let bar_options = bar_window_options(&settings.read(cx).bar);
+            let (bar_toggle_tx, bar_toggle_rx) =
+                smol::channel::unbounded::<kuma_shell::msg::Request>();
+            kuma_shell::msg::spawn_listener(bar_toggle_tx);
 
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
+            let msg_settings = settings.clone();
+            let msg_nostr = nostr.clone();
+            let msg_sysmon = sysmon.clone();
 
-        cx.open_window(wallpaper_options(), |_, cx| {
-            cx.new(|cx| kuma_shell::wallpaper::WallpaperView::new(settings.clone(), cx))
-        })
-        .expect("failed to open wallpaper window");
+            // The persistent surfaces (wallpaper, bar) and the watch that
+            // keeps them alive: opened by the same `ensure` pass that
+            // recreates them after their outputs go away, so startup and
+            // recovery are one code path. The shell does not quit when
+            // windows close: gpui's default quit mode exits on the last
+            // window close (QuitMode::Default on non-macOS, set above), so
+            // the builder pins QuitMode::Explicit and the shell idles
+            // displayless (bus names held, the logind sleep inhibitor held)
+            // while the watch brings the surfaces back when outputs do.
+            // Exit is the compositor's death, which is session end.
+            kuma_shell::surfaces::init(
+                kuma_shell::surfaces::SurfaceDeps {
+                    niri,
+                    sysmon,
+                    settings,
+                    notifications,
+                    tray,
+                    nostr,
+                    lock,
+                },
+                cx,
+            );
+            kuma_shell::surfaces::ensure(cx);
+            kuma_shell::surfaces::watch(cx);
 
-        cx.open_window(bar_options, |_, cx| {
-            cx.new(|cx| {
-                ShellBar::new(
-                    niri.clone(),
-                    sysmon.clone(),
-                    settings.clone(),
-                    notifications.clone(),
-                    tray.clone(),
-                    nostr.clone(),
-                    cx,
-                )
-            })
-        })
-        .expect("failed to open layer-shell window: compositor must support wlr-layer-shell");
-
-        let (bar_toggle_tx, bar_toggle_rx) = smol::channel::unbounded::<kuma_shell::msg::Request>();
-        kuma_shell::msg::spawn_listener(bar_toggle_tx);
-
-        let msg_settings = settings.clone();
-        let msg_nostr = nostr.clone();
-        let msg_sysmon = sysmon.clone();
-        cx.spawn(async move |cx| {
-            while let Ok(request) = bar_toggle_rx.recv().await {
-                log::info!("msg: {request:?}");
-                let _ = cx.update(|cx| match request {
-                    kuma_shell::msg::Request::Launcher => {
-                        kuma_shell::panel::toggle_panel(kuma_shell::panel::PanelKind::Launcher, cx);
-                    }
-                    kuma_shell::msg::Request::Settings => {
-                        kuma_shell::panel::toggle_panel(kuma_shell::panel::PanelKind::Settings, cx);
-                    }
-                    kuma_shell::msg::Request::Notifications => {
-                        let settings = msg_settings.clone();
-                        settings.update(cx, |settings, cx| {
-                            let dnd = !settings.notifications.dnd;
-                            settings.set_notifications_dnd(dnd, cx);
-                        });
-                    }
-                    kuma_shell::msg::Request::Volume(cmd) => {
-                        msg_sysmon.update(cx, |sysmon, cx| match cmd {
-                            kuma_shell::msg::VolumeCmd::Up => sysmon.request_volume(5, cx),
-                            kuma_shell::msg::VolumeCmd::Down => sysmon.request_volume(-5, cx),
-                            kuma_shell::msg::VolumeCmd::Mute => sysmon.request_mute_toggle(cx),
-                        });
-                    }
-                    kuma_shell::msg::Request::Brightness(cmd) => {
-                        msg_sysmon.update(cx, |sysmon, cx| match cmd {
-                            kuma_shell::msg::BrightnessCmd::Up => sysmon.request_brightness(5, cx),
-                            kuma_shell::msg::BrightnessCmd::Down => {
-                                sysmon.request_brightness(-5, cx)
+            cx.spawn(async move |cx| {
+                while let Ok(request) = bar_toggle_rx.recv().await {
+                    log::info!("msg: {request:?}");
+                    let _ = cx.update(|cx| match request {
+                        kuma_shell::msg::Request::Launcher => {
+                            kuma_shell::panel::toggle_panel(
+                                kuma_shell::panel::PanelKind::Launcher,
+                                cx,
+                            );
+                        }
+                        kuma_shell::msg::Request::Settings => {
+                            kuma_shell::panel::toggle_panel(
+                                kuma_shell::panel::PanelKind::Settings,
+                                cx,
+                            );
+                        }
+                        kuma_shell::msg::Request::Notifications => {
+                            let settings = msg_settings.clone();
+                            settings.update(cx, |settings, cx| {
+                                let dnd = !settings.notifications.dnd;
+                                settings.set_notifications_dnd(dnd, cx);
+                            });
+                        }
+                        kuma_shell::msg::Request::Volume(cmd) => {
+                            msg_sysmon.update(cx, |sysmon, cx| match cmd {
+                                kuma_shell::msg::VolumeCmd::Up => sysmon.request_volume(5, cx),
+                                kuma_shell::msg::VolumeCmd::Down => sysmon.request_volume(-5, cx),
+                                kuma_shell::msg::VolumeCmd::Mute => sysmon.request_mute_toggle(cx),
+                            });
+                        }
+                        kuma_shell::msg::Request::Brightness(cmd) => {
+                            msg_sysmon.update(cx, |sysmon, cx| match cmd {
+                                kuma_shell::msg::BrightnessCmd::Up => {
+                                    sysmon.request_brightness(5, cx)
+                                }
+                                kuma_shell::msg::BrightnessCmd::Down => {
+                                    sysmon.request_brightness(-5, cx)
+                                }
+                            });
+                        }
+                        kuma_shell::msg::Request::MicMute => {
+                            msg_sysmon.update(cx, |sysmon, cx| sysmon.request_mic_toggle(cx));
+                        }
+                        kuma_shell::msg::Request::Nostr(uri) => {
+                            // The scheme handler's landing: the offer
+                            // arrives even with the panel open; the view
+                            // watches the entity and lands on Pair. The
+                            // panel is opened, not toggled: a clicked link
+                            // must never close the panel over its own offer.
+                            msg_nostr.update(cx, |state, cx| state.offer(uri, cx));
+                            let open = kuma_shell::panel::is_open(
+                                &kuma_shell::panel::PanelKind::Nostr,
+                                cx,
+                            );
+                            if !open {
+                                kuma_shell::panel::toggle_panel(
+                                    kuma_shell::panel::PanelKind::Nostr,
+                                    cx,
+                                );
                             }
-                        });
-                    }
-                    kuma_shell::msg::Request::MicMute => {
-                        msg_sysmon.update(cx, |sysmon, cx| sysmon.request_mic_toggle(cx));
-                    }
-                    kuma_shell::msg::Request::Nostr(uri) => {
-                        // The scheme handler's landing: the offer
-                        // arrives even with the panel open; the view
-                        // watches the entity and lands on Pair. The
-                        // panel is opened, not toggled: a clicked link
-                        // must never close the panel over its own offer.
-                        msg_nostr.update(cx, |state, cx| state.offer(uri, cx));
-                        let open = cx
-                            .global::<kuma_shell::panel::PanelHost>()
-                            .is_open(&kuma_shell::panel::PanelKind::Nostr);
-                        if !open {
-                            kuma_shell::panel::toggle_panel(
-                                kuma_shell::panel::PanelKind::Nostr,
+                        }
+                        kuma_shell::msg::Request::NostrPanel => {
+                            // The keybind's landing: the same open, no
+                            // offer. A second press toggles closed; the
+                            // panel belongs to whoever opened it last.
+                            let open = kuma_shell::panel::is_open(
+                                &kuma_shell::panel::PanelKind::Nostr,
                                 cx,
                             );
+                            if !open {
+                                kuma_shell::panel::toggle_panel(
+                                    kuma_shell::panel::PanelKind::Nostr,
+                                    cx,
+                                );
+                            }
                         }
-                    }
-                    kuma_shell::msg::Request::NostrPanel => {
-                        // The keybind's landing: the same open, no
-                        // offer. A second press toggles closed; the
-                        // panel belongs to whoever opened it last.
-                        let open = cx
-                            .global::<kuma_shell::panel::PanelHost>()
-                            .is_open(&kuma_shell::panel::PanelKind::Nostr);
-                        if !open {
-                            kuma_shell::panel::toggle_panel(
-                                kuma_shell::panel::PanelKind::Nostr,
-                                cx,
-                            );
-                        }
-                    }
-                });
-            }
-        })
-        .detach();
-    });
-}
-
-fn wallpaper_options() -> WindowOptions {
-    WindowOptions {
-        titlebar: None,
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(0.), px(0.)),
-        })),
-        app_id: Some("kuma-shell-wallpaper".into()),
-        window_background: WindowBackgroundAppearance::Opaque,
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-shell-wallpaper".into(),
-            layer: Layer::Background,
-            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            exclusive_zone: Some(px(-1.)),
-            keyboard_interactivity: KeyboardInteractivity::None,
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
+                    });
+                }
+            })
+            .detach();
+        });
 }
 
 fn run_cli(args: &[String]) -> i32 {
@@ -304,27 +290,4 @@ fn cli_av(
         return Ok(());
     }
     standalone()
-}
-
-fn bar_window_options(config: &BarConfig) -> WindowOptions {
-    WindowOptions {
-        titlebar: None,
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(0.), px(config.height + config.offset_top)),
-        })),
-        app_id: Some("kuma-shell".into()),
-        window_background: WindowBackgroundAppearance::Transparent,
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-shell".into(),
-            layer: Layer::Top,
-            // always stretched full-width; width/align/offset are applied by the
-            // view's content div so every geometry setting can change live
-            anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
-            exclusive_zone: Some(px(config.height + config.offset_top)),
-            keyboard_interactivity: KeyboardInteractivity::None,
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
 }

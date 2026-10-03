@@ -310,6 +310,10 @@ pub struct PanelHost {
 
 struct OpenPanel {
     kind: PanelKind,
+    /// The session's windows, kept for liveness probes: a session whose
+    /// surfaces the compositor closed (its output went away) reads as
+    /// closed, so the next toggle opens instead of eating the press.
+    windows: Vec<gpui::AnyWindowHandle>,
     close: Box<dyn Fn(&mut App)>,
 }
 
@@ -371,15 +375,29 @@ impl PanelHost {
         self.dock_menu.clone()
     }
 
-    pub fn is_open(&self, kind: &PanelKind) -> bool {
-        self.open
-            .as_ref()
-            .is_some_and(|session| session.kind == *kind)
-    }
-
     fn take_close(&mut self) -> Option<Box<dyn Fn(&mut App)>> {
         self.open.take().map(|session| session.close)
     }
+}
+
+/// Whether a panel of this kind is open with its surfaces actually
+/// alive: a session whose windows the compositor closed (its output
+/// went away) reads as closed. Free function because the probe needs
+/// `cx`; the plain kind check alone would leave a stale session
+/// reporting itself open forever.
+pub fn is_open(kind: &PanelKind, cx: &mut App) -> bool {
+    let Some(windows) = cx
+        .global::<PanelHost>()
+        .open
+        .as_ref()
+        .filter(|session| session.kind == *kind)
+        .map(|session| session.windows.clone())
+    else {
+        return false;
+    };
+    windows
+        .iter()
+        .any(|window| window.update(cx, |_, _, _| {}).is_ok())
 }
 
 /// Toggle a panel open/closed. Free function because the host lives in `cx`.
@@ -412,11 +430,29 @@ pub fn toggle_panel_at(
 }
 
 fn open_panel(kind: PanelKind, cx: &mut App) {
+    // a session whose surfaces the compositor closed (its output went
+    // away) reads as closed: running the stale close would only log
+    // "window not found", and the toggle would eat its own press
+    let open_windows = cx
+        .global::<PanelHost>()
+        .open
+        .as_ref()
+        .map(|session| session.windows.clone())
+        .unwrap_or_default();
+    let dead = !open_windows.is_empty()
+        && open_windows
+            .iter()
+            .all(|window| window.update(cx, |_, _, _| {}).is_err());
     let closed = {
         let host = cx.global_mut::<PanelHost>();
-        let closed_kind = host.open.as_ref().map(|session| session.kind);
-        log::info!("toggle_panel({kind:?}): open={:?}", closed_kind);
-        (closed_kind, host.take_close())
+        if dead {
+            host.open = None;
+            (None, None)
+        } else {
+            let closed_kind = host.open.as_ref().map(|session| session.kind);
+            log::info!("toggle_panel({kind:?}): open={:?}", closed_kind);
+            (closed_kind, host.take_close())
+        }
     };
     if let (Some(closed_kind), Some(close)) = closed {
         defer_close(close, cx);
@@ -440,13 +476,17 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
     let namespace = kind.namespace();
 
     let mut close_steps: Vec<Box<dyn Fn(&mut App)>> = Vec::new();
+    let mut windows: Vec<gpui::AnyWindowHandle> = Vec::new();
 
     match cx.open_window(scrim_options(), |_, cx| cx.new(|_| ScrimView)) {
-        Ok(handle) => close_steps.push(Box::new(move |cx| {
-            if let Err(err) = handle.update(cx, |_, window, _| window.remove_window()) {
-                log::error!("closing {namespace} scrim failed: {err:#}");
-            }
-        })),
+        Ok(handle) => {
+            windows.push(*handle);
+            close_steps.push(Box::new(move |cx| {
+                if let Err(err) = handle.update(cx, |_, window, _| window.remove_window()) {
+                    log::error!("closing {namespace} scrim failed: {err:#}");
+                }
+            }));
+        }
         Err(err) => log::error!("failed to open {namespace} scrim: {err:#}"),
     }
 
@@ -464,11 +504,14 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
             cx.new(|_| PanelView(view))
         },
     ) {
-        Ok(handle) => Box::new(move |cx| {
-            if let Err(err) = handle.update(cx, |_, window, _| window.remove_window()) {
-                log::error!("closing {namespace} panel failed: {err:#}");
-            }
-        }),
+        Ok(handle) => {
+            windows.push(*handle);
+            Box::new(move |cx| {
+                if let Err(err) = handle.update(cx, |_, window, _| window.remove_window()) {
+                    log::error!("closing {namespace} panel failed: {err:#}");
+                }
+            })
+        }
         Err(err) => {
             log::error!("failed to open {namespace} panel: {err:#}");
             Box::new(|_| {})
@@ -480,6 +523,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
         let host = cx.global_mut::<PanelHost>();
         host.open = Some(OpenPanel {
             kind,
+            windows,
             close: Box::new(move |cx| {
                 for close_step in &close_steps {
                     close_step(cx);

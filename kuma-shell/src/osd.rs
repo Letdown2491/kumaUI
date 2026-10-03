@@ -11,7 +11,9 @@ use gpui::{
     App, AppContext, Bounds, Context, Entity, Render, Window, WindowBackgroundAppearance,
     WindowBounds, WindowHandle, WindowKind, WindowOptions, div,
     layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
-    point, prelude::*, px, relative, rgb, rgba, size, svg,
+    point,
+    prelude::*,
+    px, relative, rgb, rgba, size, svg,
 };
 
 use crate::panel::PanelHost;
@@ -62,22 +64,26 @@ fn snapshot_of(sysmon: &SysMon, settings: &Settings) -> OsdSnapshot {
 
 /// The card for one change; None when the two snapshots agree (the
 /// full poll notifies even when nothing moved). When several changed
-/// in one tick, volume wins: it is the commonest drumbeat. The dnd
-/// and profile arms need a previous value to diff against: their
-/// first sighting is the startup fill, not a thing the user did.
+/// in one tick, volume wins: it is the commonest drumbeat. Every arm
+/// needs a previous value to diff against: a first sighting is the
+/// startup fill (a slow first read landing a poll late), not a thing
+/// the user did.
 fn content_for_change(before: OsdSnapshot, after: OsdSnapshot) -> Option<OsdContent> {
     if before.volume != after.volume
         && let Some(volume) = after.volume
+        && before.volume.is_some()
     {
         return Some(volume_content(volume));
     }
     if before.brightness != after.brightness
         && let Some(brightness) = after.brightness
+        && before.brightness.is_some()
     {
         return Some(brightness_content(brightness));
     }
     if before.mic != after.mic
         && let Some(mic) = after.mic
+        && before.mic.is_some()
     {
         return Some(mic_content(mic));
     }
@@ -114,7 +120,11 @@ fn mic_content(mic: Mic) -> OsdContent {
     OsdContent {
         icon: "icons/mic.svg",
         label: "Microphone",
-        value: if mic.muted { "Muted".into() } else { "On".into() },
+        value: if mic.muted {
+            "Muted".into()
+        } else {
+            "On".into()
+        },
         percent: None,
         urgent: mic.muted,
     }
@@ -196,6 +206,11 @@ impl Osd {
     }
 
     fn show(&mut self, content: OsdContent, cx: &mut Context<Self>) {
+        // with no displays there is nothing to show the card on; the
+        // next card rides the watch's recreation like every surface
+        if cx.displays().is_empty() {
+            return;
+        }
         self.generation += 1;
         let generation = self.generation;
         // the card is pushed into the view, never read back from this
@@ -208,6 +223,10 @@ impl Osd {
                     view.content = Some(content);
                     cx.notify();
                 }) {
+                    // a dead handle (the card's surface died with its
+                    // output) must not wedge the OSD shut forever: the
+                    // next card opens a fresh window
+                    self.window = None;
                     log::error!("osd update failed: {err:#}");
                 }
             }
@@ -253,12 +272,7 @@ impl Osd {
 }
 
 /// Wire the OSD to its sources: every notify is a chance to diff.
-pub fn run(
-    osd: &Entity<Osd>,
-    sysmon: &Entity<SysMon>,
-    settings: &Entity<Settings>,
-    cx: &mut App,
-) {
+pub fn run(osd: &Entity<Osd>, sysmon: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
     let watcher = osd.clone();
     cx.observe(sysmon, move |_, cx| {
         watcher.update(cx, |osd, cx| osd.reconcile(cx));
@@ -346,24 +360,23 @@ impl Render for OsdView {
             });
 
         let view = cx.weak_entity();
-        let measured =
-            crate::panel::MeasureHeight::new(card, move |content_height, window, cx| {
-                let Some(view) = view.upgrade() else {
-                    return;
-                };
-                let mut resized = None;
-                view.update(cx, |this, cx| {
-                    let new_height = content_height.clamp(40., 96.);
-                    if (this.height - new_height).abs() > 0.5 {
-                        this.height = new_height;
-                        cx.notify();
-                        resized = Some(new_height);
-                    }
-                });
-                if let Some(height) = resized {
-                    window.resize(size(px(OSD_WIDTH), px(height)));
+        let measured = crate::panel::MeasureHeight::new(card, move |content_height, window, cx| {
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let mut resized = None;
+            view.update(cx, |this, cx| {
+                let new_height = content_height.clamp(40., 96.);
+                if (this.height - new_height).abs() > 0.5 {
+                    this.height = new_height;
+                    cx.notify();
+                    resized = Some(new_height);
                 }
             });
+            if let Some(height) = resized {
+                window.resize(size(px(OSD_WIDTH), px(height)));
+            }
+        });
 
         div()
             .size_full()
@@ -402,7 +415,13 @@ mod tests {
 
     #[test]
     fn a_change_rises_and_agreement_shows_nothing() {
-        let quiet = OsdSnapshot::default();
+        let quiet = OsdSnapshot {
+            volume: Some(Volume {
+                percent: 50,
+                muted: false,
+            }),
+            ..Default::default()
+        };
         let loud = OsdSnapshot {
             volume: Some(Volume {
                 percent: 64,
@@ -441,13 +460,20 @@ mod tests {
 
     #[test]
     fn volume_outranks_brightness_when_both_move() {
-        let before = OsdSnapshot::default();
+        let before = OsdSnapshot {
+            volume: Some(Volume {
+                percent: 40,
+                muted: false,
+            }),
+            brightness: Some(Brightness { percent: 70 }),
+            ..Default::default()
+        };
         let after = OsdSnapshot {
             volume: Some(Volume {
                 percent: 50,
                 muted: false,
             }),
-            brightness: Some(Brightness { percent: 70 }),
+            brightness: Some(Brightness { percent: 60 }),
             ..Default::default()
         };
         assert_eq!(
@@ -467,8 +493,26 @@ mod tests {
         };
         assert_eq!(content_for_change(OsdSnapshot::default(), fill), None);
 
+        // the same startup fill for every polled field: a value arriving
+        // with no previous one is the poll finding the world (a slow
+        // first read, a device showing up late), not the user pressing
+        // anything
+        let learned = OsdSnapshot {
+            volume: Some(Volume {
+                percent: 64,
+                muted: false,
+            }),
+            mic: Some(Mic { muted: false }),
+            brightness: Some(Brightness { percent: 80 }),
+            ..Default::default()
+        };
+        assert_eq!(content_for_change(OsdSnapshot::default(), learned), None);
+
         // a real toggle names itself
-        let on = OsdSnapshot { dnd: Some(true), ..fill };
+        let on = OsdSnapshot {
+            dnd: Some(true),
+            ..fill
+        };
         let content = content_for_change(fill, on).expect("a dnd toggle yields content");
         assert_eq!(content.label, "Do Not Disturb");
         assert_eq!(content.value, "On");

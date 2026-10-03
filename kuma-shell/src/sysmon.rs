@@ -413,10 +413,7 @@ impl SysMon {
             self.av_request_at = Some(Instant::now());
             cx.notify();
         }
-        self.queue(
-            AvRequest::Volume(VolumeRequest::Set(percent), previous),
-            cx,
-        );
+        self.queue(AvRequest::Volume(VolumeRequest::Set(percent), previous), cx);
     }
 
     /// One request seam for brightness (the quick-settings slider): optimistic
@@ -577,32 +574,30 @@ pub fn run(state: &Entity<SysMon>, cx: &mut App) {
                 })
                 .await;
             previous = previous_next;
-            let Ok(quick_recheck) = state
-                .update(cx, |sysmon, cx| {
-                    let moved = if full {
-                        sysmon.battery = snapshot.battery;
-                        sysmon.cpu = snapshot.cpu;
-                        sysmon.bluetooth = snapshot.bluetooth.clone();
-                        sysmon.network = snapshot.network.clone();
-                        sysmon.power_profile = snapshot.power_profile;
-                        sysmon.media = snapshot.media.clone();
-                        sysmon.recording = snapshot.recording.clone();
-                        log::info!("sysmon snapshot: {snapshot:?}");
-                        // the trio rides the same confirm gate as the
-                        // fast pass: the full pass doesn't get to
-                        // bypass it
-                        sysmon.absorb_av(&snapshot);
-                        true
-                    } else {
-                        sysmon.absorb_av(&snapshot)
-                    };
-                    if moved {
-                        cx.notify();
-                    }
-                    // a stored confirm candidate re-checks soon
-                    sysmon.av_confirming.is_some()
-                })
-            else {
+            let Ok(quick_recheck) = state.update(cx, |sysmon, cx| {
+                let moved = if full {
+                    sysmon.battery = snapshot.battery;
+                    sysmon.cpu = snapshot.cpu;
+                    sysmon.bluetooth = snapshot.bluetooth.clone();
+                    sysmon.network = snapshot.network.clone();
+                    sysmon.power_profile = snapshot.power_profile;
+                    sysmon.media = snapshot.media.clone();
+                    sysmon.recording = snapshot.recording.clone();
+                    log::info!("sysmon snapshot: {snapshot:?}");
+                    // the trio rides the same confirm gate as the
+                    // fast pass: the full pass doesn't get to
+                    // bypass it
+                    sysmon.absorb_av(&snapshot);
+                    true
+                } else {
+                    sysmon.absorb_av(&snapshot)
+                };
+                if moved {
+                    cx.notify();
+                }
+                // a stored confirm candidate re-checks soon
+                sysmon.av_confirming.is_some()
+            }) else {
                 break;
             };
             if quick_recheck {

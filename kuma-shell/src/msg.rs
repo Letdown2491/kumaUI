@@ -233,10 +233,7 @@ mod tests {
     #[test]
     fn the_settings_verb_toggles_the_panel() {
         // launcher semantics: the same press that opened closes
-        assert_eq!(
-            parse(&to_line(&Request::Settings)),
-            Some(Request::Settings)
-        );
+        assert_eq!(parse(&to_line(&Request::Settings)), Some(Request::Settings));
         assert_eq!(to_line(&Request::Settings), "{\"Settings\":\"Toggle\"}");
     }
 

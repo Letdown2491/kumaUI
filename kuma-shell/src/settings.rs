@@ -605,7 +605,13 @@ impl Settings {
         }
     }
 
-    fn move_widget_impl(&mut self, from: Section, index: usize, to: Section, to_index: usize) -> bool {
+    fn move_widget_impl(
+        &mut self,
+        from: Section,
+        index: usize,
+        to: Section,
+        to_index: usize,
+    ) -> bool {
         if index >= self.widgets(from).len() {
             return false;
         }
@@ -836,10 +842,7 @@ mod tests {
         assert!(!settings.move_widget_impl(Section::Right, 1, Section::Right, 2));
         // a real same-section move still works
         assert!(settings.move_widget_impl(Section::Right, 0, Section::Right, 3));
-        assert_eq!(
-            settings.widgets(Section::Right)[2].kind,
-            WidgetKind::Cpu
-        );
+        assert_eq!(settings.widgets(Section::Right)[2].kind, WidgetKind::Cpu);
     }
 
     #[test]

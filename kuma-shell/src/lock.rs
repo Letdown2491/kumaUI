@@ -454,6 +454,32 @@ pub fn engage(state: &Entity<LockState>, cx: &mut App) {
     }
 }
 
+/// The surfaces watch's lock arm: a locked session whose surfaces died
+/// with their outputs gets them back when displays exist again. An
+/// unlocked session needs nothing; its surfaces arrive with the next
+/// [`engage`].
+pub fn ensure_surfaces(state: &Entity<LockState>, cx: &mut App) {
+    let locked = state.read(cx).is_locked();
+    if !locked {
+        return;
+    }
+    let surfaces = state.read(cx).surfaces.clone();
+    let live = surfaces
+        .iter()
+        .filter(|surface| surface.update(cx, |_, _, _| {}).is_ok())
+        .count();
+    if needs_lock_surfaces(locked, live, cx.displays().len()) {
+        open_lock_surfaces(state, cx);
+    }
+}
+
+/// Whether the lock surface pass should run. Pinned by test: outputs
+/// returning while locked must bring the lock screen back, and nothing
+/// else recreates it.
+fn needs_lock_surfaces(locked: bool, live_surfaces: usize, displays: usize) -> bool {
+    locked && live_surfaces == 0 && displays > 0
+}
+
 /// Listen for logind's session Lock/Unlock signals and drive the state.
 /// `loginctl lock-session` (any keybind), the idle watcher, and
 /// PrepareForSleep all land here through [`engage`].
@@ -586,4 +612,21 @@ async fn run_lock_listener(tx: Sender<LockEvent>, hint_rx: Receiver<bool>) -> an
     })
     .detach();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_lock_surfaces;
+
+    #[test]
+    fn locked_sessions_get_surfaces_back_only_when_displays_exist() {
+        // outputs returned while locked: the lock screen comes back
+        assert!(needs_lock_surfaces(true, 0, 1));
+        // unlocked: surfaces arrive with the next engage, not the watch
+        assert!(!needs_lock_surfaces(false, 0, 1));
+        // live surfaces: leave them alone
+        assert!(!needs_lock_surfaces(true, 2, 1));
+        // displayless: there is nothing to attach to; wait
+        assert!(!needs_lock_surfaces(true, 0, 0));
+    }
 }

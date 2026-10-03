@@ -74,22 +74,21 @@ impl Render for CalendarView {
             .pb(px(14.))
             .gap_2()
             .child(
-                kit::pane_header(&header)
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .child(nav_button(
-                                "cal-prev",
-                                "icons/chevron-left.svg",
-                                cx.listener(|this, _, _, cx| this.step(-1, cx)),
-                            ))
-                            .child(nav_button(
-                                "cal-next",
-                                "icons/chevron-right.svg",
-                                cx.listener(|this, _, _, cx| this.step(1, cx)),
-                            )),
-                    ),
+                kit::pane_header(&header).child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(nav_button(
+                            "cal-prev",
+                            "icons/chevron-left.svg",
+                            cx.listener(|this, _, _, cx| this.step(-1, cx)),
+                        ))
+                        .child(nav_button(
+                            "cal-next",
+                            "icons/chevron-right.svg",
+                            cx.listener(|this, _, _, cx| this.step(1, cx)),
+                        )),
+                ),
             )
             .child(weekday_row())
             .child(

@@ -247,6 +247,22 @@ impl DockHost {
             let settings = settings.read(cx);
             (settings.dock.enabled, settings.dock.position)
         };
+        // with no displays there is nothing to attach to: the compositor
+        // closes the surface immediately, so wait for the surfaces watch
+        // to call again when one appears
+        if cx.displays().is_empty() {
+            return;
+        }
+        // a compositor-side close (the output the dock was on went away)
+        // leaves a dead handle: the probe reads it as gone so this sync
+        // recreates instead of guarding a ghost
+        if !self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.update(cx, |_, _, _| {}).is_ok())
+        {
+            self.window = None;
+        }
         if !enabled {
             self.close(cx);
             return;
@@ -303,6 +319,18 @@ pub fn run(niri: Entity<NiriState>, settings: Entity<Settings>, cx: &mut App) {
     });
     cx.set_global(DockHostGlobal(host.clone()));
     let _ = host.update(cx, |host, cx| host.sync(&niri, &settings, cx));
+}
+
+/// The surfaces watch's dock arm: re-run the sync, which no-ops while
+/// the window is alive and recreates it when it died with its output.
+pub fn ensure(niri: &Entity<NiriState>, settings: &Entity<Settings>, cx: &mut App) {
+    let Some(host) = cx
+        .try_global::<DockHostGlobal>()
+        .map(|global| global.0.clone())
+    else {
+        return;
+    };
+    let _ = host.update(cx, |host, cx| host.sync(niri, settings, cx));
 }
 
 /// The dock surface: a rounded card of entries centered on a stretched,
