@@ -668,11 +668,11 @@ impl SettingsView {
     }
 
     /// The idle page: the three clauses of the idle contract, in
-    /// execution order. The timeouts are entered as minutes in a
-    /// click-to-edit field (0 is Off); Enter commits the whole number,
-    /// nothing is written per keystroke. The clocks are independent,
-    /// never clamped, and a dim note says when the order would
-    /// surprise.
+    /// execution order. Each clock wears an on/off toggle and a
+    /// click-to-edit minute field; Enter or a click anywhere else
+    /// commits the whole number, nothing is written per keystroke.
+    /// The clocks are independent, never clamped, and a dim note says
+    /// when the order would surprise.
     fn idle_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let idle = self.settings.read(cx).idle;
         let lock_row = self.idle_number_row(
@@ -681,6 +681,7 @@ impl SettingsView {
             "Lock after",
             IdleSlider::Lock,
             idle.lock_timeout,
+            900,
             cx,
         );
         let screen_row = self.idle_number_row(
@@ -689,6 +690,7 @@ impl SettingsView {
             "Screens off after",
             IdleSlider::ScreenOff,
             idle.screen_off_timeout,
+            960,
             cx,
         );
 
@@ -700,6 +702,12 @@ impl SettingsView {
             .flex_col()
             .gap_3()
             .overflow_y_scroll()
+            // a press anywhere commits the open field: click-away is
+            // apply, not discard
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.commit_idle_edit(cx)),
+            )
             .child(
                 kit::card("idle-timeouts")
                     .child(lock_row)
@@ -709,7 +717,7 @@ impl SettingsView {
                             div()
                                 .text_size(px(11.))
                                 .text_color(rgb(TEXT_DIM))
-                                .child("Press Enter to apply."),
+                                .child("Enter or click away to apply."),
                         )
                     }),
             )
@@ -742,8 +750,11 @@ impl SettingsView {
             )
     }
 
-    /// One idle row: icon, name, the minute field, and the committed
-    /// value spelled out. Click the field to edit; Enter applies.
+    /// One idle row: icon, name, an on/off toggle, the minute field,
+    /// in that order. Off disables the field (the clock is 0); on
+    /// again revives the clock at its default. Click the field to
+    /// edit; Enter or a click elsewhere applies.
+    #[allow(clippy::too_many_arguments)]
     fn idle_number_row(
         &mut self,
         id: &str,
@@ -751,28 +762,59 @@ impl SettingsView {
         name: &str,
         which: IdleSlider,
         seconds: u64,
+        default_seconds: u64,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
+        let enabled = seconds > 0;
         let editing = self
             .idle_edit
             .as_ref()
-            .filter(|edit| edit.which == which);
+            .filter(|edit| edit.which == which && enabled);
         let text = editing
             .map(|edit| edit.text.clone())
             .unwrap_or_else(|| (seconds / 60).to_string());
+        let toggle_id = SharedString::from(format!("{id}-enabled"));
+        let settings = self.settings.clone();
         div()
             .id(SharedString::from(id))
             .flex()
             .items_center()
             .gap_2()
             .py_1()
-            .child(gpui::svg().path(icon).size(px(16.)).text_color(rgb(TEXT)))
+            .child(gpui::svg().path(icon).size(px(16.)).text_color(rgb(
+                if enabled { TEXT } else { TEXT_DIM },
+            )))
             .child(
                 div()
                     .flex_1()
                     .text_size(px(12.))
-                    .text_color(rgb(TEXT))
+                    .text_color(rgb(if enabled { TEXT } else { TEXT_DIM }))
                     .child(name.to_string()),
+            )
+            .child(
+                div()
+                    .id(toggle_id)
+                    .cursor_pointer()
+                    .child(crate::controls::toggle_switch(enabled))
+                    .on_click(move |_, _, cx| {
+                        // toggling off is 0 (Off); on again revives the
+                        // clock at its default
+                        settings.update(cx, |settings, cx| {
+                            let on = match which {
+                                IdleSlider::Lock => settings.idle.lock_timeout == 0,
+                                IdleSlider::ScreenOff => settings.idle.screen_off_timeout == 0,
+                            };
+                            let seconds = if on { default_seconds } else { 0 };
+                            match which {
+                                IdleSlider::Lock => {
+                                    settings.set_idle_lock_timeout(seconds, cx)
+                                }
+                                IdleSlider::ScreenOff => {
+                                    settings.set_idle_screen_off_timeout(seconds, cx)
+                                }
+                            }
+                        });
+                    }),
             )
             .child(
                 div()
@@ -781,6 +823,29 @@ impl SettingsView {
                         el.track_focus(&focus)
                             .on_key_down(cx.listener(Self::idle_edit_key))
                     })
+                    .when(enabled, |el| {
+                        el.cursor_text().on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                if this
+                                    .idle_edit
+                                    .as_ref()
+                                    .is_some_and(|edit| edit.which == which)
+                                {
+                                    return;
+                                }
+                                let focus = cx.focus_handle();
+                                focus.focus(window, cx);
+                                this.idle_edit = Some(IdleEdit {
+                                    which,
+                                    // seeded with the committed minutes,
+                                    // so backspace edits what is there
+                                    text: (seconds / 60).to_string(),
+                                    focus,
+                                });
+                                cx.notify();
+                            },
+                        ))
+                    })
                     .w(px(72.))
                     .px_2()
                     .py_1()
@@ -788,35 +853,25 @@ impl SettingsView {
                     .bg(rgb(INSET))
                     .border_1()
                     .border_color(rgb(if editing.is_some() { ACCENT } else { DIVIDER }))
-                    .cursor_text()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if this.idle_edit.as_ref().is_some_and(|edit| edit.which == which) {
-                            return;
-                        }
-                        // switching fields commits the open one first
-                        this.commit_idle_edit(cx);
-                        let focus = cx.focus_handle();
-                        focus.focus(window, cx);
-                        this.idle_edit = Some(IdleEdit {
-                            which,
-                            text: String::new(),
-                            focus,
-                        });
-                        cx.notify();
-                    }))
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(if editing.is_some() { TEXT } else { TEXT_DIM }))
+                            .text_color(rgb(if editing.is_some() {
+                                TEXT
+                            } else if enabled {
+                                TEXT_DIM
+                            } else {
+                                TEXT_DIM
+                            }))
                             .text_align(gpui::TextAlign::Right)
+                            .when(editing.is_some(), |el| el.child(text.clone()))
                             .when(editing.is_none(), |el| {
-                                el.child(if seconds == 0 {
-                                    "Off".to_string()
-                                } else {
+                                el.child(if enabled {
                                     format!("{} min", seconds / 60)
+                                } else {
+                                    "Off".to_string()
                                 })
-                            })
-                            .when(editing.is_some(), |el| el.child(text.clone())),
+                            }),
                     ),
             )
     }
