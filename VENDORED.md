@@ -38,3 +38,12 @@ local patches, which should be recorded here.
   hover on the dead window). The forwarding methods (`handle_input`,
   `set_focused`, `set_hovered`, `report_visibility`, `set_appearance`,
   `set_button_layout`) now return early on a closed window.
+- `crates/gpui_linux/src/linux/wayland/client.rs`: `GlobalRemove` retires
+  the bound `wl_output` (registry names tracked in `output_global_names`).
+  A compositor removes the global on unplug or output disable, the inert
+  object sees no event of its own, and the upstream TODO left
+  `cx.displays()` reporting outputs that are gone for the rest of the
+  session. With ghosts, the shell's surfaces watch would keep creating
+  layer surfaces the compositor immediately closes (a 2s create/close
+  spin against a displayless compositor); retired outputs make
+  `cx.displays()` truthful so the watch can idle.
