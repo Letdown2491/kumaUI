@@ -496,6 +496,39 @@ impl ShellBar {
                 }))
                 .into_any_element()
             }),
+            WidgetKind::PowerProfile => sysmon.power_profile.map(|profile| {
+                let label = profile.title();
+                sys_widget(
+                    widget.kind,
+                    widget.mode,
+                    Some(label.to_string()),
+                    if profile == crate::sysmon::PowerProfile::Performance {
+                        URGENT
+                    } else {
+                        TEXT
+                    },
+                    move |sysmon: &SysMon, _| match sysmon.power_profile {
+                        Some(profile) => {
+                            format!("Power profile: {}", profile.title()).into()
+                        }
+                        None => "Power profile unknown".into(),
+                    },
+                    widget_icon(widget.kind),
+                    tooltips_on,
+                    self.sysmon.clone(),
+                )
+                .cursor_pointer()
+                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    // hang the popup under the pointer, i.e. under this widget
+                    let anchor = f32::from(event.position().x);
+                    crate::panel::toggle_panel_anchored(
+                        crate::panel::PanelKind::PowerProfile,
+                        anchor,
+                        cx,
+                    )
+                }))
+                .into_any_element()
+            }),
             WidgetKind::Media => sysmon.media.clone().map(|media| {
                 let text = if media.artist.is_empty() {
                     media.title.clone()

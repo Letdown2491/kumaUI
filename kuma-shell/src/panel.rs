@@ -172,6 +172,7 @@ pub enum PanelKind {
     Notifications,
     Volume,
     Brightness,
+    PowerProfile,
     DockMenu,
     Nostr,
 }
@@ -186,6 +187,7 @@ impl PanelKind {
             PanelKind::Notifications => (560., 520., KeyboardInteractivity::OnDemand),
             PanelKind::Volume => (360., 150., KeyboardInteractivity::OnDemand),
             PanelKind::Brightness => (360., 150., KeyboardInteractivity::OnDemand),
+            PanelKind::PowerProfile => (280., 170., KeyboardInteractivity::OnDemand),
             PanelKind::DockMenu => (180., 96., KeyboardInteractivity::OnDemand),
             PanelKind::Nostr => (560., 520., KeyboardInteractivity::OnDemand),
         }
@@ -199,6 +201,7 @@ impl PanelKind {
             PanelKind::Notifications => "notifications",
             PanelKind::Volume => "volume",
             PanelKind::Brightness => "brightness",
+            PanelKind::PowerProfile => "power-profile",
             PanelKind::DockMenu => "dock-menu",
             PanelKind::Nostr => "nostr",
         }
@@ -272,6 +275,9 @@ impl PanelKind {
                         geometry,
                     )
                 })
+                .into(),
+            PanelKind::PowerProfile => cx
+                .new(|cx| crate::power_panel::PowerProfileView::new(sysmon, window, cx, geometry))
                 .into(),
             PanelKind::DockMenu => {
                 let context = cx.global::<PanelHost>().dock_menu();
