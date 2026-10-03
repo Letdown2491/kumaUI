@@ -21,6 +21,8 @@ pub enum WidgetKind {
     Apps,
     Cpu,
     Ram,
+    Temp,
+    Disk,
     Volume,
     Mic,
     Brightness,
@@ -77,6 +79,16 @@ pub const WIDGETS: &[WidgetSpec] = &[
         kind: WidgetKind::Ram,
         label: "Memory",
         icon: Some(WidgetIconSpec::Path("icons/memory.svg")),
+    },
+    WidgetSpec {
+        kind: WidgetKind::Temp,
+        label: "CPU temperature",
+        icon: Some(WidgetIconSpec::Path("icons/temp.svg")),
+    },
+    WidgetSpec {
+        kind: WidgetKind::Disk,
+        label: "Disk",
+        icon: Some(WidgetIconSpec::Path("icons/drive.svg")),
     },
     WidgetSpec {
         kind: WidgetKind::Volume,
@@ -369,6 +381,24 @@ pub struct Settings {
     pub dock: DockSettings,
     #[serde(default)]
     pub idle: IdleSettings,
+    #[serde(default)]
+    pub sysinfo: SysInfoSettings,
+}
+
+/// The sysinfo widgets' knobs: which mount the disk widget watches.
+/// A missing or unreadable mount is a hidden widget, not an error.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SysInfoSettings {
+    pub disk_mount: std::path::PathBuf,
+}
+
+impl Default for SysInfoSettings {
+    fn default() -> Self {
+        Self {
+            disk_mount: std::path::PathBuf::from("/"),
+        }
+    }
 }
 
 /// The idle contract: lock at 15 minutes, monitors off a minute later,
@@ -513,6 +543,7 @@ impl Default for Settings {
             notifications: NotificationSettings::default(),
             dock: DockSettings::default(),
             idle: IdleSettings::default(),
+            sysinfo: SysInfoSettings::default(),
         }
     }
 }
@@ -953,7 +984,7 @@ mod tests {
             WidgetKind::Cpu.icon_spec(),
             Some(WidgetIconSpec::Path("icons/cpu.svg"))
         );
-        assert_eq!(WIDGETS.len(), 17);
+        assert_eq!(WIDGETS.len(), 19);
     }
 
     #[test]

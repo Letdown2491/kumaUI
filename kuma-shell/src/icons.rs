@@ -38,6 +38,8 @@ impl AssetSource for KumaAssets {
             "icons/logout.svg" => Some(include_bytes!("../icons/logout.svg").as_slice()),
             "icons/power.svg" => Some(include_bytes!("../icons/power.svg").as_slice()),
             "icons/memory.svg" => Some(include_bytes!("../icons/memory.svg").as_slice()),
+            "icons/temp.svg" => Some(include_bytes!("../icons/temp.svg").as_slice()),
+            "icons/drive.svg" => Some(include_bytes!("../icons/drive.svg").as_slice()),
             "icons/check.svg" => Some(include_bytes!("../icons/check.svg").as_slice()),
             "icons/x.svg" => Some(include_bytes!("../icons/x.svg").as_slice()),
             "icons/chevron-right.svg" => {

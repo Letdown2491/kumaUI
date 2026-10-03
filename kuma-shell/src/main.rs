@@ -41,10 +41,10 @@ fn main() {
             let niri = cx.new(|_| SessionState::default());
             kuma_shell::session::connect(&niri, cx);
 
-            let sysmon = cx.new(|_| SysMon::default());
-            kuma_shell::sysmon::run(&sysmon, cx);
-
             let settings = cx.new(|_| Settings::load());
+
+            let sysmon = cx.new(|_| SysMon::default());
+            kuma_shell::sysmon::run(&sysmon, &settings, cx);
 
             let osd = cx.new(|_| kuma_shell::osd::Osd::new(sysmon.clone(), settings.clone()));
             kuma_shell::osd::run(&osd, &sysmon, &settings, cx);

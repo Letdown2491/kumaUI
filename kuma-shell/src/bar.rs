@@ -517,6 +517,47 @@ impl ShellBar {
                 )
                 .into_any_element()
             }),
+            WidgetKind::Temp => sysmon.temp.map(|temp| {
+                // hot enough to care: the alarm color says the fans
+                // are losing
+                let color = if temp >= 85 { URGENT } else { TEXT };
+                sys_widget(
+                    widget.kind,
+                    widget.mode,
+                    Some(format!("{temp}°C")),
+                    color,
+                    move |sysmon: &SysMon, _| match sysmon.temp {
+                        Some(temp) => format!("CPU temperature: {temp}°C").into(),
+                        None => "CPU temperature unknown".into(),
+                    },
+                    widget_icon(widget.kind),
+                    tooltips_on,
+                    self.sysmon.clone(),
+                )
+                .into_any_element()
+            }),
+            WidgetKind::Disk => sysmon.disk.map(|disk| {
+                sys_widget(
+                    widget.kind,
+                    widget.mode,
+                    Some(format!("Disk {}%", disk.percent)),
+                    if disk.percent >= 90 { URGENT } else { TEXT },
+                    move |sysmon: &SysMon, _| match sysmon.disk {
+                        Some(disk) => format!(
+                            "{}: {:.0} GiB of {:.0} GiB used",
+                            sysmon.disk_mount.display(),
+                            disk.used_mib as f32 / 1024.,
+                            disk.total_mib as f32 / 1024.
+                        )
+                        .into(),
+                        None => "Disk unknown".into(),
+                    },
+                    widget_icon(widget.kind),
+                    tooltips_on,
+                    self.sysmon.clone(),
+                )
+                .into_any_element()
+            }),
             WidgetKind::Mic => sysmon.mic.map(|mic| {
                 let muted = mic.muted;
                 let text = if muted {

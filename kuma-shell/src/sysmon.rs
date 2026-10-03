@@ -6,6 +6,8 @@ use std::{
 use anyhow::Context as _;
 use gpui::{App, AppContext, Context, Entity};
 
+use crate::settings::Settings;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Battery {
     pub percent: u8,
@@ -39,6 +41,15 @@ pub struct Ram {
     pub percent: u8,
     /// Mebibytes: meminfo speaks kB, the struct speaks MiB to keep the
     /// arithmetic integral.
+    pub used_mib: u64,
+    pub total_mib: u64,
+}
+
+/// A mount's disk state: usage percent for the widget's text, the
+/// absolute pair for its tooltip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Disk {
+    pub percent: u8,
     pub used_mib: u64,
     pub total_mib: u64,
 }
@@ -164,6 +175,11 @@ pub struct SysMon {
     pub brightness: Option<Brightness>,
     pub cpu: Option<f32>,
     pub ram: Option<Ram>,
+    pub temp: Option<u32>,
+    pub disk: Option<Disk>,
+    /// The mount the disk widget watches: user state, mirrored from
+    /// the settings' sysinfo section.
+    pub disk_mount: std::path::PathBuf,
     pub bluetooth: Option<BluetoothState>,
     pub network: Option<NetworkState>,
     pub power_profile: Option<PowerProfile>,
@@ -597,7 +613,24 @@ fn bounced(last: Option<Instant>, now: Instant) -> bool {
     last.is_some_and(|at| now.duration_since(at) < MUTE_BOUNCE)
 }
 
-pub fn run(state: &Entity<SysMon>, cx: &mut App) {
+pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
+    // the disk mount is user state: seeded once, then mirrored on
+    // settings changes (no re-mint needed, the poll reads it per tick)
+    let mount = settings.read(cx).sysinfo.disk_mount.clone();
+    state.update(cx, |sysmon, _| sysmon.disk_mount = mount);
+    {
+        let state = state.downgrade();
+        cx.observe(settings, move |settings, cx| {
+            let mount = settings.read(cx).sysinfo.disk_mount.clone();
+            let _ = state.update(cx, |sysmon, _| {
+                if sysmon.disk_mount != mount {
+                    sysmon.disk_mount = mount;
+                }
+            });
+        })
+        .detach();
+    }
+
     let state = state.downgrade();
     cx.spawn(async move |cx| {
         let mut previous: Option<CpuSample> = None;
@@ -605,11 +638,14 @@ pub fn run(state: &Entity<SysMon>, cx: &mut App) {
         loop {
             let full = tick % FULL_PASS_EVERY == 0;
             tick = tick.wrapping_add(1);
+            let Ok(disk_mount) = state.update(cx, |sysmon, _| sysmon.disk_mount.clone()) else {
+                break;
+            };
             let (snapshot, previous_next) = cx
                 .background_spawn(async move {
                     let mut previous = previous;
                     let snapshot = if full {
-                        refresh(&mut previous)
+                        refresh(&mut previous, &disk_mount)
                     } else {
                         refresh_av()
                     };
@@ -622,6 +658,8 @@ pub fn run(state: &Entity<SysMon>, cx: &mut App) {
                     sysmon.battery = snapshot.battery;
                     sysmon.cpu = snapshot.cpu;
                     sysmon.ram = snapshot.ram;
+                    sysmon.temp = snapshot.temp;
+                    sysmon.disk = snapshot.disk;
                     sysmon.bluetooth = snapshot.bluetooth.clone();
                     sysmon.network = snapshot.network.clone();
                     sysmon.power_profile = snapshot.power_profile;
@@ -662,6 +700,8 @@ struct Snapshot {
     brightness: Option<Brightness>,
     cpu: Option<f32>,
     ram: Option<Ram>,
+    temp: Option<u32>,
+    disk: Option<Disk>,
     bluetooth: Option<BluetoothState>,
     network: Option<NetworkState>,
     power_profile: Option<PowerProfile>,
@@ -669,7 +709,7 @@ struct Snapshot {
     recording: Option<RecordingState>,
 }
 
-fn refresh(previous: &mut Option<CpuSample>) -> Snapshot {
+fn refresh(previous: &mut Option<CpuSample>, disk_mount: &std::path::Path) -> Snapshot {
     Snapshot {
         battery: read_battery(),
         volume: read_volume(),
@@ -677,6 +717,8 @@ fn refresh(previous: &mut Option<CpuSample>) -> Snapshot {
         brightness: read_brightness(),
         cpu: sample_cpu_usage(previous),
         ram: read_ram(),
+        temp: read_cpu_temp(),
+        disk: read_disk(disk_mount),
         bluetooth: read_bluetooth(),
         network: read_network(),
         power_profile: read_power_profile(),
@@ -1113,6 +1155,102 @@ fn parse_meminfo(text: &str) -> Option<Ram> {
     })
 }
 
+/// The CPU's temperature: the kernel's hwmon tree, the chip named for
+/// the CPU preferred (coretemp on Intel, k10temp or zenpower on AMD),
+/// its hottest zone speaking; thermal zones that name a cpu are the
+/// fallback. Degrees, not milli-degrees.
+fn read_cpu_temp() -> Option<u32> {
+    const CPU_CHIPS: [&str; 3] = ["coretemp", "k10temp", "zenpower"];
+    let mut candidates: Vec<(u8, u32)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/class/hwmon") {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let Ok(name) = std::fs::read_to_string(dir.join("name")) else {
+                continue;
+            };
+            let priority = u8::from(CPU_CHIPS.contains(&name.trim()));
+            let Ok(zones) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for zone in zones.flatten() {
+                let file = zone.file_name().to_string_lossy().to_string();
+                if file.starts_with("temp") && file.ends_with("_input") {
+                    if let Some(temp) = read_milli_degrees(&zone.path()) {
+                        candidates.push((priority, temp));
+                    }
+                }
+            }
+        }
+    }
+    // the thermal_zone fallback: machines whose CPU sensor only shows
+    // there (x86_pkg_temp, soc thermal)
+    if let Ok(entries) = std::fs::read_dir("/sys/class/thermal") {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let Some(rest) = file_name.strip_prefix("thermal_zone") else {
+                continue;
+            };
+            if !rest.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(ty) = std::fs::read_to_string(entry.path().join("type")) else {
+                continue;
+            };
+            if !ty.trim().contains("cpu") {
+                continue;
+            }
+            if let Some(temp) = read_milli_degrees(&entry.path()) {
+                candidates.push((1, temp));
+            }
+        }
+    }
+    // a named CPU chip outranks a thermal zone; the hottest zone wins
+    // within a chip
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    candidates.first().map(|(_, temp)| *temp)
+}
+
+/// One hwmon/thermal reading: milli-degrees in, degrees out. A
+/// missing or unparsable file is no reading at all.
+fn read_milli_degrees(path: &std::path::Path) -> Option<u32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.trim().parse::<u32>().ok().map(|milli| milli / 1000)
+}
+
+/// A mount's disk usage from statvfs: the percent is the df number,
+/// used over (used plus the user's available), so the reserved-root
+/// blocks don't make a full-feeling disk read two-thirds.
+fn read_disk(mount: &std::path::Path) -> Option<Disk> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(mount.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    parse_statvfs(
+        u64::try_from(stat.f_frsize).ok()?,
+        stat.f_blocks,
+        stat.f_bfree,
+        stat.f_bavail,
+    )
+}
+
+fn parse_statvfs(frsize: u64, blocks: u64, bfree: u64, bavail: u64) -> Option<Disk> {
+    let total_mib = blocks * frsize / (1024 * 1024);
+    let used_mib = (blocks - bfree) * frsize / (1024 * 1024);
+    let user_avail_mib = bavail * frsize / (1024 * 1024);
+    let denominator = used_mib + user_avail_mib;
+    if denominator == 0 {
+        return None;
+    }
+    Some(Disk {
+        percent: ((used_mib * 100) / denominator) as u8,
+        used_mib,
+        total_mib,
+    })
+}
+
 // `stat` is the contents of /proc/<pid>/stat: starttime is field 22
 // (1-indexed); fields after the comm parenthesis start at field 3, so it's
 // index 19 of the post-paren fields. Clock ticks are 100/sec.
@@ -1207,6 +1345,19 @@ mod tests {
         assert!(parse_meminfo("MemTotal:          0 kB\nMemAvailable:      0 kB\n").is_none());
         // missing fields are None, not a panic
         assert!(parse_meminfo("MemTotal:       16384000 kB\n").is_none());
+    }
+
+    #[test]
+    fn statvfs_numbers_read_as_disk() {
+        // 10 GiB of blocks, 5 GiB free, but the user may only take 4
+        // (bavail): the percent is the df number, used over what the
+        // user could still fill
+        let disk = parse_statvfs(4096, 2_621_440, 1_310_720, 1_048_576).unwrap();
+        assert_eq!(disk.total_mib, 10240);
+        assert_eq!(disk.used_mib, 5120);
+        assert_eq!(disk.percent, 55);
+        // a zero-block filesystem is no disk at all
+        assert!(parse_statvfs(4096, 0, 0, 0).is_none());
     }
 
     #[test]
