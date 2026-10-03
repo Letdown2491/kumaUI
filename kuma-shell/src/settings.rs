@@ -750,6 +750,21 @@ impl Settings {
         self.commit(cx);
     }
 
+    pub fn set_idle_lock_timeout(&mut self, seconds: u64, cx: &mut Context<Self>) {
+        self.idle.lock_timeout = seconds;
+        self.commit(cx);
+    }
+
+    pub fn set_idle_screen_off_timeout(&mut self, seconds: u64, cx: &mut Context<Self>) {
+        self.idle.screen_off_timeout = seconds;
+        self.commit(cx);
+    }
+
+    pub fn set_idle_lock_before_suspend(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.idle.lock_before_suspend = enabled;
+        self.commit(cx);
+    }
+
     /// Pin by desktop-file path (the usage-counts key); already-pinned is a
     /// no-op, order preserved.
     pub fn dock_pin(&mut self, desktop_path: &str, cx: &mut Context<Self>) {
@@ -947,5 +962,18 @@ mod tests {
         assert_eq!(explicit.idle.lock_timeout, 600);
         assert_eq!(explicit.idle.screen_off_timeout, 0);
         assert!(!explicit.idle.lock_before_suspend);
+    }
+
+    #[test]
+    fn idle_clocks_are_independent() {
+        // the clocks are documented, not enforced: a config whose
+        // screens would blank before the lock engages round-trips
+        // unchanged, no clamping
+        let inverted: Settings = toml::from_str(
+            "[idle]\nlock_timeout = 900\nscreen_off_timeout = 300\nlock_before_suspend = true\n",
+        )
+        .unwrap();
+        assert_eq!(inverted.idle.lock_timeout, 900);
+        assert_eq!(inverted.idle.screen_off_timeout, 300);
     }
 }

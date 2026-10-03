@@ -94,6 +94,7 @@ enum Page {
     Widgets,
     Ordering,
     Dock,
+    Idle,
     Backgrounds,
 }
 
@@ -105,6 +106,7 @@ impl Page {
             Page::Widgets => "Widgets",
             Page::Ordering => "Ordering",
             Page::Dock => "Dock",
+            Page::Idle => "Idle",
             Page::Backgrounds => "Backgrounds",
         }
     }
@@ -116,16 +118,18 @@ impl Page {
             Page::Widgets => "icons/widgets.svg",
             Page::Ordering => "icons/order.svg",
             Page::Dock => "icons/dock.svg",
+            Page::Idle => "icons/clock.svg",
             Page::Backgrounds => "icons/image.svg",
         }
     }
 
-    const ALL: [Page; 6] = [
+    const ALL: [Page; 7] = [
         Page::Quick,
         Page::Bar,
         Page::Widgets,
         Page::Ordering,
         Page::Dock,
+        Page::Idle,
         Page::Backgrounds,
     ];
 }
@@ -174,6 +178,36 @@ enum Drag {
     Volume,
 }
 
+/// Which idle slider the idle page is dragging. The slider works in
+/// minutes (its percent is the minutes); seconds only exist at the
+/// settings seam.
+#[derive(Clone, Copy, PartialEq)]
+enum IdleSlider {
+    Lock,
+    ScreenOff,
+}
+
+/// An in-flight idle drag: the live minutes, held here so the TOML
+/// write lands once, on release, not on every mouse move.
+struct IdleDrag {
+    which: IdleSlider,
+    track: crate::controls::TrackStash,
+    preview: u8,
+}
+
+/// The display name for an idle timeout: Off at zero, minutes to the
+/// hour, hours and minutes past it.
+fn idle_label(seconds: u64) -> String {
+    if seconds == 0 {
+        return "Off".to_string();
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes} min");
+    }
+    format!("{}h {:02}", minutes / 60, minutes % 60)
+}
+
 pub struct SettingsView {
     settings: Entity<Settings>,
     sysmon: Entity<crate::sysmon::SysMon>,
@@ -188,6 +222,8 @@ pub struct SettingsView {
     /// own view, and a view recreated per render would forget its arm
     /// between SysMon's polls
     power_row: Entity<kit::ConfirmActions>,
+    /// the idle slider being dragged, with its live preview
+    idle_drag: Option<IdleDrag>,
 }
 
 impl SettingsView {
@@ -239,6 +275,7 @@ impl SettingsView {
             drop_preview: None,
             thumbs: HashMap::new(),
             power_row,
+            idle_drag: None,
         }
     }
 
@@ -642,6 +679,160 @@ impl SettingsView {
                     .text_size(px(11.))
                     .text_color(rgb(TEXT_DIM))
                     .child("Right-click an app in the dock to pin or unpin it."),
+            )
+    }
+
+    /// The idle page: the three clauses of the idle contract, in
+    /// execution order. The sliders work in minutes (0 is Off); the
+    /// clocks are independent, never clamped, and a dim note says when
+    /// the order would surprise. Drags preview live and commit once,
+    /// on release.
+    fn idle_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let idle = self.settings.read(cx).idle;
+        let lock_minutes = ((idle.lock_timeout / 60) as u8).min(100);
+        let screen_minutes = ((idle.screen_off_timeout / 60) as u8).min(100);
+        let lock = match &self.idle_drag {
+            Some(drag) if drag.which == IdleSlider::Lock => drag.preview,
+            _ => lock_minutes,
+        };
+        let screen = match &self.idle_drag {
+            Some(drag) if drag.which == IdleSlider::ScreenOff => drag.preview,
+            _ => screen_minutes,
+        };
+
+        let lock_row = self.idle_slider_row(
+            "idle-lock",
+            "icons/lock.svg",
+            "Lock after",
+            IdleSlider::Lock,
+            lock,
+            cx,
+        );
+        let screen_row = self.idle_slider_row(
+            "idle-screen-off",
+            "icons/brightness.svg",
+            "Screens off after",
+            IdleSlider::ScreenOff,
+            screen,
+            cx,
+        );
+
+        let settings_handle = self.settings.clone();
+        div()
+            .id("page-idle")
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .overflow_y_scroll()
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if let Some(drag) = &mut this.idle_drag
+                    && let Some(minutes) = drag
+                        .track
+                        .get()
+                        .and_then(|bounds| crate::controls::value_at(event.position.x, bounds))
+                {
+                    drag.preview = minutes;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(drag) = this.idle_drag.take() {
+                        let seconds = u64::from(drag.preview) * 60;
+                        this.settings.update(cx, |settings, cx| match drag.which {
+                            IdleSlider::Lock => settings.set_idle_lock_timeout(seconds, cx),
+                            IdleSlider::ScreenOff => {
+                                settings.set_idle_screen_off_timeout(seconds, cx)
+                            }
+                        });
+                    }
+                }),
+            )
+            .child(
+                kit::card("idle-timeouts")
+                    .child(lock_row)
+                    .child(screen_row),
+            )
+            .child(crate::controls::toggle_row(
+                "idle-lock-before-suspend",
+                "icons/shield.svg",
+                "Lock before sleep",
+                idle.lock_before_suspend,
+                move |_, _, cx| {
+                    settings_handle.update(cx, |settings, cx| {
+                        let enabled = !settings.idle.lock_before_suspend;
+                        settings.set_idle_lock_before_suspend(enabled, cx);
+                    });
+                },
+            ))
+            .when(
+                idle.lock_timeout > 0 && idle.screen_off_timeout > 0,
+                |el| {
+                    el.when(idle.screen_off_timeout < idle.lock_timeout, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(TEXT_DIM))
+                                .child(
+                                    "Screens blank before the lock engages. The clocks are independent, nothing is clamped.",
+                                ),
+                        )
+                    })
+                },
+            )
+    }
+
+    /// One idle slider row: icon, name, track, and the live value. The
+    /// slider's percent is minutes, 0 meaning Off.
+    fn idle_slider_row(
+        &self,
+        id: &str,
+        icon: &'static str,
+        name: &str,
+        which: IdleSlider,
+        minutes: u8,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let track = crate::controls::track_stash();
+        div()
+            .id(SharedString::from(id))
+            .flex()
+            .items_center()
+            .gap_2()
+            .py_1()
+            .child(gpui::svg().path(icon).size(px(16.)).text_color(rgb(TEXT)))
+            .child(
+                div()
+                    .w(px(96.))
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .child(name.to_string()),
+            )
+            .child(crate::controls::slider_track(minutes, track.clone()))
+            .child(
+                div()
+                    .w(px(48.))
+                    .text_size(px(11.))
+                    .text_color(rgb(TEXT_DIM))
+                    .text_align(gpui::TextAlign::Right)
+                    .child(idle_label(u64::from(minutes) * 60)),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    if let Some(minutes) = track
+                        .get()
+                        .and_then(|bounds| crate::controls::value_at(event.position.x, bounds))
+                    {
+                        this.idle_drag = Some(IdleDrag {
+                            which,
+                            track: track.clone(),
+                            preview: minutes,
+                        });
+                    }
+                }),
             )
     }
 
@@ -1188,6 +1379,7 @@ impl Render for SettingsView {
                 el.child(self.ordering_page(cx))
             })
             .when(self.page == Page::Dock, |el| el.child(self.dock_page(cx)))
+            .when(self.page == Page::Idle, |el| el.child(self.idle_page(cx)))
             .when(self.page == Page::Backgrounds, |el| {
                 el.child(self.backgrounds_page(cx))
             });
@@ -1230,5 +1422,13 @@ mod tests {
             percent_decode_path("file:///truncated%2"),
             PathBuf::from("/truncated%2")
         );
+    }
+
+    #[test]
+    fn idle_labels_name_the_timeout() {
+        assert_eq!(idle_label(0), "Off");
+        assert_eq!(idle_label(900), "15 min");
+        assert_eq!(idle_label(960), "16 min");
+        assert_eq!(idle_label(5400), "1h 30");
     }
 }
