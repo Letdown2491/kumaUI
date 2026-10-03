@@ -43,3 +43,10 @@ is translation, not duplication. Widgets, dock, and `SurfaceDeps` take
   widgets should hide rather than render stale data.
 - The state-apply tests moved with the state into `session.rs`; the
   niri-side tests cover only its wire translation.
+- (2026-10-03) The sway adapter shipped as predicted: `sway.rs` produces
+  the six events and answers the commands. One divergence from a pure 1:1:
+  every workspace event refetches the workspace list, because sway's
+  visible/focused flags are authoritative and the events alone cannot
+  clear a workspace the mirror already holds (sway destroys the empty
+  workspace you leave). XWayland windows fall back to the WM class for
+  the app id.

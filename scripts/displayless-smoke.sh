@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # The displayless smoke: the Shell must idle through zero outputs with its
-# bus names held, and bring its surfaces back when an output appears.
+# bus names held, and bring its surfaces back when an output appears. It
+# also asserts the session mirror end to end: the sway adapter detected at
+# startup, workspace switches and the msg command path reporting back, and
+# a real window (foot) opening and closing in the mirror.
 #
 # A compositor with no outputs is the condition: kumaOS CI reaches it with
 # qemu (virtio-vga, display none) and niri; this script reaches it with a

@@ -30,11 +30,28 @@ volumes, so builds are incremental.
   up; to run it by hand, stop the service first.
 - The service logs errors only (no RUST_LOG). To diagnose in place, add
   `Environment=RUST_LOG=info` to the override and restart; the per-request
-  `msg:` lines, OSD cards, and poll snapshots appear in
-  `journalctl --user -u kuma-shell`. PAM unlock failures log at info level
-  (`unlock attempt failed: ...`).
+  `msg:` lines, the `surfaces:` recreate lines, the `session:` mirror
+  transitions (`session: workspaces N (focused X), windows M (focused Y)`),
+  OSD cards, and poll snapshots appear in `journalctl --user -u kuma-shell`.
+  PAM unlock failures log at info level (`unlock attempt failed: ...`).
 - Lock screen: `loginctl lock-session` to lock, password to unlock,
   `loginctl unlock-session` as a backdoor.
+- Tests run inside the build container (no host toolchain):
+
+      ./scripts/build.sh test --release -p kuma-shell
+
+- The displayless smoke runs the whole surface lifecycle plus the session
+  mirror under a headless sway, in a second container image (niri cannot
+  start in a container; sway stands in). It needs the release binary the
+  build step produced, mounted at `/work/target`:
+
+      podman build -t localhost/kuma-test-compositor \
+        -f containers/kuma-test-compositor.containerfile containers/
+      podman run --rm -v "$PWD":/work:Z localhost/kuma-test-compositor \
+        /work/scripts/displayless-smoke.sh
+
+  The memory probe (`scripts/memory-probe.sh`) uses the same image and the
+  same mount.
 
 ## Writing
 

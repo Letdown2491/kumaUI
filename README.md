@@ -27,7 +27,7 @@ kumaOS is atomic and has no host toolchain, so the script builds inside a podman
 
 On a regular Linux box, a plain `cargo build --release` works too; you need a Rust toolchain (see `rust-toolchain.toml`) and the dev headers the containerfile installs: `pkgconf-pkg-config fontconfig-devel freetype-devel libxkbcommon-devel pam-devel`.
 
-Runtime requirements: a Wayland compositor with `wlr-layer-shell` and `ext-session-lock` (niri is the primary target), and PAM.
+Runtime requirements: a Wayland compositor with `wlr-layer-shell` and `ext-session-lock`, and PAM. niri is the primary target; sway works end to end (the bar's workspaces, window title, and dock ride a compositor-neutral session mirror, [ADR-0012](docs/adr/0012-compositor-neutral-session-state.md)). Hyprland speaks the same protocols but is untested.
 
 ## Vendored gpui
 
@@ -35,7 +35,7 @@ kuma-shell depends on gpui via a path dependency into `vendor/zed/` (gitignored,
 
 ## Repository notes
 
-- [`CONTEXT.md`](CONTEXT.md): domain glossary, the names of the seams in the code, one line each.
+- [`CONTEXT.md`](CONTEXT.md): domain glossary (the names of the seams in the code, one line each) and the four-rule ethos that governs them.
 - [`docs/adr/`](docs/adr/): architecture decision records, including two about lock-screen failure modes that only ever show up as "PAM rejects the password the user typed correctly".
 - [`AGENTS.md`](AGENTS.md): how AI agents should build, run, and debug in this repo.
 - `kuma-shell/icons/`: the widget and panel icons, hand-made SVGs.

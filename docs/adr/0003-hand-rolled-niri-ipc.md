@@ -24,3 +24,6 @@ IPC backwards-compatibility contract in the niri wiki.
   hand. If the shell ever needs broad IPC coverage (e.g. full window layouts,
   screencast management), revisit: switching to the crate should be cheap
   because all wire parsing concentrates in `parse_event` + the request helpers.
+- (2026-10-03) The same choice was made for sway's i3-style IPC in
+  `sway.rs`: a hand-rolled 14-byte header and JSON subset, no `swayipc`
+  crate, for the same reasons.
