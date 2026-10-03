@@ -3,7 +3,6 @@
 //! module may mention niri.
 
 use std::{
-    collections::HashMap,
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
