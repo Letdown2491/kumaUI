@@ -339,6 +339,10 @@ impl Default for BarConfig {
 pub struct BackgroundConfig {
     pub folder: PathBuf,
     pub current: String,
+    /// Rotate the folder's images every N minutes (0 = off). The
+    /// current name rides the existing config round-trip, so the
+    /// shown wallpaper survives a restart.
+    pub rotate_minutes: u32,
 }
 
 impl Default for BackgroundConfig {
@@ -349,12 +353,51 @@ impl Default for BackgroundConfig {
         Self {
             folder,
             current: "default".to_string(),
+            rotate_minutes: 0,
         }
     }
 }
 
 pub fn default_wallpaper() -> PathBuf {
     PathBuf::from("/usr/share/backgrounds/kuma/kuma-wallpaper.jpg")
+}
+
+/// The image files in a wallpapers folder, sorted by name: the
+/// backgrounds gallery and the rotation runner share one listing.
+pub fn background_images(folder: &std::path::Path) -> Vec<(String, PathBuf)> {
+    const IMAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "avif"];
+    let mut files: Vec<(String, PathBuf)> = std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path.extension().is_some_and(|ext| {
+                    IMAGE_EXTENSIONS.contains(&ext.to_string_lossy().to_lowercase().as_str())
+                })
+        })
+        .filter_map(|path| {
+            let name = path.file_name()?.to_string_lossy().to_string();
+            Some((name, path))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// The next wallpaper in the folder: the entry after the current one,
+/// wrapping; a current the folder doesn't know falls to the first
+/// entry. A folder with nothing in it has no next.
+pub fn next_background(entries: &[(String, PathBuf)], current: &str) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let position = entries.iter().position(|(name, _)| name == current);
+    let next = match position {
+        Some(index) => (index + 1) % entries.len(),
+        None => 0,
+    };
+    Some(entries[next].0.clone())
 }
 
 impl BackgroundConfig {
@@ -778,6 +821,11 @@ impl Settings {
         self.commit(cx);
     }
 
+    pub fn set_background_rotate(&mut self, minutes: u32, cx: &mut Context<Self>) {
+        self.background.rotate_minutes = minutes;
+        self.commit(cx);
+    }
+
     pub fn set_background_folder(&mut self, folder: PathBuf, cx: &mut Context<Self>) {
         self.background.folder = folder;
         self.background.current = "default".to_string();
@@ -1011,6 +1059,20 @@ mod tests {
         assert_eq!(explicit.idle.lock_timeout, 600);
         assert_eq!(explicit.idle.screen_off_timeout, 0);
         assert!(!explicit.idle.lock_before_suspend);
+    }
+
+    #[test]
+    fn next_background_walks_and_wraps() {
+        let entries = [
+            ("a.jpg".to_string(), PathBuf::from("a")),
+            ("b.jpg".to_string(), PathBuf::from("b")),
+            ("c.jpg".to_string(), PathBuf::from("c")),
+        ];
+        assert_eq!(next_background(&entries, "a.jpg").as_deref(), Some("b.jpg"));
+        assert_eq!(next_background(&entries, "c.jpg").as_deref(), Some("a.jpg"));
+        // a current the folder doesn't know falls to the first
+        assert_eq!(next_background(&entries, "zzz").as_deref(), Some("a.jpg"));
+        assert_eq!(next_background(&[], "a.jpg"), None);
     }
 
     #[test]

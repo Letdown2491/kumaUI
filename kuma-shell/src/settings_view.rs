@@ -29,7 +29,6 @@ const RADII: [BarRadius; 5] = [
     BarRadius::Lg,
     BarRadius::Xl,
 ];
-const IMAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "avif"];
 
 async fn pick_folder() -> anyhow::Result<Option<PathBuf>> {
     let files = ashpd::desktop::file_chooser::SelectedFiles::open_file()
@@ -71,6 +70,9 @@ fn percent_decode_path(uri: &str) -> PathBuf {
 fn load_thumb(path: PathBuf) -> Option<Arc<RenderImage>> {
     crate::imaging::decode_thumbnail(&path, 240, 160).map(Arc::new)
 }
+
+/// The rotation choices the backgrounds page offers: off, or minutes.
+const ROTATIONS: [u32; 4] = [0, 10, 30, 60];
 
 /// Spawn one power command: the idle.rs pattern, fire and forget.
 fn power_action(
@@ -1296,24 +1298,7 @@ impl SettingsView {
     fn backgrounds_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let background = self.settings.read(cx).background.clone();
         let mut entries = vec![("default".to_string(), crate::settings::default_wallpaper())];
-        if let Ok(folder) = std::fs::read_dir(&background.folder) {
-            let mut files: Vec<(String, PathBuf)> = folder
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .filter(|path| {
-                    path.is_file()
-                        && path.extension().is_some_and(|ext| {
-                            IMAGE_EXTENSIONS
-                                .contains(&ext.to_string_lossy().to_lowercase().as_str())
-                        })
-                })
-                .filter_map(|path| {
-                    let name = path.file_name()?.to_string_lossy().to_string();
-                    Some((name, path))
-                })
-                .collect();
-            files.sort();
-            entries.extend(files);
-        }
+        entries.extend(crate::settings::background_images(&background.folder));
 
         for (_, path) in entries.clone() {
             self.ensure_thumb(path, cx);
@@ -1393,6 +1378,23 @@ impl SettingsView {
                         ),
                 ),
             )
+            .child(kit::setting_row(
+                "Rotate",
+                self.segmented(
+                    "rotate",
+                    &ROTATIONS,
+                    background.rotate_minutes,
+                    |minutes| {
+                        if minutes == 0 {
+                            "Off".to_string()
+                        } else {
+                            format!("{minutes} min")
+                        }
+                    },
+                    |settings, minutes, cx| settings.set_background_rotate(minutes, cx),
+                    cx,
+                ),
+            ))
             .child(
                 div().id("gallery").grid().grid_cols(3).gap_2().children(
                     entries

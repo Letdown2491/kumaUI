@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{Context, Entity, ObjectFit, Render, RenderImage, Window, div, img, prelude::*, rgb};
+use gpui::{App, AppContext, Context, Entity, ObjectFit, Render, RenderImage, Window, div, img, prelude::*, rgb};
 
-use crate::settings::Settings;
+use crate::settings::{Settings, background_images, next_background};
+use std::time::{Duration, Instant};
 
 pub struct WallpaperView {
     settings: Entity<Settings>,
@@ -20,6 +21,47 @@ impl WallpaperView {
             shown: None,
         }
     }
+}
+
+/// The rotation runner: when `rotate_minutes` is on, walk the folder's
+/// images on that cadence by writing the next name through the
+/// settings mutator; the wallpaper surface re-renders from the change,
+/// and the config round-trip keeps the shown wallpaper across
+/// restarts. A slow 30s tick reads the interval each time, so a
+/// settings change applies without re-minting the loop; an interval
+/// of 0 rests, and turning it on starts from the next tick.
+pub fn run(settings: &Entity<Settings>, cx: &mut App) {
+    let settings = settings.clone();
+    cx.spawn(async move |cx| {
+        let mut last_rotate: Option<Instant> = None;
+        loop {
+            cx.background_executor().timer(Duration::from_secs(30)).await;
+            let minutes = cx.update(|cx| settings.read(cx).background.rotate_minutes);
+            let Some(minutes) = u64::from(minutes).checked_sub(1) else {
+                // off: a fresh interval starts from the next tick
+                continue;
+            };
+            let due = last_rotate
+                .map(|at| at.elapsed() >= Duration::from_secs((minutes + 1) * 60))
+                .unwrap_or(true);
+            if !due {
+                continue;
+            }
+            last_rotate = Some(Instant::now());
+            let next = cx.update(|cx| {
+                settings.update(cx, |settings, _| {
+                    let entries = background_images(&settings.background.folder);
+                    next_background(&entries, &settings.background.current)
+                })
+            });
+            if let Some(next) = next {
+                cx.update(|cx| {
+                    settings.update(cx, |settings, cx| settings.set_background(next, cx))
+                });
+            }
+        }
+    })
+    .detach();
 }
 
 impl Render for WallpaperView {

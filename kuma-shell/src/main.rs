@@ -43,6 +43,8 @@ fn main() {
 
             let settings = cx.new(|_| Settings::load());
 
+            kuma_shell::wallpaper::run(&settings, cx);
+
             let sysmon = cx.new(|_| SysMon::default());
             kuma_shell::sysmon::run(&sysmon, &settings, cx);
 
