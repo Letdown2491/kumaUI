@@ -536,16 +536,16 @@ impl ShellBar {
                 )
                 .into_any_element()
             }),
-            WidgetKind::Disk => sysmon.disk.map(|disk| {
+            WidgetKind::Disk => sysmon.disk.clone().map(|disk| {
                 sys_widget(
                     widget.kind,
                     widget.mode,
                     Some(format!("Disk {}%", disk.percent)),
                     if disk.percent >= 90 { URGENT } else { TEXT },
-                    move |sysmon: &SysMon, _| match sysmon.disk {
+                    move |sysmon: &SysMon, _| match sysmon.disk.clone() {
                         Some(disk) => format!(
                             "{}: {:.0} GiB of {:.0} GiB used",
-                            sysmon.disk_mount.display(),
+                            disk.mount,
                             disk.used_mib as f32 / 1024.,
                             disk.total_mib as f32 / 1024.
                         )

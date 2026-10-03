@@ -46,12 +46,14 @@ pub struct Ram {
 }
 
 /// A mount's disk state: usage percent for the widget's text, the
-/// absolute pair for its tooltip.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// absolute pair for its tooltip, and the mount actually measured
+/// (a virtual configured mount resolves to the data mount under it).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Disk {
     pub percent: u8,
     pub used_mib: u64,
     pub total_mib: u64,
+    pub mount: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -659,7 +661,7 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
                     sysmon.cpu = snapshot.cpu;
                     sysmon.ram = snapshot.ram;
                     sysmon.temp = snapshot.temp;
-                    sysmon.disk = snapshot.disk;
+                    sysmon.disk = snapshot.disk.clone();
                     sysmon.bluetooth = snapshot.bluetooth.clone();
                     sysmon.network = snapshot.network.clone();
                     sysmon.power_profile = snapshot.power_profile;
@@ -1220,7 +1222,85 @@ fn read_milli_degrees(path: &std::path::Path) -> Option<u32> {
 /// A mount's disk usage from statvfs: the percent is the df number,
 /// used over (used plus the user's available), so the reserved-root
 /// blocks don't make a full-feeling disk read two-thirds.
+///
+/// Atomic distros mount the root at a virtual filesystem (composefs,
+/// overlay) whose statvfs numbers describe the deployment image, not
+/// the disk under it; a virtual mount walks the data mounts that back
+/// it (/var, then /sysroot) instead. A traditional distro's root is a
+/// real filesystem and reads directly, so one path serves both.
 fn read_disk(mount: &std::path::Path) -> Option<Disk> {
+    let real = |path: &std::path::Path| -> Option<Disk> {
+        match mount_fstype(path) {
+            Some(fstype) if !is_virtual_fs(&fstype) => statvfs_disk(path).map(|disk| Disk {
+                mount: path.display().to_string(),
+                ..disk
+            }),
+            _ => None,
+        }
+    };
+    real(mount)
+        .or_else(|| real(std::path::Path::new("/var")))
+        .or_else(|| real(std::path::Path::new("/sysroot")))
+}
+
+/// Filesystems whose statvfs doesn't describe a disk the user fills:
+/// the atomic root views and the kernel's own trees.
+fn is_virtual_fs(fstype: &str) -> bool {
+    matches!(
+        fstype,
+        "composefs" | "overlay" | "squashfs" | "tmpfs" | "ramfs" | "devtmpfs" | "proc" | "sysfs"
+            | "cgroup2" | "bpf" | "tracefs" | "debugfs" | "securityfs" | "pstore" | "mqueue"
+            | "hugetlbfs" | "efivarfs" | "configfs" | "autofs" | "binfmt_misc"
+    )
+}
+
+/// The filesystem type of the deepest entry in /proc/mounts whose
+/// mount point contains the path. No /proc/mounts, no answer.
+fn mount_fstype(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string("/proc/mounts").ok()?;
+    mount_fstype_of(&text, &path.to_string_lossy())
+}
+
+fn mount_fstype_of(mounts: &str, path: &str) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let _device = fields.next()?;
+        let point = fields.next()?;
+        let fstype = fields.next()?;
+        let point = unescape_mount_path(point);
+        let covers = point == "/"
+            || (path.starts_with(&point)
+                && (path.len() == point.len() || path[point.len()..].starts_with('/')));
+        // equal depth: the later entry shadowed the earlier one
+        if covers && best.as_ref().map_or(true, |(len, _)| point.len() >= *len) {
+            best = Some((point.len(), fstype.to_string()));
+        }
+    }
+    best.map(|(_, fstype)| fstype)
+}
+
+/// /proc/mounts escapes spaces (and friends) in mount points as
+/// backslash-octal; decode the common case.
+fn unescape_mount_path(point: &str) -> String {
+    let bytes = point.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            if let Ok(value) = u8::from_str_radix(&point[i + 1..i + 4], 8) {
+                out.push(value);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn statvfs_disk(mount: &std::path::Path) -> Option<Disk> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(mount.as_os_str().as_bytes()).ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -1248,6 +1328,8 @@ fn parse_statvfs(frsize: u64, blocks: u64, bfree: u64, bavail: u64) -> Option<Di
         percent: ((used_mib * 100) / denominator) as u8,
         used_mib,
         total_mib,
+        // the caller names the mount it actually read
+        mount: String::new(),
     })
 }
 
@@ -1358,6 +1440,39 @@ mod tests {
         assert_eq!(disk.percent, 55);
         // a zero-block filesystem is no disk at all
         assert!(parse_statvfs(4096, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn virtual_filesystems_are_denied_the_disk_widget() {
+        // the atomic root views and the kernel's trees
+        for fstype in ["composefs", "overlay", "squashfs", "tmpfs", "proc"] {
+            assert!(is_virtual_fs(fstype), "{fstype} should be virtual");
+        }
+        for fstype in ["ext4", "btrfs", "xfs", "zfs"] {
+            assert!(!is_virtual_fs(fstype), "{fstype} should be real");
+        }
+    }
+
+    #[test]
+    fn the_deepest_mount_names_the_fstype() {
+        let mounts = "composefs / overlay ro\n\
+                      /dev/sda1 / btrfs ro\n\
+                      /dev/sda1 /var btrfs rw\n\
+                      /dev/sda2 /var/home ext4 rw\n";
+        assert_eq!(
+            mount_fstype_of(mounts, "/var/home/martin").as_deref(),
+            Some("ext4")
+        );
+        assert_eq!(mount_fstype_of(mounts, "/var").as_deref(), Some("btrfs"));
+        assert_eq!(mount_fstype_of(mounts, "/etc").as_deref(), Some("btrfs"));
+        // paths the table covers, answers for; a stranger has none
+        assert_eq!(mount_fstype_of("", "/var"), None);
+    }
+
+    #[test]
+    fn escaped_mount_points_decode() {
+        assert_eq!(unescape_mount_path("/mnt/my\\040disk"), "/mnt/my disk");
+        assert_eq!(unescape_mount_path("/plain"), "/plain");
     }
 
     #[test]
