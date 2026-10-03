@@ -547,18 +547,19 @@ impl SettingsView {
             .when_some(profile, |el, _| {
                 el.child(kit::setting_row("Power profile", profile_segmented))
             })
-            .child(self.quiet_section(cx))
+            .child(self.dnd_section(cx))
             .child(self.power_section(cx))
     }
 
-    /// The quiet-hours card: a schedule toggle (first switch-on seeds
-    /// 22 to 7), the two end fields, and the urgent pass-through. The
-    /// fields reuse the idle page's numeric-edit machinery, committed
-    /// by Enter or a click anywhere.
-    fn quiet_section(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+    /// The DND card: the manual toggle, and the quiet-hours schedule
+    /// tucked beneath it (a schedule toggle that seeds 22 to 7 on
+    /// first switch-on, the two end fields, and the urgent
+    /// pass-through). The fields reuse the numeric-edit machinery,
+    /// committed by Enter or a click anywhere.
+    fn dnd_section(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let notifications = self.settings.read(cx).notifications;
-        let enabled =
-            notifications.quiet_from.is_some() && notifications.quiet_to.is_some();
+        let dnd = notifications.dnd;
+        let enabled = notifications.quiet_from.is_some() && notifications.quiet_to.is_some();
         let from_row = self.quiet_time_row(
             "quiet-from",
             "From",
@@ -574,29 +575,40 @@ impl SettingsView {
             cx,
         );
         let settings = self.settings.clone();
-        kit::card("quick-quiet")
-            .child(kit::card_title("Quiet hours"))
-            .child(kit::card_note(
-                "Holds do not disturb on between the two hours; a manual toggle inside the window holds until the next boundary.",
-            ))
+        kit::card("quick-dnd")
             .child(crate::controls::toggle_row(
-                "toggle-quiet",
-                "icons/moon.svg",
-                "Schedule quiet hours",
-                enabled,
+                "toggle-dnd",
+                "icons/bell.svg",
+                "Do not disturb",
+                dnd,
                 move |_, _, cx| {
                     settings.update(cx, |settings, cx| {
-                        let on = !(settings.notifications.quiet_from.is_some()
-                            && settings.notifications.quiet_to.is_some());
-                        let (from, to) = if on {
-                            (Some(22), Some(7))
-                        } else {
-                            (None, None)
-                        };
-                        settings.set_quiet_hours(from, to, cx);
+                        let dnd = !settings.notifications.dnd;
+                        settings.set_notifications_dnd(dnd, cx);
                     });
                 },
             ))
+            .child({
+                let settings = self.settings.clone();
+                crate::controls::toggle_row(
+                    "toggle-quiet",
+                    "icons/moon.svg",
+                    "Schedule quiet hours",
+                    enabled,
+                    move |_, _, cx| {
+                        settings.update(cx, |settings, cx| {
+                            let on = !(settings.notifications.quiet_from.is_some()
+                                && settings.notifications.quiet_to.is_some());
+                            let (from, to) = if on {
+                                (Some(22), Some(7))
+                            } else {
+                                (None, None)
+                            };
+                            settings.set_quiet_hours(from, to, cx);
+                        });
+                    },
+                )
+            })
             .when(enabled, |el| {
                 el.child(from_row)
                     .child(to_row)
