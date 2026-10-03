@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
@@ -12,6 +13,7 @@ use smol::channel::{Receiver, Sender, unbounded};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedValue, Str};
 
+use crate::imaging::IconImage;
 use crate::settings::Settings;
 
 const OBJECT_PATH: &str = "/org/freedesktop/Notifications";
@@ -245,7 +247,9 @@ impl NotificationState {
         notification.id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.notifications
             .retain(|existing| existing.id != notification.id);
-        insert_notification(&mut self.notifications, notification, MAX_HISTORY);
+        for evicted in insert_notification(&mut self.notifications, notification, MAX_HISTORY) {
+            Self::drop_icon(&evicted.icon, cx);
+        }
         self.unread += 1;
         cx.notify();
         let id = self.notifications[0].id;
@@ -258,9 +262,26 @@ impl NotificationState {
         match event {
             DaemonEvent::Notify(notification) => {
                 // a replace removes the old entry and keeps the id
+                let previous = self
+                    .notifications
+                    .iter()
+                    .find(|existing| existing.id == notification.id)
+                    .map(|existing| existing.icon.clone());
                 self.notifications
                     .retain(|existing| existing.id != notification.id);
-                insert_notification(&mut self.notifications, notification, MAX_HISTORY);
+                for evicted in
+                    insert_notification(&mut self.notifications, notification, MAX_HISTORY)
+                {
+                    Self::drop_icon(&evicted.icon, cx);
+                }
+                // a replaced entry's icon must not pin its atlas slot
+                // unless the replacement carries the same image
+                if let Some(previous) = previous {
+                    let replacement = self.notifications.first().and_then(|n| n.icon.clone());
+                    if !same_raster(&previous, &replacement) {
+                        Self::drop_icon(&previous, cx);
+                    }
+                }
                 self.unread += 1;
                 cx.notify();
                 let id = self.notifications[0].id;
@@ -281,12 +302,15 @@ impl NotificationState {
             return;
         };
         let already_closed = self.notifications[index].closed;
-        self.notifications.remove(index);
+        let removed = self.notifications.remove(index);
         self.unread = self.unread.saturating_sub(1);
         cx.notify();
         if !already_closed {
             let _ = self.signals.try_send(SignalOut::Closed(id, reason));
         }
+        // the entry is gone from everywhere that matters (the toast for
+        // it closes just below), so its atlas tiles can go too
+        Self::drop_icon(&removed.icon, cx);
         self.close_toast_if(id, cx);
     }
 
@@ -326,7 +350,9 @@ impl NotificationState {
     /// Drop the whole history (the panel's clear button).
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         if !self.notifications.is_empty() {
-            self.notifications.clear();
+            for notification in self.notifications.drain(..) {
+                Self::drop_icon(&notification.icon, cx);
+            }
             self.unread = 0;
             cx.notify();
         }
@@ -383,6 +409,17 @@ impl NotificationState {
         }
     }
 
+    /// Free an icon's atlas tiles. The `img` element never drops the
+    /// tile it paints, so a notification's icon would otherwise pin its
+    /// slot in the polychrome atlas forever: the atlas grows a new page
+    /// once full, and on a real session those pages are what the
+    /// suspend cycle swaps out.
+    fn drop_icon(icon: &Option<IconImage>, cx: &mut Context<Self>) {
+        if let Some(IconImage::Raster(image)) = icon {
+            cx.drop_image(image.clone(), None);
+        }
+    }
+
     /// Close the toast if it's showing this notification.
     fn close_toast_if(&mut self, id: u32, cx: &mut Context<Self>) {
         if self
@@ -396,10 +433,25 @@ impl NotificationState {
 }
 
 /// Newest first, capped: pure list surgery, testable without a context.
-fn insert_notification(list: &mut Vec<Notification>, notification: Notification, cap: usize) {
+/// Returns the entries the cap pushed out, whose icons the caller must
+/// drop from the atlas.
+fn insert_notification(
+    list: &mut Vec<Notification>,
+    notification: Notification,
+    cap: usize,
+) -> Vec<Notification> {
     list.insert(0, notification);
     if list.len() > cap {
-        list.truncate(cap);
+        return list.split_off(cap);
+    }
+    Vec::new()
+}
+
+/// Whether two icon slots hold the same decoded image.
+fn same_raster(a: &Option<IconImage>, b: &Option<IconImage>) -> bool {
+    match (a, b) {
+        (Some(IconImage::Raster(a)), Some(IconImage::Raster(b))) => Arc::ptr_eq(a, b),
+        _ => false,
     }
 }
 
@@ -542,13 +594,42 @@ mod tests {
     #[test]
     fn history_is_newest_first_and_capped() {
         let mut list = Vec::new();
+        let mut evicted_all = Vec::new();
         for id in 1..=60 {
-            insert_notification(&mut list, notification(id), 50);
+            evicted_all.extend(insert_notification(&mut list, notification(id), 50));
         }
         // newest first, and the 50 newest survived
         assert_eq!(list.len(), 50);
         assert_eq!(list[0].id, 60);
         assert_eq!(list.last().unwrap().id, 11);
+        // the 10 oldest were pushed out, oldest first: their icons are
+        // what the caller must drop from the atlas
+        let mut evicted_ids: Vec<u32> = evicted_all.iter().map(|n| n.id).collect();
+        evicted_ids.sort_unstable();
+        assert_eq!(evicted_ids, (1..=10).collect::<Vec<u32>>());
+        // at the cap, insertion pushes out exactly the oldest
+        let evicted = insert_notification(&mut list, notification(61), 50);
+        assert_eq!(evicted.iter().map(|n| n.id).collect::<Vec<u32>>(), [11]);
+        assert_eq!(list[0].id, 61);
+        assert_eq!(list.len(), 50);
+    }
+
+    #[test]
+    fn same_raster_compares_by_pointer() {
+        fn render_image() -> std::sync::Arc<gpui::RenderImage> {
+            std::sync::Arc::new(gpui::RenderImage::new(smallvec::smallvec![image::Frame::new(
+                image::RgbaImage::new(1, 1)
+            )]))
+        }
+        let image = render_image();
+        let raster = Some(IconImage::Raster(image.clone()));
+        // the same Arc is the same image, clones included
+        assert!(same_raster(&raster, &Some(IconImage::Raster(image.clone()))));
+        // a distinct image is not
+        let other = Some(IconImage::Raster(render_image()));
+        assert!(!same_raster(&raster, &other));
+        // nothing matches nothing
+        assert!(!same_raster(&None, &None));
     }
 
     #[test]

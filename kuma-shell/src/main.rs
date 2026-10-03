@@ -99,6 +99,23 @@ fn main() {
             kuma_shell::surfaces::ensure(cx);
             kuma_shell::surfaces::watch(cx);
 
+            // Hand freed heap back to the OS on a slow cadence. glibc's
+            // per-thread arenas never shrink on their own: weeks of panel
+            // and toast churn leave every page a session ever touched
+            // mapped, and each suspend cycle swaps the lot out for good.
+            // malloc_trim(0) walks all arenas and madvises the free ones
+            // away; it is cheap when there is nothing to release.
+            let background = cx.background_executor().clone();
+            cx.background_spawn(async move {
+                loop {
+                    background.timer(std::time::Duration::from_secs(30)).await;
+                    // SAFETY: malloc_trim takes the arena locks itself
+                    // and only madvises pages nothing can reach.
+                    unsafe { libc::malloc_trim(0) };
+                }
+            })
+            .detach();
+
             cx.spawn(async move |cx| {
                 while let Ok(request) = bar_toggle_rx.recv().await {
                     log::info!("msg: {request:?}");
