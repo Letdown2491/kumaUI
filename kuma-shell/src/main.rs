@@ -278,7 +278,7 @@ fn run_cli(args: &[String]) -> i32 {
                 eprintln!("usage: kuma-shell msg workspace <1-based workspace number>");
                 return 1;
             };
-            kuma_shell::niri::focus_workspace_index(number)
+            kuma_shell::session::focus_workspace_index(number)
         }
         other => {
             eprintln!("kuma-shell: unknown command {other:?}");

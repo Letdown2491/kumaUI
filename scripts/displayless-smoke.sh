@@ -143,4 +143,46 @@ busctl --user status org.freedesktop.Notifications >/dev/null 2>&1 \
 	|| fail "bus name lost across the hotplug cycle"
 pass "still owns org.freedesktop.Notifications"
 
+# the session mirror: the sway adapter detected at startup, feeding the
+# neutral session state the widgets read. The startup detection and the
+# first snapshot land in the log's first seconds, hence no marker.
+grep -q "session: sway compositor detected" /tmp/kuma-shell.log \
+	|| fail "the sway adapter was not detected at startup"
+pass "sway adapter detected"
+
+echo "--- session" >>/tmp/kuma-shell.log
+swaymsg workspace 2 >/dev/null
+# sway destroys the workspace left behind and mints a fresh node, so the
+# count need not move; what must hold is parity: sway says workspace
+# number 2 holds focus, and the mirror reports that workspace's exact
+# node id
+[ "$(swaymsg -t get_workspaces | jq -r '[.[] | select(.focused)][0].num')" = "2" ] \
+	|| fail "sway did not focus workspace 2"
+focused_id="$(swaymsg -t get_workspaces | jq -r '[.[] | select(.focused)][0].id')"
+await_log "session" "focused ${focused_id})" 20 \
+	|| { tail -20 /tmp/kuma-shell.log; fail "the mirror did not see the workspace switch"; }
+# the command path rides the same seam: the msg CLI's workspace verb
+# asks sway to focus, and the mirror reports the switch back
+echo "--- msg" >>/tmp/kuma-shell.log
+"$SHELL_BIN" msg workspace 3 >/dev/null 2>&1 \
+	|| fail "msg workspace failed over the sway adapter"
+[ "$(swaymsg -t get_workspaces | jq -r '[.[] | select(.focused)][0].num')" = "3" ] \
+	|| fail "sway says workspace 3 is not the focused one"
+focused_id="$(swaymsg -t get_workspaces | jq -r '[.[] | select(.focused)][0].id')"
+await_log "msg" "focused ${focused_id})" 20 \
+	|| { tail -20 /tmp/kuma-shell.log; fail "msg workspace did not reach the mirror"; }
+pass "workspace mirror and command path work on sway"
+
+# a real toplevel: open one, watch the mirror, close it, watch again.
+# foot is spawned directly (swaymsg exec's children are unreliable in
+# here) and killed by criteria (kill hits whatever holds focus)
+echo "--- window" >>/tmp/kuma-shell.log
+foot -e sh -c 'sleep 60' >/dev/null 2>&1 &
+await_log "window" "windows 1 (focused " 20 \
+	|| { tail -20 /tmp/kuma-shell.log; fail "the mirror did not see the window open"; }
+swaymsg '[app_id=foot] kill' >/dev/null 2>&1
+await_log "window" "windows 0 (focused none)" 20 \
+	|| { tail -20 /tmp/kuma-shell.log; fail "the mirror did not see the window close"; }
+pass "window mirror tracks open and close on sway"
+
 echo "displayless smoke: all green"

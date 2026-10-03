@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use gpui::{App, AppContext, Entity};
+use gpui::{App, Entity};
 use log::debug;
 use serde::Deserialize;
 
@@ -99,6 +99,7 @@ impl SessionState {
     }
 
     pub(crate) fn apply(&mut self, event: SessionEvent) {
+        let before = self.summary();
         match event {
             SessionEvent::Workspaces(workspaces) => self.workspaces = workspaces,
             SessionEvent::WorkspaceActivated { id, focused } => {
@@ -141,6 +142,34 @@ impl SessionState {
             }
             SessionEvent::WindowFocusChanged(id) => self.focused_window = id,
         }
+        // transition-only: the mirror's own telemetry, and the smoke's
+        // assertion surface. A summary that kept logging would spam
+        // every alt-tab; a summary that never logs leaves nothing to
+        // diagnose a dead adapter with.
+        let after = self.summary();
+        if after != before {
+            log::info!(
+                "session: workspaces {} (focused {}), windows {} (focused {})",
+                after.0,
+                after.1.map(|id| id.to_string()).unwrap_or_else(|| "none".into()),
+                after.2,
+                after.3.map(|id| id.to_string()).unwrap_or_else(|| "none".into()),
+            );
+        }
+    }
+
+    /// (workspace count, focused workspace id, window count, focused
+    /// window id): what changed between two applies.
+    fn summary(&self) -> (usize, Option<u64>, usize, Option<u64>) {
+        (
+            self.workspaces.len(),
+            self.workspaces
+                .iter()
+                .find(|workspace| workspace.is_focused)
+                .map(|workspace| workspace.id),
+            self.windows.len(),
+            self.focused_window,
+        )
     }
 }
 
@@ -150,7 +179,11 @@ impl SessionState {
 /// session-fed widgets hide rather than render stale data.
 pub fn connect(state: &Entity<SessionState>, cx: &mut App) {
     if crate::niri::socket_path().is_ok() {
+        log::info!("session: niri compositor detected");
         crate::niri::connect(state, cx);
+    } else if crate::sway::socket_path().is_ok() {
+        log::info!("session: sway compositor detected");
+        crate::sway::connect(state, cx);
     } else {
         debug!("no compositor session source found; session widgets stay empty");
     }
@@ -158,18 +191,30 @@ pub fn connect(state: &Entity<SessionState>, cx: &mut App) {
 
 /// Focus a workspace by its internal id: the bar's click action.
 pub fn focus_workspace(id: u64) -> Result<()> {
-    crate::niri::focus_workspace(id)
+    if crate::niri::socket_path().is_ok() {
+        crate::niri::focus_workspace(id)
+    } else {
+        crate::sway::focus_workspace(id)
+    }
 }
 
 /// Focus a workspace by its 1-based number: the MSG CLI path, where the
 /// human (or keybind) speaks in workspace numbers, not internal ids.
 pub fn focus_workspace_index(index: u32) -> Result<()> {
-    crate::niri::focus_workspace_index(index)
+    if crate::niri::socket_path().is_ok() {
+        crate::niri::focus_workspace_index(index)
+    } else {
+        crate::sway::focus_workspace_index(index)
+    }
 }
 
 /// Focus one window: the dock's click action.
 pub fn focus_window(id: u64) -> Result<()> {
-    crate::niri::focus_window(id)
+    if crate::niri::socket_path().is_ok() {
+        crate::niri::focus_window(id)
+    } else {
+        crate::sway::focus_window(id)
+    }
 }
 
 #[cfg(test)]
