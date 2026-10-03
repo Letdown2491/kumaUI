@@ -176,6 +176,7 @@ struct DragState {
 enum Drag {
     Brightness,
     Volume,
+    Mic,
 }
 
 /// Which idle field the idle page is editing.
@@ -310,6 +311,7 @@ impl SettingsView {
     fn quick_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let sysmon = self.sysmon.read(cx);
         let volume = sysmon.volume;
+        let mic = sysmon.mic;
         let brightness = sysmon.brightness;
         let wifi = sysmon.network.as_ref().map(|network| network.wifi_enabled);
         let bluetooth = sysmon.bluetooth.as_ref().map(|bluetooth| bluetooth.enabled);
@@ -392,6 +394,56 @@ impl SettingsView {
             })
         });
 
+        let mic_row = mic.map(|mic| {
+            let track = crate::controls::track_stash();
+            let muted = mic.muted;
+            crate::controls::slider_row(
+                "icons/mic.svg",
+                if muted { URGENT } else { TEXT },
+                mic.percent,
+                crate::controls::slider_track(mic.percent, track.clone()),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.dragging = Some(DragState {
+                        which: Drag::Mic,
+                        track: track.clone(),
+                    });
+                    if let Some(percent) = track
+                        .get()
+                        .and_then(|bounds| crate::controls::value_at(event.position.x, bounds))
+                    {
+                        this.sysmon
+                            .update(cx, |sysmon, cx| sysmon.request_set_mic_volume(percent, cx));
+                    }
+                }),
+            )
+            .child(if muted {
+                kit::button(
+                    "mic-toggle",
+                    "Unmute",
+                    Some("icons/mic.svg"),
+                    ButtonVariant::Ghost,
+                    cx.listener(|this, _, _, cx| {
+                        this.sysmon
+                            .update(cx, |sysmon, cx| sysmon.request_mic_toggle(cx));
+                    }),
+                )
+            } else {
+                kit::button(
+                    "mic-toggle",
+                    "Mute",
+                    Some("icons/x.svg"),
+                    ButtonVariant::Ghost,
+                    cx.listener(|this, _, _, cx| {
+                        this.sysmon
+                            .update(cx, |sysmon, cx| sysmon.request_mic_toggle(cx));
+                    }),
+                )
+            })
+        });
+
         let profile_segmented = self.segmented(
             "power-profile",
             &crate::sysmon::PROFILES,
@@ -423,6 +475,7 @@ impl SettingsView {
                     this.sysmon.update(cx, |sysmon, cx| match which {
                         Drag::Brightness => sysmon.request_set_brightness(percent, cx),
                         Drag::Volume => sysmon.request_set_volume(percent, cx),
+                        Drag::Mic => sysmon.request_set_mic_volume(percent, cx),
                     });
                 }
             }))
@@ -432,16 +485,20 @@ impl SettingsView {
                     this.dragging = None;
                 }),
             )
-            .when(brightness.is_some() || volume.is_some(), |el| {
-                el.child(
-                    // the sliders live in one card so the quick page reads
-                    // as a stack of cards, the toggles are cards of their
-                    // own; skipped outright when there is nothing to slide
-                    kit::card("quick-sliders")
-                        .when_some(brightness_row, |el, row| el.child(row))
-                        .when_some(volume_row, |el, row| el.child(row)),
-                )
-            })
+            .when(
+                brightness.is_some() || volume.is_some() || mic.is_some(),
+                |el| {
+                    el.child(
+                        // the sliders live in one card so the quick page reads
+                        // as a stack of cards, the toggles are cards of their
+                        // own; skipped outright when there is nothing to slide
+                        kit::card("quick-sliders")
+                            .when_some(brightness_row, |el, row| el.child(row))
+                            .when_some(volume_row, |el, row| el.child(row))
+                            .when_some(mic_row, |el, row| el.child(row)),
+                    )
+                },
+            )
             .when_some(wifi, |el, enabled| {
                 el.child(crate::controls::toggle_row(
                     "toggle-wifi",
