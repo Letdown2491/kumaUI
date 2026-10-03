@@ -528,20 +528,20 @@ impl SettingsView {
                     }),
                 ))
             })
+            .child(self.dnd_section(cx))
             .when_some(profile, |el, _| {
                 el.child(kit::setting_row("Power profile", profile_segmented))
             })
-            .child(self.dnd_section(cx))
             .child(self.power_section(cx))
     }
 
-    /// The DND section: the manual toggle, and the quiet-hours
-    /// schedule revealed beneath it (the schedule toggle appears when
-    /// DND is on, the two end fields and the urgent pass-through when
-    /// the schedule is on; first switch-on seeds 22 to 7). The fields
-    /// reuse the numeric-edit machinery, committed by Enter or a
-    /// click anywhere.
-    fn dnd_section(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+    /// The DND section: the manual toggle as its own card like the
+    /// page's other toggles, with the quiet-hours schedule revealed
+    /// beneath it (the schedule toggle appears when DND is on, the
+    /// two end fields and the urgent pass-through when the schedule
+    /// is on; first switch-on seeds 22 to 7). The fields reuse the
+    /// numeric-edit machinery, committed by Enter or a click anywhere.
+    fn dnd_section(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let notifications = self.settings.read(cx).notifications;
         let dnd = notifications.dnd;
         let enabled =
@@ -561,7 +561,10 @@ impl SettingsView {
             cx,
         );
         let settings = self.settings.clone();
-        kit::card("quick-dnd")
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
             .child(crate::controls::toggle_row(
                 "toggle-dnd",
                 "icons/bell.svg",
@@ -643,7 +646,10 @@ impl SettingsView {
             .flex()
             .items_center()
             .gap_2()
-            .py_1()
+            .px_3p5()
+            .py_2p5()
+            .rounded_lg()
+            .bg(rgb(SURFACE))
             .child(
                 div()
                     .flex_1()
