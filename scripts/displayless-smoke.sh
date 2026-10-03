@@ -42,7 +42,11 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 # headless sway has no use for realtime priority anyway
 cp /usr/bin/sway /tmp/sway
 /tmp/sway -c /dev/null >/tmp/sway.log 2>&1 &
-sleep 2
+# the wayland socket appears when sway is listening: poll, don't guess
+for _ in $(seq 10); do
+	[ -n "$(ls "$XDG_RUNTIME_DIR" 2>/dev/null | grep '^wayland-')" ] && break
+	sleep 1
+done
 export WAYLAND_DISPLAY="$(ls "$XDG_RUNTIME_DIR" | grep '^wayland-' | head -1)"
 [ -n "$WAYLAND_DISPLAY" ] || { cat /tmp/sway.log; fail "sway exposed no wayland socket"; }
 # swaymsg does not find the IPC socket on its own in here; hand it over
@@ -87,9 +91,12 @@ shell_pid=$!
 
 # the deliverable: sixty seconds without a working output, alive the
 # whole time, bus name owned. The systemd restart counter would read 0:
-# nothing exited.
-sleep 65
-kill -0 "$shell_pid" 2>/dev/null || { cat /tmp/kuma-shell.log; fail "shell exited while displayless"; }
+# nothing exited. The duration is the contract, so it is not shortened;
+# a shell that dies at second 3 fails at second 3, not at second 60.
+for _ in $(seq 65); do
+	kill -0 "$shell_pid" 2>/dev/null || { cat /tmp/kuma-shell.log; fail "shell exited while displayless"; }
+	sleep 1
+done
 pass "alive after 65s displayless"
 
 busctl --user status org.freedesktop.Notifications >/dev/null 2>&1 \
@@ -104,7 +111,6 @@ pass "missing config.toml failed soft"
 # wallpaper and the bar on it, from nothing
 echo "--- hotplug 1" >>/tmp/kuma-shell.log
 swaymsg create_output >/dev/null
-sleep 2
 kill -0 "$shell_pid" 2>/dev/null || { tail -20 /tmp/kuma-shell.log; fail "shell exited when the output appeared"; }
 await_log "hotplug 1" "surfaces: displays now 1" 20 || fail "the watch did not see the hotplug"
 await_log "hotplug 1" "surfaces: wallpaper opened" 20 \
@@ -119,7 +125,6 @@ pass "surfaces opened when the output appeared"
 opens_before_unplug="$(grep -c 'surfaces: wallpaper opened' /tmp/kuma-shell.log)"
 echo "--- unplug" >>/tmp/kuma-shell.log
 unplug_all_outputs
-sleep 2
 kill -0 "$shell_pid" 2>/dev/null || { tail -20 /tmp/kuma-shell.log; fail "shell exited when the output went away"; }
 await_log "unplug" "surfaces: displays now 0" 20 || fail "displays did not retire on unplug"
 [ "$(grep -c 'surfaces: wallpaper opened' /tmp/kuma-shell.log)" = "$opens_before_unplug" ] \
