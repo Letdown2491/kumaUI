@@ -181,17 +181,20 @@ enum Drag {
     Mic,
 }
 
-/// Which idle field the idle page is editing.
+/// Which field a numeric edit is driving: the idle page's two clocks
+/// and the quick page's quiet-hours ends.
 #[derive(Clone, Copy, PartialEq)]
-enum IdleSlider {
+enum EditField {
     Lock,
     ScreenOff,
+    QuietFrom,
+    QuietTo,
 }
 
 /// An open idle edit: the digits typed so far and the field's focus.
 /// Nothing is written until Enter commits the whole number.
-struct IdleEdit {
-    which: IdleSlider,
+struct NumEdit {
+    which: EditField,
     text: String,
     focus: FocusHandle,
 }
@@ -211,7 +214,7 @@ pub struct SettingsView {
     /// between SysMon's polls
     power_row: Entity<kit::ConfirmActions>,
     /// the idle field being edited, if any
-    idle_edit: Option<IdleEdit>,
+    num_edit: Option<NumEdit>,
 }
 
 impl SettingsView {
@@ -263,7 +266,7 @@ impl SettingsView {
             drop_preview: None,
             thumbs: HashMap::new(),
             power_row,
-            idle_edit: None,
+            num_edit: None,
         }
     }
 
@@ -310,7 +313,7 @@ impl SettingsView {
 
     /// The quick page: sliders and toggles that ride the SysMon request
     /// seams, one click deep from the gear.
-    fn quick_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+    fn quick_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let sysmon = self.sysmon.read(cx);
         let volume = sysmon.volume;
         let mic = sysmon.mic;
@@ -544,7 +547,156 @@ impl SettingsView {
             .when_some(profile, |el, _| {
                 el.child(kit::setting_row("Power profile", profile_segmented))
             })
+            .child(self.quiet_section(cx))
             .child(self.power_section(cx))
+    }
+
+    /// The quiet-hours card: a schedule toggle (first switch-on seeds
+    /// 22 to 7), the two end fields, and the urgent pass-through. The
+    /// fields reuse the idle page's numeric-edit machinery, committed
+    /// by Enter or a click anywhere.
+    fn quiet_section(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let notifications = self.settings.read(cx).notifications;
+        let enabled =
+            notifications.quiet_from.is_some() && notifications.quiet_to.is_some();
+        let from_row = self.quiet_time_row(
+            "quiet-from",
+            "From",
+            EditField::QuietFrom,
+            notifications.quiet_from,
+            cx,
+        );
+        let to_row = self.quiet_time_row(
+            "quiet-to",
+            "To",
+            EditField::QuietTo,
+            notifications.quiet_to,
+            cx,
+        );
+        let settings = self.settings.clone();
+        kit::card("quick-quiet")
+            .child(kit::card_title("Quiet hours"))
+            .child(kit::card_note(
+                "Holds do not disturb on between the two hours; a manual toggle inside the window holds until the next boundary.",
+            ))
+            .child(crate::controls::toggle_row(
+                "toggle-quiet",
+                "icons/moon.svg",
+                "Schedule quiet hours",
+                enabled,
+                move |_, _, cx| {
+                    settings.update(cx, |settings, cx| {
+                        let on = !(settings.notifications.quiet_from.is_some()
+                            && settings.notifications.quiet_to.is_some());
+                        let (from, to) = if on {
+                            (Some(22), Some(7))
+                        } else {
+                            (None, None)
+                        };
+                        settings.set_quiet_hours(from, to, cx);
+                    });
+                },
+            ))
+            .when(enabled, |el| {
+                el.child(from_row)
+                    .child(to_row)
+                    .child({
+                        let settings = self.settings.clone();
+                        crate::controls::toggle_row(
+                            "toggle-quiet-urgent",
+                            "icons/shield-check.svg",
+                            "Let critical through",
+                            notifications.quiet_urgent,
+                            move |_, _, cx| {
+                                settings.update(cx, |settings, cx| {
+                                    let urgent = !settings.notifications.quiet_urgent;
+                                    settings.set_quiet_urgent(urgent, cx);
+                                });
+                            },
+                        )
+                    })
+                    .when(self.num_edit.is_some(), |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(TEXT_DIM))
+                                .child("Enter or click away to apply. Whole hours, 24h."),
+                        )
+                    })
+            })
+    }
+
+    /// One quiet-hours end: the hour as "22:00", click to edit the
+    /// bare hour number, Enter or click-away commits.
+    fn quiet_time_row(
+        &mut self,
+        id: &str,
+        name: &str,
+        which: EditField,
+        hour: Option<u8>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let editing = self.num_edit.as_ref().filter(|edit| edit.which == which);
+        let text = editing.map(|edit| edit.text.clone()).unwrap_or_default();
+        div()
+            .id(SharedString::from(id))
+            .flex()
+            .items_center()
+            .gap_2()
+            .py_1()
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(12.))
+                    .text_color(rgb(TEXT))
+                    .child(name.to_string()),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("{id}-field")))
+                    .when_some(editing.map(|edit| edit.focus.clone()), |el, focus| {
+                        el.track_focus(&focus)
+                            .on_key_down(cx.listener(Self::num_edit_key))
+                    })
+                    .cursor_text()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.num_edit.as_ref().is_some_and(|edit| edit.which == which) {
+                            return;
+                        }
+                        let focus = cx.focus_handle();
+                        focus.focus(window, cx);
+                        this.num_edit = Some(NumEdit {
+                            which,
+                            // seeded with the committed hour, so
+                            // backspace edits what is there
+                            text: hour.map(|h| h.to_string()).unwrap_or_default(),
+                            focus,
+                        });
+                        cx.notify();
+                    }))
+                    .w(px(72.))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(INSET))
+                    .border_1()
+                    .border_color(rgb(if editing.is_some() { ACCENT } else { DIVIDER }))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(if editing.is_some() {
+                                TEXT
+                            } else {
+                                TEXT_DIM
+                            }))
+                            .when(editing.is_some(), |el| el.child(text.clone()))
+                            .when(editing.is_none(), |el| {
+                                el.child(
+                                    hour.map(|h| format!("{h}:00")).unwrap_or_else(|| "Off".into()),
+                                )
+                            }),
+                    ),
+            )
     }
 
     /// The power row: logout, reboot, poweroff, behind the kit's
@@ -738,7 +890,7 @@ impl SettingsView {
             "idle-lock",
             "icons/lock.svg",
             "Lock after",
-            IdleSlider::Lock,
+            EditField::Lock,
             idle.lock_timeout,
             900,
             cx,
@@ -747,7 +899,7 @@ impl SettingsView {
             "idle-screen-off",
             "icons/brightness.svg",
             "Screens off after",
-            IdleSlider::ScreenOff,
+            EditField::ScreenOff,
             idle.screen_off_timeout,
             960,
             cx,
@@ -765,13 +917,13 @@ impl SettingsView {
             // apply, not discard
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.commit_idle_edit(cx)),
+                cx.listener(|this, _, _, cx| this.commit_num_edit(cx)),
             )
             .child(
                 kit::card("idle-timeouts")
                     .child(lock_row)
                     .child(screen_row)
-                    .when(self.idle_edit.is_some(), |el| {
+                    .when(self.num_edit.is_some(), |el| {
                         el.child(
                             div()
                                 .text_size(px(11.))
@@ -819,14 +971,14 @@ impl SettingsView {
         id: &str,
         icon: &'static str,
         name: &str,
-        which: IdleSlider,
+        which: EditField,
         seconds: u64,
         default_seconds: u64,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
         let enabled = seconds > 0;
         let editing = self
-            .idle_edit
+            .num_edit
             .as_ref()
             .filter(|edit| edit.which == which && enabled);
         let text = editing
@@ -860,17 +1012,20 @@ impl SettingsView {
                         // clock at its default
                         settings.update(cx, |settings, cx| {
                             let on = match which {
-                                IdleSlider::Lock => settings.idle.lock_timeout == 0,
-                                IdleSlider::ScreenOff => settings.idle.screen_off_timeout == 0,
+                                EditField::Lock => settings.idle.lock_timeout == 0,
+                                EditField::ScreenOff => settings.idle.screen_off_timeout == 0,
+                                // the quiet ends never pass through here
+                                _ => unreachable!("quiet fields have no idle toggle"),
                             };
                             let seconds = if on { default_seconds } else { 0 };
                             match which {
-                                IdleSlider::Lock => {
+                                EditField::Lock => {
                                     settings.set_idle_lock_timeout(seconds, cx)
                                 }
-                                IdleSlider::ScreenOff => {
+                                EditField::ScreenOff => {
                                     settings.set_idle_screen_off_timeout(seconds, cx)
                                 }
+                                _ => unreachable!("quiet fields have no idle toggle"),
                             }
                         });
                     }),
@@ -880,13 +1035,13 @@ impl SettingsView {
                     .id(SharedString::from(format!("{id}-field")))
                     .when_some(editing.map(|edit| edit.focus.clone()), |el, focus| {
                         el.track_focus(&focus)
-                            .on_key_down(cx.listener(Self::idle_edit_key))
+                            .on_key_down(cx.listener(Self::num_edit_key))
                     })
                     .when(enabled, |el| {
                         el.cursor_text().on_click(cx.listener(
                             move |this, _, window, cx| {
                                 if this
-                                    .idle_edit
+                                    .num_edit
                                     .as_ref()
                                     .is_some_and(|edit| edit.which == which)
                                 {
@@ -894,7 +1049,7 @@ impl SettingsView {
                                 }
                                 let focus = cx.focus_handle();
                                 focus.focus(window, cx);
-                                this.idle_edit = Some(IdleEdit {
+                                this.num_edit = Some(NumEdit {
                                     which,
                                     // seeded with the committed minutes,
                                     // so backspace edits what is there
@@ -937,8 +1092,8 @@ impl SettingsView {
 
     /// Commit the open idle edit, if any: the digits are minutes, the
     /// settings seam gets seconds. An unparsable field reverts.
-    fn commit_idle_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.idle_edit.take() else {
+    fn commit_num_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.num_edit.take() else {
             return;
         };
         let Ok(minutes) = edit.text.trim().parse::<u64>() else {
@@ -948,14 +1103,32 @@ impl SettingsView {
         let seconds = minutes * 60;
         let which = edit.which;
         self.settings.update(cx, |settings, cx| match which {
-            IdleSlider::Lock => settings.set_idle_lock_timeout(seconds, cx),
-            IdleSlider::ScreenOff => settings.set_idle_screen_off_timeout(seconds, cx),
+            EditField::Lock => settings.set_idle_lock_timeout(seconds, cx),
+            EditField::ScreenOff => settings.set_idle_screen_off_timeout(seconds, cx),
+            // the quiet ends are hours of the day; anything past 23
+            // (or empty) reverts
+            EditField::QuietFrom | EditField::QuietTo => {
+                // the quiet ends are hours of the day; anything past
+                // 23 (or empty) reverts
+                let Some(hour) =
+                    edit.text.trim().parse::<u8>().ok().filter(|h| *h <= 23)
+                else {
+                    cx.notify();
+                    return;
+                };
+                let s = &settings.notifications;
+                let (from, to) = match which {
+                    EditField::QuietFrom => (Some(hour), s.quiet_to),
+                    _ => (s.quiet_from, Some(hour)),
+                };
+                settings.set_quiet_hours(from, to, cx);
+            }
         });
     }
 
     /// Keys for an open idle edit: digits build the number, Enter
     /// commits, and anything else is ignored while typing.
-    fn idle_edit_key(
+    fn num_edit_key(
         &mut self,
         event: &gpui::KeyDownEvent,
         _window: &mut Window,
@@ -963,10 +1136,10 @@ impl SettingsView {
     ) {
         let key = event.keystroke.key.as_str();
         if key == "enter" {
-            self.commit_idle_edit(cx);
+            self.commit_num_edit(cx);
             return;
         }
-        if let Some(edit) = &mut self.idle_edit {
+        if let Some(edit) = &mut self.num_edit {
             match key {
                 "backspace" => {
                     edit.text.pop();

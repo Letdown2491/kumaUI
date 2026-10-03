@@ -205,6 +205,12 @@ pub struct NotificationState {
     pub unread: usize,
     /// Mirrored from Settings (the source of truth; persisted there).
     pub dnd: bool,
+    /// Whether the quiet-hours window is active right now (recomputed
+    /// on a slow tick and on settings changes).
+    pub scheduled: bool,
+    /// A manual toggle's decision inside an active window: it holds
+    /// until the window boundary re-arms the schedule.
+    manual_override: Option<bool>,
     settings: Entity<Settings>,
     signals: Sender<SignalOut>,
     /// The toast currently on screen, if any: its notification id and window.
@@ -221,18 +227,23 @@ pub struct NotificationState {
 impl NotificationState {
     fn new(settings: Entity<Settings>, signals: Sender<SignalOut>, cx: &mut Context<Self>) -> Self {
         let dnd = settings.read(cx).notifications.dnd;
-        cx.observe(&settings, |this, settings, cx| {
-            let dnd = settings.read(cx).notifications.dnd;
-            if this.dnd != dnd {
-                this.dnd = dnd;
-                cx.notify();
+        let scheduled = {
+            let s = settings.read(cx).notifications;
+            match (s.quiet_from, s.quiet_to) {
+                (Some(from), Some(to)) => {
+                    crate::settings::in_quiet_window(now_minutes(), from, to)
+                }
+                _ => false,
             }
-        })
-        .detach();
+        };
+        cx.observe(&settings, |this, _, cx| this.on_settings(cx))
+            .detach();
         Self {
             notifications: Vec::new(),
             unread: 0,
             dnd,
+            scheduled,
+            manual_override: None,
             settings,
             signals,
             toast: None,
@@ -240,10 +251,67 @@ impl NotificationState {
         }
     }
 
+    /// Settings moved: re-mirror the manual DND value and re-read the
+    /// quiet window (an edit may have crossed a boundary).
+    fn on_settings(&mut self, cx: &mut Context<Self>) {
+        let dnd = self.settings.read(cx).notifications.dnd;
+        if self.dnd != dnd {
+            self.dnd = dnd;
+        }
+        self.evaluate_schedule(cx);
+    }
+
+    /// The DND state that actually gates toasts: inside the quiet
+    /// window it is on unless the manual override says otherwise;
+    /// outside, it is the plain mirrored toggle.
+    pub fn dnd_effective(&self) -> bool {
+        if self.scheduled {
+            self.manual_override.unwrap_or(true)
+        } else {
+            self.dnd
+        }
+    }
+
+    /// Re-read the quiet-hours window from settings; a boundary
+    /// crossing flips `scheduled` and clears any manual override (the
+    /// override's contract is to hold until the next boundary).
+    fn evaluate_schedule(&mut self, cx: &mut Context<Self>) {
+        let scheduled = {
+            let s = self.settings.read(cx).notifications;
+            match (s.quiet_from, s.quiet_to) {
+                (Some(from), Some(to)) => {
+                    crate::settings::in_quiet_window(now_minutes(), from, to)
+                }
+                _ => false,
+            }
+        };
+        if scheduled != self.scheduled {
+            self.scheduled = scheduled;
+            self.manual_override = None;
+            log::info!(
+                "quiet hours {}",
+                if scheduled { "on" } else { "off" }
+            );
+            cx.notify();
+        }
+    }
+
+    /// Whether a notification with this urgency may show its toast:
+    /// DND silences everything except a critical allowed through by
+    /// the quiet-hours pass-through.
+    fn toast_allowed(&self, urgency: Urgency, cx: &Context<Self>) -> bool {
+        if !self.dnd_effective() {
+            return true;
+        }
+        let settings = self.settings.read(cx);
+        settings.notifications.quiet_urgent && urgency == Urgency::Critical
+    }
+
     /// The shell notifying itself: the signer's "asks waiting" nudge and
     /// a failed act's sentence ride the same road a client's Notify call
     /// would: DND, history, and the toast behave identically.
     pub fn push(&mut self, mut notification: Notification, cx: &mut Context<Self>) {
+        let urgency = notification.urgency;
         notification.id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.notifications
             .retain(|existing| existing.id != notification.id);
@@ -253,7 +321,7 @@ impl NotificationState {
         self.unread += 1;
         cx.notify();
         let id = self.notifications[0].id;
-        if !self.dnd {
+        if self.toast_allowed(urgency, cx) {
             self.show_toast(id, cx);
         }
     }
@@ -261,6 +329,7 @@ impl NotificationState {
     fn apply(&mut self, event: DaemonEvent, cx: &mut Context<Self>) {
         match event {
             DaemonEvent::Notify(notification) => {
+                let urgency = notification.urgency;
                 // a replace removes the old entry and keeps the id
                 let previous = self
                     .notifications
@@ -285,7 +354,7 @@ impl NotificationState {
                 self.unread += 1;
                 cx.notify();
                 let id = self.notifications[0].id;
-                if !self.dnd {
+                if self.toast_allowed(urgency, cx) {
                     self.show_toast(id, cx);
                 }
             }
@@ -333,10 +402,18 @@ impl NotificationState {
     }
 
     /// DND rides Settings: the toggle flips it there, this mirrors it.
+    /// Inside the quiet window the flip is an override (held until the
+    /// boundary re-arms the schedule), not a write to the persisted
+    /// manual value.
     pub fn toggle_dnd(&mut self, cx: &mut Context<Self>) {
-        let dnd = !self.dnd;
-        self.settings
-            .update(cx, |settings, cx| settings.set_notifications_dnd(dnd, cx));
+        let dnd = !self.dnd_effective();
+        if self.scheduled {
+            self.manual_override = Some(dnd);
+            cx.notify();
+        } else {
+            self.settings
+                .update(cx, |settings, cx| settings.set_notifications_dnd(dnd, cx));
+        }
     }
 
     /// The panel opened: everything is seen.
@@ -470,6 +547,13 @@ pub fn time_ago(received_at: DateTime<Local>) -> String {
     }
 }
 
+/// Minutes since local midnight: the quiet-hours check's "now".
+fn now_minutes() -> u32 {
+    use chrono::Timelike;
+    let now = Local::now().time();
+    now.hour() * 60 + now.minute()
+}
+
 /// Start the daemon and hand back the state it feeds. The daemon runs on the
 /// background executor; events ride a channel into the app's loop (the
 /// same shape as the niri stream); signal emission rides one back.
@@ -490,6 +574,19 @@ pub fn start(settings: Entity<Settings>, cx: &mut App) -> Entity<NotificationSta
     cx.spawn(async move |cx| {
         while let Ok(event) = events_rx.recv().await {
             let _ = event_state.update(cx, |state, cx| state.apply(event, cx));
+        }
+    })
+    .detach();
+
+    // the quiet-hours clock: a slow tick re-evaluates the window, so a
+    // boundary crossing needs no other excuse to flip the schedule
+    let tick_state = state.clone();
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(30))
+                .await;
+            tick_state.update(cx, |state, cx| state.evaluate_schedule(cx));
         }
     })
     .detach();

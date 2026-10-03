@@ -800,7 +800,7 @@ impl ShellBar {
             WidgetKind::Notifications => {
                 let state = self.notifications.read(cx);
                 let unread = state.unread;
-                let dnd = state.dnd;
+                let dnd = state.dnd_effective();
                 let text = if unread > 0 {
                     Some(unread.to_string())
                 } else {
@@ -817,15 +817,24 @@ impl ShellBar {
                 let notifications = self.notifications.clone();
                 let tooltip = move |_: &SysMon, cx: &App| {
                     let state = notifications.read(cx);
-                    if state.dnd {
+                    let mode = if state.scheduled {
+                        "do not disturb (quiet hours)"
+                    } else if state.dnd {
+                        "do not disturb"
+                    } else {
+                        "on"
+                    };
+                    if state.dnd_effective() {
                         format!(
-                            "Notifications: do not disturb ({} in history)",
+                            "Notifications: {} ({} in history)",
+                            mode,
                             state.notifications.len()
                         )
                         .into()
                     } else {
                         format!(
-                            "Notifications: {} in history, {} unseen",
+                            "Notifications: {} ({} in history, {} unseen)",
+                            mode,
                             state.notifications.len(),
                             state.unread
                         )

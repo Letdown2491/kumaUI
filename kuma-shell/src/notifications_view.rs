@@ -291,7 +291,14 @@ impl NotificationsView {
 impl Render for NotificationsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let notifications: Vec<Notification> = self.state.read(cx).notifications.clone();
-        let dnd = self.state.read(cx).dnd;
+        let state = self.state.read(cx);
+        let dnd = state.dnd_effective();
+        let scheduled = state.scheduled;
+        let dnd_label = if scheduled {
+            "Do not disturb (quiet hours)"
+        } else {
+            "Do not disturb"
+        };
         let list = if notifications.is_empty() {
             kit::empty_state(
                 "icons/bell.svg",
@@ -338,7 +345,7 @@ impl Render for NotificationsView {
             .child(crate::controls::toggle_row(
                 "dnd-toggle",
                 "icons/bell.svg",
-                "Do not disturb",
+                dnd_label,
                 dnd,
                 cx.listener(|this, _, _, cx| {
                     this.state.update(cx, |state, cx| state.toggle_dnd(cx));

@@ -472,10 +472,35 @@ impl Default for IdleSettings {
 
 /// Do-not-disturb: persisted, mirrored into the notification state, and
 /// consulted whenever a notification arrives (no toasts while on).
+/// Quiet hours add a scheduled window during which the state holds DND
+/// on automatically; the hours are whole hours of the day (24h), and a
+/// window that crosses midnight (22 to 7) is the common case.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationSettings {
     pub dnd: bool,
+    /// The quiet window's start hour (0-23); None disables scheduling.
+    pub quiet_from: Option<u8>,
+    /// The quiet window's end hour (0-23); both ends must be set.
+    pub quiet_to: Option<u8>,
+    /// Critical-urgency notifications pass through during quiet hours.
+    pub quiet_urgent: bool,
+}
+
+/// Whether `now` (minutes since midnight) sits inside the quiet window
+/// between the two hours: a same-day window is a straight range, a
+/// midnight-crossing window is the complement, and equal ends mean
+/// always-on.
+pub fn in_quiet_window(now: u32, from: u8, to: u8) -> bool {
+    let (from, to) = (u32::from(from) * 60, u32::from(to) * 60);
+    if from == to {
+        return true;
+    }
+    if from < to {
+        (from..to).contains(&now)
+    } else {
+        now >= from || now < to
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -837,6 +862,17 @@ impl Settings {
         self.commit(cx);
     }
 
+    pub fn set_quiet_hours(&mut self, from: Option<u8>, to: Option<u8>, cx: &mut Context<Self>) {
+        self.notifications.quiet_from = from;
+        self.notifications.quiet_to = to;
+        self.commit(cx);
+    }
+
+    pub fn set_quiet_urgent(&mut self, urgent: bool, cx: &mut Context<Self>) {
+        self.notifications.quiet_urgent = urgent;
+        self.commit(cx);
+    }
+
     pub fn set_dock_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.dock.enabled = enabled;
         self.commit(cx);
@@ -1059,6 +1095,22 @@ mod tests {
         assert_eq!(explicit.idle.lock_timeout, 600);
         assert_eq!(explicit.idle.screen_off_timeout, 0);
         assert!(!explicit.idle.lock_before_suspend);
+    }
+
+    #[test]
+    fn quiet_window_matches_wrap_and_bounds() {
+        // a same-day window is a straight range
+        assert!(in_quiet_window(13 * 60 + 30, 13, 14));
+        assert!(!in_quiet_window(14 * 60, 13, 14));
+        // the common case: 22 to 7 crosses midnight
+        assert!(in_quiet_window(23 * 60, 22, 7));
+        assert!(in_quiet_window(5 * 60, 22, 7));
+        assert!(!in_quiet_window(12 * 60, 22, 7));
+        assert!(!in_quiet_window(21 * 60 + 59, 22, 7));
+        assert!(in_quiet_window(22 * 60, 22, 7));
+        // equal ends mean always-on
+        assert!(in_quiet_window(0, 9, 9));
+        assert!(in_quiet_window(23 * 60 + 59, 9, 9));
     }
 
     #[test]

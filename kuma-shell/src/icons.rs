@@ -26,6 +26,7 @@ impl AssetSource for KumaAssets {
             "icons/widgets.svg" => Some(include_bytes!("../icons/widgets.svg").as_slice()),
             "icons/image.svg" => Some(include_bytes!("../icons/image.svg").as_slice()),
             "icons/shield.svg" => Some(include_bytes!("../icons/shield.svg").as_slice()),
+            "icons/moon.svg" => Some(include_bytes!("../icons/moon.svg").as_slice()),
             "icons/shield-lock.svg" => Some(include_bytes!("../icons/shield-lock.svg").as_slice()),
             "icons/shield-check.svg" => {
                 Some(include_bytes!("../icons/shield-check.svg").as_slice())
