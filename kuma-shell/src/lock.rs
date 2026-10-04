@@ -350,11 +350,11 @@ impl Render for LockView {
                     .items_center()
                     .justify_center()
                     .gap_4()
-                    .child(div().text_size(px(64.)).text_color(rgb(TEXT)).child(time))
+                    .child(div().text_size(px(64.)).text_color(rgb(crate::theme::current().text)).child(time))
                     .child(
                         div()
                             .text_size(px(14.))
-                            .text_color(rgb(TEXT_DIM))
+                            .text_color(rgb(crate::theme::current().text_dim))
                             .child(date),
                     )
                     .child(
@@ -367,14 +367,14 @@ impl Render for LockView {
                             .px_4()
                             .py_2()
                             .rounded_xl()
-                            .bg(rgba(PANEL_BG))
+                            .bg(rgba(crate::theme::current().panel_bg))
                             .border_1()
-                            .border_color(rgb(if message.is_some() { URGENT } else { DIVIDER }))
+                            .border_color(rgb(if message.is_some() { crate::theme::URGENT } else { crate::theme::current().divider }))
                             .text_size(px(13.))
                             .text_color(rgb(if busy || password_len == 0 {
-                                TEXT_DIM
+                                crate::theme::current().text_dim
                             } else {
-                                TEXT
+                                crate::theme::current().text
                             }))
                             .child(field),
                     )
@@ -382,7 +382,7 @@ impl Render for LockView {
                         el.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(URGENT))
+                                .text_color(rgb(crate::theme::URGENT))
                                 .child(message),
                         )
                     }),

@@ -209,9 +209,9 @@ impl Render for SliderPanelView {
                 controls::slider_row(
                     kind.icon(),
                     if muted && kind != SliderKind::Brightness {
-                        URGENT
+                        crate::theme::URGENT
                     } else {
-                        TEXT
+                        crate::theme::current().text
                     },
                     percent,
                     controls::slider_track(percent, stash.clone()),
@@ -264,13 +264,13 @@ impl Render for SliderPanelView {
         // whatever the last poll caught.
         let content = content.when(kind == SliderKind::Volume, |el| {
             let streams = sysmon.streams.clone();
-            el.child(div().mt_1().h(px(1.)).w_full().bg(rgba(DIVIDER_SOFT)))
+            el.child(div().mt_1().h(px(1.)).w_full().bg(rgba(crate::theme::current().divider_soft)))
                 .children(if streams.is_empty() {
                     vec![div()
                         .id("no-streams")
                         .py_1()
                         .text_size(px(11.5))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .child("No apps playing")]
                 } else {
                     streams
@@ -309,7 +309,7 @@ impl Render for SliderPanelView {
                                                 gpui::svg()
                                                     .data(&bytes)
                                                     .size(px(16.))
-                                                    .text_color(rgb(TEXT)),
+                                                    .text_color(rgb(crate::theme::current().text)),
                                             ),
                                         })
                                         .when_none(&icon, |el| {
@@ -317,7 +317,7 @@ impl Render for SliderPanelView {
                                                 gpui::svg()
                                                     .path("icons/volume.svg")
                                                     .size(px(14.))
-                                                    .text_color(rgb(TEXT_DIM)),
+                                                    .text_color(rgb(crate::theme::current().text_dim)),
                                             )
                                         }),
                                 )
@@ -326,7 +326,7 @@ impl Render for SliderPanelView {
                                         .flex_1()
                                         .min_w_0()
                                         .text_size(px(12.))
-                                        .text_color(rgb(TEXT))
+                                        .text_color(rgb(crate::theme::current().text))
                                         .truncate()
                                         .child(label),
                                 )
@@ -335,7 +335,7 @@ impl Render for SliderPanelView {
                                     div()
                                         .w(px(32.))
                                         .text_size(px(11.))
-                                        .text_color(rgb(TEXT_DIM))
+                                        .text_color(rgb(crate::theme::current().text_dim))
                                         .text_align(TextAlign::Right)
                                         .child(format!("{}%", stream.percent)),
                                 )

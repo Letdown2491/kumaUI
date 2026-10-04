@@ -32,7 +32,7 @@ impl WeatherPanelView {
 
     fn current_block(&self, current: &Current, fahrenheit: bool, stale: bool) -> gpui::Div {
         let (condition, icon) = WeatherState::condition(current.code);
-        let color = if stale { TEXT_DIM } else { TEXT };
+        let color = if stale { crate::theme::current().text_dim } else { crate::theme::current().text };
         div()
             .flex()
             .items_center()
@@ -52,7 +52,7 @@ impl WeatherPanelView {
                     .child(
                         div()
                             .text_size(px(12.5))
-                            .text_color(rgb(TEXT_DIM))
+                            .text_color(rgb(crate::theme::current().text_dim))
                             .child(format!(
                                 "Feels like {} / {}",
                                 WeatherState::format_temp(fahrenheit, current.feels_c),
@@ -84,7 +84,7 @@ impl WeatherPanelView {
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(crate::theme::current().text))
                             .child(format!(
                                 "{} / {}",
                                 WeatherState::format_temp(fahrenheit, current.hi_c),
@@ -103,7 +103,7 @@ impl WeatherPanelView {
                     .child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(crate::theme::current().text))
                             .child(format!("{:.0} km/h", current.wind_kph)),
                     ),
             ))
@@ -115,7 +115,7 @@ impl WeatherPanelView {
         fahrenheit: bool,
         stale: bool,
     ) -> gpui::Div {
-        let color = if stale { TEXT_DIM } else { TEXT };
+        let color = if stale { crate::theme::current().text_dim } else { crate::theme::current().text };
         div()
             .flex()
             .justify_between()
@@ -136,30 +136,30 @@ impl WeatherPanelView {
                     .flex_1()
                     .py_1p5()
                     .rounded_md()
-                    .bg(rgb(INSET))
+                    .bg(rgb(crate::theme::current().inset))
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(TEXT_DIM))
+                            .text_color(rgb(crate::theme::current().text_dim))
                             .child(name),
                     )
                     .child(gpui::svg().path(icon).size(px(18.)).text_color(rgb(color)))
                     .child(
                         div()
                             .text_size(px(11.5))
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(crate::theme::current().text))
                             .child(WeatherState::format_temp(fahrenheit, day.hi_c)),
                     )
                     .child(
                         div()
                             .text_size(px(10.5))
-                            .text_color(rgb(TEXT_DIM))
+                            .text_color(rgb(crate::theme::current().text_dim))
                             .child(WeatherState::format_temp(fahrenheit, day.lo_c)),
                     )
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(rgb(TEXT_DIM))
+                            .text_color(rgb(crate::theme::current().text_dim))
                             .child(format!("{}%", day.rain)),
                     )
             }))
@@ -200,7 +200,7 @@ impl Render for WeatherPanelView {
                         div()
                             .h(px(1.))
                             .w_full()
-                            .bg(rgba(DIVIDER_SOFT))
+                            .bg(rgba(crate::theme::current().divider_soft))
                             .into_any_element(),
                         self.forecast_strip(&forecast, fahrenheit, stale)
                             .into_any_element(),

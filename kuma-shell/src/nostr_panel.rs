@@ -267,7 +267,7 @@ impl NostrSignerView {
             .size(px(size))
             .flex_shrink_0()
             .rounded_md()
-            .bg(rgb(INSET))
+            .bg(rgb(crate::theme::current().inset))
             .overflow_hidden();
         match decoded {
             Some(IconImage::Raster(raster)) => tile.child(
@@ -279,14 +279,14 @@ impl NostrSignerView {
                 gpui::svg()
                     .data(&bytes)
                     .size(px(size / 2.))
-                    .text_color(rgb(ACCENT)),
+                    .text_color(rgb(crate::theme::current().accent)),
             ),
             // The stranger's tile: a puzzle glyph until an image exists.
             None => tile.child(
                 gpui::svg()
                     .path("icons/puzzle.svg")
                     .size(px(size / 2.))
-                    .text_color(rgb(ACCENT)),
+                    .text_color(rgb(crate::theme::current().accent)),
             ),
         }
     }
@@ -410,9 +410,9 @@ impl Render for NostrSignerView {
                     })
                     .size(px(16.))
                     .text_color(rgb(if unlocked == Some(true) {
-                        ACCENT
+                        crate::theme::current().accent
                     } else {
-                        TEXT_DIM
+                        crate::theme::current().text_dim
                     })),
             );
 
@@ -524,14 +524,14 @@ fn ask_card(
                             div()
                                 .text_size(px(12.5))
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT))
+                                .text_color(rgb(crate::theme::current().text))
                                 .truncate()
                                 .child(label),
                         )
                         .child(
                             div()
                                 .text_size(px(12.))
-                                .text_color(rgb(TEXT_DIM))
+                                .text_color(rgb(crate::theme::current().text_dim))
                                 .child(summary),
                         ),
                 ),
@@ -543,14 +543,14 @@ fn ask_card(
             el.child(
                 div()
                     .text_size(px(12.))
-                    .text_color(rgb(URGENT))
+                    .text_color(rgb(crate::theme::URGENT))
                     .child("⚠ Sensitive action: review carefully before approving"),
             )
         })
         .children(prompt.kind.map(|kind| {
             div()
                 .text_size(px(11.))
-                .text_color(rgb(TEXT_DIM))
+                .text_color(rgb(crate::theme::current().text_dim))
                 .child(match &prompt.kind_label {
                     Some(label) => format!("kind: {kind} ({label})"),
                     None => format!("kind: {kind}"),
@@ -559,13 +559,13 @@ fn ask_card(
         .children(prompt.content.clone().map(|content| {
             div()
                 .text_size(px(12.))
-                .text_color(rgb(TEXT))
+                .text_color(rgb(crate::theme::current().text))
                 .child(content)
         }))
         .children(prompt.detail.clone().map(|detail| {
             div()
                 .text_size(px(11.))
-                .text_color(rgb(TEXT_DIM))
+                .text_color(rgb(crate::theme::current().text_dim))
                 .child(detail)
         }));
 
@@ -683,7 +683,7 @@ fn app_card(
                         .min_w_0()
                         .text_size(px(12.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(if revoked { TEXT_DIM } else { TEXT }))
+                        .text_color(rgb(if revoked { crate::theme::current().text_dim } else { crate::theme::current().text }))
                         .truncate()
                         .child(nostr::display_name(app)),
                 )
@@ -696,9 +696,9 @@ fn app_card(
                         .px_1()
                         .py_0p5()
                         .rounded_sm()
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .cursor_pointer()
-                        .hover(|el| el.bg(rgb(SURFACE_HOVER)))
+                        .hover(|el| el.bg(rgb(crate::theme::current().surface_hover)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.selected_app = Some(pubkey.clone());
                             cx.notify();
@@ -707,14 +707,14 @@ fn app_card(
                             gpui::svg()
                                 .path("icons/chevron-right.svg")
                                 .size(px(14.))
-                                .text_color(rgb(TEXT_DIM)),
+                                .text_color(rgb(crate::theme::current().text_dim)),
                         ),
                 ),
         )
         .child(
             div()
                 .text_size(px(11.))
-                .text_color(rgb(if revoked { URGENT } else { TEXT_DIM }))
+                .text_color(rgb(if revoked { crate::theme::URGENT } else { crate::theme::current().text_dim }))
                 .child(format!(
                     "{}{}",
                     if revoked { "revoked · " } else { "" },
@@ -753,9 +753,9 @@ fn app_detail(
                 .py_0p5()
                 .rounded_sm()
                 .text_size(px(11.))
-                .text_color(rgb(ACCENT))
+                .text_color(rgb(crate::theme::current().accent))
                 .cursor_pointer()
-                .hover(|el| el.bg(rgb(SURFACE)))
+                .hover(|el| el.bg(rgb(crate::theme::current().surface)))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.selected_app = None;
                     cx.notify();
@@ -764,7 +764,7 @@ fn app_detail(
                     gpui::svg()
                         .path("icons/arrow-left.svg")
                         .size(px(12.))
-                        .text_color(rgb(ACCENT)),
+                        .text_color(rgb(crate::theme::current().accent)),
                 )
                 .child("Paired apps"),
         )
@@ -787,14 +787,14 @@ fn app_detail(
                                     div()
                                         .text_size(px(12.5))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(TEXT))
+                                        .text_color(rgb(crate::theme::current().text))
                                         .truncate()
                                         .child(nostr::display_name(app)),
                                 )
                                 .child(
                                     div()
                                         .text_size(px(11.))
-                                        .text_color(rgb(TEXT_DIM))
+                                        .text_color(rgb(crate::theme::current().text_dim))
                                         .truncate()
                                         .child(app.pubkey.clone()),
                                 ),
@@ -803,7 +803,7 @@ fn app_detail(
                 .child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .child(facts.join(" · ")),
                 ),
         )
@@ -813,13 +813,13 @@ fn app_detail(
                     div()
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(crate::theme::current().text))
                         .child("Trust level"),
                 )
                 .child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .child(
                             "ask confirms every act, basic signs the everyday safe list, and \
                              trust signs everything unattended; the doctor grades it Warn",
@@ -857,7 +857,7 @@ fn app_detail(
             kit::card("detail-perms").child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .child(format!("asks for: {perms}")),
             )
         }))
@@ -867,7 +867,7 @@ fn app_detail(
                     div()
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(crate::theme::current().text))
                         .child("This app"),
                 )
                 .child(
@@ -924,7 +924,7 @@ fn app_detail(
                 .child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .child(if revoked {
                             "a revoked app is refused whatever it carries; delete forgets it outright"
                         } else {
@@ -964,11 +964,11 @@ fn log_row(entry: &nostr::LogEntry, apps: &[PairedApp], index: usize) -> gpui::S
     // alarm, an allowance the accent, anything else stays quiet.
     let verdict_color = if entry.verdict.starts_with("denied") || entry.verdict.contains("expired")
     {
-        URGENT
+        crate::theme::URGENT
     } else if entry.verdict.starts_with("allowed") {
-        ACCENT
+        crate::theme::current().accent
     } else {
-        TEXT_DIM
+        crate::theme::current().text_dim
     };
     let when = chrono::DateTime::from_timestamp(entry.at as i64, 0)
         .map(|t| t.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string())
@@ -985,21 +985,21 @@ fn log_row(entry: &nostr::LogEntry, apps: &[PairedApp], index: usize) -> gpui::S
                         .min_w_0()
                         .text_size(px(12.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(crate::theme::current().text))
                         .truncate()
                         .child(who),
                 )
                 .child(
                     div()
                         .text_size(px(10.))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .child(when),
                 ),
         )
         .child(
             div()
                 .text_size(px(12.))
-                .text_color(rgb(TEXT_DIM))
+                .text_color(rgb(crate::theme::current().text_dim))
                 .child(entry.summary.clone()),
         )
         .child(
@@ -1033,10 +1033,10 @@ fn pair_pane(
                     div()
                         .text_size(px(12.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(crate::theme::current().text))
                         .child("No identity yet."),
                 )
-                .child(div().text_size(px(12.)).text_color(rgb(TEXT_DIM)).child(
+                .child(div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
                     "Run kuma-nostr setup; it asks which road: a fresh key, or one you \
                              already hold (nsec, hex, a recovery phrase, or an ncryptsec and its \
                              passphrase).",
@@ -1053,10 +1053,10 @@ fn pair_pane(
                     div()
                         .text_size(px(12.5))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(crate::theme::current().text))
                         .child("The bunker is locked."),
                 )
-                .child(div().text_size(px(12.)).text_color(rgb(TEXT_DIM)).child(
+                .child(div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
                     "Unlock from a terminal: kuma-nostr unlock. The keyring is open in \
                              this session, so it costs nothing, and the pairing URI comes with \
                              the unlock.",
@@ -1078,7 +1078,7 @@ fn pair_ready(
     let pane = div().flex().flex_col().gap_2p5();
     let pane = pane.children(offered_uri.clone().map(|uri| offer_card(uri, cx)));
     let pane = pane
-        .child(div().text_size(px(12.)).text_color(rgb(TEXT_DIM)).child(
+        .child(div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
             "Copy a fresh URI into any NIP-46 app. It pairs one app once; the connect \
                      burns it, so mint another for the next app.",
         ))
@@ -1106,14 +1106,14 @@ fn pair_ready(
                     }),
                 )),
         )
-        .child(div().text_size(px(11.)).text_color(rgb(TEXT_DIM)).child(
+        .child(div().text_size(px(11.)).text_color(rgb(crate::theme::current().text_dim)).child(
             "Rotation retires every outstanding URI at once; apps holding old copies \
                      need a fresh one.",
         ));
     let pane = pane.children(inactivity.map(|remaining| {
         div()
             .text_size(px(11.))
-            .text_color(rgb(TEXT_DIM))
+            .text_color(rgb(crate::theme::current().text_dim))
             .child(format!(
                 "the vault locks itself after {remaining}s of no unlock and no keep-alive; \
                  this panel keeps it alive while you are here"
@@ -1147,13 +1147,13 @@ fn offer_card(uri: String, cx: &mut Context<NostrSignerView>) -> gpui::Stateful<
             div()
                 .text_size(px(12.5))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(TEXT))
+                .text_color(rgb(crate::theme::current().text))
                 .child(match &name {
                     Some(name) => format!("A client asked to pair: {name}"),
                     None => "A client asked to pair".to_string(),
                 }),
         )
-        .child(div().text_size(px(12.)).text_color(rgb(TEXT_DIM)).child(
+        .child(div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
             "Pairing it signs nothing until you answer its asks. Ignore throws the \
                      invite away.",
         ))
@@ -1234,9 +1234,9 @@ fn wrap_pane(pane: gpui::Div) -> gpui::Div {
 /// and wears the alarm, basic wears the accent, ask stays quiet.
 fn level_badge(level: &str) -> gpui::Div {
     let (icon, color) = match level {
-        "trust" => ("icons/shield-lock.svg", URGENT),
-        "basic" => ("icons/shield-check.svg", ACCENT),
-        _ => ("icons/shield.svg", TEXT_DIM),
+        "trust" => ("icons/shield-lock.svg", crate::theme::URGENT),
+        "basic" => ("icons/shield-check.svg", crate::theme::current().accent),
+        _ => ("icons/shield.svg", crate::theme::current().text_dim),
     };
     div()
         .flex()

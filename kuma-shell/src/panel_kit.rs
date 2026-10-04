@@ -28,7 +28,7 @@ pub fn card(id: impl Into<SharedString>) -> gpui::Stateful<Div> {
         .px_3p5()
         .py_3()
         .rounded_lg()
-        .bg(rgb(SURFACE))
+        .bg(rgb(crate::theme::current().surface))
 }
 
 /// A card's title: the 13px semibold line every card opens with, over
@@ -37,7 +37,7 @@ pub fn card_title(title: &str) -> Div {
     div()
         .text_size(px(13.))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(TEXT))
+        .text_color(rgb(crate::theme::current().text))
         .child(title.to_string())
 }
 
@@ -46,7 +46,7 @@ pub fn card_title(title: &str) -> Div {
 pub fn card_note(note: &str) -> Div {
     div()
         .text_size(px(11.))
-        .text_color(rgb(TEXT_DIM))
+        .text_color(rgb(crate::theme::current().text_dim))
         .child(note.to_string())
 }
 
@@ -66,13 +66,13 @@ pub fn setting_row(label: &str, control: impl IntoElement) -> gpui::Stateful<Div
         .px_3p5()
         .py_2p5()
         .rounded_lg()
-        .bg(rgb(SURFACE))
+        .bg(rgb(crate::theme::current().surface))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .text_size(px(12.))
-                .text_color(rgb(TEXT))
+                .text_color(rgb(crate::theme::current().text))
                 .truncate()
                 .child(label.to_string()),
         )
@@ -90,7 +90,7 @@ pub fn pane_header(title: &str) -> Div {
             .min_w_0()
             .text_size(px(17.))
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(TEXT))
+            .text_color(rgb(crate::theme::current().text))
             .truncate()
             .child(title.to_string()),
     )
@@ -109,7 +109,7 @@ pub fn tabbed_pane(header: Div, body: impl IntoElement) -> Div {
         .min_w_0()
         .gap_2p5()
         .child(header)
-        .child(div().h(px(1.)).w_full().bg(rgba(DIVIDER_SOFT)))
+        .child(div().h(px(1.)).w_full().bg(rgba(crate::theme::current().divider_soft)))
         .child(body)
 }
 
@@ -120,10 +120,10 @@ pub fn count_badge(count: usize) -> Div {
         .px_2()
         .py_0p5()
         .rounded_full()
-        .bg(rgb(ACCENT))
+        .bg(rgb(crate::theme::current().accent))
         .text_size(px(11.))
         .font_weight(FontWeight::BOLD)
-        .text_color(rgb(ACCENT_TEXT))
+        .text_color(rgb(crate::theme::current().accent_text))
         .child(count.to_string())
 }
 
@@ -139,7 +139,7 @@ impl Render for TooltipView {
             .rounded_sm()
             .bg(rgb(0x11111B))
             .text_size(px(12.))
-            .text_color(rgb(TEXT))
+            .text_color(rgb(crate::theme::current().text))
             .child(self.text.clone())
     }
 }
@@ -174,20 +174,20 @@ pub fn rail_tab(
         .py_2()
         .rounded_md()
         .cursor_pointer()
-        .when(active, |el| el.bg(rgb(SURFACE)))
-        .hover(|el| el.bg(rgb(SURFACE)))
+        .when(active, |el| el.bg(rgb(crate::theme::current().surface)))
+        .hover(|el| el.bg(rgb(crate::theme::current().surface)))
         .tooltip(text_tooltip(label.into()))
         .on_click(on_click)
         .child(
             gpui::svg()
                 .path(icon)
                 .size(px(16.))
-                .text_color(rgb(if active { ACCENT } else { TEXT_DIM })),
+                .text_color(rgb(if active { crate::theme::current().accent } else { crate::theme::current().text_dim })),
         )
         .children(badge.map(|count| {
             div()
                 .text_size(px(10.))
-                .text_color(rgb(if active { ACCENT } else { TEXT_DIM }))
+                .text_color(rgb(if active { crate::theme::current().accent } else { crate::theme::current().text_dim }))
                 .child(count.to_string())
         }))
 }
@@ -213,13 +213,13 @@ pub fn empty_state(icon: &'static str, title: &str, subtitle: &str) -> Div {
             div()
                 .text_size(px(14.))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(TEXT))
+                .text_color(rgb(crate::theme::current().text))
                 .child(title.to_string()),
         )
         .child(
             div()
                 .text_size(px(12.))
-                .text_color(rgb(TEXT_DIM))
+                .text_color(rgb(crate::theme::current().text_dim))
                 .child(subtitle.to_string()),
         )
 }
@@ -245,9 +245,9 @@ pub fn button(
     on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> gpui::Stateful<Div> {
     let (fg, glyph) = match variant {
-        ButtonVariant::Primary => (ACCENT_TEXT, ACCENT_TEXT),
-        ButtonVariant::Ghost => (ACCENT, ACCENT),
-        ButtonVariant::Destructive => (ACCENT_TEXT, ACCENT_TEXT),
+        ButtonVariant::Primary => (crate::theme::current().accent_text, crate::theme::current().accent_text),
+        ButtonVariant::Ghost => (crate::theme::current().accent, crate::theme::current().accent),
+        ButtonVariant::Destructive => (crate::theme::current().accent_text, crate::theme::current().accent_text),
     };
     let base = div()
         .id(id.into())
@@ -261,9 +261,9 @@ pub fn button(
         .text_color(rgb(fg))
         .cursor_pointer();
     let base = match variant {
-        ButtonVariant::Primary => base.bg(rgb(ACCENT)),
-        ButtonVariant::Ghost => base.hover(|el| el.bg(rgb(SURFACE))),
-        ButtonVariant::Destructive => base.bg(rgb(URGENT)),
+        ButtonVariant::Primary => base.bg(rgb(crate::theme::current().accent)),
+        ButtonVariant::Ghost => base.hover(|el| el.bg(rgb(crate::theme::current().surface))),
+        ButtonVariant::Destructive => base.bg(rgb(crate::theme::URGENT)),
     };
     base.children(icon.map(|path| gpui::svg().path(path).size(px(11.)).text_color(rgb(glyph))))
         .child(label.to_string())
@@ -281,8 +281,8 @@ pub fn icon_button(
     on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> gpui::Stateful<Div> {
     let (rest, hover) = match variant {
-        ButtonVariant::Destructive => (URGENT, URGENT),
-        _ => (TEXT_DIM, TEXT),
+        ButtonVariant::Destructive => (crate::theme::URGENT, crate::theme::URGENT),
+        _ => (crate::theme::current().text_dim, crate::theme::current().text),
     };
     div()
         .id(id.into())
@@ -293,7 +293,7 @@ pub fn icon_button(
         .rounded_sm()
         .cursor_pointer()
         .text_color(rgb(rest))
-        .hover(move |el| el.bg(rgb(SURFACE)).text_color(rgb(hover)))
+        .hover(move |el| el.bg(rgb(crate::theme::current().surface)).text_color(rgb(hover)))
         .child(gpui::svg().path(icon).size(px(13.)).text_color(rgb(rest)))
         .on_click(on_click)
 }
@@ -406,8 +406,8 @@ impl Render for ConfirmActions {
                         let _ = cx;
                         move |_, _, _| {}
                     })
-                    .text_color(rgb(TEXT_DIM))
-                    .bg(rgb(SURFACE)),
+                    .text_color(rgb(crate::theme::current().text_dim))
+                    .bg(rgb(crate::theme::current().surface)),
                     // at rest: quiet words that hover
                     None => button(
                         id,

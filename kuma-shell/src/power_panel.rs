@@ -41,8 +41,8 @@ impl Render for PowerProfileView {
                     .py_2()
                     .rounded_md()
                     .cursor_pointer()
-                    .bg(rgb(if active { SURFACE } else { INSET }))
-                    .hover(|style| style.bg(rgb(SURFACE)))
+                    .bg(rgb(if active { crate::theme::current().surface } else { crate::theme::current().inset }))
+                    .hover(|style| style.bg(rgb(crate::theme::current().surface)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.sysmon
                             .update(cx, |sysmon, cx| sysmon.request_power_profile(profile, cx));
@@ -51,13 +51,13 @@ impl Render for PowerProfileView {
                         svg()
                             .path("icons/power-profile.svg")
                             .size(px(14.))
-                            .text_color(rgb(if active { ACCENT } else { TEXT_DIM })),
+                            .text_color(rgb(if active { crate::theme::current().accent } else { crate::theme::current().text_dim })),
                     )
                     .child(
                         div()
                             .flex_1()
                             .text_size(px(12.))
-                            .text_color(rgb(if active { TEXT } else { TEXT_DIM }))
+                            .text_color(rgb(if active { crate::theme::current().text } else { crate::theme::current().text_dim }))
                             .child(profile.title()),
                     )
                     .when(active, |el| {
@@ -65,7 +65,7 @@ impl Render for PowerProfileView {
                             svg()
                                 .path("icons/check.svg")
                                 .size(px(12.))
-                                .text_color(rgb(ACCENT)),
+                                .text_color(rgb(crate::theme::current().accent)),
                         )
                     })
             }),

@@ -46,7 +46,7 @@ pub fn slider_track(value: u8, stash: TrackStash) -> Canvas<Bounds<Pixels>> {
             window.paint_quad(quad(
                 bounds,
                 px(3.),
-                rgb(SURFACE),
+                rgb(crate::theme::current().surface),
                 px(0.),
                 gpui::transparent_black(),
                 gpui::BorderStyle::default(),
@@ -60,7 +60,7 @@ pub fn slider_track(value: u8, stash: TrackStash) -> Canvas<Bounds<Pixels>> {
                     size: size(fill_width, track_height),
                 },
                 px(3.),
-                rgb(ACCENT),
+                rgb(crate::theme::current().accent),
                 px(0.),
                 gpui::transparent_black(),
                 gpui::BorderStyle::default(),
@@ -77,7 +77,7 @@ pub fn slider_track(value: u8, stash: TrackStash) -> Canvas<Bounds<Pixels>> {
                     size: size(knob, knob),
                 },
                 px(6.),
-                rgb(TEXT),
+                rgb(crate::theme::current().text),
                 px(0.),
                 gpui::transparent_black(),
                 gpui::BorderStyle::default(),
@@ -113,7 +113,7 @@ pub fn slider_row(
             div()
                 .w(px(32.))
                 .text_size(px(11.))
-                .text_color(rgb(TEXT_DIM))
+                .text_color(rgb(crate::theme::current().text_dim))
                 .text_align(TextAlign::Right)
                 .child(format!("{percent}%")),
         )
@@ -136,21 +136,21 @@ pub fn toggle_row(
         .px_3p5()
         .py_2p5()
         .rounded_lg()
-        .bg(rgb(SURFACE))
+        .bg(rgb(crate::theme::current().surface))
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(SURFACE_HOVER)))
+        .hover(|style| style.bg(rgb(crate::theme::current().surface_hover)))
         .on_click(on_click)
         .child(
             svg()
                 .path(icon_path)
                 .size(px(16.))
-                .text_color(rgb(if enabled { TEXT } else { TEXT_DIM })),
+                .text_color(rgb(if enabled { crate::theme::current().text } else { crate::theme::current().text_dim })),
         )
         .child(
             div()
                 .flex_1()
                 .text_size(px(12.))
-                .text_color(rgb(if enabled { TEXT } else { TEXT_DIM }))
+                .text_color(rgb(if enabled { crate::theme::current().text } else { crate::theme::current().text_dim }))
                 .child(label.to_string()),
         )
         .child(toggle_switch(enabled))
@@ -165,17 +165,17 @@ pub fn toggle_switch(enabled: bool) -> Div {
         .w(track)
         .h(px(16.))
         .rounded_full()
-        .bg(rgb(if enabled { ACCENT } else { INSET }))
+        .bg(rgb(if enabled { crate::theme::current().accent } else { crate::theme::current().inset }))
         .border_1()
-        .border_color(rgb(DIVIDER))
+        .border_color(rgb(crate::theme::current().divider))
         .flex()
         .items_center()
         .when(enabled, |el| el.justify_end())
         .px_1()
         .child(div().size(knob).rounded_full().bg(rgb(if enabled {
-            ACCENT_TEXT
+            crate::theme::current().accent_text
         } else {
-            TEXT_DIM
+            crate::theme::current().text_dim
         })))
 }
 

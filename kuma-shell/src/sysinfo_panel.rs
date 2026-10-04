@@ -116,14 +116,14 @@ impl SysPanelView {
                 .child(
                     div()
                         .text_size(px(10.))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .text_align(align)
                         .child(label.to_string()),
                 )
                 .child(
                     div()
                         .text_size(px(12.))
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(crate::theme::current().text))
                         .text_align(align)
                         .child(value),
                 );
@@ -277,7 +277,7 @@ impl Render for SysPanelView {
                     .mr(px(1.))
                     .h(px(((*sample as f32 / 100.0).max(0.04) * 48.0) as f32))
                     .rounded_sm()
-                    .bg(rgb(if *sample >= 85 { URGENT } else { ACCENT }))
+                    .bg(rgb(if *sample >= 85 { crate::theme::URGENT } else { crate::theme::current().accent }))
             })
             .collect();
         let spark = div()
@@ -286,7 +286,7 @@ impl Render for SysPanelView {
             .items_end()
             .h(px(48.))
             .rounded_md()
-            .bg(rgb(INSET))
+            .bg(rgb(crate::theme::current().inset))
             .px(px(4.))
             .py(px(4.))
             .overflow_hidden()
@@ -313,7 +313,7 @@ impl Render for SysPanelView {
             .children(caption.map(|caption| {
                 div()
                     .text_size(px(12.))
-                    .text_color(rgb(TEXT))
+                    .text_color(rgb(crate::theme::current().text))
                     .child(caption)
             }))
             .child(stats);

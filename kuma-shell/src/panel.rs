@@ -741,7 +741,7 @@ pub fn chrome(
                 .top(px(0.))
                 .left(px(0.))
                 .size_full()
-                .text_color(rgba(crate::theme::PANEL_BG)),
+                .text_color(rgba(crate::theme::current().panel_bg)),
         )
         .child(content)
 }

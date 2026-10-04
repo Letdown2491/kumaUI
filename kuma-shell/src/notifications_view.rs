@@ -127,9 +127,9 @@ impl Render for ToastView {
             .flex()
             .flex_col()
             .rounded_xl()
-            .bg(rgba(PANEL_BG))
+            .bg(rgba(crate::theme::current().panel_bg))
             .border_1()
-            .border_color(rgb(DIVIDER))
+            .border_color(rgb(crate::theme::current().divider))
             .overflow_hidden()
             .cursor_pointer()
             .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
@@ -171,7 +171,7 @@ impl Render for ToastView {
                             .child(
                                 div()
                                     .text_size(px(10.))
-                                    .text_color(rgb(TEXT_DIM))
+                                    .text_color(rgb(crate::theme::current().text_dim))
                                     .truncate()
                                     .child(notification.app_name.clone()),
                             ),
@@ -179,7 +179,7 @@ impl Render for ToastView {
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(crate::theme::current().text))
                             .truncate()
                             .child(notification.summary.clone()),
                     )
@@ -187,7 +187,7 @@ impl Render for ToastView {
                         el.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(TEXT_DIM))
+                                .text_color(rgb(crate::theme::current().text_dim))
                                 .max_h(px(BODY_MAX_HEIGHT))
                                 .overflow_hidden()
                                 .child(notification.body.clone()),
@@ -203,9 +203,9 @@ impl Render for ToastView {
                         .h_full()
                         .w_full()
                         .rounded_full()
-                        .bg(rgba(DIVIDER_SOFT))
+                        .bg(rgba(crate::theme::current().divider_soft))
                         .overflow_hidden()
-                        .child(div().h_full().w(relative(progress)).bg(rgb(ACCENT))),
+                        .child(div().h_full().w(relative(progress)).bg(rgb(crate::theme::current().accent))),
                 ),
             );
 
@@ -371,7 +371,7 @@ fn notification_card(
 
     kit::card(SharedString::from(format!("notification-{id}")))
         .cursor_pointer()
-        .hover(|el| el.bg(rgb(SURFACE_HOVER)))
+        .hover(|el| el.bg(rgb(crate::theme::current().surface_hover)))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.state.update(cx, |state, cx| state.dismiss(id, 2, cx));
         }))
@@ -393,7 +393,7 @@ fn notification_card(
                         .child(
                             div()
                                 .text_size(px(10.))
-                                .text_color(rgb(TEXT_DIM))
+                                .text_color(rgb(crate::theme::current().text_dim))
                                 .truncate()
                                 .child(app_name),
                         ),
@@ -401,21 +401,21 @@ fn notification_card(
                 .child(
                     div()
                         .text_size(px(10.))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .child(when),
                 ),
         )
         .child(
             div()
                 .text_size(px(12.))
-                .text_color(rgb(TEXT))
+                .text_color(rgb(crate::theme::current().text))
                 .child(summary),
         )
         .when(!body.is_empty(), |el| {
             el.child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .child(body),
             )
         })

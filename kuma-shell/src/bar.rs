@@ -199,7 +199,7 @@ impl Render for ShellBar {
                 .grid_cols(3)
                 .items_center()
                 .px_2()
-                .bg(rgba(theme::PANEL_BG)),
+                .bg(rgba(crate::theme::current().panel_bg)),
             bar.radius,
             bar.corners,
         )
@@ -316,7 +316,7 @@ impl Render for SysmonTooltip {
             .rounded_sm()
             .bg(rgb(0x11111B))
             .text_size(px(12.))
-            .text_color(rgb(TEXT))
+            .text_color(rgb(crate::theme::current().text))
             // one line by design: these are short status labels, and a
             // wrapped tail ("held" alone on line two) reads broken
             .whitespace_nowrap()
@@ -407,7 +407,7 @@ impl ShellBar {
                         svg()
                             .path("icons/apps.svg")
                             .size(px(16.))
-                            .text_color(rgb(TEXT)),
+                            .text_color(rgb(crate::theme::current().text)),
                     )
                     .into_any_element(),
             ),
@@ -425,7 +425,7 @@ impl ShellBar {
                     widget.kind,
                     widget.mode,
                     text,
-                    TEXT,
+                    crate::theme::current().text,
                     move |sysmon: &SysMon, _| {
                         let percent = sysmon
                             .cpu
@@ -485,7 +485,7 @@ impl ShellBar {
                     widget.kind,
                     widget.mode,
                     Some(text),
-                    if muted { URGENT } else { TEXT },
+                    if muted { crate::theme::URGENT } else { crate::theme::current().text },
                     move |sysmon: &SysMon, _| match sysmon.volume {
                         Some(volume) if volume.muted => "Volume muted".into(),
                         Some(volume) => format!("Volume: {}%", volume.percent).into(),
@@ -518,7 +518,7 @@ impl ShellBar {
                     widget.kind,
                     widget.mode,
                     Some(format!("{}%", brightness.percent)),
-                    TEXT,
+                    crate::theme::current().text,
                     move |sysmon: &SysMon, _| {
                         let percent = sysmon.brightness.map(|b| b.percent).unwrap_or(0);
                         format!("Brightness: {percent}%").into()
@@ -559,7 +559,7 @@ impl ShellBar {
                     widget.kind,
                     widget.mode,
                     text,
-                    TEXT,
+                    crate::theme::current().text,
                     move |sysmon: &SysMon, _| match sysmon.ram {
                         Some(ram) => format!(
                             "Memory: {:.1} GiB of {:.1} GiB",
@@ -584,7 +584,7 @@ impl ShellBar {
             WidgetKind::Temp => sysmon.temp.map(|temp| {
                 // hot enough to care: the alarm color says the fans
                 // are losing
-                let color = if temp >= 85 { URGENT } else { TEXT };
+                let color = if temp >= 85 { crate::theme::URGENT } else { crate::theme::current().text };
                 let text = match widget.mode {
                     WidgetMode::Text => Some(format!("TEMP: {temp}°C")),
                     WidgetMode::IconText => Some(format!("{temp}°C")),
@@ -622,7 +622,7 @@ impl ShellBar {
                     widget.kind,
                     widget.mode,
                     text,
-                    if percent >= 90 { URGENT } else { TEXT },
+                    if percent >= 90 { crate::theme::URGENT } else { crate::theme::current().text },
                     move |sysmon: &SysMon, _| match sysmon.disk.clone() {
                         Some(disk) => format!(
                             "{}: {:.0} GiB of {:.0} GiB used",
@@ -656,7 +656,7 @@ impl ShellBar {
                     widget.kind,
                     widget.mode,
                     Some(text),
-                    if muted { URGENT } else { TEXT },
+                    if muted { crate::theme::URGENT } else { crate::theme::current().text },
                     move |sysmon: &SysMon, _| match sysmon.mic {
                         Some(mic) if mic.muted => "Microphone muted".into(),
                         Some(mic) => format!("Microphone: {}%", mic.percent).into(),
@@ -681,9 +681,9 @@ impl ShellBar {
                     widget.mode,
                     Some(label.to_string()),
                     if profile == crate::sysmon::PowerProfile::Performance {
-                        URGENT
+                        crate::theme::URGENT
                     } else {
-                        TEXT
+                        crate::theme::current().text
                     },
                     move |sysmon: &SysMon, _| match sysmon.power_profile {
                         Some(profile) => {
@@ -715,8 +715,8 @@ impl ShellBar {
                     format!("{} – {}", media.artist, media.title)
                 };
                 let color = match media.status {
-                    Playback::Playing => ACCENT,
-                    Playback::Paused | Playback::Stopped => TEXT_DIM,
+                    Playback::Playing => crate::theme::current().accent,
+                    Playback::Paused | Playback::Stopped => crate::theme::current().text_dim,
                 };
                 sys_widget(
                     widget.kind,
@@ -775,7 +775,7 @@ impl ShellBar {
                     widget.kind,
                     widget.mode,
                     Some(text),
-                    if low { URGENT } else { TEXT },
+                    if low { crate::theme::URGENT } else { crate::theme::current().text },
                     move |sysmon: &SysMon, _| {
                         let status = sysmon.battery.map(|battery| {
                             if battery.percent >= 100 {
@@ -824,7 +824,7 @@ impl ShellBar {
                     .as_ref()
                     .map(|resolved| resolved.label.clone());
                 let stale = state.stale();
-                let color = if stale { TEXT_DIM } else { TEXT };
+                let color = if stale { crate::theme::current().text_dim } else { crate::theme::current().text };
                 // no location configured reads as a hidden widget until
                 // the settings page fills one in
                 let current = state.current.as_ref()?;
@@ -890,7 +890,7 @@ impl ShellBar {
                         widget.kind,
                         widget.mode,
                         Some(self.clock.clone()),
-                        TEXT,
+                        crate::theme::current().text,
                         move |_: &SysMon, _| date.clone().into(),
                         widget_icon(widget.kind),
                         tooltips_on,
@@ -908,11 +908,11 @@ impl ShellBar {
                 let connected: Vec<&crate::sysmon::BluetoothDevice> =
                     bt.devices.iter().filter(|device| device.connected).collect();
                 let (color, text) = if !bt.enabled {
-                    (TEXT_DIM, None)
+                    (crate::theme::current().text_dim, None)
                 } else if connected.is_empty() {
-                    (TEXT, None)
+                    (crate::theme::current().text, None)
                 } else {
-                    (ACCENT, Some(connected.len().to_string()))
+                    (crate::theme::current().accent, Some(connected.len().to_string()))
                 };
                 sys_widget(
                     widget.kind,
@@ -967,7 +967,7 @@ impl ShellBar {
                     widget.kind,
                     widget.mode,
                     text,
-                    if net.online { TEXT } else { URGENT },
+                    if net.online { crate::theme::current().text } else { crate::theme::URGENT },
                     move |sysmon: &SysMon, _| {
                         let Some(net) = &sysmon.network else {
                             return "Network: unknown".into();
@@ -1006,11 +1006,11 @@ impl ShellBar {
                     None
                 };
                 let color = if unread > 0 {
-                    ACCENT
+                    crate::theme::current().accent
                 } else if dnd {
-                    TEXT_DIM
+                    crate::theme::current().text_dim
                 } else {
-                    TEXT
+                    crate::theme::current().text
                 };
                 // live tooltip: re-reads the state each time it renders
                 let notifications = self.notifications.clone();
@@ -1064,7 +1064,7 @@ impl ShellBar {
                 // shield, quiet when the queue is empty.
                 let pending = self.nostr.read(cx).prompts.len();
                 let text = (pending > 0).then(|| pending.to_string());
-                let color = if pending > 0 { ACCENT } else { TEXT };
+                let color = if pending > 0 { crate::theme::current().accent } else { crate::theme::current().text };
                 // live tooltip: re-reads the state each time it renders
                 let nostr = self.nostr.clone();
                 let tooltip = move |_: &SysMon, cx: &App| {
@@ -1156,7 +1156,7 @@ fn tray_icon(
             None => div()
                 .size(px(6.))
                 .rounded_full()
-                .bg(rgb(TEXT_DIM))
+                .bg(rgb(crate::theme::current().text_dim))
                 .into_any_element(),
         })
 }
@@ -1289,17 +1289,17 @@ fn workspaces_widget(
                             el.min_w(px(34.))
                                 .px_2()
                                 .rounded_full()
-                                .bg(rgb(ACCENT))
-                                .text_color(rgb(ACCENT_TEXT))
+                                .bg(rgb(crate::theme::current().accent))
+                                .text_color(rgb(crate::theme::current().accent_text))
                         })
                         .when(!workspace.focused, |el| {
                             el.px_1().text_color(if workspace.active {
-                                rgb(TEXT)
+                                rgb(crate::theme::current().text)
                             } else {
-                                rgb(TEXT_DIM)
+                                rgb(crate::theme::current().text_dim)
                             })
                         })
-                        .when(workspace.urgent, |el| el.text_color(rgb(URGENT)))
+                        .when(workspace.urgent, |el| el.text_color(rgb(crate::theme::URGENT)))
                         .child(workspace.label.clone()),
                 )
         }))
@@ -1315,7 +1315,7 @@ fn window_title_widget(title: &str, tooltips_on: bool) -> gpui::Stateful<Div> {
         .flex()
         .items_center()
         .text_size(px(12.))
-        .text_color(rgb(TEXT))
+        .text_color(rgb(crate::theme::current().text))
         .when(tooltips_on, |el| el.tooltip(text_tooltip(title.into())))
         .truncate()
         .child(title.to_string())
@@ -1349,14 +1349,14 @@ fn recording_indicator(
             })
             .detach();
         }))
-        .child(div().size(px(8.)).rounded_full().bg(rgb(URGENT)))
+        .child(div().size(px(8.)).rounded_full().bg(rgb(crate::theme::URGENT)))
         .child(
             div()
                 .h(px(16.))
                 .flex()
                 .items_center()
                 .text_size(px(12.))
-                .text_color(rgb(URGENT))
+                .text_color(rgb(crate::theme::URGENT))
                 .child(format!("{mins}:{secs:02}")),
         )
 }
@@ -1376,6 +1376,6 @@ fn gear_button(cx: &mut Context<ShellBar>, tooltips_on: bool) -> gpui::Stateful<
             svg()
                 .path("icons/gear.svg")
                 .size(px(16.))
-                .text_color(rgb(TEXT)),
+                .text_color(rgb(crate::theme::current().text)),
         )
 }

@@ -409,24 +409,24 @@ impl Render for LauncherView {
                         .px_3()
                         .py_2()
                         .rounded_md()
-                        .bg(rgb(INSET))
+                        .bg(rgb(crate::theme::current().inset))
                         .border_1()
-                        .border_color(rgb(DIVIDER))
+                        .border_color(rgb(crate::theme::current().divider))
                         .child(
                             gpui::svg()
                                 .path("icons/search.svg")
                                 .size(px(13.))
-                                .text_color(rgb(TEXT_DIM)),
+                                .text_color(rgb(crate::theme::current().text_dim)),
                         )
                         .child(if query.is_empty() {
                             div()
                                 .text_size(px(14.))
-                                .text_color(rgb(TEXT_DIM))
+                                .text_color(rgb(crate::theme::current().text_dim))
                                 .child("Search apps…")
                         } else {
                             div()
                                 .text_size(px(14.))
-                                .text_color(rgb(TEXT))
+                                .text_color(rgb(crate::theme::current().text))
                                 .child(query.clone())
                         }),
                 )
@@ -477,17 +477,17 @@ fn app_row(
         .py_1p5()
         .rounded_md()
         .cursor_pointer()
-        .bg(rgb(if is_selected { SURFACE } else { 0x00000000 }))
+        .bg(rgb(if is_selected { crate::theme::current().surface } else { 0x00000000 }))
         .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
             let _ = launch(&app.exec, app.terminal);
             crate::panel::close_panels(cx);
         })
-        .hover(|style| style.bg(rgb(SURFACE_HOVER)))
+        .hover(|style| style.bg(rgb(crate::theme::current().surface_hover)))
         .child(
             div()
                 .size(px(26.))
                 .rounded_md()
-                .bg(rgb(if is_selected { ACCENT } else { INSET }))
+                .bg(rgb(if is_selected { crate::theme::current().accent } else { crate::theme::current().inset }))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -499,12 +499,12 @@ fn app_row(
                             .size_full(),
                     ),
                     IconImage::Svg(bytes) => {
-                        el.child(gpui::svg().data(&bytes).size(px(18.)).text_color(rgb(TEXT)))
+                        el.child(gpui::svg().data(&bytes).size(px(18.)).text_color(rgb(crate::theme::current().text)))
                     }
                 })
                 .when_none(&icon, |el| {
                     el.text_size(px(12.))
-                        .text_color(rgb(if is_selected { ACCENT_TEXT } else { TEXT }))
+                        .text_color(rgb(if is_selected { crate::theme::current().accent_text } else { crate::theme::current().text }))
                         .child(app.name.chars().next().unwrap_or('?').to_string())
                 }),
         )
@@ -518,7 +518,7 @@ fn app_row(
                 } else {
                     gpui::FontWeight::NORMAL
                 })
-                .text_color(rgb(if is_selected { TEXT } else { TEXT_DIM }))
+                .text_color(rgb(if is_selected { crate::theme::current().text } else { crate::theme::current().text_dim }))
                 .truncate()
                 .child(app.name.clone()),
         )

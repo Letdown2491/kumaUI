@@ -163,11 +163,11 @@ impl Render for WidgetDragGhost {
             .px_2()
             .py_1()
             .rounded_md()
-            .bg(rgba(PANEL_BG))
+            .bg(rgba(crate::theme::current().panel_bg))
             .border_1()
-            .border_color(rgb(DIVIDER))
+            .border_color(rgb(crate::theme::current().divider))
             .text_size(px(11.))
-            .text_color(rgb(TEXT))
+            .text_color(rgb(crate::theme::current().text))
             .child(self.label.clone())
     }
 }
@@ -307,7 +307,7 @@ impl SettingsView {
             .gap_0p5()
             .p_0p5()
             .rounded_md()
-            .bg(rgb(INSET))
+            .bg(rgb(crate::theme::current().inset))
             .children(options.iter().map(|&option| {
                 let active = option == current;
                 let on_pick = on_pick.clone();
@@ -318,12 +318,12 @@ impl SettingsView {
                     .rounded_sm()
                     .text_size(px(11.))
                     .cursor_pointer()
-                    .bg(rgb(if active { ACCENT } else { INSET }))
-                    .text_color(rgb(if active { ACCENT_TEXT } else { TEXT_DIM }))
+                    .bg(rgb(if active { crate::theme::current().accent } else { crate::theme::current().inset }))
+                    .text_color(rgb(if active { crate::theme::current().accent_text } else { crate::theme::current().text_dim }))
                     .hover(|style| {
                         style
-                            .bg(rgb(if active { ACCENT } else { SURFACE }))
-                            .text_color(rgb(if active { ACCENT_TEXT } else { TEXT }))
+                            .bg(rgb(if active { crate::theme::current().accent } else { crate::theme::current().surface }))
+                            .text_color(rgb(if active { crate::theme::current().accent_text } else { crate::theme::current().text }))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings
@@ -349,7 +349,7 @@ impl SettingsView {
             let track = crate::controls::track_stash();
             crate::controls::slider_row(
                 "icons/brightness.svg",
-                TEXT,
+                crate::theme::current().text,
                 brightness.percent,
                 crate::controls::slider_track(brightness.percent, track.clone()),
             )
@@ -376,7 +376,7 @@ impl SettingsView {
             let muted = volume.muted;
             crate::controls::slider_row(
                 "icons/volume.svg",
-                if muted { URGENT } else { TEXT },
+                if muted { crate::theme::URGENT } else { crate::theme::current().text },
                 volume.percent,
                 crate::controls::slider_track(volume.percent, track.clone()),
             )
@@ -426,7 +426,7 @@ impl SettingsView {
             let muted = mic.muted;
             crate::controls::slider_row(
                 "icons/mic.svg",
-                if muted { URGENT } else { TEXT },
+                if muted { crate::theme::URGENT } else { crate::theme::current().text },
                 mic.percent,
                 crate::controls::slider_track(mic.percent, track.clone()),
             )
@@ -644,7 +644,7 @@ impl SettingsView {
                         el.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(TEXT_DIM))
+                                .text_color(rgb(crate::theme::current().text_dim))
                                 .child("Enter or click away to apply. Whole hours, 24h."),
                         )
                     })
@@ -671,12 +671,12 @@ impl SettingsView {
             .px_3p5()
             .py_2p5()
             .rounded_lg()
-            .bg(rgb(SURFACE))
+            .bg(rgb(crate::theme::current().surface))
             .child(
                 div()
                     .flex_1()
                     .text_size(px(12.))
-                    .text_color(rgb(TEXT))
+                    .text_color(rgb(crate::theme::current().text))
                     .child(name.to_string()),
             )
             .child(
@@ -706,16 +706,16 @@ impl SettingsView {
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(INSET))
+                    .bg(rgb(crate::theme::current().inset))
                     .border_1()
-                    .border_color(rgb(if editing.is_some() { ACCENT } else { DIVIDER }))
+                    .border_color(rgb(if editing.is_some() { crate::theme::current().accent } else { crate::theme::current().divider }))
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(if editing.is_some() {
-                                TEXT
+                                crate::theme::current().text
                             } else {
-                                TEXT_DIM
+                                crate::theme::current().text_dim
                             }))
                             .when(editing.is_some(), |el| el.child(text.clone()))
                             .when(editing.is_none(), |el| {
@@ -827,7 +827,7 @@ impl SettingsView {
             .gap_0p5()
             .p_0p5()
             .rounded_md()
-            .bg(rgb(INSET))
+            .bg(rgb(crate::theme::current().inset))
             .children(corners.iter().map(|&(label, corner, active)| {
                 div()
                     .id(SharedString::from(format!(
@@ -839,12 +839,12 @@ impl SettingsView {
                     .rounded_sm()
                     .text_size(px(11.))
                     .cursor_pointer()
-                    .bg(rgb(if active { ACCENT } else { INSET }))
-                    .text_color(rgb(if active { ACCENT_TEXT } else { TEXT_DIM }))
+                    .bg(rgb(if active { crate::theme::current().accent } else { crate::theme::current().inset }))
+                    .text_color(rgb(if active { crate::theme::current().accent_text } else { crate::theme::current().text_dim }))
                     .hover(|style| {
                         style
-                            .bg(rgb(if active { ACCENT } else { SURFACE }))
-                            .text_color(rgb(if active { ACCENT_TEXT } else { TEXT }))
+                            .bg(rgb(if active { crate::theme::current().accent } else { crate::theme::current().surface }))
+                            .text_color(rgb(if active { crate::theme::current().accent_text } else { crate::theme::current().text }))
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings
@@ -901,7 +901,7 @@ impl SettingsView {
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .child("Right-click an app in the dock to pin or unpin it."),
             )
     }
@@ -955,7 +955,7 @@ impl SettingsView {
                         el.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(TEXT_DIM))
+                                .text_color(rgb(crate::theme::current().text_dim))
                                 .child("Enter or click away to apply."),
                         )
                     }),
@@ -979,7 +979,7 @@ impl SettingsView {
                         el.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(TEXT_DIM))
+                                .text_color(rgb(crate::theme::current().text_dim))
                                 .child(
                                     "Screens blank before the lock engages. The clocks are independent, nothing is clamped.",
                                 ),
@@ -1001,7 +1001,7 @@ impl SettingsView {
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .child("A city with its state, or a postal code."),
             )
             .child(
@@ -1034,22 +1034,22 @@ impl SettingsView {
                     .px_3()
                     .py_2()
                     .rounded_md()
-                    .bg(rgb(INSET))
+                    .bg(rgb(crate::theme::current().inset))
                     .border_1()
                     .border_color(rgb(if self.weather_edit.is_some() {
-                        ACCENT
+                        crate::theme::current().accent
                     } else {
-                        DIVIDER
+                        crate::theme::current().divider
                     }))
                     .child(
                         div()
                             .text_size(px(12.5))
                             .text_color(rgb(if self.weather_edit.is_some() {
-                                TEXT
+                                crate::theme::current().text
                             } else if weather.query.is_empty() {
-                                TEXT_DIM
+                                crate::theme::current().text_dim
                             } else {
-                                TEXT
+                                crate::theme::current().text
                             }))
                             .when_some(
                                 self.weather_edit.as_ref().map(|edit| edit.text.clone()),
@@ -1068,18 +1068,18 @@ impl SettingsView {
                 (Some(WeatherResolve::Working), _) => {
                     vec![div()
                         .text_size(px(11.))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .child("Resolving...")]
                 }
                 (Some(WeatherResolve::Failed(err)), _) => {
                     vec![div()
                         .text_size(px(11.))
-                        .text_color(rgb(URGENT))
+                        .text_color(rgb(crate::theme::URGENT))
                         .child(err.clone())]
                 }
                 (None, Some(resolved)) => vec![div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .child(format!("Resolved: {}", resolved.label))],
                 (None, None) => vec![],
             });
@@ -1117,7 +1117,7 @@ impl SettingsView {
                 el.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .child(
                             "The weather widget stays hidden until a location resolves.",
                         ),
@@ -1233,13 +1233,13 @@ impl SettingsView {
             .gap_2()
             .py_1()
             .child(gpui::svg().path(icon).size(px(16.)).text_color(rgb(
-                if enabled { TEXT } else { TEXT_DIM },
+                if enabled { crate::theme::current().text } else { crate::theme::current().text_dim },
             )))
             .child(
                 div()
                     .flex_1()
                     .text_size(px(12.))
-                    .text_color(rgb(if enabled { TEXT } else { TEXT_DIM }))
+                    .text_color(rgb(if enabled { crate::theme::current().text } else { crate::theme::current().text_dim }))
                     .child(name.to_string()),
             )
             .child(
@@ -1304,18 +1304,18 @@ impl SettingsView {
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(INSET))
+                    .bg(rgb(crate::theme::current().inset))
                     .border_1()
-                    .border_color(rgb(if editing.is_some() { ACCENT } else { DIVIDER }))
+                    .border_color(rgb(if editing.is_some() { crate::theme::current().accent } else { crate::theme::current().divider }))
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(if editing.is_some() {
-                                TEXT
+                                crate::theme::current().text
                             } else if enabled {
-                                TEXT_DIM
+                                crate::theme::current().text_dim
                             } else {
-                                TEXT_DIM
+                                crate::theme::current().text_dim
                             }))
                             .text_align(gpui::TextAlign::Right)
                             .when(editing.is_some(), |el| el.child(text.clone()))
@@ -1439,7 +1439,7 @@ impl SettingsView {
             .px_3p5()
             .py_2()
             .rounded_lg()
-            .bg(rgb(SURFACE))
+            .bg(rgb(crate::theme::current().surface))
             .child(
                 gpui::svg()
                     .path(match kind.icon_spec() {
@@ -1447,14 +1447,14 @@ impl SettingsView {
                         _ => "icons/puzzle.svg",
                     })
                     .size(px(16.))
-                    .text_color(rgb(if enabled { TEXT } else { TEXT_DIM })),
+                    .text_color(rgb(if enabled { crate::theme::current().text } else { crate::theme::current().text_dim })),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .text_size(px(12.))
-                    .text_color(rgb(if enabled { TEXT } else { TEXT_DIM }))
+                    .text_color(rgb(if enabled { crate::theme::current().text } else { crate::theme::current().text_dim }))
                     .truncate()
                     .child(kind.label()),
             )
@@ -1502,7 +1502,7 @@ impl SettingsView {
                 ),
             )
             .child(
-                div().text_size(px(11.)).text_color(rgb(TEXT_DIM)).child(
+                div().text_size(px(11.)).text_color(rgb(crate::theme::current().text_dim)).child(
                     "Drag between sections to place them; drop on a chip to slot it before.",
                 ),
             )
@@ -1517,16 +1517,16 @@ impl SettingsView {
                 div()
                     .text_size(px(10.))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .child(label.to_uppercase()),
             )
-            .child(div().flex_1().h(px(1.)).bg(rgba(theme::SOFT_DIVIDER)))
+            .child(div().flex_1().h(px(1.)).bg(rgba(crate::theme::current().divider_soft)))
     }
 
     /// The insertion indicator: the accent line a drag leaves between
     /// chips, saying where the widget will land.
     fn drop_line(&self) -> Div {
-        div().w_full().h(px(2.)).rounded_full().bg(rgb(ACCENT))
+        div().w_full().h(px(2.)).rounded_full().bg(rgb(crate::theme::current().accent))
     }
 
     fn section_list(&self, section: Section, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
@@ -1567,7 +1567,7 @@ impl SettingsView {
                 el.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .child("no widgets: drop one here"),
                 )
             })
@@ -1603,7 +1603,7 @@ impl SettingsView {
                 div()
                     .text_size(px(11.5))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(rgb(TEXT))
+                    .text_color(rgb(crate::theme::current().text))
                     .truncate()
                     .child(kind.label()),
             )
@@ -1665,7 +1665,7 @@ impl SettingsView {
             .gap_0p5()
             .p_0p5()
             .rounded_sm()
-            .bg(rgb(INSET))
+            .bg(rgb(crate::theme::current().inset))
             .children(
                 [WidgetMode::Icon, WidgetMode::IconText, WidgetMode::Text].map(|mode| {
                     let active = mode == current;
@@ -1678,8 +1678,8 @@ impl SettingsView {
                         .py_0p5()
                         .rounded_sm()
                         .cursor_pointer()
-                        .bg(rgb(if active { ACCENT } else { INSET }))
-                        .hover(|style| style.bg(rgb(if active { ACCENT } else { SURFACE })))
+                        .bg(rgb(if active { crate::theme::current().accent } else { crate::theme::current().inset }))
+                        .hover(|style| style.bg(rgb(if active { crate::theme::current().accent } else { crate::theme::current().surface })))
                         .tooltip(kit::text_tooltip(mode.label().into()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.settings.update(cx, |settings, cx| {
@@ -1691,7 +1691,7 @@ impl SettingsView {
                                 gpui::svg()
                                     .path(icon_path)
                                     .size(px(12.))
-                                    .text_color(rgb(if active { ACCENT_TEXT } else { TEXT_DIM })),
+                                    .text_color(rgb(if active { crate::theme::current().accent_text } else { crate::theme::current().text_dim })),
                             )
                         })
                         .when(mode != WidgetMode::Icon, |el| {
@@ -1700,7 +1700,7 @@ impl SettingsView {
                                     .text_size(px(10.))
                                     .line_height(px(12.))
                                     .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(if active { ACCENT_TEXT } else { TEXT_DIM }))
+                                    .text_color(rgb(if active { crate::theme::current().accent_text } else { crate::theme::current().text_dim }))
                                     .child("Aa"),
                             )
                         })
@@ -1736,7 +1736,7 @@ impl SettingsView {
                                 .flex_1()
                                 .min_w_0()
                                 .text_size(px(11.))
-                                .text_color(rgb(TEXT_DIM))
+                                .text_color(rgb(crate::theme::current().text_dim))
                                 .truncate()
                                 .child(format!("Folder: {}", background.folder.display())),
                         )
@@ -1866,7 +1866,7 @@ impl SettingsView {
                     .rounded_sm()
                     .overflow_hidden()
                     .border_2()
-                    .border_color(rgb(if selected { ACCENT } else { DIVIDER }))
+                    .border_color(rgb(if selected { crate::theme::current().accent } else { crate::theme::current().divider }))
                     .when_some(thumb, |el, thumb| {
                         el.child(
                             img(gpui::ImageSource::Render(thumb))
@@ -1874,7 +1874,7 @@ impl SettingsView {
                                 .size_full(),
                         )
                     })
-                    .when(!has_thumb, |el| el.bg(rgb(INSET)))
+                    .when(!has_thumb, |el| el.bg(rgb(crate::theme::current().inset)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let name = name.clone();
                         this.settings
@@ -1885,7 +1885,7 @@ impl SettingsView {
             .child(
                 div()
                     .text_size(px(10.))
-                    .text_color(rgb(if selected { TEXT } else { TEXT_DIM }))
+                    .text_color(rgb(if selected { crate::theme::current().text } else { crate::theme::current().text_dim }))
                     .truncate()
                     .child(label),
             )
@@ -1961,7 +1961,7 @@ impl Render for SettingsView {
                 .pb(px(12.))
                 .track_focus(&self.focus_handle)
                 .child(sidebar)
-                .child(div().w(px(1.)).bg(rgba(theme::SOFT_DIVIDER)))
+                .child(div().w(px(1.)).bg(rgba(crate::theme::current().divider_soft)))
                 .child(kit::tabbed_pane(header, content)),
         )
     }

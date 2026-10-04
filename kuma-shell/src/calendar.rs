@@ -157,13 +157,13 @@ fn nav_button(
         .py_0p5()
         .rounded_sm()
         .cursor_pointer()
-        .hover(|el| el.bg(rgb(SURFACE)))
+        .hover(|el| el.bg(rgb(crate::theme::current().surface)))
         .on_click(on_click)
         .child(
             gpui::svg()
                 .path(icon)
                 .size(px(14.))
-                .text_color(rgb(TEXT_DIM)),
+                .text_color(rgb(crate::theme::current().text_dim)),
         )
 }
 
@@ -179,7 +179,7 @@ fn weekday_row() -> Div {
                 .items_center()
                 .justify_center()
                 .text_size(px(11.))
-                .text_color(rgb(TEXT_DIM))
+                .text_color(rgb(crate::theme::current().text_dim))
                 .child(name.to_string())
         }))
 }
@@ -194,15 +194,15 @@ fn day_cell(date: NaiveDate, is_today: bool) -> gpui::Stateful<Div> {
         .justify_center()
         .text_size(px(12.))
         .text_color(if is_today {
-            rgb(ACCENT_TEXT)
+            rgb(crate::theme::current().accent_text)
         } else {
-            rgb(TEXT)
+            rgb(crate::theme::current().text)
         })
         .child(day);
     if is_today {
         // fill the whole cell and round it into the oval badge
-        cell.bg(rgb(ACCENT)).rounded_full()
+        cell.bg(rgb(crate::theme::current().accent)).rounded_full()
     } else {
-        cell.hover(|el| el.bg(rgb(SURFACE_HOVER)))
+        cell.hover(|el| el.bg(rgb(crate::theme::current().surface_hover)))
     }
 }

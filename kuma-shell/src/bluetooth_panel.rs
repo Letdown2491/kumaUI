@@ -72,20 +72,20 @@ impl BluetoothPanelView {
             .px_3()
             .py_2()
             .rounded_lg()
-            .bg(rgb(if device.connected { SURFACE } else { INSET }))
-            .hover(|el| el.bg(rgb(SURFACE_HOVER)))
+            .bg(rgb(if device.connected { crate::theme::current().surface } else { crate::theme::current().inset }))
+            .hover(|el| el.bg(rgb(crate::theme::current().surface_hover)))
             .child(
                 gpui::svg()
                     .path("icons/bluetooth.svg")
                     .size(px(15.))
-                    .text_color(rgb(if device.connected { ACCENT } else { TEXT })),
+                    .text_color(rgb(if device.connected { crate::theme::current().accent } else { crate::theme::current().text })),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .text_size(px(12.5))
-                    .text_color(rgb(if device.connected { ACCENT } else { TEXT }))
+                    .text_color(rgb(if device.connected { crate::theme::current().accent } else { crate::theme::current().text }))
                     .truncate()
                     .child(device.alias.clone()),
             );
@@ -93,14 +93,14 @@ impl BluetoothPanelView {
             row = row.child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .child(format!("{battery}%")),
             );
         }
         row = row.child(
             div()
                 .text_size(px(11.))
-                .text_color(rgb(if device.connected { TEXT } else { TEXT_DIM }))
+                .text_color(rgb(if device.connected { crate::theme::current().text } else { crate::theme::current().text_dim }))
                 .child(state_word),
         )
         .on_mouse_down(
@@ -205,7 +205,7 @@ impl Render for BluetoothPanelView {
         }
 
         content = content
-            .child(div().h(px(1.)).w_full().bg(rgba(DIVIDER_SOFT)))
+            .child(div().h(px(1.)).w_full().bg(rgba(crate::theme::current().divider_soft)))
             .child(
                 div()
                     .flex()
@@ -215,7 +215,7 @@ impl Render for BluetoothPanelView {
                         div()
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(crate::theme::current().text))
                             .child("Devices"),
                     )
                     .child(kit::button(
@@ -234,7 +234,7 @@ impl Render for BluetoothPanelView {
                 el.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(URGENT))
+                        .text_color(rgb(crate::theme::URGENT))
                         .child(error),
                 )
             })

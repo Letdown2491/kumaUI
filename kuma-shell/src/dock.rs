@@ -56,9 +56,9 @@ impl Render for DragGhost {
             .px_2()
             .py_1()
             .rounded_md()
-            .bg(rgba(PANEL_BG))
+            .bg(rgba(crate::theme::current().panel_bg))
             .border_1()
-            .border_color(rgb(DIVIDER))
+            .border_color(rgb(crate::theme::current().divider))
             .child(match &self.icon {
                 Some(IconImage::Raster(raster)) => img(ImageSource::Render(raster.clone()))
                     .size(px(24.))
@@ -67,13 +67,13 @@ impl Render for DragGhost {
                 None => svg()
                     .path("icons/dock.svg")
                     .size(px(24.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .into_any_element(),
             })
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT))
+                    .text_color(rgb(crate::theme::current().text))
                     .child(self.label.clone()),
             )
     }
@@ -451,9 +451,9 @@ impl Render for DockView {
                 .gap(px(GAP))
                 .p(px(PADDING))
                 .rounded_xl()
-                .bg(rgba(PANEL_BG))
+                .bg(rgba(crate::theme::current().panel_bg))
                 .border_1()
-                .border_color(rgb(DIVIDER))
+                .border_color(rgb(crate::theme::current().divider))
                 .overflow_hidden()
                 .children(
                     all_entries
@@ -513,15 +513,15 @@ impl Render for DockMenuView {
             .flex_col()
             .p(px(4.))
             .rounded_xl()
-            .bg(rgba(PANEL_BG))
+            .bg(rgba(crate::theme::current().panel_bg))
             .border_1()
-            .border_color(rgb(DIVIDER))
+            .border_color(rgb(crate::theme::current().divider))
             .when_some(self.context.clone(), |el, context| {
                 let settings = self.settings.clone();
                 el.child(
                     div()
                         .text_size(px(10.))
-                        .text_color(rgb(TEXT_DIM))
+                        .text_color(rgb(crate::theme::current().text_dim))
                         .px_2()
                         .py_1()
                         .truncate()
@@ -560,9 +560,9 @@ fn menu_row(label: &'static str, on_click: impl Fn(&mut App) + 'static) -> gpui:
         .py_1p5()
         .rounded_md()
         .cursor_pointer()
-        .hover(|el| el.bg(rgb(SURFACE)))
+        .hover(|el| el.bg(rgb(crate::theme::current().surface)))
         .text_size(px(12.))
-        .text_color(rgb(TEXT))
+        .text_color(rgb(crate::theme::current().text))
         .on_click(move |_, _, cx| on_click(cx))
         .child(label)
 }
@@ -644,8 +644,8 @@ fn dock_icon(
         .size(px(CELL))
         .rounded_xl()
         .cursor_pointer()
-        .hover(|el| el.bg(rgb(SURFACE_HOVER)))
-        .when(focused, |el| el.bg(rgb(SURFACE)))
+        .hover(|el| el.bg(rgb(crate::theme::current().surface_hover)))
+        .when(focused, |el| el.bg(rgb(crate::theme::current().surface)))
         .tooltip(crate::panel_kit::text_tooltip(tooltip.into()))
         .on_click(cx.listener(move |_, _, _, cx| {
             if is_fixture {
@@ -687,7 +687,7 @@ fn dock_icon(
             _ if is_fixture => svg()
                 .path("icons/apps.svg")
                 .size(px(32.))
-                .text_color(rgb(TEXT))
+                .text_color(rgb(crate::theme::current().text))
                 .into_any_element(),
             Some(IconImage::Raster(raster)) => img(ImageSource::Render(raster))
                 .size(px(32.))
@@ -696,15 +696,15 @@ fn dock_icon(
             None => svg()
                 .path("icons/dock.svg")
                 .size(px(32.))
-                .text_color(rgb(TEXT_DIM))
+                .text_color(rgb(crate::theme::current().text_dim))
                 .into_any_element(),
         });
 
     if running {
         cell = cell.child(div().size(px(4.)).rounded_full().bg(rgb(if focused {
-            ACCENT
+            crate::theme::current().accent
         } else {
-            TEXT_DIM
+            crate::theme::current().text_dim
         })));
     }
 

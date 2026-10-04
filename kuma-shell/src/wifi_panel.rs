@@ -103,20 +103,20 @@ impl WifiPanelView {
             .px_3()
             .py_2()
             .rounded_lg()
-            .bg(rgb(if point.active { SURFACE } else { INSET }))
-            .hover(|el| el.bg(rgb(SURFACE_HOVER)))
+            .bg(rgb(if point.active { crate::theme::current().surface } else { crate::theme::current().inset }))
+            .hover(|el| el.bg(rgb(crate::theme::current().surface_hover)))
             .child(
                 gpui::svg()
                     .path(Self::signal_icon(point.strength))
                     .size(px(15.))
-                    .text_color(rgb(if point.active { ACCENT } else { TEXT })),
+                    .text_color(rgb(if point.active { crate::theme::current().accent } else { crate::theme::current().text })),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .text_size(px(12.5))
-                    .text_color(rgb(if point.active { ACCENT } else { TEXT }))
+                    .text_color(rgb(if point.active { crate::theme::current().accent } else { crate::theme::current().text }))
                     .truncate()
                     .child(ssid.clone()),
             );
@@ -124,7 +124,7 @@ impl WifiPanelView {
             row = row.child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .child("joining..."),
             );
         } else {
@@ -133,7 +133,7 @@ impl WifiPanelView {
                     gpui::svg()
                         .path("icons/check.svg")
                         .size(px(12.))
-                        .text_color(rgb(TEXT_DIM)),
+                        .text_color(rgb(crate::theme::current().text_dim)),
                 );
             }
             if point.secured {
@@ -141,7 +141,7 @@ impl WifiPanelView {
                     gpui::svg()
                         .path("icons/key.svg")
                         .size(px(12.))
-                        .text_color(rgb(TEXT_DIM)),
+                        .text_color(rgb(crate::theme::current().text_dim)),
                 );
             }
         }
@@ -185,26 +185,26 @@ impl WifiPanelView {
             .px_3()
             .py_2()
             .rounded_lg()
-            .bg(rgb(INSET))
+            .bg(rgb(crate::theme::current().inset))
             .border_1()
-            .border_color(rgb(ACCENT))
+            .border_color(rgb(crate::theme::current().accent))
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .child(format!("Password for {}", edit.ssid)),
             )
             .child(
                 div()
                     .flex_1()
                     .text_size(px(12.5))
-                    .text_color(rgb(TEXT))
+                    .text_color(rgb(crate::theme::current().text))
                     .child("•".repeat(edit.text.chars().count())),
             )
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(crate::theme::current().text_dim))
                     .child("Enter to join, Esc to cancel"),
             )
     }
@@ -299,21 +299,21 @@ impl Render for WifiPanelView {
                         gpui::svg()
                             .path("icons/wifi.svg")
                             .size(px(16.))
-                            .text_color(rgb(ACCENT)),
+                            .text_color(rgb(crate::theme::current().accent)),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_size(px(12.5))
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(crate::theme::current().text))
                             .truncate()
                             .child(ssid.clone()),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(rgb(TEXT_DIM))
+                            .text_color(rgb(crate::theme::current().text_dim))
                             .child("connected"),
                     )
                     .when(saved_here, |el| {
@@ -336,7 +336,7 @@ impl Render for WifiPanelView {
         points.dedup_by(|a, b| a.ssid == b.ssid);
 
         content = content
-            .child(div().h(px(1.)).w_full().bg(rgba(DIVIDER_SOFT)))
+            .child(div().h(px(1.)).w_full().bg(rgba(crate::theme::current().divider_soft)))
             .child(
                 div()
                     .flex()
@@ -346,7 +346,7 @@ impl Render for WifiPanelView {
                         div()
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(crate::theme::current().text))
                             .child("Networks"),
                     )
                     .child(kit::button(
@@ -365,7 +365,7 @@ impl Render for WifiPanelView {
                 el.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(URGENT))
+                        .text_color(rgb(crate::theme::URGENT))
                         .child(error),
                 )
             })

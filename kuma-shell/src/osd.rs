@@ -300,8 +300,8 @@ impl Render for OsdView {
         let Some(content) = self.content.clone() else {
             return div().size_full();
         };
-        let color = if content.urgent { URGENT } else { ACCENT };
-        let icon_color = if content.urgent { URGENT } else { TEXT };
+        let color = if content.urgent { crate::theme::URGENT } else { crate::theme::current().accent };
+        let icon_color = if content.urgent { crate::theme::URGENT } else { crate::theme::current().text };
         let card = div()
             .w(px(OSD_WIDTH))
             .flex()
@@ -310,9 +310,9 @@ impl Render for OsdView {
             .px(px(14.))
             .py(px(10.))
             .rounded_xl()
-            .bg(rgba(PANEL_BG))
+            .bg(rgba(crate::theme::current().panel_bg))
             .border_1()
-            .border_color(rgb(DIVIDER))
+            .border_color(rgb(crate::theme::current().divider))
             .child(
                 div()
                     .flex()
@@ -329,7 +329,7 @@ impl Render for OsdView {
                             .flex_1()
                             .min_w_0()
                             .text_size(px(12.))
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(crate::theme::current().text))
                             .truncate()
                             .child(content.label),
                     )
@@ -347,7 +347,7 @@ impl Render for OsdView {
                         .h(px(4.))
                         .w_full()
                         .rounded_full()
-                        .bg(rgb(INSET))
+                        .bg(rgb(crate::theme::current().inset))
                         .overflow_hidden()
                         .child(
                             div()
