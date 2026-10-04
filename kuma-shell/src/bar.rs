@@ -966,6 +966,15 @@ impl ShellBar {
                     self.sysmon.clone(),
                     None,
                 )
+                .cursor_pointer()
+                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    let anchor = f32::from(event.position().x);
+                    crate::panel::toggle_panel_anchored(
+                        crate::panel::PanelKind::Wifi,
+                        anchor,
+                        cx,
+                    )
+                }))
                 .into_any_element()
             }),
             WidgetKind::Notifications => {

@@ -67,6 +67,8 @@ impl AssetSource for KumaAssets {
             "icons/cloud-lightning.svg" => {
                 Some(include_bytes!("../icons/cloud-lightning.svg").as_slice())
             }
+            "icons/wifi-mid.svg" => Some(include_bytes!("../icons/wifi-mid.svg").as_slice()),
+            "icons/wifi-low.svg" => Some(include_bytes!("../icons/wifi-low.svg").as_slice()),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))

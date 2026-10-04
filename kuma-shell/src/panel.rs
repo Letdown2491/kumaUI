@@ -182,6 +182,7 @@ pub enum PanelKind {
     DockMenu,
     Nostr,
     Weather,
+    Wifi,
 }
 
 impl PanelKind {
@@ -205,6 +206,7 @@ impl PanelKind {
             PanelKind::Nostr => (560., 520., KeyboardInteractivity::OnDemand),
             // measured height refines this: the forecast strip sets it
             PanelKind::Weather => (320., 240., KeyboardInteractivity::OnDemand),
+            PanelKind::Wifi => (360., 320., KeyboardInteractivity::OnDemand),
         }
     }
 
@@ -226,6 +228,7 @@ impl PanelKind {
             PanelKind::DockMenu => "dock-menu",
             PanelKind::Nostr => "nostr",
             PanelKind::Weather => "weather",
+            PanelKind::Wifi => "wifi",
         }
     }
 
@@ -380,6 +383,9 @@ impl PanelKind {
                 .new(|cx| {
                     crate::weather_panel::WeatherPanelView::new(weather, settings, window, cx, geometry)
                 })
+                .into(),
+            PanelKind::Wifi => cx
+                .new(|cx| crate::wifi_panel::WifiPanelView::new(sysmon, window, cx, geometry))
                 .into(),
         }
     }
@@ -1056,6 +1062,8 @@ mod tests {
             PanelKind::Brightness,
             PanelKind::DockMenu,
             PanelKind::Nostr,
+            PanelKind::Weather,
+            PanelKind::Wifi,
         ] {
             let (width, height, keyboard) = kind.geometry();
             assert!(width > 0., "{kind:?} geometry");

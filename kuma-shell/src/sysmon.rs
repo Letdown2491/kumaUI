@@ -82,6 +82,26 @@ pub struct NetworkState {
     /// The Wi-Fi radio itself (nmcli radio wifi), distinct from being
     /// connected: quick settings toggles the radio.
     pub wifi_enabled: bool,
+    /// The visible access points, scanned only while the Wi-Fi panel
+    /// is open (the list call is too heavy for the idle shell).
+    pub access_points: Vec<AccessPoint>,
+    /// The remembered wireless connections, same scan gate.
+    pub saved: Vec<String>,
+}
+
+/// One visible access point from `nmcli dev wifi list`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessPoint {
+    pub ssid: String,
+    /// Signal strength, 0 to 100.
+    pub strength: u8,
+    /// WPA/WPA2/802.1X or open: an open network joins without a
+    /// password, a secured unknown one asks.
+    pub secured: bool,
+    /// The network the machine is on right now.
+    pub active: bool,
+    /// In the saved connections: joins without asking.
+    pub known: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -241,6 +261,12 @@ pub struct SysMon {
     av_confirming: Option<AvRead>,
     /// The serialized av worker's queue, started by the first request.
     av_sender: Option<smol::channel::Sender<AvRequest>>,
+    /// The Wi-Fi panel's last connect/forget failure: the panel shows
+    /// it inline; the next action or scan clears it.
+    pub wifi_error: Option<String>,
+    /// The SSID a connect request is in flight for: the panel's
+    /// "joining..." tag. Cleared by the scan that confirms it.
+    pub connecting_ssid: Option<String>,
 }
 
 /// One poll read of the audio and brightness trio: the candidate state.
@@ -573,6 +599,89 @@ impl SysMon {
         .detach();
     }
 
+    /// A fresh AP scan right now, same pattern: the Wi-Fi panel calls
+    /// this when it opens and on its rescan press.
+    pub fn scan_wifi_now(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| self_scan(this, cx).await)
+            .detach();
+    }
+
+    /// A trigger of the NIC's own scan, then a fresh list: the
+    /// panel's rescan press. The rescan takes seconds; the list
+    /// refreshes when it lands.
+    pub fn request_wifi_rescan(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let _ = cx
+                .background_spawn(async move {
+                    Command::new("nmcli")
+                        .args(["dev", "wifi", "rescan"])
+                        .output()
+                })
+                .await;
+            self_scan(this, cx).await;
+        })
+        .detach();
+    }
+
+    /// Join a network: nmcli uses saved credentials on its own for a
+    /// known SSID, so a password only rides along for a secured
+    /// unknown one. The next scan reconciles; a failure surfaces in
+    /// the panel as `wifi_error`.
+    pub fn request_wifi_connect(
+        &mut self,
+        ssid: String,
+        password: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.connecting_ssid = Some(ssid.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let mut command = Command::new("nmcli");
+                    command.args(["dev", "wifi", "connect", &ssid]);
+                    if let Some(password) = &password {
+                        command.args(["password", password]);
+                    }
+                    let output = command.output()?;
+                    anyhow::ensure!(output.status.success(), "nmcli connect failed");
+                    Ok(())
+                })
+                .await;
+            let _ = this.update(cx, |sysmon, cx| {
+                sysmon.wifi_error = result.err().map(|err| format!("{err:#}"));
+                cx.notify();
+            });
+            // the scan that confirms the join (or the error's state)
+            self_scan(this, cx).await;
+        })
+        .detach();
+    }
+
+    /// Delete a remembered connection. The next scan reconciles; a
+    /// failure surfaces in the panel as `wifi_error`.
+    pub fn request_wifi_forget(&mut self, ssid: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let output = Command::new("nmcli")
+                        .args(["connection", "delete", &ssid])
+                        .output()?;
+                    anyhow::ensure!(output.status.success(), "nmcli delete failed");
+                    Ok(())
+                })
+                .await;
+            let _ = this.update(cx, |sysmon, cx| {
+                sysmon.wifi_error = result.err().map(|err| format!("{err:#}"));
+                cx.notify();
+            });
+            self_scan(this, cx).await;
+        })
+        .detach();
+    }
+
+    /// Delete a remembered connection. The next scan reconciles; a
+
     /// One request seam for brightness (the quick-settings slider): optimistic
     /// snapshot write, queue, rollback on error.
     pub fn request_set_brightness(&mut self, percent: u8, cx: &mut Context<Self>) {
@@ -715,6 +824,30 @@ fn bounced(last: Option<Instant>, now: Instant) -> bool {
     last.is_some_and(|at| now.duration_since(at) < MUTE_BOUNCE)
 }
 
+/// The AP-and-saved scan the Wi-Fi actions finish with: one read,
+/// one state write, one notify.
+async fn self_scan(this: gpui::WeakEntity<SysMon>, cx: &mut gpui::AsyncApp) {
+    let scan = cx
+        .background_spawn(async move {
+            let mut network = NetworkState::default();
+            network.access_points = read_access_points();
+            network.saved = read_saved_wifi();
+            for point in &mut network.access_points {
+                point.known = network.saved.contains(&point.ssid);
+            }
+            network
+        })
+        .await;
+    let _ = this.update(cx, |sysmon, cx| {
+        if let Some(network) = &mut sysmon.network {
+            network.access_points = scan.access_points;
+            network.saved = scan.saved;
+        }
+        sysmon.connecting_ssid = None;
+        cx.notify();
+    });
+}
+
 pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
     // the disk mount is user state: seeded once, then mirrored on
     // settings changes (no re-mint needed, the poll reads it per tick)
@@ -744,15 +877,18 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
                 break;
             };
             // the stream scan rides only while the volume panel is
-            // open: the status dump is the heaviest call in the pass
+            // open: the status dump is the heaviest call in the pass.
+            // Same gate for the Wi-Fi panel's AP list.
             let scan_streams = full
                 && cx
                     .update(|cx| crate::panel::is_open(&crate::panel::PanelKind::Volume, cx));
+            let scan_wifi = full
+                && cx.update(|cx| crate::panel::is_open(&crate::panel::PanelKind::Wifi, cx));
             let (snapshot, previous_next) = cx
                 .background_spawn(async move {
                     let mut previous = previous;
                     let snapshot = if full {
-                        refresh(&mut previous, &disk_mount, scan_streams)
+                        refresh(&mut previous, &disk_mount, scan_streams, scan_wifi)
                     } else {
                         refresh_av()
                     };
@@ -860,6 +996,7 @@ fn refresh(
     previous: &mut Option<CpuSample>,
     disk_mount: &std::path::Path,
     scan_streams: bool,
+    scan_wifi: bool,
 ) -> Snapshot {
     let usage = sample_cpu_usage(previous);
     Snapshot {
@@ -880,7 +1017,7 @@ fn refresh(
         temp: read_cpu_temp(),
         disk: read_disk(disk_mount),
         bluetooth: read_bluetooth(),
-        network: read_network(),
+        network: read_network(scan_wifi),
         power_profile: read_power_profile(),
         media: read_media(),
         recording: read_recording(),
@@ -1122,7 +1259,7 @@ fn read_bluetooth() -> Option<BluetoothState> {
     Some(BluetoothState { enabled, devices })
 }
 
-fn read_network() -> Option<NetworkState> {
+fn read_network(scan_wifi: bool) -> Option<NetworkState> {
     let connectivity = Command::new("nmcli")
         .args(["networking", "connectivity"])
         .output()
@@ -1137,6 +1274,8 @@ fn read_network() -> Option<NetworkState> {
         wifi: false,
         ssid: None,
         wifi_enabled: read_wifi_radio().unwrap_or(false),
+        access_points: Vec::new(),
+        saved: Vec::new(),
     };
     if let Ok(status) = Command::new("nmcli")
         .args(["-t", "-f", "TYPE,STATE,CONNECTION", "device", "status"])
@@ -1145,7 +1284,107 @@ fn read_network() -> Option<NetworkState> {
     {
         apply_device_status(&mut network, &String::from_utf8_lossy(&status.stdout));
     }
+    // the AP list and the saved connections ride the panel-open gate:
+    // two more nmcli calls, only paid while someone is picking
+    if scan_wifi && network.wifi_enabled {
+        network.access_points = read_access_points();
+        network.saved = read_saved_wifi();
+        for point in &mut network.access_points {
+            point.known = network.saved.contains(&point.ssid);
+        }
+    }
     Some(network)
+}
+
+/// The visible access points: SSID, signal, security, and whether the
+/// machine is on it now. A missing SSID (a hidden network) drops out.
+fn read_access_points() -> Vec<AccessPoint> {
+    let Ok(output) = Command::new("nmcli")
+        .args([
+            "-t",
+            "-f",
+            "SSID,SIGNAL,SECURITY,ACTIVE",
+            "dev",
+            "wifi",
+            "list",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_access_points(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The remembered wireless connections: names whose type is the
+/// wifi one in `nmcli -t -f NAME,TYPE connection show`.
+fn read_saved_wifi() -> Vec<String> {
+    let Ok(output) = Command::new("nmcli")
+        .args(["-t", "-f", "NAME,TYPE", "connection", "show"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.rsplit_once(':'))
+        .filter(|(_, kind)| *kind == "802-11-wireless" || *kind == "wifi")
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+/// `nmcli -t` escapes a literal colon in a field as `\:`; split on
+/// the unescaped colons only.
+fn split_nmcli_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            field.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == ':' {
+            fields.push(std::mem::take(&mut field));
+        } else {
+            field.push(character);
+        }
+    }
+    fields.push(field);
+    fields
+}
+
+/// The AP list: `SSID:SIGNAL:SECURITY:ACTIVE`, trailing colons
+/// padding empty fields. An empty SSID is a hidden network: dropped.
+fn parse_access_points(output: &str) -> Vec<AccessPoint> {
+    output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(split_nmcli_line)
+        .filter_map(|fields| {
+            let ssid = fields.first()?.trim().to_string();
+            if ssid.is_empty() || ssid == "--" {
+                return None;
+            }
+            let signal = fields.get(1)?.trim().parse().ok()?;
+            let security = fields.get(2).map(|field| field.trim()).unwrap_or("");
+            let active = fields.get(3).map(|field| field.trim() == "yes")?;
+            Some(AccessPoint {
+                ssid,
+                strength: signal,
+                secured: !security.is_empty() && security != "--",
+                active,
+                // filled in by the caller against the saved list
+                known: false,
+            })
+        })
+        .collect()
 }
 
 /// `nmcli radio wifi` prints "enabled" / "disabled".
@@ -1709,6 +1948,39 @@ fn read_uptime() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nmcli_ap_lines_parse() {
+        // real shapes: open and secured networks, an escaped colon in
+        // an SSID, the hidden network's empty SSID, padding colons
+        let text = "HomeNet:82:WPA2:yes\n\
+                    Coffee Shop:45:--:no\n\
+                    W\\:ired:70:WPA1 WPA2:no\n\
+                    :38:WPA2:no\n";
+        let points = parse_access_points(text);
+        assert_eq!(points.len(), 3, "the hidden network drops out");
+        assert_eq!(points[0].ssid, "HomeNet");
+        assert!(points[0].secured && points[0].active);
+        assert_eq!(points[0].strength, 82);
+        assert!(!points[1].secured, "open network");
+        assert_eq!(points[2].ssid, "W:ired", "escaped colon is literal");
+        assert!(!points[2].active);
+    }
+
+    #[test]
+    fn nmcli_saved_connections_filter_wireless() {
+        let text = "HomeNet:802-11-wireless\n\
+                    Wired bridge:ethernet\n\
+                    VPN:vpn\n\
+                   SSID with spaces:802-11-wireless\n";
+        let saved: Vec<String> = text
+            .lines()
+            .filter_map(|line| line.rsplit_once(':'))
+            .filter(|(_, kind)| *kind == "802-11-wireless" || *kind == "wifi")
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert_eq!(saved, vec!["HomeNet", "SSID with spaces"]);
+    }
 
     #[test]
     fn cpu_delta_computes_usage_fraction() {

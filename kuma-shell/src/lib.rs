@@ -30,3 +30,4 @@ pub mod tray;
 pub mod wallpaper;
 pub mod weather;
 pub mod weather_panel;
+pub mod wifi_panel;
