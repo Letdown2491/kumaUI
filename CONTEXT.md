@@ -24,6 +24,7 @@ One line per term. These names are the seams in the code; use them in code, docs
 - **MSG CLI**: `kuma-shell msg <verb>`, thin client subcommands (volume up/down/mute, mic-mute, brightness up/down, media, launcher, settings, notifications, nostr) that ride the IPC socket (`$XDG_RUNTIME_DIR/kuma-shell.sock`) into the running Shell, falling back to standalone `wpctl`/`brightnessctl` when no Shell listens. This is what niri keybinds spawn.
 - **Memory return**: the two seams that keep the Shell's footprint at its working set over weeks: notification icons' atlas tiles drop when their entries leave the history (`notifications.rs::drop_icon`; the `img` element never drops the tile it paints), and a 30 s background `malloc_trim(0)` madvises glibc's freed arena pages back to the OS (`main.rs`, ADR-0011). The memory probe (`scripts/memory-probe.sh`) runs the Shell under scripted load in the test container and reads the per-phase deltas.
 - **Vendored gpui**: the gpui framework, vendored from zed main at a pinned commit (`VENDORED.md`); the crates.io release predates layer-shell.
+- **Greeter**: the login screen (`kuma-greeter` binary, `greeter.rs` protocol, `docs/greeter-deploy.md`): a gpui layer-shell surface launched by greetd through a minimal hosting niri, speaking greetd's framed-JSON IPC; success exits the process so greetd starts the session. Loads the settings fallbacks for wallpaper and theme (the greeter user has no user settings); answers any PAM auth message generically, which is the seam fingerprint auth will ride.
 
 ## Ethos
 

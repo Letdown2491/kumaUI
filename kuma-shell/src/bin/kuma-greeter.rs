@@ -41,11 +41,19 @@ fn main() {
     }
 
     application().with_assets(KumaAssets).run(|cx: &mut App| {
+        log::info!("kuma-greeter starting (pid {})", std::process::id());
         let state = cx.new(GreeterState::new);
-        cx.open_window(window_options(), |window, cx| {
+        // a failed window must not panic: greetd holds the VT and the
+        // service decides whether to retry; exiting nonzero is honest
+        match cx.open_window(window_options(), |window, cx| {
             cx.new(|cx| GreeterView::new(state, window, cx))
-        })
-        .expect("the greeter window");
+        }) {
+            Ok(_) => {}
+            Err(err) => {
+                log::error!("opening the greeter window failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
     });
 }
 
