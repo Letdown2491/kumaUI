@@ -25,6 +25,10 @@ export WLR_BACKENDS=headless
 export WLR_LIBINPUT_NO_DEVICES=1
 export WLR_RENDERER=pixman
 export RUST_LOG=info
+# the shipped configuration runs with this cap (the shell's override
+# sets it): glibc's arena-per-thread spread otherwise pads the probe's
+# numbers by hundreds of MB and drowns the phase deltas
+export MALLOC_ARENA_MAX=2
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
