@@ -204,7 +204,7 @@ impl Render for ShellBar {
                 .min_w_0()
                 .flex()
                 .justify_center()
-                .gap_1()
+                .gap_1p5()
                 .overflow_hidden()
                 .children(
                     settings
@@ -217,7 +217,7 @@ impl Render for ShellBar {
             div()
                 .flex()
                 .justify_end()
-                .gap_1()
+                .gap_1p5()
                 .child(self.render_section(Section::Right, cx, tooltips_on))
                 .when_some(self.sysmon.read(cx).recording.clone(), |el, rec| {
                     el.child(recording_indicator(&rec, cx, tooltips_on))
@@ -342,7 +342,7 @@ pub use crate::panel_kit::text_tooltip;
 impl ShellBar {
     fn render_section(&self, section: Section, cx: &mut Context<Self>, tooltips_on: bool) -> Div {
         let widgets: Vec<WidgetConfig> = self.settings.read(cx).widgets(section).to_vec();
-        div().flex().flex_row().items_center().gap_1().children(
+        div().flex().flex_row().items_center().gap_1p5().children(
             widgets
                 .iter()
                 .filter_map(|widget| self.render_widget(widget, cx, tooltips_on)),
@@ -390,7 +390,6 @@ impl ShellBar {
                     .id("widget-apps")
                     .flex()
                     .items_center()
-                    .px_1()
                     .cursor_pointer()
                     .when(tooltips_on, |el| el.tooltip(text_tooltip("Apps".into())))
                     .on_click(cx.listener(|_, _, _, cx| {
@@ -399,29 +398,72 @@ impl ShellBar {
                     .child(
                         svg()
                             .path("icons/apps.svg")
-                            .size(px(14.))
+                            .size(px(16.))
                             .text_color(rgb(TEXT)),
                     )
                     .into_any_element(),
             ),
             WidgetKind::Cpu => sysmon.cpu.map(|usage| {
                 let percent = (usage * 100.0).round() as u32;
+                // the bar stays lean: the icon says CPU, the text only
+                // has to say how much; detail lives in the panel the
+                // click opens
+                let text = match widget.mode {
+                    WidgetMode::Text => Some(format!("CPU: {percent}%")),
+                    WidgetMode::IconText => Some(format!("{percent}%")),
+                    WidgetMode::Icon => None,
+                };
                 sys_widget(
                     widget.kind,
                     widget.mode,
-                    Some(format!("CPU {percent}%")),
+                    text,
                     TEXT,
                     move |sysmon: &SysMon, _| {
                         let percent = sysmon
                             .cpu
                             .map(|usage| (usage * 100.0).round() as u32)
                             .unwrap_or(0);
-                        format!("CPU usage: {percent}%").into()
+                        let mut lines = vec![format!("CPU usage: {percent}%")];
+                        if let Some(cores) = &sysmon.cpu_cores {
+                            let per_core: Vec<String> = cores
+                                .iter()
+                                .map(|core| format!("{}%", (core * 100.0).round()))
+                                .collect();
+                            lines.push(format!("Per core: {}", per_core.join(" ")));
+                        }
+                        if let Some(temp) = sysmon.temp {
+                            lines.push(format!("Temperature: {temp}°C"));
+                        }
+                        if let Some((loads, procs)) = sysmon.loadavg {
+                            lines.push(format!(
+                                "Load: {:.2} {:.2} {:.2} ({procs} processes)",
+                                loads[0], loads[1], loads[2]
+                            ));
+                        }
+                        if let Some(secs) = sysmon.uptime {
+                            let days = secs / 86_400;
+                            let hours = (secs % 86_400) / 3600;
+                            let minutes = (secs % 3600) / 60;
+                            lines.push(if days > 0 {
+                                format!("Up: {days}d {hours}h")
+                            } else if hours > 0 {
+                                format!("Up: {hours}h {minutes}m")
+                            } else {
+                                format!("Up: {minutes}m")
+                            });
+                        }
+                        lines.join("\n").into()
                     },
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
+                .cursor_pointer()
+                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    let anchor = f32::from(event.position().x);
+                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Cpu, anchor, cx)
+                }))
                 .into_any_element()
             }),
             WidgetKind::Volume => sysmon.volume.map(|volume| {
@@ -444,6 +486,7 @@ impl ShellBar {
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
                 .cursor_pointer()
                 .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
@@ -475,6 +518,7 @@ impl ShellBar {
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
                 .cursor_pointer()
                 .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
@@ -497,10 +541,16 @@ impl ShellBar {
                 .into_any_element()
             }),
             WidgetKind::Ram => sysmon.ram.map(|ram| {
+                let percent = ram.percent;
+                let text = match widget.mode {
+                    WidgetMode::Text => Some(format!("RAM: {percent}%")),
+                    WidgetMode::IconText => Some(format!("{percent}%")),
+                    WidgetMode::Icon => None,
+                };
                 sys_widget(
                     widget.kind,
                     widget.mode,
-                    Some(format!("RAM {}%", ram.percent)),
+                    text,
                     TEXT,
                     move |sysmon: &SysMon, _| match sysmon.ram {
                         Some(ram) => format!(
@@ -514,17 +564,28 @@ impl ShellBar {
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
+                .cursor_pointer()
+                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    let anchor = f32::from(event.position().x);
+                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Ram, anchor, cx)
+                }))
                 .into_any_element()
             }),
             WidgetKind::Temp => sysmon.temp.map(|temp| {
                 // hot enough to care: the alarm color says the fans
                 // are losing
                 let color = if temp >= 85 { URGENT } else { TEXT };
+                let text = match widget.mode {
+                    WidgetMode::Text => Some(format!("TEMP: {temp}°C")),
+                    WidgetMode::IconText => Some(format!("{temp}°C")),
+                    WidgetMode::Icon => None,
+                };
                 sys_widget(
                     widget.kind,
                     widget.mode,
-                    Some(format!("{temp}°C")),
+                    text,
                     color,
                     move |sysmon: &SysMon, _| match sysmon.temp {
                         Some(temp) => format!("CPU temperature: {temp}°C").into(),
@@ -533,15 +594,27 @@ impl ShellBar {
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
+                .cursor_pointer()
+                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    let anchor = f32::from(event.position().x);
+                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Temp, anchor, cx)
+                }))
                 .into_any_element()
             }),
             WidgetKind::Disk => sysmon.disk.clone().map(|disk| {
+                let percent = disk.percent;
+                let text = match widget.mode {
+                    WidgetMode::Text => Some(format!("DISK: {percent}%")),
+                    WidgetMode::IconText => Some(format!("{percent}%")),
+                    WidgetMode::Icon => None,
+                };
                 sys_widget(
                     widget.kind,
                     widget.mode,
-                    Some(format!("Disk {}%", disk.percent)),
-                    if disk.percent >= 90 { URGENT } else { TEXT },
+                    text,
+                    if percent >= 90 { URGENT } else { TEXT },
                     move |sysmon: &SysMon, _| match sysmon.disk.clone() {
                         Some(disk) => format!(
                             "{}: {:.0} GiB of {:.0} GiB used",
@@ -555,7 +628,13 @@ impl ShellBar {
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
+                .cursor_pointer()
+                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    let anchor = f32::from(event.position().x);
+                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Disk, anchor, cx)
+                }))
                 .into_any_element()
             }),
             WidgetKind::Mic => sysmon.mic.map(|mic| {
@@ -578,6 +657,7 @@ impl ShellBar {
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
                 .cursor_pointer()
                 .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
@@ -606,6 +686,7 @@ impl ShellBar {
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
                 .cursor_pointer()
                 .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
@@ -656,6 +737,7 @@ impl ShellBar {
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.sysmon
@@ -712,7 +794,17 @@ impl ShellBar {
                     ))),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
+                .cursor_pointer()
+                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    let anchor = f32::from(event.position().x);
+                    crate::panel::toggle_panel_anchored(
+                        crate::panel::PanelKind::Battery,
+                        anchor,
+                        cx,
+                    )
+                }))
                 .into_any_element()
             }),
             WidgetKind::Clock => {
@@ -727,6 +819,7 @@ impl ShellBar {
                         widget_icon(widget.kind),
                         tooltips_on,
                         self.sysmon.clone(),
+                    None,
                     )
                     .cursor_pointer()
                     .on_click(cx.listener(|_, _, _, cx| {
@@ -763,6 +856,7 @@ impl ShellBar {
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
                 .into_any_element()
             }),
@@ -794,6 +888,7 @@ impl ShellBar {
                     widget_icon(widget.kind),
                     tooltips_on,
                     self.sysmon.clone(),
+                    None,
                 )
                 .into_any_element()
             }),
@@ -851,6 +946,7 @@ impl ShellBar {
                         widget_icon(widget.kind),
                         tooltips_on,
                         self.sysmon.clone(),
+                    None,
                     )
                     .cursor_pointer()
                     .on_click(cx.listener(|_, _, _, cx| {
@@ -881,6 +977,7 @@ impl ShellBar {
                         widget_icon(widget.kind),
                         tooltips_on,
                         self.sysmon.clone(),
+                    None,
                     )
                     .cursor_pointer()
                     .on_click(cx.listener(|_, _, _, cx| {
@@ -900,7 +997,6 @@ impl ShellBar {
                         .flex()
                         .items_center()
                         .gap_0p5()
-                        .px_1()
                         .children(items.iter().map(|item| tray_icon(item, cx, tooltips_on)))
                         .into_any_element(),
                 )
@@ -976,16 +1072,15 @@ fn widget_icon(kind: WidgetKind) -> Option<WidgetIcon> {
 }
 
 fn battery_icon_svg(percent: u8, charging: bool, on_ac: bool) -> std::sync::Arc<[u8]> {
-    // level rendered in 5% steps inside the body (y 7..19); while charging the
-    // body is full with a bolt cut out of it; on AC (held at threshold) it
-    // also shows full
-    let level = if charging || on_ac {
-        12.
-    } else {
-        (percent.min(100) / 5) as f32 / 100. * 12.
-    };
+    // the battery's traditional narrow glyph (body x 6..18, like the
+    // original): it is not a feather icon, it is a battery, and the
+    // level readout inside is what carries the meaning
+    // level fills the body interior (y 7..19) in steps; while charging
+    // the interior is full with a bolt cut out of it; on AC (held at
+    // threshold) it also shows full
+    let level = (percent.min(100) as f32) / 100. * 12.;
     let y = 19. - level;
-    let fill = if charging {
+    let fill = if charging || on_ac {
         r#"<path fill-rule="evenodd" d="M8 7h8v12H8z M12.9 7.5 9.9 13.2h2L11 18.5l3.7-6.2h-2.1l2-4.8z"/>"#.to_string()
     } else {
         format!(r#"<rect x="8" y="{y}" width="8" height="{level}" rx="1"/>"#)
@@ -1005,32 +1100,42 @@ fn sys_widget(
     icon: Option<WidgetIcon>,
     tooltips_on: bool,
     sysmon: Entity<SysMon>,
+    extra: Option<gpui::Stateful<Div>>,
 ) -> gpui::Stateful<Div> {
     div()
         .id(SharedString::from(format!("widget-{kind:?}")))
         .flex()
         .items_center()
         .gap_1()
-        .px_1()
         .when(tooltips_on, |el| {
             el.tooltip(sysmon_tooltip(sysmon, tooltip))
         })
         .when(mode != WidgetMode::Text, |el| match icon {
             Some(icon) => {
                 let icon_element = match icon {
-                    WidgetIcon::Path(path) => svg().path(path).size(px(14.)),
-                    WidgetIcon::Data(bytes) => svg().data(&bytes).size(px(14.)),
+                    WidgetIcon::Path(path) => svg().path(path).size(px(16.)),
+                    WidgetIcon::Data(bytes) => svg().data(&bytes).size(px(16.)),
                 };
                 el.child(icon_element.text_color(rgb(color)))
             }
             None => el,
         })
+        .when_some(extra, |el, extra| el.child(extra))
         .when(mode != WidgetMode::Icon, |el| {
             el.child(
+                // a fixed 16px box with the text centered in it: the
+                // widget's text stands the same height as its icons
+                // and rides the vertical middle, not the baseline
                 div()
-                    .text_size(px(12.))
-                    .text_color(rgb(color))
-                    .children(text),
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(color))
+                            .children(text),
+                    ),
             )
         })
 }
@@ -1047,12 +1152,10 @@ fn workspaces_widget(
         .gap_1()
         .children(items.iter().map(|workspace| {
             let workspace_id = workspace.id;
-            // outer box carries the bar-wide horizontal rhythm (px_1, same
-            // as every sys_widget: edge and inter-widget gaps come out
-            // uniform at 12px); the badge inside is the visual oval
+            // spacing is the section's gap, nothing per-widget: one
+            // source of truth, so inter-widget rhythm cannot drift
             div()
                 .id(workspace.id)
-                .px_1()
                 .on_click(cx.listener(move |_, _, _, cx| {
                     cx.background_spawn(async move {
                         if let Err(err) = crate::session::focus_workspace(workspace_id) {
@@ -1075,6 +1178,9 @@ fn workspaces_widget(
                         .justify_center()
                         .py_0p5()
                         .text_size(px(12.))
+                        // same 16px middle-aligned box every widget
+                        // stands on
+                        .h(px(16.))
                         .when(workspace.focused, |el| {
                             el.min_w(px(34.))
                                 .px_2()
@@ -1100,6 +1206,10 @@ fn window_title_widget(title: &str, tooltips_on: bool) -> gpui::Stateful<Div> {
         .id("widget-window-title")
         .min_w_0()
         .overflow_hidden()
+        // a 16px box with the text centered, like every widget's text
+        .h(px(16.))
+        .flex()
+        .items_center()
         .text_size(px(12.))
         .text_color(rgb(TEXT))
         .when(tooltips_on, |el| el.tooltip(text_tooltip(title.into())))
@@ -1138,6 +1248,9 @@ fn recording_indicator(
         .child(div().size(px(8.)).rounded_full().bg(rgb(URGENT)))
         .child(
             div()
+                .h(px(16.))
+                .flex()
+                .items_center()
                 .text_size(px(12.))
                 .text_color(rgb(URGENT))
                 .child(format!("{mins}:{secs:02}")),
@@ -1147,7 +1260,6 @@ fn recording_indicator(
 fn gear_button(cx: &mut Context<ShellBar>, tooltips_on: bool) -> gpui::Stateful<Div> {
     div()
         .id("settings-gear")
-        .px_1()
         .cursor_pointer()
         .when(tooltips_on, |el| {
             el.tooltip(text_tooltip("Settings".into()))
@@ -1159,7 +1271,7 @@ fn gear_button(cx: &mut Context<ShellBar>, tooltips_on: bool) -> gpui::Stateful<
         .child(
             svg()
                 .path("icons/gear.svg")
-                .size(px(14.))
+                .size(px(16.))
                 .text_color(rgb(TEXT)),
         )
 }

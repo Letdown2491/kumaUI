@@ -163,10 +163,20 @@ fn read_recording() -> Option<RecordingState> {
     })
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct CpuSample {
     idle: u64,
     total: u64,
+    /// One (idle, total) pair per core, from the cpuN lines.
+    cores: Vec<(u64, u64)>,
+}
+
+/// One poll's CPU reading: the total usage fraction and per-core
+/// fractions (same length every poll, the poll loop guarantees that).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CpuUsage {
+    pub total: f32,
+    pub cores: Vec<f32>,
 }
 
 #[derive(Default)]
@@ -176,6 +186,19 @@ pub struct SysMon {
     pub mic: Option<Mic>,
     pub brightness: Option<Brightness>,
     pub cpu: Option<f32>,
+    /// Per-core usage fractions, same order as the kernel's cpuN lines.
+    pub cpu_cores: Option<Vec<f32>>,
+    /// The total usage's recent history, newest last, capped at
+    /// HISTORY_LEN samples (one per full poll).
+    pub cpu_history: Vec<f32>,
+    /// The other sysinfo widgets' histories, same cadence, as percents.
+    pub ram_history: Vec<u32>,
+    pub temp_history: Vec<u32>,
+    pub disk_history: Vec<u32>,
+    pub battery_history: Vec<u32>,
+    /// (1, 5, 15 minute) load averages and the process count.
+    pub loadavg: Option<([f32; 3], u32)>,
+    pub uptime: Option<u64>,
     pub ram: Option<Ram>,
     pub temp: Option<u32>,
     pub disk: Option<Disk>,
@@ -592,6 +615,10 @@ impl SysMon {
 /// shell (a keybind running wpctl, a hardware key) reads as real time,
 /// cheap enough to keep forever: two wpctl calls and two sysfs reads.
 const FAST_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The sysinfo widgets' sparkline depth: one sample per full poll, so
+/// this is the recent window the little graphs show.
+const HISTORY_LEN: usize = 60;
 /// When a poll read differs from the state and waits for the next
 /// read to confirm it (the confirm gate), the re-check rides a short
 /// timer instead of the next full tick: an outside change should not
@@ -659,6 +686,39 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
                 let moved = if full {
                     sysmon.battery = snapshot.battery;
                     sysmon.cpu = snapshot.cpu;
+                    sysmon.cpu_cores = snapshot.cpu_cores.clone();
+                    sysmon.loadavg = snapshot.loadavg;
+                    sysmon.uptime = snapshot.uptime;
+                    if let Some(usage) = snapshot.cpu {
+                        sysmon.cpu_history.push(usage);
+                        if sysmon.cpu_history.len() > HISTORY_LEN {
+                            sysmon.cpu_history.remove(0);
+                        }
+                    }
+                    if let Some(ram) = &snapshot.ram {
+                        sysmon.ram_history.push(u32::from(ram.percent));
+                        if sysmon.ram_history.len() > HISTORY_LEN {
+                            sysmon.ram_history.remove(0);
+                        }
+                    }
+                    if let Some(temp) = snapshot.temp {
+                        sysmon.temp_history.push(temp);
+                        if sysmon.temp_history.len() > HISTORY_LEN {
+                            sysmon.temp_history.remove(0);
+                        }
+                    }
+                    if let Some(disk) = &snapshot.disk {
+                        sysmon.disk_history.push(u32::from(disk.percent));
+                        if sysmon.disk_history.len() > HISTORY_LEN {
+                            sysmon.disk_history.remove(0);
+                        }
+                    }
+                    if let Some(battery) = &snapshot.battery {
+                        sysmon.battery_history.push(u32::from(battery.percent));
+                        if sysmon.battery_history.len() > HISTORY_LEN {
+                            sysmon.battery_history.remove(0);
+                        }
+                    }
                     sysmon.ram = snapshot.ram;
                     sysmon.temp = snapshot.temp;
                     sysmon.disk = snapshot.disk.clone();
@@ -701,6 +761,9 @@ struct Snapshot {
     mic: Option<Mic>,
     brightness: Option<Brightness>,
     cpu: Option<f32>,
+    cpu_cores: Option<Vec<f32>>,
+    loadavg: Option<([f32; 3], u32)>,
+    uptime: Option<u64>,
     ram: Option<Ram>,
     temp: Option<u32>,
     disk: Option<Disk>,
@@ -712,12 +775,16 @@ struct Snapshot {
 }
 
 fn refresh(previous: &mut Option<CpuSample>, disk_mount: &std::path::Path) -> Snapshot {
+    let usage = sample_cpu_usage(previous);
     Snapshot {
         battery: read_battery(),
         volume: read_volume(),
         mic: read_mic(),
         brightness: read_brightness(),
-        cpu: sample_cpu_usage(previous),
+        cpu: usage.as_ref().map(|usage| usage.total),
+        cpu_cores: usage.as_ref().map(|usage| usage.cores.clone()),
+        loadavg: read_loadavg(),
+        uptime: read_uptime(),
         ram: read_ram(),
         temp: read_cpu_temp(),
         disk: read_disk(disk_mount),
@@ -1343,20 +1410,20 @@ fn parse_recording_stat(stat: &str, uptime_secs: f64) -> Option<u64> {
     Some(elapsed.max(0.0) as u64)
 }
 
-fn sample_cpu_usage(previous: &mut Option<CpuSample>) -> Option<f32> {
-    let line = std::fs::read_to_string("/proc/stat").ok()?;
-    let sample = parse_cpu_stat(&line)?;
+fn sample_cpu_usage(previous: &mut Option<CpuSample>) -> Option<CpuUsage> {
+    let text = std::fs::read_to_string("/proc/stat").ok()?;
+    let sample = parse_cpu_stat(&text)?;
     let usage = previous
         .take()
-        .and_then(|previous| cpu_delta(previous, sample));
+        .and_then(|previous| cpu_usage(previous, sample.clone()));
     *previous = Some(sample);
     usage
 }
 
-fn parse_cpu_stat(line: &str) -> Option<CpuSample> {
-    let fields: Vec<u64> = line
-        .lines()
-        .next()?
+fn parse_cpu_stat(text: &str) -> Option<CpuSample> {
+    let mut lines = text.lines();
+    let aggregate = lines.next()?;
+    let fields: Vec<u64> = aggregate
         .split_whitespace()
         .skip(1)
         .filter_map(|field| field.parse().ok())
@@ -1364,10 +1431,46 @@ fn parse_cpu_stat(line: &str) -> Option<CpuSample> {
     if fields.len() < 5 {
         return None;
     }
+    // the cpuN lines after the aggregate: one (idle, total) per core
+    let cores = lines
+        .filter(|line| line.starts_with("cpu") && line.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
+        .filter_map(|line| {
+            let fields: Vec<u64> = line
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|field| field.parse().ok())
+                .collect();
+            if fields.len() < 5 {
+                return None;
+            }
+            Some((fields[3] + fields[4], fields.iter().sum()))
+        })
+        .collect();
     Some(CpuSample {
         idle: fields[3] + fields[4],
         total: fields.iter().sum(),
+        cores,
     })
+}
+
+fn cpu_usage(previous: CpuSample, sample: CpuSample) -> Option<CpuUsage> {
+    let total = cpu_delta(previous.clone(), sample.clone())?;
+    let cores = previous
+        .cores
+        .iter()
+        .zip(sample.cores.iter())
+        .filter_map(|(previous, sample)| {
+            let (p_idle, p_total) = *previous;
+            let (s_idle, s_total) = *sample;
+            let delta = s_total.saturating_sub(p_total);
+            if delta == 0 {
+                None
+            } else {
+                Some((1.0 - s_idle.saturating_sub(p_idle) as f32 / delta as f32).max(0.0))
+            }
+        })
+        .collect();
+    Some(CpuUsage { total, cores })
 }
 
 fn cpu_delta(previous: CpuSample, sample: CpuSample) -> Option<f32> {
@@ -1380,6 +1483,36 @@ fn cpu_delta(previous: CpuSample, sample: CpuSample) -> Option<f32> {
     }
 }
 
+/// /proc/loadavg: the three averages and the running/total process
+/// counts bundled in the fourth field.
+fn read_loadavg() -> Option<([f32; 3], u32)> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok()?;
+    parse_loadavg(&text)
+}
+
+fn parse_loadavg(text: &str) -> Option<([f32; 3], u32)> {
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let loads = [
+        fields.first()?.parse().ok()?,
+        fields.get(1)?.parse().ok()?,
+        fields.get(2)?.parse().ok()?,
+    ];
+    // "x/y entities": y is the total process count
+    let counts = fields.get(3)?;
+    let procs = counts.split('/').nth(1)?.parse().ok()?;
+    Some((loads, procs))
+}
+
+/// Seconds since boot, from /proc/uptime.
+fn read_uptime() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/uptime").ok()?;
+    text.split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+        .map(|secs| secs as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1389,18 +1522,21 @@ mod tests {
         let previous = CpuSample {
             idle: 1000,
             total: 2000,
+            cores: vec![],
         };
         let busy = CpuSample {
             idle: 1000,
             total: 3000,
+            cores: vec![],
         };
         let idle = CpuSample {
             idle: 1500,
             total: 3000,
+            cores: vec![],
         };
-        assert_eq!(cpu_delta(previous, busy), Some(1.0));
-        assert_eq!(cpu_delta(previous, idle), Some(0.5));
-        assert_eq!(cpu_delta(previous, previous), None);
+        assert_eq!(cpu_delta(previous.clone(), busy), Some(1.0));
+        assert_eq!(cpu_delta(previous.clone(), idle), Some(0.5));
+        assert_eq!(cpu_delta(previous.clone(), previous), None);
     }
 
     #[test]
@@ -1412,6 +1548,42 @@ mod tests {
             99106 + 646 + 27178 + 5737528 + 25604 + 0 + 9318 + 0 + 0 + 0
         );
         assert!(parse_cpu_stat("garbage").is_none());
+    }
+
+    #[test]
+    fn cpu_stat_cores_parse() {
+        let text = "cpu  1000 0 1000 8000 0 0 0 0 0 0\n\
+                    cpu0 500 0 500 9000 0 0 0 0 0 0\n\
+                    cpu1 250 0 250 9500 0 0 0 0 0 0\n\
+                    intr 123\n";
+        let sample = parse_cpu_stat(text).unwrap();
+        assert_eq!(sample.cores.len(), 2);
+        assert_eq!(sample.cores[0], (9000, 10000));
+        assert_eq!(sample.cores[1], (9500, 10000));
+    }
+
+    #[test]
+    fn cpu_usage_reads_per_core() {
+        let previous = parse_cpu_stat(
+            "cpu  1000 0 1000 8000 0 0 0 0 0 0\ncpu0 500 0 500 9000 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        let sample = parse_cpu_stat(
+            "cpu  1500 0 1000 8500 0 0 0 0 0 0\ncpu0 750 0 500 9250 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        let usage = cpu_usage(previous, sample).unwrap();
+        assert_eq!(usage.total, 0.5);
+        // core0: half its delta is idle
+        assert_eq!(usage.cores, vec![0.5]);
+    }
+
+    #[test]
+    fn loadavg_parses_loads_and_processes() {
+        let (loads, procs) = parse_loadavg("0.42 0.39 0.31 2/2471 12345\n").unwrap();
+        assert_eq!(loads, [0.42, 0.39, 0.31]);
+        assert_eq!(procs, 2471);
+        assert!(parse_loadavg("0.42 0.39\n").is_none());
     }
 
     #[test]

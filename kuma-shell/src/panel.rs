@@ -174,6 +174,11 @@ pub enum PanelKind {
     Brightness,
     Mic,
     PowerProfile,
+    Cpu,
+    Ram,
+    Temp,
+    Disk,
+    Battery,
     DockMenu,
     Nostr,
 }
@@ -190,6 +195,11 @@ impl PanelKind {
             PanelKind::Brightness => (360., 150., KeyboardInteractivity::OnDemand),
             PanelKind::Mic => (360., 150., KeyboardInteractivity::OnDemand),
             PanelKind::PowerProfile => (280., 170., KeyboardInteractivity::OnDemand),
+            PanelKind::Cpu => (320., 220., KeyboardInteractivity::OnDemand),
+            PanelKind::Ram | PanelKind::Temp | PanelKind::Disk => {
+                (320., 220., KeyboardInteractivity::OnDemand)
+            }
+            PanelKind::Battery => (320., 220., KeyboardInteractivity::OnDemand),
             PanelKind::DockMenu => (180., 96., KeyboardInteractivity::OnDemand),
             PanelKind::Nostr => (560., 520., KeyboardInteractivity::OnDemand),
         }
@@ -205,6 +215,11 @@ impl PanelKind {
             PanelKind::Brightness => "brightness",
             PanelKind::Mic => "mic",
             PanelKind::PowerProfile => "power-profile",
+            PanelKind::Cpu => "cpu",
+            PanelKind::Ram => "ram",
+            PanelKind::Temp => "temp",
+            PanelKind::Disk => "disk",
+            PanelKind::Battery => "battery",
             PanelKind::DockMenu => "dock-menu",
             PanelKind::Nostr => "nostr",
         }
@@ -292,6 +307,61 @@ impl PanelKind {
                 .into(),
             PanelKind::PowerProfile => cx
                 .new(|cx| crate::power_panel::PowerProfileView::new(sysmon, window, cx, geometry))
+                .into(),
+            PanelKind::Cpu => cx
+                .new(|cx| {
+                    crate::sysinfo_panel::SysPanelView::new(
+                        crate::sysinfo_panel::SysPanel::Cpu,
+                        sysmon,
+                        window,
+                        cx,
+                        geometry,
+                    )
+                })
+                .into(),
+            PanelKind::Ram => cx
+                .new(|cx| {
+                    crate::sysinfo_panel::SysPanelView::new(
+                        crate::sysinfo_panel::SysPanel::Ram,
+                        sysmon,
+                        window,
+                        cx,
+                        geometry,
+                    )
+                })
+                .into(),
+            PanelKind::Temp => cx
+                .new(|cx| {
+                    crate::sysinfo_panel::SysPanelView::new(
+                        crate::sysinfo_panel::SysPanel::Temp,
+                        sysmon,
+                        window,
+                        cx,
+                        geometry,
+                    )
+                })
+                .into(),
+            PanelKind::Disk => cx
+                .new(|cx| {
+                    crate::sysinfo_panel::SysPanelView::new(
+                        crate::sysinfo_panel::SysPanel::Disk,
+                        sysmon,
+                        window,
+                        cx,
+                        geometry,
+                    )
+                })
+                .into(),
+            PanelKind::Battery => cx
+                .new(|cx| {
+                    crate::sysinfo_panel::SysPanelView::new(
+                        crate::sysinfo_panel::SysPanel::Battery,
+                        sysmon,
+                        window,
+                        cx,
+                        geometry,
+                    )
+                })
                 .into(),
             PanelKind::DockMenu => {
                 let context = cx.global::<PanelHost>().dock_menu();

@@ -23,6 +23,7 @@ pub mod settings_view;
 pub mod slider_panel;
 pub mod surfaces;
 pub mod sway;
+pub mod sysinfo_panel;
 pub mod sysmon;
 pub mod theme;
 pub mod tray;
