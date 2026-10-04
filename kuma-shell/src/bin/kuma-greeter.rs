@@ -9,11 +9,11 @@
 
 use std::io::BufRead;
 
+use gpui::layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions};
 use gpui::{
     prelude::*, div, px, rgba, rgb, App, AppContext, Context, Focusable, FocusHandle,
     KeyDownEvent, Render, Window, WindowKind, WindowOptions,
-};
-use kuma_shell::greeter::{self, GreetdClient, LoginOutcome};
+};use kuma_shell::greeter::{self, GreetdClient, LoginOutcome};
 use kuma_shell::icons::KumaAssets;
 use kuma_shell::theme;
 
@@ -105,12 +105,26 @@ fn headless(args: &[String]) -> i32 {
 }
 
 fn window_options() -> WindowOptions {
+    // layer shell, the lock screen's shape: fullscreen on the output,
+    // exclusive keyboard. The shell's windows all ride this path; the
+    // plain toplevel path dies on niri with a wp_viewport protocol
+    // error (gpui's viewport gets a value niri rejects)
     WindowOptions {
         titlebar: None,
         app_id: Some("kuma-greeter".into()),
         window_background: gpui::WindowBackgroundAppearance::Opaque,
-        window_bounds: Some(gpui::WindowBounds::Fullscreen(gpui::Bounds::default())),
-        kind: WindowKind::Normal,
+        window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
+            origin: gpui::point(px(0.), px(0.)),
+            size: gpui::size(px(0.), px(0.)),
+        })),
+        kind: WindowKind::LayerShell(LayerShellOptions {
+            namespace: "kuma-greeter".into(),
+            layer: Layer::Overlay,
+            exclusive_zone: Some(px(-1.)),
+            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+            keyboard_interactivity: KeyboardInteractivity::Exclusive,
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }

@@ -1,0 +1,11 @@
+# The rehearsal greetd config: a second greeter on VT2, next to the
+# live session, touching nothing in /etc/greetd/config.toml. Launch:
+#   sudo systemd-run greetd --config <this file>
+# Tear down: sudo pkill greetd (kills only this instance; the boot
+# one runs under systemd as greetd.service, leave it alone).
+[terminal]
+vt = 2
+
+[default_session]
+command = "niri -c /var/home/martin/Documents/kumaui/greeter-niri.kdl -- sh -c \"XDG_CACHE_HOME=/tmp/kuma-greeter-cache exec /var/usrlocal/bin/kuma-greeter 2>>/tmp/kuma-greeter.log\""
+user = "martin"
