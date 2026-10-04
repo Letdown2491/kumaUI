@@ -7,5 +7,5 @@
 vt = 2
 
 [default_session]
-command = "niri -c /var/home/martin/Documents/kumaui/greeter-niri.kdl -- sh -c \"XDG_CACHE_HOME=/tmp/kuma-greeter-cache exec /var/usrlocal/bin/kuma-greeter 2>>/tmp/kuma-greeter.log\""
+command = "niri -c /var/home/martin/Documents/kumaui/greeter-niri.kdl -- sh -c 'WAYLAND_DEBUG=1 RUST_LOG=debug exec /var/usrlocal/bin/kuma-greeter 2>>/tmp/kuma-greeter.log'"
 user = "martin"
