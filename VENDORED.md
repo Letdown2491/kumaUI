@@ -46,3 +46,12 @@ local patches, which should be recorded here.
   layer surfaces the compositor immediately closes (a 2s create/close
   spin against a displayless compositor); retired outputs make
   `cx.displays()` truthful so the watch can idle.
+- `crates/gpui_linux/src/linux/wayland/window.rs`: `set_size_and_scale`
+  skips `wp_viewport::set_destination` when the size is zero. Layer
+  surfaces start at zero size and get their real size from the layer
+  configure, but a scale event can land first (niri announces
+  `preferred_buffer_scale 2` before the configure on a 162-DPI panel),
+  and `set_destination(0, 0)` is a viewporter protocol violation niri
+  answers by killing the client. Found by the greeter rehearsal
+  (docs/greeter-deploy.md); the lock screen never met it because the
+  session niri is configured with scale 1.
