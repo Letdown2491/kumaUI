@@ -238,7 +238,7 @@ impl SysPanelView {
                         } else if battery.charging {
                             "charging"
                         } else if battery.on_ac {
-                            "on AC (charge held)"
+                            "on AC (held)"
                         } else {
                             "discharging"
                         }

@@ -312,6 +312,9 @@ impl Render for SysmonTooltip {
             .bg(rgb(0x11111B))
             .text_size(px(12.))
             .text_color(rgb(TEXT))
+            // one line by design: these are short status labels, and a
+            // wrapped tail ("held" alone on line two) reads broken
+            .whitespace_nowrap()
             .child(text)
     }
 }
@@ -775,7 +778,7 @@ impl ShellBar {
                             } else if battery.charging {
                                 "charging"
                             } else if battery.on_ac {
-                                "on AC (charge held)"
+                                "on AC (held)"
                             } else {
                                 "discharging"
                             }

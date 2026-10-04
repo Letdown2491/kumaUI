@@ -56,6 +56,18 @@ pub struct Disk {
     pub mount: String,
 }
 
+/// One playback stream (a sink input): the volume panel's per-app
+/// rows. `binary` is the client executable in the status output's
+/// brackets, the stable handle for desktop-file icon matching.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stream {
+    pub id: u32,
+    pub name: String,
+    pub binary: String,
+    pub percent: u8,
+    pub muted: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BluetoothState {
     pub enabled: bool,
@@ -199,6 +211,9 @@ pub struct SysMon {
     /// (1, 5, 15 minute) load averages and the process count.
     pub loadavg: Option<([f32; 3], u32)>,
     pub uptime: Option<u64>,
+    /// Playback streams, populated only while the volume panel is
+    /// open (see the scan gate in the poll loop).
+    pub streams: Vec<Stream>,
     pub ram: Option<Ram>,
     pub temp: Option<u32>,
     pub disk: Option<Disk>,
@@ -272,6 +287,10 @@ enum AvRequest {
     BrightnessAbsolute(u8, Option<Brightness>),
     Mic(Option<Mic>),
     MicVolume(u8, Option<Mic>),
+    /// A stream's absolute volume: the panel's slider path.
+    StreamVolume(u32, u8),
+    /// A stream's mute toggle: the panel's mute button.
+    StreamMute(u32),
 }
 
 impl AvRequest {
@@ -338,6 +357,24 @@ impl AvRequest {
                         sysmon.mic = previous; // rollback; the next poll reconciles
                         cx.notify();
                     });
+                }
+            }
+            AvRequest::StreamVolume(id, percent) => {
+                if let Err(err) = cx
+                    .background_spawn(async move { set_stream_volume(id, percent) })
+                    .await
+                {
+                    // no optimistic state to roll back: the stream's
+                    // row reconciles on the next panel-open scan
+                    log::error!("stream volume request failed: {err:#}");
+                }
+            }
+            AvRequest::StreamMute(id) => {
+                if let Err(err) = cx
+                    .background_spawn(async move { toggle_stream_mute(id) })
+                    .await
+                {
+                    log::error!("stream mute toggle failed: {err:#}");
                 }
             }
         }
@@ -498,6 +535,42 @@ impl SysMon {
             cx.notify();
         }
         self.queue(AvRequest::Volume(VolumeRequest::Set(percent), previous), cx);
+    }
+
+    /// A stream's absolute volume: the volume panel's per-app slider.
+    /// Optimistic write on the matching row (when the snapshot still
+    /// has it), queue; the next panel-open scan reconciles.
+    pub fn request_set_stream_volume(&mut self, id: u32, percent: u8, cx: &mut Context<Self>) {
+        if let Some(stream) = self.streams.iter_mut().find(|stream| stream.id == id) {
+            stream.percent = percent;
+            cx.notify();
+        }
+        self.queue(AvRequest::StreamVolume(id, percent), cx);
+    }
+
+    /// A stream's mute toggle: the volume panel's per-app button.
+    /// Optimistic flip on the matching row, queue, scan reconciles.
+    pub fn request_stream_mute_toggle(&mut self, id: u32, cx: &mut Context<Self>) {
+        if let Some(stream) = self.streams.iter_mut().find(|stream| stream.id == id) {
+            stream.muted = !stream.muted;
+            cx.notify();
+        }
+        self.queue(AvRequest::StreamMute(id), cx);
+    }
+
+    /// A fresh stream scan right now, off the poll's clock: the panel
+    /// calls this when it opens so the rows are there on the first
+    /// paint instead of a full pass later. The poll keeps its own
+    /// panel-open cadence after that.
+    pub fn scan_streams_now(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let streams = cx.background_spawn(async move { read_streams() }).await;
+            let _ = this.update(cx, |sysmon, cx| {
+                sysmon.streams = streams;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// One request seam for brightness (the quick-settings slider): optimistic
@@ -670,11 +743,16 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
             let Ok(disk_mount) = state.update(cx, |sysmon, _| sysmon.disk_mount.clone()) else {
                 break;
             };
+            // the stream scan rides only while the volume panel is
+            // open: the status dump is the heaviest call in the pass
+            let scan_streams = full
+                && cx
+                    .update(|cx| crate::panel::is_open(&crate::panel::PanelKind::Volume, cx));
             let (snapshot, previous_next) = cx
                 .background_spawn(async move {
                     let mut previous = previous;
                     let snapshot = if full {
-                        refresh(&mut previous, &disk_mount)
+                        refresh(&mut previous, &disk_mount, scan_streams)
                     } else {
                         refresh_av()
                     };
@@ -722,6 +800,7 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
                     sysmon.ram = snapshot.ram;
                     sysmon.temp = snapshot.temp;
                     sysmon.disk = snapshot.disk.clone();
+                    sysmon.streams = snapshot.streams.clone();
                     sysmon.bluetooth = snapshot.bluetooth.clone();
                     sysmon.network = snapshot.network.clone();
                     sysmon.power_profile = snapshot.power_profile;
@@ -764,6 +843,9 @@ struct Snapshot {
     cpu_cores: Option<Vec<f32>>,
     loadavg: Option<([f32; 3], u32)>,
     uptime: Option<u64>,
+    /// Playback streams, scanned only while the volume panel is open
+    /// (the status dump is too heavy for the idle shell).
+    streams: Vec<Stream>,
     ram: Option<Ram>,
     temp: Option<u32>,
     disk: Option<Disk>,
@@ -774,7 +856,11 @@ struct Snapshot {
     recording: Option<RecordingState>,
 }
 
-fn refresh(previous: &mut Option<CpuSample>, disk_mount: &std::path::Path) -> Snapshot {
+fn refresh(
+    previous: &mut Option<CpuSample>,
+    disk_mount: &std::path::Path,
+    scan_streams: bool,
+) -> Snapshot {
     let usage = sample_cpu_usage(previous);
     Snapshot {
         battery: read_battery(),
@@ -785,6 +871,11 @@ fn refresh(previous: &mut Option<CpuSample>, disk_mount: &std::path::Path) -> Sn
         cpu_cores: usage.as_ref().map(|usage| usage.cores.clone()),
         loadavg: read_loadavg(),
         uptime: read_uptime(),
+        streams: if scan_streams {
+            read_streams()
+        } else {
+            Vec::new()
+        },
         ram: read_ram(),
         temp: read_cpu_temp(),
         disk: read_disk(disk_mount),
@@ -854,6 +945,24 @@ pub fn set_volume(percent: u8) -> anyhow::Result<()> {
         .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{percent}%")])
         .output()?;
     anyhow::ensure!(output.status.success(), "wpctl set-volume failed");
+    Ok(())
+}
+
+/// A stream's absolute volume, same shape as the sink's: the id names
+/// the sink input, clamped to 100 so wpctl can't amplify.
+fn set_stream_volume(id: u32, percent: u8) -> anyhow::Result<()> {
+    let output = Command::new("wpctl")
+        .args(["set-volume", &id.to_string(), &format!("{percent}%")])
+        .output()?;
+    anyhow::ensure!(output.status.success(), "wpctl set-volume failed");
+    Ok(())
+}
+
+fn toggle_stream_mute(id: u32) -> anyhow::Result<()> {
+    let output = Command::new("wpctl")
+        .args(["set-mute", &id.to_string(), "toggle"])
+        .output()?;
+    anyhow::ensure!(output.status.success(), "wpctl set-mute failed");
     Ok(())
 }
 
@@ -1164,6 +1273,90 @@ fn parse_wpctl_volume(text: &str) -> Option<Volume> {
         percent: (level * 100.0).round() as u8,
         muted: text.contains("[MUTED]"),
     })
+}
+
+/// The Audio section's stream list: `(id, display name, client
+/// binary)` per playback stream. Only the Audio section counts (Video
+/// keeps its own Streams block), and only the top-level stream lines
+/// (the channel routing lines under each stream carry " > ").
+fn parse_streams(text: &str) -> Vec<(u32, String, String)> {
+    let mut in_audio = false;
+    let mut in_streams = false;
+    let mut streams = Vec::new();
+    for line in text.lines() {
+        let top_level = !line.starts_with(' ');
+        if top_level {
+            in_audio = line.trim() == "Audio";
+            in_streams = false;
+            continue;
+        }
+        if !in_audio {
+            continue;
+        }
+        if line.trim().ends_with("Streams:") {
+            in_streams = true;
+            continue;
+        }
+        if !in_streams || line.contains(" > ") {
+            continue;
+        }
+        // "        67. PipeWire ALSA [gst-launch-1.0]"
+        let trimmed = line.trim();
+        let Some((id, rest)) = trimmed.split_once(". ") else {
+            continue;
+        };
+        let Ok(id) = id.parse() else {
+            continue;
+        };
+        let (name, binary) = match rest.rsplit_once(" [").and_then(|(name, binary)| {
+            binary
+                .strip_suffix(']')
+                .map(|binary| (name.trim().to_string(), binary.to_string()))
+        }) {
+            Some(pair) => pair,
+            None => (rest.trim().to_string(), rest.trim().to_string()),
+        };
+        streams.push((id, name, binary));
+    }
+    streams
+}
+
+/// Every playback stream on the default server, with each stream's
+/// volume read one call later. Only called while the volume panel is
+/// open: `wpctl status` dumps the whole graph, too heavy for the idle
+/// shell.
+fn read_streams() -> Vec<Stream> {
+    let Ok(output) = Command::new("wpctl").arg("status").output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_streams(&String::from_utf8_lossy(&output.stdout))
+        .into_iter()
+        .filter_map(|(id, name, binary)| {
+            let volume = Command::new("wpctl")
+                .args(["get-volume", &id.to_string()])
+                .output()
+                .ok()?;
+            if !volume.status.success() {
+                return None;
+            }
+            let volume = parse_wpctl_volume(&String::from_utf8_lossy(&volume.stdout))?;
+            // filter hard: a stream parked at zero is an app holding
+            // its sink input open, not something anyone mixes
+            if volume.percent == 0 {
+                return None;
+            }
+            Some(Stream {
+                id,
+                name,
+                binary,
+                percent: volume.percent,
+                muted: volume.muted,
+            })
+        })
+        .collect()
 }
 
 fn read_volume() -> Option<Volume> {
@@ -1548,6 +1741,49 @@ mod tests {
             99106 + 646 + 27178 + 5737528 + 25604 + 0 + 9318 + 0 + 0 + 0
         );
         assert!(parse_cpu_stat("garbage").is_none());
+    }
+
+    #[test]
+    fn wpctl_status_streams_parse() {
+        // the shape wpctl 1.6 prints: top-level section headers, the
+        // Audio block's Streams list with channel routing lines under
+        // each stream, and a second Streams block under Video that
+        // must not leak in
+        let text = [
+            "PipeWire 'pipewire-0' [1.6.9, martin@motherbox, cookie:3081952736]",
+            " └─ Clients:",
+            "        33. WirePlumber [1.6.9, martin@motherbox]",
+            "Audio",
+            " ├─ Devices:",
+            " │      42. Radeon HD Audio Controller [alsa]",
+            " ├─ Sinks:",
+            " │  *   51. Ryzen HD Audio Controller Analog Stereo [vol: 0.50]",
+            " ├─ Filters:",
+            " │",
+            " └─ Streams:",
+            "        67. PipeWire ALSA [gst-launch-1.0]                              ",
+            "             70. output_FL       > ALC257 Analog:playback_FL\t[active]",
+            "        89. Firefox [firefox]",
+            "",
+            "Video",
+            " └─ Streams:",
+            "        55. Integrated Camera: Integrated C [libcamera]",
+        ]
+        .join("\n");
+        let streams = parse_streams(&text);
+        assert_eq!(
+            streams,
+            vec![
+                (67u32, "PipeWire ALSA".to_string(), "gst-launch-1.0".to_string()),
+                (89u32, "Firefox".to_string(), "firefox".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn wpctl_status_without_streams_parses_empty() {
+        let text = "Audio\n ├─ Sinks:\n │  *   51. Analog Stereo [vol: 0.50]\n └─ Streams:\n\nVideo\n";
+        assert!(parse_streams(text).is_empty());
     }
 
     #[test]
