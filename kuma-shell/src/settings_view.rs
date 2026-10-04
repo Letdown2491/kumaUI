@@ -71,6 +71,21 @@ fn load_thumb(path: PathBuf) -> Option<Arc<RenderImage>> {
     crate::imaging::decode_thumbnail(&path, 240, 160).map(Arc::new)
 }
 
+/// The thumbnail decode lane: at most three full-resolution decodes
+/// run at once, so opening a large gallery cannot stack a dozen
+/// multi-MB decodes into one memory spike. The channel is the token
+/// bucket: send while slots are free, receive one back when done.
+fn decode_lane() -> &'static (
+    smol::channel::Sender<()>,
+    smol::channel::Receiver<()>,
+) {
+    static LANE: std::sync::OnceLock<(
+        smol::channel::Sender<()>,
+        smol::channel::Receiver<()>,
+    )> = std::sync::OnceLock::new();
+    LANE.get_or_init(|| smol::channel::bounded(3))
+}
+
 /// The rotation choices the backgrounds page offers: off, or minutes.
 const ROTATIONS: [u32; 4] = [0, 10, 30, 60];
 
@@ -2034,11 +2049,19 @@ impl SettingsView {
             return;
         }
         self.thumbs.insert(path.clone(), None);
+        let (lane, release) = decode_lane();
+        let lane = lane.clone();
         cx.spawn(async move |this, cx| {
+            // a slot first, or the burst stacks up
+            if lane.send(()).await.is_err() {
+                return;
+            }
             let path_for_task = path.clone();
             let thumb = cx
                 .background_spawn(async move { load_thumb(path_for_task) })
                 .await;
+            // the slot back, whether the decode produced anything
+            let _ = release.recv().await;
             let _ = this.update(cx, |this, cx| {
                 this.thumbs.insert(path, thumb);
                 cx.notify();
