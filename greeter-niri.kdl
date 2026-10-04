@@ -2,5 +2,9 @@
 // one greeter window. No keybinds, no gestures, no session wiring:
 // greetd launches this niri on the test VT, niri launches
 // kuma-greeter as its startup command, and GREETD_SOCK flows down
-// through the environment. Ctrl+Alt+F1 (or F3) still switches VTs,
-// that is compositor-independent.
+// through the environment. The hotkey overlay is noise on a login
+// screen, so it never shows. Ctrl+Alt+F1 (or F3) still switches
+// VTs, that is compositor-independent.
+hotkey-overlay {
+    skip-at-startup
+}

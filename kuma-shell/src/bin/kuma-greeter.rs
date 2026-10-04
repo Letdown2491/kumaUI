@@ -8,6 +8,7 @@
 //! stdin, no UI) for the VT2 dress rehearsal and scripting.
 
 use std::io::BufRead;
+use std::sync::Arc;
 
 use gpui::layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions};
 use gpui::{
@@ -136,6 +137,7 @@ const USERNAME: usize = 0;
 const PASSWORD: usize = 1;
 
 struct GreeterState {
+    wallpaper: Option<std::sync::Arc<gpui::RenderImage>>,
     username: String,
     password: String,
     focus: usize,
@@ -151,6 +153,27 @@ struct GreeterState {
 
 impl GreeterState {
     fn new(cx: &mut Context<Self>) -> Self {
+        // the wallpaper and theme come from the same settings file the
+        // shell reads; under the production greeter user the file may
+        // not exist and Settings::load falls back to defaults
+        let settings = cx.new(|_| kuma_shell::settings::Settings::load());
+        settings.update(cx, |settings, cx| settings.refresh_theme(cx));
+        let wallpaper_path = settings.read(cx).background.current_path();
+
+        // decoded off-thread; the screen shows the dark base until it lands
+        cx.spawn(async move |this, cx| {
+            let image = cx
+                .background_spawn(async move {
+                    kuma_shell::imaging::decode_file(&wallpaper_path).map(Arc::new)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.wallpaper = image;
+                cx.notify();
+            });
+        })
+        .detach();
+
         let sessions =
             greeter::wayland_sessions(std::path::Path::new("/usr/share/wayland-sessions"));
         let clock = chrono::Local::now().format("%H:%M").to_string();
@@ -176,6 +199,7 @@ impl GreeterState {
         .detach();
 
         Self {
+            wallpaper: None,
             username: String::new(),
             password: String::new(),
             focus: USERNAME,
@@ -367,7 +391,11 @@ impl Focusable for GreeterView {
 
 impl Render for GreeterView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui::{img, ObjectFit};
+
         let state = self.state.read(cx);
+        let theme = theme::current();
+        let wallpaper = state.wallpaper.clone();
         let theme = theme::current();
         let username = state.username.clone();
         let password = state.password.clone();
@@ -395,6 +423,14 @@ impl Render for GreeterView {
                     .update(cx, |state, cx| state.handle_key(event, cx));
             }))
             .bg(rgb(theme.panel_bg))
+            .when_some(wallpaper, |el, image| {
+                el.child(
+                    img(gpui::ImageSource::Render(image))
+                        .object_fit(ObjectFit::Cover)
+                        .size_full()
+                        .absolute(),
+                )
+            })
             .child(
                 div()
                     .absolute()
