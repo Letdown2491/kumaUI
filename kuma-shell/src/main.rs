@@ -45,6 +45,7 @@ fn main() {
             settings.update(cx, |settings, cx| settings.refresh_theme(cx));
 
             kuma_shell::wallpaper::run(&settings, cx);
+            kuma_shell::night_light::run(&settings, cx);
 
             let sysmon = cx.new(|_| SysMon::default());
             kuma_shell::sysmon::run(&sysmon, &settings, cx);

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyView, App, ClickEvent, Context, Div, Entity, FontWeight, IntoElement, ParentElement,
-    Render, SharedString, Window, div, px, rgb, rgba,
+    Anchor, AnyView, App, ClickEvent, Context, Div, Entity, FontWeight, IntoElement,
+    ParentElement, Render, SharedString, Window, anchored, deferred, div, px, rgb, rgba,
 };
 
 use crate::theme::*;
@@ -48,6 +48,140 @@ pub fn card_note(note: &str) -> Div {
         .text_size(px(11.))
         .text_color(rgb(crate::theme::current().text_dim))
         .child(note.to_string())
+}
+
+/// The dropdown: a value button that opens a floating options list
+/// (deferred + anchored, the gpui popover shape), closes on a pick or
+/// a press outside. The open state lives with the caller, since views
+/// here hold menu state as fields across re-renders.
+#[allow(clippy::too_many_arguments)]
+pub fn dropdown<V: 'static>(
+    cx: &mut Context<V>,
+    id: &str,
+    label: String,
+    options: Vec<String>,
+    current: usize,
+    open: bool,
+    on_toggle: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+    on_pick: impl Fn(usize, &mut V, &mut Window, &mut Context<V>) + 'static,
+    on_close: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+) -> gpui::Stateful<Div> {
+    let on_toggle = std::rc::Rc::new(on_toggle);
+    let on_close = std::rc::Rc::new(on_close);
+    let on_pick = std::rc::Rc::new(on_pick);
+    let toggle = cx.listener({
+        let on_toggle = on_toggle.clone();
+        move |this, _: &gpui::ClickEvent, window, cx| on_toggle(this, window, cx)
+    });
+    let close = cx.listener({
+        let on_close = on_close.clone();
+        move |this, _: &gpui::MouseDownEvent, window, cx| on_close(this, window, cx)
+    });
+    let picks: Vec<std::rc::Rc<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>> = (0
+        ..options.len())
+        .map(|index| {
+            let on_pick = on_pick.clone();
+            let listener = cx.listener(
+                move |this: &mut V, _: &gpui::ClickEvent, window, cx| {
+                    on_pick(index, this, window, cx)
+                },
+            );
+            std::rc::Rc::new(listener) as _
+        })
+        .collect();    let list_id = SharedString::from(format!("{id}-menu"));
+    div()
+        .id(SharedString::from(id))
+        .flex()
+        .items_center()
+        .child(
+            div()
+                .id(SharedString::from(format!("{id}-value")))
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(crate::theme::current().inset))
+                .border_1()
+                .border_color(rgb(if open {
+                    crate::theme::current().accent
+                } else {
+                    crate::theme::current().divider
+                }))
+                .cursor_pointer()
+                .hover(|el| el.bg(rgb(crate::theme::current().surface_hover)))
+                .on_click(toggle)
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(crate::theme::current().text))
+                        .child(label),
+                )
+                .child(
+                    gpui::svg()
+                        .path("icons/arrow-down.svg")
+                        .size(px(10.))
+                        .text_color(rgb(crate::theme::current().text_dim)),
+                ),
+        )
+        .when(open, |el| {
+            el.child(
+                deferred(
+                    anchored()
+                        .anchor(Anchor::TopLeft)
+                        .snap_to_window_with_margin(px(4.))
+                        .child(
+                            div()
+                                .id(list_id)
+                                .flex()
+                                .flex_col()
+                                .min_w(px(64.))
+                                .max_h(px(280.))
+                                .overflow_y_scroll()
+                                .mt_1()
+                                .rounded_md()
+                                .border_1()
+                                .shadow_lg()
+                                .bg(rgb(crate::theme::current().surface))
+                                .border_color(rgb(crate::theme::current().divider))
+                                .on_mouse_down_out(close)
+                                .children(options.iter().enumerate().map(|(index, option)| {
+                                    let pick = picks[index].clone();
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "{id}-opt-{index}"
+                                        )))
+                                        .flex()
+                                        .items_center()
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .cursor_pointer()
+                                        .hover(|el| {
+                                            el.bg(rgb(
+                                                crate::theme::current().surface_hover,
+                                            ))
+                                        })
+                                        .on_click(move |event, window, app| {
+                                            pick(event, window, app)
+                                        })
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .text_color(rgb(if index == current {
+                                                    crate::theme::current().accent
+                                                } else {
+                                                    crate::theme::current().text
+                                                }))
+                                                .child(option.clone()),
+                                        )
+                                        .into_any_element()
+                                })),
+                        ),
+                )
+                .priority(1000),
+            )
+        })
 }
 
 /// The setting row: a card that carries one setting, its name on the

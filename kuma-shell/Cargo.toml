@@ -25,4 +25,5 @@ env_logger = "0.11"
 toml = "0.9"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = "0.3"
 libc = "0.2"

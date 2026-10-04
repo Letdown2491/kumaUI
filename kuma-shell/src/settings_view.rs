@@ -99,6 +99,7 @@ enum Page {
     Idle,
     Backgrounds,
     Weather,
+    NightLight,
 }
 
 impl Page {
@@ -112,6 +113,7 @@ impl Page {
             Page::Idle => "Idle",
             Page::Backgrounds => "Backgrounds",
             Page::Weather => "Weather",
+            Page::NightLight => "Night Light",
         }
     }
 
@@ -125,10 +127,11 @@ impl Page {
             Page::Idle => "icons/clock.svg",
             Page::Backgrounds => "icons/image.svg",
             Page::Weather => "icons/cloud.svg",
+            Page::NightLight => "icons/moon.svg",
         }
     }
 
-    const ALL: [Page; 8] = [
+    const ALL: [Page; 9] = [
         Page::Quick,
         Page::Bar,
         Page::Widgets,
@@ -137,6 +140,7 @@ impl Page {
         Page::Idle,
         Page::Backgrounds,
         Page::Weather,
+        Page::NightLight,
     ];
 }
 
@@ -216,6 +220,21 @@ struct NumEdit {
     focus: FocusHandle,
 }
 
+/// Which half of the window a dropdown edits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NightField {
+    Start,
+    End,
+}
+
+/// Which of the three dropdowns in a half.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NightPart {
+    Hour,
+    Minute,
+    Meridiem,
+}
+
 pub struct SettingsView {
     settings: Entity<Settings>,
     sysmon: Entity<crate::sysmon::SysMon>,
@@ -235,6 +254,8 @@ pub struct SettingsView {
     /// the weather location field, if open, and the resolve's state
     weather_edit: Option<WeatherEdit>,
     weather_resolve: Option<WeatherResolve>,
+    /// the open night light dropdown, if any
+    night_menu: Option<(NightField, NightPart)>,
 }
 
 impl SettingsView {
@@ -289,6 +310,7 @@ impl SettingsView {
             num_edit: None,
             weather_edit: None,
             weather_resolve: None,
+            night_menu: None,
         }
     }
 
@@ -912,6 +934,183 @@ impl SettingsView {
     /// commits the whole number, nothing is written per keystroke.
     /// The clocks are independent, never clamped, and a dim note says
     /// when the order would surprise.
+    /// The night light page: the toggle, the temperature, and the
+    /// optional window ("HH:MM" each). The window rules are pinned in
+    /// settings.rs tests: start == end is the whole day, start > end
+    /// spans midnight.
+    /// The night light page: the toggle, the temperature, and the
+    /// optional window as dropdown trios (hour, minute, AM/PM). The
+    /// window rules are pinned in settings.rs tests: start == end is
+    /// the whole day, start > end spans midnight.
+    fn night_light_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        const TEMPS: [u32; 6] = [6500, 5000, 4000, 3400, 2700, 2500];
+        let config = self.settings.read(cx).night_light.clone();
+        let settings_handle = self.settings.clone();
+
+        /// One dropdown of the trio, wired to the view's menu state
+        /// and the settings mutator.
+        fn time_dropdown(
+            this: &mut SettingsView,
+            which: NightField,
+            part: NightPart,
+            value: Option<&str>,
+            cx: &mut Context<SettingsView>,
+        ) -> gpui::Stateful<Div> {
+            let (hour, minute, meridiem) = crate::settings::to_12h(value);
+            let (options, current): (Vec<String>, usize) = match part {
+                NightPart::Hour => (
+                    crate::settings::HOUR_CHOICES
+                        .iter()
+                        .map(|h| h.to_string())
+                        .collect(),
+                    hour,
+                ),
+                NightPart::Minute => (
+                    crate::settings::MINUTE_CHOICES
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect(),
+                    minute,
+                ),
+                NightPart::Meridiem => (
+                    crate::settings::MERIDIEM_CHOICES
+                        .iter()
+                        .map(|m| m.to_string())
+                        .collect(),
+                    meridiem,
+                ),
+            };
+            let label = options[current].clone();
+            let id = format!("night-{which:?}-{part:?}");
+            let open = this.night_menu == Some((which, part));
+            kit::dropdown(
+                cx,
+                &id,
+                label,
+                options,
+                current,
+                open,
+                // toggle
+                move |this: &mut SettingsView, _, cx| {
+                    this.night_menu =
+                        if this.night_menu == Some((which, part)) {
+                            None
+                        } else {
+                            Some((which, part))
+                        };
+                    cx.notify();
+                },
+                // pick: recompute this half's "HH:MM", keep the other
+                move |index, this: &mut SettingsView, _, cx| {
+                    this.night_menu = None;
+                    this.settings.update(cx, |settings, cx| {
+                        let s = &settings.night_light;
+                        let (hour, minute, meridiem) = crate::settings::to_12h(
+                            match which {
+                                NightField::Start => s.window_start.as_deref(),
+                                NightField::End => s.window_end.as_deref(),
+                            },
+                        );
+                        let (hour, minute, meridiem) = match part {
+                            NightPart::Hour => (index, minute, meridiem),
+                            NightPart::Minute => (hour, index, meridiem),
+                            NightPart::Meridiem => (hour, minute, index),
+                        };
+                        let value = crate::settings::from_12h(hour, minute, meridiem);
+                        let (start, end) = match which {
+                            NightField::Start => (Some(value), s.window_end.clone()),
+                            NightField::End => (s.window_start.clone(), Some(value)),
+                        };
+                        settings.set_night_light_window(start, end, cx);
+                    });
+                },
+                // close
+                move |this: &mut SettingsView, _, cx| {
+                    this.night_menu = None;
+                    cx.notify();
+                },
+            )
+        }
+
+        let start = config.window_start.clone();
+        let end = config.window_end.clone();
+        let start_row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(crate::theme::current().text))
+                    .child("From"),
+            )
+            .child(time_dropdown(
+                self, NightField::Start, NightPart::Hour, start.as_deref(), cx,
+            ))
+            .child(time_dropdown(
+                self, NightField::Start, NightPart::Minute, start.as_deref(), cx,
+            ))
+            .child(time_dropdown(
+                self, NightField::Start, NightPart::Meridiem, start.as_deref(), cx,
+            ));
+        let end_row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(crate::theme::current().text))
+                    .child("To"),
+            )
+            .child(time_dropdown(
+                self, NightField::End, NightPart::Hour, end.as_deref(), cx,
+            ))
+            .child(time_dropdown(
+                self, NightField::End, NightPart::Minute, end.as_deref(), cx,
+            ))
+            .child(time_dropdown(
+                self, NightField::End, NightPart::Meridiem, end.as_deref(), cx,
+            ));
+
+        div()
+            .id("page-night-light")
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .overflow_y_scroll()
+            .child(crate::controls::toggle_row(
+                "night-light-toggle",
+                "icons/moon.svg",
+                "Night light",
+                config.enabled,
+                move |_, _, cx| {
+                    settings_handle.update(cx, |settings, cx| {
+                        settings.set_night_light_enabled(!settings.night_light.enabled, cx)
+                    });
+                },
+            ))
+            .child(kit::setting_row(
+                "Temperature",
+                self.segmented(
+                    "night-kelvin",
+                    &TEMPS,
+                    config.kelvin,
+                    |kelvin| format!("{kelvin}K"),
+                    |settings, kelvin, cx| settings.set_night_light_kelvin(kelvin, cx),
+                    cx,
+                ),
+            ))
+            .child(
+                kit::card("night-light-window")
+                    .child(kit::card_note(
+                        "Only tint between these times; both dropdowns set means the window is on. 9:00 PM to 7:00 AM spans midnight.",
+                    ))
+                    .child(start_row)
+                    .child(end_row),
+            )
+    }
     fn idle_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let idle = self.settings.read(cx).idle;
         let lock_row = self.idle_number_row(
@@ -1958,6 +2157,9 @@ impl Render for SettingsView {
             })
             .when(self.page == Page::Weather, |el| {
                 el.child(self.weather_page(cx))
+            })
+            .when(self.page == Page::NightLight, |el| {
+                el.child(self.night_light_page(cx))
             });
 
         crate::panel::chrome(

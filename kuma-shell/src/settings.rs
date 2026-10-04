@@ -379,6 +379,174 @@ impl Default for ThemeConfig {
     }
 }
 
+/// Night light: a manual toggle plus an optional fixed-time window.
+/// No geolocation, no sunrise tables: the window is what the user
+/// writes. `start > end` spans midnight; `start == end` means the
+/// whole day.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NightLightConfig {
+    pub enabled: bool,
+    /// Color temperature while applied, 2500..=6500.
+    pub kelvin: u32,
+    /// "HH:MM" window start, or None for always on.
+    pub window_start: Option<String>,
+    /// "HH:MM" window end, or None for always on.
+    pub window_end: Option<String>,
+}
+
+impl Default for NightLightConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kelvin: 6500,
+            window_start: None,
+            window_end: None,
+        }
+    }
+}
+
+impl NightLightConfig {
+    /// The parsed window: `None` means no window restriction. An
+    /// unparsable endpoint is ignored (treated as no window) rather
+    /// than blocking the feature.
+    pub fn window(&self) -> Option<((u32, u32), (u32, u32))> {
+        let (Some(start), Some(end)) = (&self.window_start, &self.window_end) else {
+            return None;
+        };
+        match (parse_hhmm(start), parse_hhmm(end)) {
+            (Some(start), Some(end)) => Some((start, end)),
+            _ => None,
+        }
+    }
+
+    /// Whether gamma should be tinted right now: the toggle is on
+    /// AND (there is no window OR the local time is inside it).
+    pub fn active_now(&self, now: (u32, u32)) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match self.window() {
+            None => true,
+            Some((start, end)) => window_contains(start, end, now),
+        }
+    }
+}
+
+/// "HH:MM" to (hour, minute).
+pub fn parse_hhmm(text: &str) -> Option<(u32, u32)> {
+    let (hour, minute) = text.trim().split_once(':')?;
+    let (hour, minute) = (hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?);
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some((hour, minute))
+}
+
+/// The dropdown trio's hour choices (12-hour clock).
+pub const HOUR_CHOICES: [&str; 12] = [
+    "12", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11",
+];
+/// The dropdown trio's minute choices.
+pub const MINUTE_CHOICES: [&str; 4] = ["00", "15", "30", "45"];
+/// The dropdown trio's half-day choices.
+pub const MERIDIEM_CHOICES: [&str; 2] = ["AM", "PM"];
+
+/// "HH:MM" 24-hour to (hour choice index, minute choice index,
+/// meridiem choice index) for the dropdown trio. An absent or
+/// unparsable value lands on 12:00 AM by index.
+pub fn to_12h(text: Option<&str>) -> (usize, usize, usize) {
+    let Some((hour, minute)) = text.and_then(parse_hhmm) else {
+        return (0, 0, 0);
+    };
+    let pm = hour >= 12;
+    let hour12 = match hour % 12 {
+        0 => 0,
+        h => h,
+    };
+    (hour12 as usize, (minute / 15) as usize, usize::from(pm))
+}
+
+/// The dropdown trio's indices back to "HH:MM" 24-hour.
+pub fn from_12h(hour: usize, minute: usize, meridiem: usize) -> String {
+    let mut hour24 = match hour {
+        0 => 0, // "12" AM
+        h => h, // 1..=11 stay
+    };
+    if hour == 0 && meridiem == 1 {
+        hour24 = 12; // "12" PM is noon
+    } else if meridiem == 1 {
+        hour24 += 12;
+    }
+    format!("{hour24:02}:{}", MINUTE_CHOICES[minute.min(3)])
+}
+
+/// The pinned schedule rule: `start == end` means the whole day,
+/// `start > end` spans midnight.
+pub fn window_contains(start: (u32, u32), end: (u32, u32), now: (u32, u32)) -> bool {
+    if start == end {
+        return true;
+    }
+    if start < end {
+        now >= start && now < end
+    } else {
+        now >= start || now < end
+    }
+}
+
+/// The linear gamma ramp for a color temperature: white at 6500K
+/// and above (6500 is the "off" temperature, and sRGB white is D65
+/// anyway), red-heavy and blue-starved as the temperature drops.
+/// The per-channel scale comes from the Tanner Helland approximation,
+/// clamped so nothing saturates past full scale. The protocol's ramps
+/// are 16-bit (the XML says "16-byte", a long-standing typo: the fd
+/// length must be three times gamma size).
+pub fn kelvin_ramp(kelvin: u32, size: u16) -> Vec<[u16; 3]> {
+    if kelvin >= 6500 {
+        return (0..size)
+            .map(|step| {
+                let level = (f64::from(step) / f64::from(size.saturating_sub(1)).max(1.)
+                    * 65535.)
+                    .round() as u16;
+                [level, level, level]
+            })
+            .collect();
+    }
+    let kelvin = kelvin.clamp(1000, 40000) as f64 / 100.;
+    let (r, g, b) = {
+        let t = kelvin;
+        let red = if t <= 66. {
+            255.
+        } else {
+            329.7 * (t - 60.).powf(-0.1332047592)
+        };
+        let green = if t <= 66. {
+            99.47 * t.ln() - 161.12
+        } else {
+            288.12 * (t - 60.).powf(-0.0755148492)
+        };
+        let blue = if t >= 66. {
+            255.
+        } else if t <= 19. {
+            0.
+        } else {
+            138.52 * (t - 10.).ln() - 305.04
+        };
+        (
+            red.clamp(0., 255.) / 255.,
+            green.clamp(0., 255.) / 255.,
+            blue.clamp(0., 255.) / 255.,
+        )
+    };
+    (0..size)
+        .map(|step| {
+            let level = f64::from(step) / f64::from(size.saturating_sub(1)).max(1.);
+            let scale = |c: f64| ((c * level) * 65535.).round() as u16;
+            [scale(r), scale(g), scale(b)]
+        })
+        .collect()
+}
+
 pub fn default_wallpaper() -> PathBuf {
     PathBuf::from("/usr/share/backgrounds/kuma/kuma-wallpaper.jpg")
 }
@@ -441,6 +609,8 @@ pub struct Settings {
     pub background: BackgroundConfig,
     #[serde(default)]
     pub theme: ThemeConfig,
+    #[serde(default)]
+    pub night_light: NightLightConfig,
     #[serde(default)]
     pub notifications: NotificationSettings,
     #[serde(default)]
@@ -666,6 +836,7 @@ impl Default for Settings {
             },
             background: BackgroundConfig::default(),
             theme: ThemeConfig::default(),
+            night_light: NightLightConfig::default(),
             notifications: NotificationSettings::default(),
             dock: DockSettings::default(),
             idle: IdleSettings::default(),
@@ -912,6 +1083,30 @@ impl Settings {
         self.refresh_theme(cx);
     }
 
+    pub fn set_night_light_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.night_light.enabled = on;
+        self.commit(cx);
+    }
+
+    pub fn set_night_light_kelvin(&mut self, kelvin: u32, cx: &mut Context<Self>) {
+        self.night_light.kelvin = kelvin.clamp(2500, 6500);
+        self.commit(cx);
+    }
+
+    /// Set the window ends as given. One end without the other is
+    /// stored but stays inactive (window() needs both); an empty
+    /// commit clears just the edited end.
+    pub fn set_night_light_window(
+        &mut self,
+        start: Option<String>,
+        end: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.night_light.window_start = start;
+        self.night_light.window_end = end;
+        self.commit(cx);
+    }
+
     /// Re-derive the palette from the current wallpaper when
     /// wallpaper-derived theming is on: decode, seed, generate, swap
     /// the live theme. A failure at any step keeps the previous
@@ -1067,6 +1262,96 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_start_equal_end_is_the_whole_day() {
+        // pinned: start == end means the whole day, not an empty window
+        assert!(window_contains((22, 0), (22, 0), (3, 0)));
+        assert!(window_contains((22, 0), (22, 0), (12, 0)));
+        assert!(window_contains((22, 0), (22, 0), (22, 0)));
+    }
+
+    #[test]
+    fn window_start_after_end_spans_midnight() {
+        // pinned: 21:00 to 07:00 covers the night on both sides
+        assert!(window_contains((21, 0), (7, 0), (23, 30)));
+        assert!(window_contains((21, 0), (7, 0), (2, 15)));
+        assert!(!window_contains((21, 0), (7, 0), (12, 0)));
+        // the boundary belongs to the start, not the end
+        assert!(window_contains((21, 0), (7, 0), (21, 0)));
+        assert!(!window_contains((21, 0), (7, 0), (7, 0)));
+    }
+
+    #[test]
+    fn window_start_before_end_is_the_ordinary_day_range() {
+        assert!(window_contains((9, 0), (17, 30), (12, 0)));
+        assert!(!window_contains((9, 0), (17, 30), (8, 59)));
+        assert!(!window_contains((9, 0), (17, 30), (17, 30)));
+    }
+
+    #[test]
+    fn active_now_needs_the_toggle_and_the_window() {
+        let mut config = NightLightConfig::default();
+        assert!(!config.active_now((23, 0)), "toggle off");
+        config.enabled = true;
+        assert!(config.active_now((23, 0)), "no window: always on");
+        config.window_start = Some("21:00".into());
+        config.window_end = Some("07:00".into());
+        assert!(config.active_now((2, 0)));
+        assert!(!config.active_now((12, 0)));
+        // an unparsable endpoint degrades to no window, not to off
+        config.window_end = Some("garbage".into());
+        assert!(config.active_now((12, 0)));
+    }
+
+    #[test]
+    fn kelvin_ramp_is_identity_at_6500_and_red_heated_below() {
+        let ramp = kelvin_ramp(6500, 256);
+        assert_eq!(ramp.len(), 256);
+        assert_eq!(ramp[255], [65535, 65535, 65535], "6500K is white");
+        assert_eq!(ramp[0], [0; 3], "black stays black");
+        let warm = kelvin_ramp(2700, 256);
+        assert_eq!(warm[255][0], 65535, "red full");
+        assert!(
+            warm[255][2] < 25000,
+            "blue starved at 2700K: {}",
+            warm[255][2]
+        );
+        // below the slider floor the clamp holds, nothing saturates
+        let floor = kelvin_ramp(2500, 256);
+        assert!(floor[255].iter().all(|c| *c <= 65535));
+    }
+
+    #[test]
+    fn parse_hhmm_rules() {
+        assert_eq!(parse_hhmm("21:30"), Some((21, 30)));
+        assert_eq!(parse_hhmm(" 7:05 "), Some((7, 5)));
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm("12:60"), None);
+        assert_eq!(parse_hhmm("nope"), None);
+    }
+
+    #[test]
+    fn twelve_hour_conversions_round_trip() {
+        // every "HH:MM" on the quarter hours survives the 12-hour
+        // dropdown trio's round trip
+        for hour in 0..24 {
+            for minute in [0, 15, 30, 45] {
+                let text = format!("{hour:02}:{minute:02}");
+                let (h, m, pm) = to_12h(Some(&text));
+                assert_eq!(from_12h(h, m, pm), text, "round trip {text}");
+            }
+        }
+        // edges: midnight is 12 AM, noon is 12 PM, 11 PM is 23:00
+        assert_eq!(from_12h(0, 0, 0), "00:00");
+        assert_eq!(from_12h(0, 0, 1), "12:00");
+        assert_eq!(from_12h(11, 3, 1), "23:45");
+        // an absent or unparsable value lands somewhere coherent
+        assert_eq!(to_12h(None), (0, 0, 0));
+        assert_eq!(to_12h(Some("garbage")), (0, 0, 0));
+        // off-grid minutes snap to the nearest quarter below
+        assert_eq!(to_12h(Some("21:37")), (9, 2, 1));
+    }
 
     #[test]
     fn missing_kinds_lists_absent_widgets() {
