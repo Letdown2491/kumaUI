@@ -23,6 +23,12 @@ fn main() {
         })
         .init();
 
+    // Startup instrumentation: every marker logs elapsed-since-main, so
+    // one journalctl pass over a login prices the phases (config read,
+    // gpui init, first surfaces) against the greetd handoff outside the
+    // process. Cheap enough to leave in: an Instant and a few logs.
+    let started = std::time::Instant::now();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
         std::process::exit(run_cli(&args));
@@ -34,15 +40,20 @@ fn main() {
         std::process::exit(1);
     }
 
+    log::info!("boot: entering gpui, {}ms", started.elapsed().as_millis());
+
     application()
         .with_quit_mode(QuitMode::Explicit)
         .with_assets(KumaAssets)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
+            log::info!("boot: app closure, {}ms", started.elapsed().as_millis());
             let niri = cx.new(|_| SessionState::default());
             kuma_shell::session::connect(&niri, cx);
+            log::info!("boot: session connected, {}ms", started.elapsed().as_millis());
 
             let settings = cx.new(|_| Settings::load());
             settings.update(cx, |settings, cx| settings.refresh_theme(cx));
+            log::info!("boot: settings loaded, {}ms", started.elapsed().as_millis());
 
             kuma_shell::wallpaper::run(&settings, cx);
             kuma_shell::night_light::run(&settings, cx);
@@ -107,6 +118,7 @@ fn main() {
             );
             kuma_shell::surfaces::ensure(cx);
             kuma_shell::surfaces::watch(cx);
+            log::info!("boot: surfaces up, {}ms", started.elapsed().as_millis());
 
             // Hand freed heap back to the OS on a slow cadence. glibc's
             // per-thread arenas never shrink on their own: weeks of panel
