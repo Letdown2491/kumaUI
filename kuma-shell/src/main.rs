@@ -55,6 +55,8 @@ fn main() {
             let tray = kuma_shell::tray::start(cx);
             let nostr = cx.new(|_| kuma_shell::nostr::NostrState::new(notifications.clone()));
             kuma_shell::nostr::run(&nostr, cx);
+            let weather = cx.new(|_| kuma_shell::weather::WeatherState::default());
+            kuma_shell::weather::run(&weather, &settings, cx);
             let lock = cx.new(|_| kuma_shell::lock::LockState::new(settings.clone()));
             kuma_shell::lock::connect(&lock, cx);
             kuma_shell::idle::run(&settings, &lock, cx);
@@ -63,6 +65,7 @@ fn main() {
                 sysmon.clone(),
                 notifications.clone(),
                 nostr.clone(),
+                weather.clone(),
             ));
 
             // the dock: its own layer-shell surface, synced to the dock settings
@@ -95,6 +98,7 @@ fn main() {
                     notifications,
                     tray,
                     nostr,
+                    weather,
                     lock,
                 },
                 cx,

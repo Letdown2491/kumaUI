@@ -35,6 +35,7 @@ pub enum WidgetKind {
     Notifications,
     Tray,
     Nostr,
+    Weather,
 }
 
 /// Where a Widget's icon comes from. The registry owns the decision; render
@@ -149,6 +150,11 @@ pub const WIDGETS: &[WidgetSpec] = &[
         kind: WidgetKind::Nostr,
         label: "Nostr Signer",
         icon: Some(WidgetIconSpec::Path("icons/shield-lock.svg")),
+    },
+    WidgetSpec {
+        kind: WidgetKind::Weather,
+        label: "Weather",
+        icon: Some(WidgetIconSpec::Generated),
     },
 ];
 
@@ -426,6 +432,8 @@ pub struct Settings {
     pub idle: IdleSettings,
     #[serde(default)]
     pub sysinfo: SysInfoSettings,
+    #[serde(default)]
+    pub weather: WeatherConfig,
 }
 
 /// The sysinfo widgets' knobs: which mount the disk widget watches.
@@ -440,6 +448,38 @@ impl Default for SysInfoSettings {
     fn default() -> Self {
         Self {
             disk_mount: std::path::PathBuf::from("/"),
+        }
+    }
+}
+
+/// A resolved location: what Nominatim answered, cached so the weather
+/// poll never geocodes and the field can show the match it picked.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedLocation {
+    pub label: String,
+    pub lat: String,
+    pub lon: String,
+}
+
+/// The weather widget's knobs: the location query, its resolved
+/// coordinates (empty until a resolve landed), and the unit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WeatherConfig {
+    /// The raw query text ("Hillsboro, OR", "97123").
+    pub query: String,
+    /// The resolved match, cached across restarts.
+    pub resolved: Option<ResolvedLocation>,
+    /// Fahrenheit (true, the default) or Celsius.
+    pub fahrenheit: bool,
+}
+
+impl Default for WeatherConfig {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            resolved: None,
+            fahrenheit: true,
         }
     }
 }
@@ -612,6 +652,7 @@ impl Default for Settings {
             dock: DockSettings::default(),
             idle: IdleSettings::default(),
             sysinfo: SysInfoSettings::default(),
+            weather: WeatherConfig::default(),
         }
     }
 }
@@ -898,6 +939,25 @@ impl Settings {
         self.commit(cx);
     }
 
+    /// The weather location: the query text and its resolved match
+    /// land together, so a stale label never outlives its coordinates.
+    /// A cleared query drops the resolve too.
+    pub fn set_weather_location(
+        &mut self,
+        query: String,
+        resolved: Option<ResolvedLocation>,
+        cx: &mut Context<Self>,
+    ) {
+        self.weather.query = query;
+        self.weather.resolved = resolved;
+        self.commit(cx);
+    }
+
+    pub fn set_weather_fahrenheit(&mut self, fahrenheit: bool, cx: &mut Context<Self>) {
+        self.weather.fahrenheit = fahrenheit;
+        self.commit(cx);
+    }
+
     /// Pin by desktop-file path (the usage-counts key); already-pinned is a
     /// no-op, order preserved.
     pub fn dock_pin(&mut self, desktop_path: &str, cx: &mut Context<Self>) {
@@ -1068,7 +1128,7 @@ mod tests {
             WidgetKind::Cpu.icon_spec(),
             Some(WidgetIconSpec::Path("icons/cpu.svg"))
         );
-        assert_eq!(WIDGETS.len(), 19);
+        assert_eq!(WIDGETS.len(), 20);
     }
 
     #[test]

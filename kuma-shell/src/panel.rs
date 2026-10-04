@@ -181,6 +181,7 @@ pub enum PanelKind {
     Battery,
     DockMenu,
     Nostr,
+    Weather,
 }
 
 impl PanelKind {
@@ -202,6 +203,8 @@ impl PanelKind {
             PanelKind::Battery => (320., 220., KeyboardInteractivity::OnDemand),
             PanelKind::DockMenu => (180., 96., KeyboardInteractivity::OnDemand),
             PanelKind::Nostr => (560., 520., KeyboardInteractivity::OnDemand),
+            // measured height refines this: the forecast strip sets it
+            PanelKind::Weather => (320., 240., KeyboardInteractivity::OnDemand),
         }
     }
 
@@ -222,6 +225,7 @@ impl PanelKind {
             PanelKind::Battery => "battery",
             PanelKind::DockMenu => "dock-menu",
             PanelKind::Nostr => "nostr",
+            PanelKind::Weather => "weather",
         }
     }
 
@@ -233,6 +237,7 @@ impl PanelKind {
         sysmon: gpui::Entity<crate::sysmon::SysMon>,
         notifications: gpui::Entity<crate::notifications::NotificationState>,
         nostr: gpui::Entity<crate::nostr::NostrState>,
+        weather: gpui::Entity<crate::weather::WeatherState>,
         window: &mut Window,
         cx: &mut App,
     ) -> gpui::AnyView {
@@ -371,6 +376,11 @@ impl PanelKind {
             PanelKind::Nostr => cx
                 .new(|cx| crate::nostr_panel::NostrSignerView::new(nostr, window, cx, geometry))
                 .into(),
+            PanelKind::Weather => cx
+                .new(|cx| {
+                    crate::weather_panel::WeatherPanelView::new(weather, settings, window, cx, geometry)
+                })
+                .into(),
         }
     }
 }
@@ -386,6 +396,9 @@ pub struct PanelHost {
     /// The signer's shared snapshot: the Nostr panel's state, and the
     /// bar widget's.
     nostr: gpui::Entity<crate::nostr::NostrState>,
+    /// The weather's slow snapshot: the panel's state and the bar
+    /// widget's.
+    weather: gpui::Entity<crate::weather::WeatherState>,
     /// The bar view, told about panel transitions so it can suppress the
     /// tooltips the compositor's re-entry would otherwise resurrect.
     bar_view: Option<gpui::WeakEntity<crate::bar::ShellBar>>,
@@ -425,12 +438,14 @@ impl PanelHost {
         sysmon: gpui::Entity<crate::sysmon::SysMon>,
         notifications: gpui::Entity<crate::notifications::NotificationState>,
         nostr: gpui::Entity<crate::nostr::NostrState>,
+        weather: gpui::Entity<crate::weather::WeatherState>,
     ) -> Self {
         Self {
             settings,
             sysmon,
             notifications,
             nostr,
+            weather,
             bar_view: None,
             open: None,
             bar: BarGeometry::default(),
@@ -551,13 +566,14 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
         }
     }
 
-    let (settings, sysmon, notifications, nostr, bar, placement) = {
+    let (settings, sysmon, notifications, nostr, weather, bar, placement) = {
         let host = cx.global_mut::<PanelHost>();
         (
             host.settings.clone(),
             host.sysmon.clone(),
             host.notifications.clone(),
             host.nostr.clone(),
+            host.weather.clone(),
             host.bar,
             host.placement,
         )
@@ -588,6 +604,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
                 sysmon.clone(),
                 notifications.clone(),
                 nostr.clone(),
+                weather.clone(),
                 window,
                 cx,
             );

@@ -98,6 +98,7 @@ enum Page {
     Dock,
     Idle,
     Backgrounds,
+    Weather,
 }
 
 impl Page {
@@ -110,6 +111,7 @@ impl Page {
             Page::Dock => "Dock",
             Page::Idle => "Idle",
             Page::Backgrounds => "Backgrounds",
+            Page::Weather => "Weather",
         }
     }
 
@@ -122,10 +124,11 @@ impl Page {
             Page::Dock => "icons/dock.svg",
             Page::Idle => "icons/clock.svg",
             Page::Backgrounds => "icons/image.svg",
+            Page::Weather => "icons/cloud.svg",
         }
     }
 
-    const ALL: [Page; 7] = [
+    const ALL: [Page; 8] = [
         Page::Quick,
         Page::Bar,
         Page::Widgets,
@@ -133,6 +136,7 @@ impl Page {
         Page::Dock,
         Page::Idle,
         Page::Backgrounds,
+        Page::Weather,
     ];
 }
 
@@ -191,6 +195,19 @@ enum EditField {
     QuietTo,
 }
 
+/// The open weather location field: the typed text and its focus.
+/// Enter commits the query and starts the resolve.
+struct WeatherEdit {
+    text: String,
+    focus: FocusHandle,
+}
+
+/// A location resolve's state: working, or why it failed last try.
+enum WeatherResolve {
+    Working,
+    Failed(String),
+}
+
 /// An open idle edit: the digits typed so far and the field's focus.
 /// Nothing is written until Enter commits the whole number.
 struct NumEdit {
@@ -215,6 +232,9 @@ pub struct SettingsView {
     power_row: Entity<kit::ConfirmActions>,
     /// the idle field being edited, if any
     num_edit: Option<NumEdit>,
+    /// the weather location field, if open, and the resolve's state
+    weather_edit: Option<WeatherEdit>,
+    weather_resolve: Option<WeatherResolve>,
 }
 
 impl SettingsView {
@@ -267,6 +287,8 @@ impl SettingsView {
             thumbs: HashMap::new(),
             power_row,
             num_edit: None,
+            weather_edit: None,
+            weather_resolve: None,
         }
     }
 
@@ -966,6 +988,218 @@ impl SettingsView {
                 },
             )
     }
+
+    /// The weather page: the location query with its resolved match,
+    /// and the unit. Enter on the field commits the query and runs
+    /// the resolve; the coordinates cache into the settings so the
+    /// poll never geocodes.
+    fn weather_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let weather = self.settings.read(cx).weather.clone();
+        let settings_handle = self.settings.clone();
+        let location_card = kit::card("weather-location")
+            .child(kit::card_title("Location"))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(TEXT_DIM))
+                    .child("A city with its state, or a postal code."),
+            )
+            .child(
+                div()
+                    .id("weather-location-field")
+                    .when_some(
+                        self.weather_edit.as_ref().map(|edit| edit.focus.clone()),
+                        |el, focus| {
+                            el.track_focus(&focus)
+                                .on_key_down(cx.listener(Self::weather_key))
+                        },
+                    )
+                    .cursor_text()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this.weather_edit.is_some() {
+                            return;
+                        }
+                        let focus = cx.focus_handle();
+                        focus.focus(window, cx);
+                        this.weather_edit = Some(WeatherEdit {
+                            // seeded with the committed query, so
+                            // backspace edits what is there
+                            text: this.settings.read(cx).weather.query.clone(),
+                            focus,
+                        });
+                        this.weather_resolve = None;
+                        cx.notify();
+                    }))
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(INSET))
+                    .border_1()
+                    .border_color(rgb(if self.weather_edit.is_some() {
+                        ACCENT
+                    } else {
+                        DIVIDER
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(rgb(if self.weather_edit.is_some() {
+                                TEXT
+                            } else if weather.query.is_empty() {
+                                TEXT_DIM
+                            } else {
+                                TEXT
+                            }))
+                            .when_some(
+                                self.weather_edit.as_ref().map(|edit| edit.text.clone()),
+                                |el, text| el.child(text),
+                            )
+                            .when(self.weather_edit.is_none(), |el| {
+                                el.child(if weather.query.is_empty() {
+                                    "Click to type a location".to_string()
+                                } else {
+                                    weather.query.clone()
+                                })
+                            }),
+                    ),
+            )
+            .children(match (&self.weather_resolve, &weather.resolved) {
+                (Some(WeatherResolve::Working), _) => {
+                    vec![div()
+                        .text_size(px(11.))
+                        .text_color(rgb(TEXT_DIM))
+                        .child("Resolving...")]
+                }
+                (Some(WeatherResolve::Failed(err)), _) => {
+                    vec![div()
+                        .text_size(px(11.))
+                        .text_color(rgb(URGENT))
+                        .child(err.clone())]
+                }
+                (None, Some(resolved)) => vec![div()
+                    .text_size(px(11.))
+                    .text_color(rgb(TEXT_DIM))
+                    .child(format!("Resolved: {}", resolved.label))],
+                (None, None) => vec![],
+            });
+        let fahrenheit = weather.fahrenheit;
+
+        div()
+            .id("page-weather")
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .overflow_y_scroll()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // click-away closes the field without resolving
+                    if this.weather_edit.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(location_card)
+            .child(crate::controls::toggle_row(
+                "weather-fahrenheit",
+                "icons/temp.svg",
+                "Fahrenheit",
+                fahrenheit,
+                move |_, _, cx| {
+                    settings_handle.update(cx, |settings, cx| {
+                        settings.set_weather_fahrenheit(!settings.weather.fahrenheit, cx);
+                    });
+                },
+            ))
+            .when(weather.resolved.is_none(), |el| {
+                el.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(TEXT_DIM))
+                        .child(
+                            "The weather widget stays hidden until a location resolves.",
+                        ),
+                )
+            })
+    }
+
+    /// The weather field's keys: Enter commits (and starts the
+    /// resolve), backspace edits, plain characters type.
+    fn weather_key(&mut self, event: &gpui::KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.weather_edit.as_mut() else {
+            return;
+        };
+        match event.keystroke.key.as_str() {
+            "enter" => {
+                let query = std::mem::take(&mut edit.text).trim().to_string();
+                self.weather_edit = None;
+                if query.is_empty() {
+                    self.settings.update(cx, |settings, cx| {
+                        settings.set_weather_location(String::new(), None, cx)
+                    });
+                    return;
+                }
+                self.weather_resolve = Some(WeatherResolve::Working);
+                cx.notify();
+                let query_text = query.clone();
+                cx.spawn(async move |this, cx| {
+                    let result =
+                        cx.background_spawn(async move { crate::weather::geolocate(&query) })
+                            .await;
+                    let _ = this.update(cx, |this, cx| {
+                        match result {
+                            Ok(resolved) => {
+                                this.weather_resolve = None;
+                                this.settings.update(cx, |settings, cx| {
+                                    settings.set_weather_location(query_text, Some(resolved), cx)
+                                });
+                            }
+                            Err(err) => {
+                                this.weather_resolve = Some(WeatherResolve::Failed(format!(
+                                    "Resolve failed: {err}"
+                                )));
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            "escape" => {
+                self.weather_edit = None;
+                cx.notify();
+            }
+            "backspace" => {
+                edit.text.pop();
+                cx.notify();
+            }
+            "space" => {
+                edit.text.push(' ');
+                cx.notify();
+            }
+            // shift alone is a capital: the key name is the lowercase
+            // letter, the shift flag says to raise it. Control and alt
+            // stay shortcuts, not text.
+            other if other.chars().count() == 1
+                && (!event.keystroke.modifiers.modified()
+                    || (event.keystroke.modifiers.shift
+                        && !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.platform)) =>
+            {
+                if event.keystroke.modifiers.shift {
+                    edit.text.push_str(&other.to_uppercase());
+                } else {
+                    edit.text.push_str(other);
+                }
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
 
     /// One idle row: icon, name, an on/off toggle, the minute field,
     /// in that order. Off disables the field (the clock is 0); on
@@ -1708,6 +1942,9 @@ impl Render for SettingsView {
             .when(self.page == Page::Idle, |el| el.child(self.idle_page(cx)))
             .when(self.page == Page::Backgrounds, |el| {
                 el.child(self.backgrounds_page(cx))
+            })
+            .when(self.page == Page::Weather, |el| {
+                el.child(self.weather_page(cx))
             });
 
         crate::panel::chrome(

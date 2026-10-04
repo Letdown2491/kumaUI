@@ -55,6 +55,18 @@ impl AssetSource for KumaAssets {
             "icons/trash.svg" => Some(include_bytes!("../icons/trash.svg").as_slice()),
             "icons/undo.svg" => Some(include_bytes!("../icons/undo.svg").as_slice()),
             "icons/copy.svg" => Some(include_bytes!("../icons/copy.svg").as_slice()),
+            "icons/sun.svg" => Some(include_bytes!("../icons/sun.svg").as_slice()),
+            "icons/cloud.svg" => Some(include_bytes!("../icons/cloud.svg").as_slice()),
+            "icons/cloud-sun.svg" => Some(include_bytes!("../icons/cloud-sun.svg").as_slice()),
+            "icons/cloud-fog.svg" => Some(include_bytes!("../icons/cloud-fog.svg").as_slice()),
+            "icons/cloud-drizzle.svg" => {
+                Some(include_bytes!("../icons/cloud-drizzle.svg").as_slice())
+            }
+            "icons/cloud-rain.svg" => Some(include_bytes!("../icons/cloud-rain.svg").as_slice()),
+            "icons/cloud-snow.svg" => Some(include_bytes!("../icons/cloud-snow.svg").as_slice()),
+            "icons/cloud-lightning.svg" => {
+                Some(include_bytes!("../icons/cloud-lightning.svg").as_slice())
+            }
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))

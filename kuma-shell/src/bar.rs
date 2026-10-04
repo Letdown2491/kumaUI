@@ -16,6 +16,7 @@ use crate::settings::{
 use crate::sysmon::{Playback, RecordingState, SysMon};
 use crate::theme;
 use crate::theme::*;
+use crate::weather::WeatherState;
 
 // transparent headroom below the bar content so tooltips have room to render
 const TOOLTIP_ROOM: f32 = 200.;
@@ -35,6 +36,7 @@ pub struct ShellBar {
     notifications: Entity<crate::notifications::NotificationState>,
     tray: Entity<crate::tray::TrayState>,
     nostr: Entity<crate::nostr::NostrState>,
+    weather: Entity<WeatherState>,
     applied_geometry: Option<(f32, f32, f32, f32)>,
     clock: String,
     /// Set by the panel host on every panel transition; consumed at the next
@@ -56,6 +58,7 @@ impl ShellBar {
         notifications: Entity<crate::notifications::NotificationState>,
         tray: Entity<crate::tray::TrayState>,
         nostr: Entity<crate::nostr::NostrState>,
+        weather: Entity<WeatherState>,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&niri, |_, _, cx| cx.notify()).detach();
@@ -64,6 +67,7 @@ impl ShellBar {
         cx.observe(&notifications, |_, _, cx| cx.notify()).detach();
         cx.observe(&tray, |_, _, cx| cx.notify()).detach();
         cx.observe(&nostr, |_, _, cx| cx.notify()).detach();
+        cx.observe(&weather, |_, _, cx| cx.notify()).detach();
 
         cx.spawn(async move |this, cx| {
             loop {
@@ -97,6 +101,7 @@ impl ShellBar {
             notifications,
             tray,
             nostr,
+            weather,
             applied_geometry: None,
             clock: String::new(),
             suppress_tooltips_requested: false,
@@ -810,6 +815,74 @@ impl ShellBar {
                 }))
                 .into_any_element()
             }),
+            WidgetKind::Weather => {
+                let state = self.weather.read(cx);
+                let weather_cfg = &self.settings.read(cx).weather;
+                let fahrenheit = weather_cfg.fahrenheit;
+                let _location = weather_cfg
+                    .resolved
+                    .as_ref()
+                    .map(|resolved| resolved.label.clone());
+                let stale = state.stale();
+                let color = if stale { TEXT_DIM } else { TEXT };
+                // no location configured reads as a hidden widget until
+                // the settings page fills one in
+                let current = state.current.as_ref()?;
+                let text = match widget.mode {
+                    WidgetMode::Icon => None,
+                    WidgetMode::IconText => Some(
+                        WeatherState::format_temp(fahrenheit, current.temp_c)
+                            .trim_end_matches(['F', 'C'])
+                            .to_string(),
+                    ),
+                    WidgetMode::Text => {
+                        Some(WeatherState::format_temp(fahrenheit, current.temp_c))
+                    }
+                };
+                let (_, condition_icon) = WeatherState::condition(current.code);
+                let weather_entity = self.weather.clone();
+                let settings_entity = self.settings.clone();
+                Some(
+                    sys_widget(
+                        widget.kind,
+                        widget.mode,
+                        text,
+                        color,
+                        move |_: &SysMon, cx: &gpui::App| {
+                            let state = weather_entity.read(cx);
+                            let weather_cfg = &settings_entity.read(cx).weather;
+                            match (&state.current, &weather_cfg.resolved) {
+                                (Some(current), Some(resolved)) => format!(
+                                    "{}: {}{}",
+                                    resolved.label,
+                                    WeatherState::format_temp(
+                                        weather_cfg.fahrenheit,
+                                        current.temp_c
+                                    ),
+                                    if state.stale() { " (stale)" } else { "" }
+                                )
+                                .into(),
+                                (_, None) => "Weather: no location set".into(),
+                                (None, Some(_)) => "Weather: waiting for first read".into(),
+                            }
+                        },
+                        Some(WidgetIcon::Path(condition_icon)),
+                        tooltips_on,
+                        self.sysmon.clone(),
+                        None,
+                    )
+                    .cursor_pointer()
+                    .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                        let anchor = f32::from(event.position().x);
+                        crate::panel::toggle_panel_anchored(
+                            crate::panel::PanelKind::Weather,
+                            anchor,
+                            cx,
+                        )
+                    }))
+                    .into_any_element(),
+                )
+            }
             WidgetKind::Clock => {
                 let date = Local::now().format("%A, %B %e").to_string();
                 Some(
