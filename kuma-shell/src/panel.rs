@@ -183,6 +183,7 @@ pub enum PanelKind {
     Nostr,
     Weather,
     Wifi,
+    Bluetooth,
 }
 
 impl PanelKind {
@@ -207,6 +208,7 @@ impl PanelKind {
             // measured height refines this: the forecast strip sets it
             PanelKind::Weather => (320., 240., KeyboardInteractivity::OnDemand),
             PanelKind::Wifi => (360., 320., KeyboardInteractivity::OnDemand),
+            PanelKind::Bluetooth => (360., 320., KeyboardInteractivity::OnDemand),
         }
     }
 
@@ -229,6 +231,7 @@ impl PanelKind {
             PanelKind::Nostr => "nostr",
             PanelKind::Weather => "weather",
             PanelKind::Wifi => "wifi",
+            PanelKind::Bluetooth => "bluetooth",
         }
     }
 
@@ -386,6 +389,11 @@ impl PanelKind {
                 .into(),
             PanelKind::Wifi => cx
                 .new(|cx| crate::wifi_panel::WifiPanelView::new(sysmon, window, cx, geometry))
+                .into(),
+            PanelKind::Bluetooth => cx
+                .new(|cx| {
+                    crate::bluetooth_panel::BluetoothPanelView::new(sysmon, window, cx, geometry)
+                })
                 .into(),
         }
     }

@@ -71,7 +71,23 @@ pub struct Stream {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BluetoothState {
     pub enabled: bool,
-    pub devices: Vec<String>,
+    /// Every device the controller knows: paired ones and, when a
+    /// discovery scan has run recently, nearby unpaired ones.
+    pub devices: Vec<BluetoothDevice>,
+}
+
+/// One device from `bluetoothctl info`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BluetoothDevice {
+    pub mac: String,
+    pub alias: String,
+    pub connected: bool,
+    pub paired: bool,
+    /// Trusted devices reconnect on their own; a paired-but-untrusted
+    /// one waits for permission.
+    pub trusted: bool,
+    /// The battery percentage, when the device reports one.
+    pub battery: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -267,6 +283,11 @@ pub struct SysMon {
     /// The SSID a connect request is in flight for: the panel's
     /// "joining..." tag. Cleared by the scan that confirms it.
     pub connecting_ssid: Option<String>,
+    /// The Bluetooth panel's failure line, same life as `wifi_error`.
+    pub bt_error: Option<String>,
+    /// The device MAC an act is in flight for: the panel's
+    /// "working..." tag.
+    pub bt_busy: Option<String>,
 }
 
 /// One poll read of the audio and brightness trio: the candidate state.
@@ -680,6 +701,100 @@ impl SysMon {
         .detach();
     }
 
+    /// A fresh bluetooth device scan right now: the panel calls this
+    /// when it opens, same as the Wi-Fi panel's.
+    pub fn scan_bluetooth_now(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let devices = cx
+                .background_spawn(async move {
+                    read_bluetooth(true)
+                        .map(|state| state.devices)
+                        .unwrap_or_default()
+                })
+                .await;
+            let _ = this.update(cx, |sysmon, cx| {
+                if let Some(state) = &mut sysmon.bluetooth {
+                    state.devices = devices;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Run discovery for a bounded window, then refresh: the panel's
+    /// scan-for-nearby press. `--timeout` is what makes this work:
+    /// bare `bluetoothctl scan on` in non-interactive mode exits at
+    /// EOF on stdin, and its exit tears discovery down before it
+    /// hears a single advertisement. `--timeout` keeps the client
+    /// alive for the window and stops cleanly after.
+    pub fn request_bluetooth_discovery(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let _ = cx
+                .background_spawn(async move {
+                    Command::new("bluetoothctl")
+                        .args(["--timeout", "12", "scan", "on"])
+                        .output()
+                })
+                .await;
+            let devices = cx
+                .background_spawn(async move {
+                    read_bluetooth(true)
+                        .map(|state| state.devices)
+                        .unwrap_or_default()
+                })
+                .await;
+            let _ = this.update(cx, |sysmon, cx| {
+                if let Some(state) = &mut sysmon.bluetooth {
+                    state.devices = devices;
+                }
+                sysmon.bt_busy = None;
+                sysmon.bt_error = None;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// One bluetoothctl act on a device: connect, disconnect, pair
+    /// (pair, then trust, then connect: a paired-but-untrusted device
+    /// waits for permission, so the panel never leaves one behind),
+    /// or remove. `busy` tags the row while it runs; a failure lands
+    /// in `bt_error` and the next scan reconciles.
+    pub fn request_bluetooth_act(
+        &mut self,
+        act: BluetoothAct,
+        mac: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.bt_busy = Some(mac.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { act.execute(&mac) })
+                .await;
+            let _ = this.update(cx, |sysmon, cx| {
+                sysmon.bt_busy = None;
+                sysmon.bt_error = result.err().map(|err| format!("{err:#}"));
+                cx.notify();
+            });
+            let devices = cx
+                .background_spawn(async move {
+                    read_bluetooth(true)
+                        .map(|state| state.devices)
+                        .unwrap_or_default()
+                })
+                .await;
+            let _ = this.update(cx, |sysmon, cx| {
+                if let Some(state) = &mut sysmon.bluetooth {
+                    state.devices = devices;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Delete a remembered connection. The next scan reconciles; a
 
     /// One request seam for brightness (the quick-settings slider): optimistic
@@ -752,7 +867,7 @@ impl SysMon {
             let result = cx
                 .background_spawn(async move {
                     let enabled = target.map(Ok).unwrap_or_else(|| {
-                        read_bluetooth()
+                        read_bluetooth(false)
                             .map(|bluetooth| !bluetooth.enabled)
                             .context("no bluetooth state to toggle")
                     })?;
@@ -878,12 +993,16 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
             };
             // the stream scan rides only while the volume panel is
             // open: the status dump is the heaviest call in the pass.
-            // Same gate for the Wi-Fi panel's AP list.
+            // The same gate drives the Wi-Fi and Bluetooth panels'
+            // device scans.
             let scan_streams = full
                 && cx
                     .update(|cx| crate::panel::is_open(&crate::panel::PanelKind::Volume, cx));
             let scan_wifi = full
-                && cx.update(|cx| crate::panel::is_open(&crate::panel::PanelKind::Wifi, cx));
+                && cx.update(|cx| {
+                    crate::panel::is_open(&crate::panel::PanelKind::Wifi, cx)
+                        || crate::panel::is_open(&crate::panel::PanelKind::Bluetooth, cx)
+                });
             let (snapshot, previous_next) = cx
                 .background_spawn(async move {
                     let mut previous = previous;
@@ -997,8 +1116,7 @@ fn refresh(
     disk_mount: &std::path::Path,
     scan_streams: bool,
     scan_wifi: bool,
-) -> Snapshot {
-    let usage = sample_cpu_usage(previous);
+) -> Snapshot {    let usage = sample_cpu_usage(previous);
     Snapshot {
         battery: read_battery(),
         volume: read_volume(),
@@ -1016,7 +1134,7 @@ fn refresh(
         ram: read_ram(),
         temp: read_cpu_temp(),
         disk: read_disk(disk_mount),
-        bluetooth: read_bluetooth(),
+        bluetooth: read_bluetooth(scan_wifi),
         network: read_network(scan_wifi),
         power_profile: read_power_profile(),
         media: read_media(),
@@ -1232,7 +1350,7 @@ pub fn set_bluetooth_power(enabled: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_bluetooth() -> Option<BluetoothState> {
+fn read_bluetooth(scan_devices: bool) -> Option<BluetoothState> {
     let show = Command::new("bluetoothctl").arg("show").output().ok()?;
     if !show.status.success() {
         return None;
@@ -1242,21 +1360,157 @@ fn read_bluetooth() -> Option<BluetoothState> {
         .any(|line| line.trim().starts_with("Powered:") && line.contains("yes"));
 
     let mut devices = Vec::new();
-    if enabled
-        && let Ok(connected) = Command::new("bluetoothctl")
+    if enabled {
+        // panel open: the full picture, every known device with its
+        // info block. Panel closed: the bar widget needs only who is
+        // connected, and that is one cheap call instead of N+1.
+        if scan_devices {
+            if let Ok(list) = Command::new("bluetoothctl").arg("devices").output()
+                && list.status.success()
+            {
+                // "Device XX:XX:XX:XX:XX:XX Alias" for every known device,
+                // paired and (after a discovery scan) nearby-unpaired
+                for line in String::from_utf8_lossy(&list.stdout).lines() {
+                    let Some((_, rest)) = line.trim().split_once("Device ") else {
+                        continue;
+                    };
+                    let Some((mac, alias)) = rest.split_once(' ') else {
+                        continue;
+                    };
+                    if let Some(device) = read_device_info(mac.trim(), alias.trim()) {
+                        devices.push(device);
+                    }
+                }
+            }
+            devices.sort_by(|a, b| {
+                b.connected
+                    .cmp(&a.connected)
+                    .then(b.paired.cmp(&a.paired))
+                    .then(a.alias.to_lowercase().cmp(&b.alias.to_lowercase()))
+            });
+        } else if let Ok(connected) = Command::new("bluetoothctl")
             .args(["devices", "Connected"])
             .output()
-        && connected.status.success()
-    {
-        for line in String::from_utf8_lossy(&connected.stdout).lines() {
-            if let Some((_, rest)) = line.split_once(' ')
-                && let Some((_, name)) = rest.split_once(' ')
-            {
-                devices.push(name.trim().to_string());
+            && connected.status.success()
+        {
+            for line in String::from_utf8_lossy(&connected.stdout).lines() {
+                let Some((_, rest)) = line.trim().split_once("Device ") else {
+                    continue;
+                };
+                let Some((mac, alias)) = rest.split_once(' ') else {
+                    continue;
+                };
+                devices.push(BluetoothDevice {
+                    mac: mac.trim().to_string(),
+                    alias: alias.trim().to_string(),
+                    connected: true,
+                    paired: true,
+                    trusted: true,
+                    battery: None,
+                });
             }
         }
     }
     Some(BluetoothState { enabled, devices })
+}
+
+/// One device's `bluetoothctl info` block: the connected/paired/
+/// trusted trio and the battery line when the device reports one.
+fn read_device_info(mac: &str, alias: &str) -> Option<BluetoothDevice> {
+    let output = Command::new("bluetoothctl").args(["info", mac]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_device_info(
+        mac.to_string(),
+        alias.to_string(),
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
+fn parse_device_info(mac: String, alias: String, text: &str) -> BluetoothDevice {
+    let mut device = BluetoothDevice {
+        mac,
+        alias,
+        connected: false,
+        paired: false,
+        trusted: false,
+        battery: None,
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("Connected:") {
+            device.connected = value.trim() == "yes";
+        } else if let Some(value) = line.strip_prefix("Paired:") {
+            device.paired = value.trim() == "yes";
+        } else if let Some(value) = line.strip_prefix("Trusted:") {
+            device.trusted = value.trim() == "yes";
+        } else if line.starts_with("Battery Percentage:") {
+            // "Battery Percentage: 0x50 (80)"
+            device.battery = line
+                .rsplit('(')
+                .next()
+                .and_then(|inner| inner.trim_end_matches(')').trim().parse().ok());
+        }
+    }
+    device
+}
+
+/// The acts the Bluetooth panel's rows ask for, each one
+/// `bluetoothctl` verb bounded by `timeout` so a hanging device can't
+/// wedge the worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BluetoothAct {
+    Connect,
+    Disconnect,
+    /// Pair, then trust, then connect: a paired-but-untrusted device
+    /// waits for permission, so the panel never leaves one behind.
+    Pair,
+    /// Unpair and forget.
+    Remove,
+}
+
+impl BluetoothAct {
+    fn execute(self, mac: &str) -> anyhow::Result<()> {
+        match self {
+            BluetoothAct::Connect => {
+                let status = Command::new("timeout")
+                    .args(["15", "bluetoothctl", "connect", mac])
+                    .status()?;
+                anyhow::ensure!(status.success(), "connect failed");
+            }
+            BluetoothAct::Disconnect => {
+                let status = Command::new("timeout")
+                    .args(["10", "bluetoothctl", "disconnect", mac])
+                    .status()?;
+                anyhow::ensure!(status.success(), "disconnect failed");
+            }
+            BluetoothAct::Pair => {
+                let status = Command::new("timeout")
+                    .args(["20", "bluetoothctl", "pair", mac])
+                    .status()?;
+                anyhow::ensure!(status.success(), "pairing failed");
+                if let Ok(trust) = Command::new("bluetoothctl")
+                    .args(["trust", mac])
+                    .status()
+                    && !trust.success()
+                {
+                    log::info!("bluetooth: trust after pair failed for {mac}");
+                }
+                let status = Command::new("timeout")
+                    .args(["15", "bluetoothctl", "connect", mac])
+                    .status()?;
+                anyhow::ensure!(status.success(), "paired, but connect failed");
+            }
+            BluetoothAct::Remove => {
+                let status = Command::new("timeout")
+                    .args(["10", "bluetoothctl", "remove", mac])
+                    .status()?;
+                anyhow::ensure!(status.success(), "remove failed");
+            }
+        }
+        Ok(())
+    }
 }
 
 fn read_network(scan_wifi: bool) -> Option<NetworkState> {
@@ -1980,6 +2234,34 @@ mod tests {
             .map(|(name, _)| name.to_string())
             .collect();
         assert_eq!(saved, vec!["HomeNet", "SSID with spaces"]);
+    }
+
+    #[test]
+    fn bluetoothctl_info_block_parses() {
+        let text = "Device 1A:2B:3C:4D:5E:6E Headphones\n\
+                    \tName: Headphones\n\
+                    \tPaired: yes\n\
+                    \tTrusted: yes\n\
+                    \tConnected: yes\n\
+                    \tBattery Percentage: 0x50 (80)\n";
+        let device = parse_device_info(
+            "1A:2B:3C:4D:5E:6E".to_string(),
+            "Headphones".to_string(),
+            text,
+        );
+        assert!(device.connected && device.paired && device.trusted);
+        assert_eq!(device.battery, Some(80));
+    }
+
+    #[test]
+    fn bluetoothctl_info_without_battery_parses() {
+        let text = "Device 1A:2B:3C:4D:5E:6E Mouse\n\
+                    \tPaired: no\n\
+                    \tTrusted: no\n\
+                    \tConnected: no\n";
+        let device = parse_device_info("mac".to_string(), "Mouse".to_string(), text);
+        assert!(!device.connected && !device.paired && !device.trusted);
+        assert_eq!(device.battery, None);
     }
 
     #[test]

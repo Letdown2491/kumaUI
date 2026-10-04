@@ -905,12 +905,14 @@ impl ShellBar {
                 )
             }
             WidgetKind::Bluetooth => sysmon.bluetooth.clone().map(|bt| {
+                let connected: Vec<&crate::sysmon::BluetoothDevice> =
+                    bt.devices.iter().filter(|device| device.connected).collect();
                 let (color, text) = if !bt.enabled {
                     (TEXT_DIM, None)
-                } else if bt.devices.is_empty() {
+                } else if connected.is_empty() {
                     (TEXT, None)
                 } else {
-                    (ACCENT, Some(bt.devices.len().to_string()))
+                    (ACCENT, Some(connected.len().to_string()))
                 };
                 sys_widget(
                     widget.kind,
@@ -923,10 +925,18 @@ impl ShellBar {
                         };
                         if !bt.enabled {
                             "Bluetooth: off".into()
-                        } else if bt.devices.is_empty() {
-                            "Bluetooth: on, no devices connected".into()
                         } else {
-                            format!("Bluetooth: {}", bt.devices.join(", ")).into()
+                            let names: Vec<String> = bt
+                                .devices
+                                .iter()
+                                .filter(|device| device.connected)
+                                .map(|device| device.alias.clone())
+                                .collect();
+                            if names.is_empty() {
+                                "Bluetooth: on, no devices connected".into()
+                            } else {
+                                format!("Bluetooth: {}", names.join(", ")).into()
+                            }
                         }
                     },
                     widget_icon(widget.kind),
@@ -934,6 +944,15 @@ impl ShellBar {
                     self.sysmon.clone(),
                     None,
                 )
+                .cursor_pointer()
+                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    let anchor = f32::from(event.position().x);
+                    crate::panel::toggle_panel_anchored(
+                        crate::panel::PanelKind::Bluetooth,
+                        anchor,
+                        cx,
+                    )
+                }))
                 .into_any_element()
             }),
             WidgetKind::Internet => sysmon.network.clone().map(|net| {
