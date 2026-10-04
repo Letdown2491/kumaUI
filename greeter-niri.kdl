@@ -5,6 +5,11 @@
 // through the environment. The hotkey overlay is noise on a login
 // screen, so it never shows. Ctrl+Alt+F1 (or F3) still switches
 // VTs, that is compositor-independent.
+layout {
+    // Matches the shell wallpaper base (0x11111B) and the session
+    // config, so greeter teardown into session start never flashes.
+    background-color "#11111B"
+}
 hotkey-overlay {
     skip-at-startup
 }

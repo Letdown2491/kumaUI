@@ -1,0 +1,15 @@
+// The session compositor config: the stock niri session, plus the
+// two things kumaOS needs. The background color matches the shell's
+// wallpaper base (0x11111B), so the gap between niri.service coming
+// up and kuma-shell painting the real wallpaper reads as a fade
+// instead of a black flash. The hotkey overlay is noise during
+// login handoff, so it never shows.
+// Wired in by the image: a niri.service drop-in appends
+// `-c /usr/share/kumaos/session-niri.kdl` to ExecStart. See
+// docs/session-deploy.md.
+layout {
+    background-color "#11111B"
+}
+hotkey-overlay {
+    skip-at-startup
+}
