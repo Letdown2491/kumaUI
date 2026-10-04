@@ -1808,6 +1808,19 @@ impl SettingsView {
                     cx,
                 ),
             ))
+            .child(crate::controls::toggle_row(
+                "theme-derived",
+                "icons/sun.svg",
+                "Derive colors from wallpaper",
+                self.settings.read(cx).theme.wallpaper_derived,
+                cx.listener(|this, _, _, cx| {
+                    this.settings.update(cx, |settings, cx| {
+                        settings.set_theme_derived(!settings.theme.wallpaper_derived, cx);
+                    });
+                    this.thumbs.clear();
+                    cx.notify();
+                }),
+            ))
             .child(
                 div().id("gallery").grid().grid_cols(3).gap_2().children(
                     entries

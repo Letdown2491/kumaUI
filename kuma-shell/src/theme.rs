@@ -71,6 +71,15 @@ pub fn set_current(theme: Theme) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = theme;
 }
 
+impl Theme {
+    /// Replace just the accent (the near-grey fallback keeps the
+    /// recognizable blue but still coordinates).
+    pub fn with_accent(mut self, accent: u32) -> Self {
+        self.accent = accent;
+        self
+    }
+}
+
 pub const PANEL_BG: u32 = 0x181825F2;
 pub const SURFACE: u32 = 0x313244;
 pub const SURFACE_HOVER: u32 = 0x45475A;

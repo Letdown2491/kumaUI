@@ -364,6 +364,21 @@ impl Default for BackgroundConfig {
     }
 }
 
+/// Wallpaper-derived theming: off until proven.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub wallpaper_derived: bool,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            wallpaper_derived: false,
+        }
+    }
+}
+
 pub fn default_wallpaper() -> PathBuf {
     PathBuf::from("/usr/share/backgrounds/kuma/kuma-wallpaper.jpg")
 }
@@ -424,6 +439,8 @@ pub struct Settings {
     pub bar: BarConfig,
     #[serde(default)]
     pub background: BackgroundConfig,
+    #[serde(default)]
+    pub theme: ThemeConfig,
     #[serde(default)]
     pub notifications: NotificationSettings,
     #[serde(default)]
@@ -648,6 +665,7 @@ impl Default for Settings {
                 ..Default::default()
             },
             background: BackgroundConfig::default(),
+            theme: ThemeConfig::default(),
             notifications: NotificationSettings::default(),
             dock: DockSettings::default(),
             idle: IdleSettings::default(),
@@ -885,6 +903,44 @@ impl Settings {
     pub fn set_background(&mut self, name: String, cx: &mut Context<Self>) {
         self.background.current = name;
         self.commit(cx);
+        self.refresh_theme(cx);
+    }
+
+    pub fn set_theme_derived(&mut self, derived: bool, cx: &mut Context<Self>) {
+        self.theme.wallpaper_derived = derived;
+        self.commit(cx);
+        self.refresh_theme(cx);
+    }
+
+    /// Re-derive the palette from the current wallpaper when
+    /// wallpaper-derived theming is on: decode, seed, generate, swap
+    /// the live theme. A failure at any step keeps the previous
+    /// palette (the defaults ultimately backstop); turning the flag
+    /// off restores the constants outright. Surfaces pick the swap up
+    /// on their next render.
+    pub fn refresh_theme(&self, cx: &mut Context<Self>) {
+        if !self.theme.wallpaper_derived {
+            crate::theme::set_current(crate::theme::Theme::default());
+            return;
+        }
+        let path = self.background.current_path();
+        cx.spawn(async move |this, cx| {
+        let derived = cx
+            .background_executor()
+            .spawn(async move {
+                crate::imaging::decode_sampled(&path).map(|sample| {
+                    crate::palette::palette(&sample, crate::palette::Flavor::Faithful)
+                })
+            })
+            .await;
+            let _ = this.update(cx, |_, cx| {
+                if let Some(theme) = derived {
+                    crate::theme::set_current(theme);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn set_background_rotate(&mut self, minutes: u32, cx: &mut Context<Self>) {
@@ -896,6 +952,7 @@ impl Settings {
         self.background.folder = folder;
         self.background.current = "default".to_string();
         self.commit(cx);
+        self.refresh_theme(cx);
     }
 
     pub fn set_notifications_dnd(&mut self, dnd: bool, cx: &mut Context<Self>) {

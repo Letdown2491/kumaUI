@@ -42,6 +42,7 @@ fn main() {
             kuma_shell::session::connect(&niri, cx);
 
             let settings = cx.new(|_| Settings::load());
+            settings.update(cx, |settings, cx| settings.refresh_theme(cx));
 
             kuma_shell::wallpaper::run(&settings, cx);
 

@@ -26,6 +26,7 @@ pub mod surfaces;
 pub mod sway;
 pub mod sysinfo_panel;
 pub mod sysmon;
+pub mod palette;
 pub mod theme;
 pub mod tray;
 pub mod wallpaper;

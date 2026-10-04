@@ -69,6 +69,19 @@ pub fn decode_file(path: &Path) -> Option<gpui::RenderImage> {
     Some(rgba_to_bgra_render_image(image.to_rgba8()))
 }
 
+/// Decode a wallpaper and squash it to exactly 112x112 RGB (37,632
+/// bytes): the sample the palette generator works from. Aspect ratio
+/// distorts, which is fine for color statistics.
+pub fn decode_sampled(path: &Path) -> Option<Vec<u8>> {
+    let image = image::ImageReader::open(path).ok()?.decode().ok()?;
+    Some(
+        image
+            .resize_exact(112, 112, image::imageops::FilterType::Triangle)
+            .to_rgb8()
+            .into_raw(),
+    )
+}
+
 pub fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<gpui::RenderImage> {
     let image = image::ImageReader::open(path).ok()?.decode().ok()?;
     let mut thumb = image.thumbnail(max_width, max_height).to_rgba8();
