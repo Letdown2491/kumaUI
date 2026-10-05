@@ -52,6 +52,16 @@ local patches, which should be recorded here.
   when given the choice, so a dragged file silently left its folder on
   drop; a file manager's outbound drags default to the non-destructive
   action. Found by the kuma-files DnD spike (issue #25).
+- `crates/gpui_linux/src/linux/wayland/client.rs`: `start_external_drag`
+  attaches a drag icon surface where upstream passes `None`. With no
+  icon, the compositor shows nothing while a drag is live (the ghost
+  view renders inside the window only), so outbound drags look broken.
+  The icon is a 128x32 Argb8888 rounded pill, CPU-rendered into a
+  memfd-backed `wl_shm` pool, attached to a `wl_surface` created from
+  the shared `wl_compositor`. The `DragIcon` object (file, pool,
+  buffer, surface) rides on `ExternalDrag` and its `Drop` destroys all
+  four when the drag finishes or cancels. Found by the kuma-files DnD
+  spike (issue #25).
 - `crates/gpui_linux/src/linux/wayland/window.rs`: `set_size_and_scale`
   skips `wp_viewport::set_destination` when the size is zero. Layer
   surfaces start at zero size and get their real size from the layer

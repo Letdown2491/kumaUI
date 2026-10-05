@@ -1,11 +1,15 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::fs;
+use std::time::{Duration, Instant};
+use std::{fs, io};
+
 use gpui::{
-    App, ClickEvent, Context, Div, ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle,
-    Focusable, KeyDownEvent, Pixels, Point, Render, Stateful, Window, div, prelude::*, px, rgb,
+    App, AppContext, ClickEvent, Context, Div, ExternalDragPayload, ExternalPaths, FileDragPaths,
+    FocusHandle, Focusable, KeyDownEvent, Pixels, Point, Render, Stateful, Window, div, prelude::*,
+    px, rgb,
 };
+use trash::{os_limited, TrashItem};
 
 use crate::theme;
 
@@ -19,10 +23,151 @@ pub(crate) struct DragEntry {
 
 #[derive(Clone)]
 struct Entry {
+    /// Directory view: the file's path. Trash view: the trash item's
+    /// `.trashinfo` path, unique even when two trashed files share an
+    /// original name. Selection and cursor key off this.
+    key: PathBuf,
     path: PathBuf,
     name: String,
     is_dir: bool,
     size: Option<u64>,
+    item: Option<TrashItem>,
+}
+
+#[derive(Clone)]
+enum Source {
+    Dir(PathBuf),
+    Trash,
+}
+
+impl PartialEq for Source {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Source::Dir(a), Source::Dir(b)) => a == b,
+            (Source::Trash, Source::Trash) => true,
+            _ => false,
+        }
+    }
+}
+impl Source {
+    fn label(&self) -> String {
+        match self {
+            Source::Dir(dir) => dir
+                .file_name()
+                .map_or_else(
+                    || dir.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                ),
+            Source::Trash => "Trash".into(),
+        }
+    }
+}
+
+struct Tab {
+    source: Source,
+    entries: Vec<Entry>,
+    selection: HashSet<PathBuf>,
+    cursor: Option<usize>,
+    history: Vec<Source>,
+    forward: Vec<Source>,
+    renaming: Option<PathBuf>,
+    rename_buffer: String,
+}
+
+/// A queued file operation. `run` executes it and returns its inverse,
+/// so the undo stack is the same type and Ctrl+Z walks it back.
+#[derive(Clone, Debug)]
+enum Op {
+    Copy { from: PathBuf, to: PathBuf },
+    Move { from: PathBuf, to: PathBuf },
+    Remove { path: PathBuf, is_dir: bool },
+    Trash { paths: Vec<PathBuf> },
+    Restore { items: Vec<TrashItem> },
+    Purge { items: Vec<TrashItem> },
+}
+
+impl Op {
+    fn verb(&self) -> &'static str {
+        match self {
+            Op::Copy { .. } => "copying",
+            Op::Move { .. } => "moving",
+            Op::Remove { .. } => "removing",
+            Op::Trash { .. } => "trashing",
+            Op::Restore { .. } => "restoring",
+            Op::Purge { .. } => "purging",
+        }
+    }
+
+    fn run(&self) -> Result<Option<Op>, String> {
+        match self {
+            Op::Copy { from, to } => {
+                if to.exists() {
+                    return Err(format!("{} already exists", to.display()));
+                }
+                if from.is_dir() {
+                    copy_dir_all(from, to).map_err(|err| format!("copy: {err}"))?;
+                } else {
+                    fs::copy(from, to).map_err(|err| format!("copy: {err}"))?;
+                }
+                Ok(Some(Op::Remove {
+                    path: to.clone(),
+                    is_dir: from.is_dir(),
+                }))
+            }
+            Op::Move { from, to } => {
+                if to.exists() {
+                    return Err(format!("{} already exists", to.display()));
+                }
+                fs::rename(from, to).map_err(|err| format!("move: {err}"))?;
+                Ok(Some(Op::Move {
+                    from: to.clone(),
+                    to: from.clone(),
+                }))
+            }
+            Op::Remove { path, is_dir } => {
+                let result = if *is_dir {
+                    fs::remove_dir_all(path)
+                } else {
+                    fs::remove_file(path)
+                };
+                result.map_err(|err| format!("remove: {err}"))?;
+                Ok(None)
+            }
+            Op::Trash { paths } => {
+                trash::delete_all(paths).map_err(|err| format!("trash: {err}"))?;
+                let all = os_limited::list().map_err(|err| format!("trash list: {err}"))?;
+                let items: Vec<TrashItem> = all
+                    .into_iter()
+                    .filter(|item| paths.contains(&item.original_path()))
+                    .collect();
+                Ok(Some(Op::Restore { items }))
+            }
+            Op::Restore { items } => {
+                os_limited::restore_all(items.clone()).map_err(|err| format!("restore: {err}"))?;
+                Ok(Some(Op::Trash {
+                    paths: items.iter().map(|item| item.original_path()).collect(),
+                }))
+            }
+            Op::Purge { items } => {
+                os_limited::purge_all(items.clone()).map_err(|err| format!("purge: {err}"))?;
+                Ok(None)
+            }
+        }
+    }
+}
+
+fn copy_dir_all(from: &Path, to: &Path) -> io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 struct Place {
@@ -31,17 +176,16 @@ struct Place {
 }
 
 pub(crate) struct Browser {
-    dir: PathBuf,
-    entries: Vec<Entry>,
-    selection: HashSet<PathBuf>,
-    cursor: Option<usize>,
-    history: Vec<PathBuf>,
-    forward: Vec<PathBuf>,
-    renaming: Option<PathBuf>,
-    rename_buffer: String,
+    tabs: Vec<Tab>,
+    active: usize,
+    clipboard: Option<(bool, Vec<PathBuf>)>,
+    undo: Vec<Op>,
     status: String,
+    progress: String,
+    busy: bool,
     focus: FocusHandle,
     places: Vec<Place>,
+    purge_armed: Option<Instant>,
 }
 
 impl Focusable for Browser {
@@ -50,24 +194,25 @@ impl Focusable for Browser {
     }
 }
 
+const PURGE_ARM: Duration = Duration::from_secs(5);
+
 impl Browser {
     pub(crate) fn new(dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let mut browser = Self {
-            dir,
-            entries: Vec::new(),
-            selection: HashSet::new(),
-            cursor: None,
-            history: Vec::new(),
-            forward: Vec::new(),
-            renaming: None,
-            rename_buffer: String::new(),
+            tabs: vec![Tab::new(Source::Dir(dir))],
+            active: 0,
+            clipboard: None,
+            undo: Vec::new(),
             status: String::new(),
+            progress: String::new(),
+            busy: false,
             focus,
             places: Self::places(),
+            purge_armed: None,
         };
-        browser.reload();
+        browser.tab_mut().reload();
         browser
     }
 
@@ -93,89 +238,438 @@ impl Browser {
         places
     }
 
-    fn reload(&mut self) {
-        match fs::read_dir(&self.dir) {
-            Ok(read) => {
-                let mut entries = Vec::new();
-                for entry in read.flatten() {
-                    let path = entry.path();
-                    let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-                    let size = fs::symlink_metadata(&path).ok().and_then(|meta| {
-                        if meta.is_dir() {
-                            None
-                        } else {
-                            Some(meta.len())
-                        }
-                    });
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    entries.push(Entry {
-                        path,
-                        name,
-                        is_dir,
-                        size,
-                    });
-                }
-                entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-                self.entries = entries;
-            }
-            Err(err) => {
-                log::error!("read_dir {}: {err}", self.dir.display());
-                self.status = format!("cannot read {}: {err}", self.dir.display());
-                self.entries.clear();
-            }
-        }
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
     }
 
-    fn load(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        if dir == self.dir {
+    fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    fn open_trash(&mut self, cx: &mut Context<Self>) {
+        self.load_source(Source::Trash, cx);
+    }
+
+    fn load_source(&mut self, source: Source, cx: &mut Context<Self>) {
+        let tab = self.tab_mut();
+        if tab.source == source {
             return;
         }
-        self.history.push(self.dir.clone());
-        self.forward.clear();
-        self.dir = dir;
-        self.selection.clear();
-        self.cursor = None;
-        self.renaming = None;
-        self.reload();
+        tab.history.push(tab.source.clone());
+        tab.forward.clear();
+        tab.source = source;
+        tab.selection.clear();
+        tab.cursor = None;
+        tab.renaming = None;
+        tab.reload();
+        self.status.clear();
+        self.purge_armed = None;
+        cx.notify();
+    }
+
+    fn new_tab(&mut self, cx: &mut Context<Self>) {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        self.tabs.push(Tab::new(Source::Dir(home)));
+        self.active = self.tabs.len() - 1;
+        self.tabs.last_mut().unwrap().reload();
         self.status.clear();
         cx.notify();
     }
 
-    fn go_back(&mut self, cx: &mut Context<Self>) {
-        let Some(previous) = self.history.pop() else {
-            return;
-        };
-        self.forward.push(self.dir.clone());
-        self.dir = previous;
-        self.selection.clear();
-        self.cursor = None;
-        self.renaming = None;
-        self.reload();
+    fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.tabs.len() == 1 {
+            // the last tab becomes a fresh home tab rather than closing
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            self.tabs[0] = Tab::new(Source::Dir(home));
+            self.tabs[0].reload();
+        } else {
+            self.tabs.remove(ix);
+            if self.active >= self.tabs.len() {
+                self.active = self.tabs.len() - 1;
+            } else if ix < self.active {
+                self.active -= 1;
+            }
+        }
         cx.notify();
     }
 
-    fn go_forward(&mut self, cx: &mut Context<Self>) {
-        let Some(next) = self.forward.pop() else {
+    fn enqueue(&mut self, mut ops: Vec<Op>, cx: &mut Context<Self>) {
+        if ops.is_empty() {
             return;
-        };
-        self.history.push(self.dir.clone());
-        self.dir = next;
-        self.selection.clear();
-        self.cursor = None;
-        self.renaming = None;
-        self.reload();
+        }
+        if self.busy {
+            self.status = "a file operation is still running".into();
+            cx.notify();
+            return;
+        }
+        self.busy = true;
+        self.purge_armed = None;
+        let total = ops.len();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let mut undo = Vec::new();
+            let mut failure: Option<String> = None;
+            for (i, op) in ops.drain(..).enumerate() {
+                let update = this.update(cx, |this, cx| {
+                    this.progress = format!("{} {} of {}", op.verb(), i + 1, total);
+                    cx.notify();
+                });
+                if let Err(err) = update {
+                    log::error!("progress update failed: {err:#}");
+                    return;
+                }
+                let outcome = {
+                    let run_op = op.clone();
+                    cx.background_spawn(async move { run_op.run() }).await
+                };
+                match outcome {
+                    Ok(Some(inverse)) => undo.push(inverse),
+                    Ok(None) => {}
+                    Err(err) => {
+                        failure = Some(format!("{} failed: {err}", op.verb()));
+                        break;
+                    }
+                }
+            }
+            let update = this.update(cx, |this, cx| {
+                this.busy = false;
+                this.progress.clear();
+                match failure {
+                    Some(err) => this.status = err,
+                    None if !undo.is_empty() => {
+                        this.status = "done; Ctrl+Z to undo".into();
+                        this.undo.extend(undo);
+                    }
+                    None => {}
+                }
+                this.tab_mut().reload();
+                cx.notify();
+            });
+            if let Err(err) = update {
+                log::error!("queue completion update failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .tab()
+            .entries
+            .iter()
+            .filter(|entry| self.tab().selection.contains(&entry.key))
+            .map(|entry| entry.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.clipboard = Some((true, paths));
+        self.status = "copied; Ctrl+V to paste".into();
         cx.notify();
     }
 
-    fn go_up(&mut self, cx: &mut Context<Self>) {
-        if let Some(parent) = self.dir.parent().map(Path::to_path_buf) {
-            self.load(parent, cx);
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .tab()
+            .entries
+            .iter()
+            .filter(|entry| self.tab().selection.contains(&entry.key))
+            .map(|entry| entry.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.clipboard = Some((false, paths));
+        self.status = "cut; Ctrl+V to paste".into();
+        cx.notify();
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some((is_copy, paths)) = self.clipboard.clone() else {
+            return;
+        };
+        let Source::Dir(dest_dir) = self.tab().source.clone() else {
+            self.status = "paste goes to a folder; trash has no paste".into();
+            cx.notify();
+            return;
+        };
+        let ops = paths
+            .iter()
+            .map(|path| {
+                let name = path.file_name().unwrap_or_default();
+                let to = dest_dir.join(name);
+                if is_copy {
+                    Op::Copy {
+                        from: path.clone(),
+                        to,
+                    }
+                } else {
+                    Op::Move {
+                        from: path.clone(),
+                        to,
+                    }
+                }
+            })
+            .collect();
+        if !is_copy {
+            self.clipboard = None;
+        }
+        self.enqueue(ops, cx);
+    }
+
+    fn undo_last(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(op) = self.undo.pop() else {
+            return;
+        };
+        log::info!("undo: {op:?}");
+        self.enqueue(vec![op], cx);
+    }
+
+    fn trash_selection(&mut self, cx: &mut Context<Self>) {
+        if self.tab().source == Source::Trash {
+            self.purge_selection(cx);
+            return;
+        }
+        let paths: Vec<PathBuf> = self
+            .tab()
+            .entries
+            .iter()
+            .filter(|entry| self.tab().selection.contains(&entry.key))
+            .map(|entry| entry.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.enqueue(vec![Op::Trash { paths }], cx);
+    }
+
+    /// Purge is the one act with no inverse, so it wears the shell's
+    /// arm-then-confirm pattern: the first Delete arms for 5s, the second
+    /// within the window goes through.
+    fn purge_selection(&mut self, cx: &mut Context<Self>) {
+        let items: Vec<TrashItem> = self
+            .tab()
+            .entries
+            .iter()
+            .filter(|entry| self.tab().selection.contains(&entry.key))
+            .filter_map(|entry| entry.item.clone())
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        match self.purge_armed {
+            Some(armed) if armed.elapsed() <= PURGE_ARM => {
+                self.purge_armed = None;
+                self.enqueue(vec![Op::Purge { items }], cx);
+            }
+            _ => {
+                self.purge_armed = Some(Instant::now());
+                self.status = "press Delete again to purge permanently (no undo)".into();
+                cx.notify();
+            }
+        }
+    }
+}
+
+impl Tab {
+    fn new(source: Source) -> Self {
+        Self {
+            source,
+            entries: Vec::new(),
+            selection: HashSet::new(),
+            cursor: None,
+            history: Vec::new(),
+            forward: Vec::new(),
+            renaming: None,
+            rename_buffer: String::new(),
+        }
+    }
+
+    fn reload(&mut self) {
+        match &self.source {
+            Source::Dir(dir) => match fs::read_dir(dir) {
+                Ok(read) => {
+                    let mut entries = Vec::new();
+                    for entry in read.flatten() {
+                        let path = entry.path();
+                        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+                        let size = fs::symlink_metadata(&path).ok().and_then(|meta| {
+                            if meta.is_dir() {
+                                None
+                            } else {
+                                Some(meta.len())
+                            }
+                        });
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        entries.push(Entry {
+                            key: path.clone(),
+                            path,
+                            name,
+                            is_dir,
+                            size,
+                            item: None,
+                        });
+                    }
+                    entries
+                        .sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+                    self.entries = entries;
+                }
+                Err(err) => {
+                    log::error!("read_dir {}: {err}", dir.display());
+                    self.entries.clear();
+                }
+            },
+            Source::Trash => {
+                let items = match os_limited::list() {
+                    Ok(items) => items,
+                    Err(err) => {
+                        log::error!("trash list: {err}");
+                        self.entries.clear();
+                        return;
+                    }
+                };
+                let mut entries = Vec::new();
+                for item in items {
+                    let size = os_limited::metadata(&item)
+                        .ok()
+                        .map(|meta| meta.size)
+                        .and_then(|size| size.size());
+                    let is_dir = os_limited::metadata(&item)
+                        .ok()
+                        .map(|meta| matches!(meta.size, trash::TrashItemSize::Entries(_)))
+                        .unwrap_or(false);
+                    entries.push(Entry {
+                        key: PathBuf::from(&item.id),
+                        path: item.original_path(),
+                        name: item.name.to_string_lossy().into_owned(),
+                        is_dir,
+                        size,
+                        item: Some(item),
+                    });
+                }
+                entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                self.entries = entries;
+            }
+        }
+        self.selection.retain(|key| {
+            self.entries
+                .iter()
+                .any(|entry| &entry.key == key)
+        });
+        if let Some(ix) = self.cursor
+            && self.entries.get(ix).is_none()
+        {
+            self.cursor = None;
+        }
+    }
+
+    fn current_dir(&self) -> Option<&Path> {
+        match &self.source {
+            Source::Dir(dir) => Some(dir.as_path()),
+            Source::Trash => None,
+        }
+    }
+}
+
+impl Browser {
+    fn route_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let keystroke = event.keystroke.clone();
+        let tab = self.tab_mut();
+
+        if tab.renaming.is_some() {
+            match keystroke.key.as_str() {
+                "enter" => self.commit_rename(cx),
+                "escape" => {
+                    tab.renaming = None;
+                    cx.notify();
+                }
+                "backspace" => {
+                    tab.rename_buffer.pop();
+                    cx.notify();
+                }
+                _ if !keystroke.modifiers.control
+                    && !keystroke.modifiers.alt
+                    && !keystroke.modifiers.platform
+                    && !keystroke.modifiers.function =>
+                {
+                    if let Some(character) = keystroke.key_char.as_deref() {
+                        tab.rename_buffer.push_str(character);
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match keystroke.key.as_str() {
+            "enter" => self.open_selection(cx),
+            "backspace" => self.go_up(cx),
+            "escape" => {
+                tab.selection.clear();
+                tab.cursor = None;
+                self.purge_armed = None;
+                cx.notify();
+            }
+            "delete" => self.trash_selection(cx),
+            "f2" => self.start_rename(cx),
+            "left" if keystroke.modifiers.alt => self.go_back(cx),
+            "right" if keystroke.modifiers.alt => self.go_forward(cx),
+            "down" => self.move_cursor(1, cx),
+            "up" => self.move_cursor(-1, cx),
+            "a" if keystroke.modifiers.control => {
+                tab.selection = tab.entries.iter().map(|e| e.key.clone()).collect();
+                cx.notify();
+            }
+            "c" if keystroke.modifiers.control => self.copy_selection(cx),
+            "x" if keystroke.modifiers.control => self.cut_selection(cx),
+            "v" if keystroke.modifiers.control => self.paste(cx),
+            "z" if keystroke.modifiers.control => self.undo_last(cx),
+            "t" if keystroke.modifiers.control => self.new_tab(cx),
+            "w" if keystroke.modifiers.control => {
+                let active = self.active;
+                self.close_tab(active, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn move_cursor(&mut self, step: isize, cx: &mut Context<Self>) {
+        let tab = self.tab_mut();
+        if tab.entries.is_empty() {
+            return;
+        }
+        let count = tab.entries.len() as isize;
+        let current = tab.cursor.map_or(-1, |ix| ix as isize);
+        let next = (current + step).clamp(0, count - 1);
+        tab.cursor = Some(next as usize);
+        let key = tab.entries[next as usize].key.clone();
+        tab.selection.clear();
+        tab.selection.insert(key);
+        cx.notify();
+    }
+
+    fn open_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tab().cursor
+            && let Some(entry) = self.tab().entries.get(ix).cloned()
+        {
+            self.open(&entry, cx);
         }
     }
 
     fn open(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+        if entry.item.is_some() {
+            // trash view: Enter restores
+            if let Some(item) = entry.item.clone() {
+                self.enqueue(vec![Op::Restore { items: vec![item] }], cx);
+            }
+            return;
+        }
         if entry.is_dir {
-            self.load(entry.path.clone(), cx);
+            self.load_source(Source::Dir(entry.path.clone()), cx);
         } else {
             match Command::new("xdg-open").arg(&entry.path).spawn() {
                 Ok(_) => self.status = format!("opened {}", entry.name),
@@ -188,50 +682,28 @@ impl Browser {
         }
     }
 
-    fn open_selection(&mut self, cx: &mut Context<Self>) {
-        if let Some(ix) = self.cursor
-            && let Some(entry) = self.entries.get(ix).cloned()
-        {
-            self.open(&entry, cx);
-        }
-    }
-
-    fn move_cursor(&mut self, step: isize, cx: &mut Context<Self>) {
-        if self.entries.is_empty() {
-            return;
-        }
-        let count = self.entries.len() as isize;
-        let current = self.cursor.map_or(-1, |ix| ix as isize);
-        let next = (current + step).clamp(0, count - 1);
-        self.cursor = Some(next as usize);
-        let path = self.entries[next as usize].path.clone();
-        self.selection.clear();
-        self.selection.insert(path);
-        cx.notify();
-    }
-
-    fn select_all(&mut self, cx: &mut Context<Self>) {
-        self.selection = self.entries.iter().map(|entry| entry.path.clone()).collect();
-        cx.notify();
-    }
-
     fn start_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(ix) = self.cursor else {
+        if self.tab().source == Source::Trash {
+            return;
+        }
+        let tab = self.tab_mut();
+        let Some(ix) = tab.cursor else {
             return;
         };
-        let Some(entry) = self.entries.get(ix) else {
+        let Some(entry) = tab.entries.get(ix) else {
             return;
         };
-        self.renaming = Some(entry.path.clone());
-        self.rename_buffer = entry.name.clone();
+        tab.renaming = Some(entry.path.clone());
+        tab.rename_buffer = entry.name.clone();
         cx.notify();
     }
 
     fn commit_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(renaming) = self.renaming.take() else {
+        let tab = self.tab_mut();
+        let Some(renaming) = tab.renaming.take() else {
             return;
         };
-        let target_name = self.rename_buffer.trim().to_owned();
+        let target_name = tab.rename_buffer.trim().to_owned();
         let current_name = renaming
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
@@ -244,13 +716,12 @@ impl Browser {
             Ok(()) => {
                 log::info!("rename: {} -> {}", renaming.display(), dest.display());
                 self.status = format!("renamed to {target_name}");
-                self.selection.retain(|path| *path != renaming);
-                if let Some(ix) = self.cursor
-                    && let Some(entry) = self.entries.get_mut(ix)
-                    && entry.path == renaming
-                {
+                let tab = self.tab_mut();
+                tab.selection.retain(|key| *key != renaming);
+                if let Some(entry) = tab.entries.iter_mut().find(|e| e.path == renaming) {
                     entry.path = dest;
                     entry.name = target_name;
+                    entry.key = entry.path.clone();
                 }
             }
             Err(err) => {
@@ -258,32 +729,45 @@ impl Browser {
                 self.status = format!("rename failed: {err}");
             }
         }
-        self.reload();
+        self.tab_mut().reload();
         cx.notify();
     }
 
-    fn trash_selection(&mut self, cx: &mut Context<Self>) {
-        if self.selection.is_empty() {
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        let tab = self.tab_mut();
+        let Some(previous) = tab.history.pop() else {
             return;
-        }
-        let mut trashed = 0usize;
-        let mut last_error = None;
-        for path in self.selection.drain() {
-            match trash::delete(&path) {
-                Ok(()) => trashed += 1,
-                Err(err) => {
-                    log::error!("trash {}: {err}", path.display());
-                    last_error = Some(err.to_string());
-                }
-            }
-        }
-        self.cursor = None;
-        self.status = match last_error {
-            Some(err) => format!("trashed {trashed}, last error: {err}"),
-            None => format!("trashed {trashed}"),
         };
-        self.reload();
+        tab.forward.push(tab.source.clone());
+        tab.source = previous;
+        tab.selection.clear();
+        tab.cursor = None;
+        tab.renaming = None;
+        tab.reload();
         cx.notify();
+    }
+
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        let tab = self.tab_mut();
+        let Some(next) = tab.forward.pop() else {
+            return;
+        };
+        tab.history.push(tab.source.clone());
+        tab.source = next;
+        tab.selection.clear();
+        tab.cursor = None;
+        tab.renaming = None;
+        tab.reload();
+        cx.notify();
+    }
+
+    fn go_up(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+            return;
+        };
+        if let Some(parent) = dir.parent().map(Path::to_path_buf) {
+            self.load_source(Source::Dir(parent), cx);
+        }
     }
 
     fn internal_move(&mut self, dragged: &DragEntry, target: &Entry, cx: &mut Context<Self>) {
@@ -295,80 +779,32 @@ impl Browser {
         if dragged.path == dest || dragged.path == target.path {
             return;
         }
-        match fs::rename(&dragged.path, &dest) {
-            Ok(()) => {
-                log::info!("move: {} into {}", dragged.path.display(), target.name);
-                self.status = format!("moved {} into {}", name, target.name);
-            }
-            Err(err) => {
-                log::error!("move {} -> {}: {err}", dragged.path.display(), dest.display());
-                self.status = format!("move failed: {err}");
-            }
-        }
-        self.reload();
-        cx.notify();
+        self.enqueue(
+            vec![Op::Move {
+                from: dragged.path.clone(),
+                to: dest,
+            }],
+            cx,
+        );
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        if self.renaming.is_some() {
-            match keystroke.key.as_str() {
-                "enter" => self.commit_rename(cx),
-                "escape" => {
-                    self.renaming = None;
-                    cx.notify();
-                }
-                "backspace" => {
-                    self.rename_buffer.pop();
-                    cx.notify();
-                }
-                _ if !keystroke.modifiers.control
-                    && !keystroke.modifiers.alt
-                    && !keystroke.modifiers.platform
-                    && !keystroke.modifiers.function =>
-                {
-                    if let Some(character) = keystroke.key_char.as_deref() {
-                        self.rename_buffer.push_str(character);
-                        cx.notify();
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-        match keystroke.key.as_str() {
-            "enter" => self.open_selection(cx),
-            "backspace" => self.go_up(cx),
-            "escape" => {
-                self.selection.clear();
-                self.cursor = None;
-                cx.notify();
-            }
-            "delete" => self.trash_selection(cx),
-            "f2" => self.start_rename(cx),
-            "left" if keystroke.modifiers.alt => self.go_back(cx),
-            "right" if keystroke.modifiers.alt => self.go_forward(cx),
-            "down" => self.move_cursor(1, cx),
-            "up" => self.move_cursor(-1, cx),
-            "a" if keystroke.modifiers.control => self.select_all(cx),
-            _ => {}
-        }
+        self.route_key(event, cx);
     }
 
     fn row(&self, ix: usize, entry: &Entry, cx: &mut Context<Self>) -> Stateful<Div> {
-        let dragged = DragEntry {
-            path: entry.path.clone(),
-            is_dir: entry.is_dir,
-        };
-        let selected = self.selection.contains(&entry.path);
-        let renaming = self.renaming.as_ref().is_some_and(|path| *path == entry.path);
+        let selected = self.tab().selection.contains(&entry.key);
+        let tab = self.tab();
+        let renaming = tab.renaming.as_ref().is_some_and(|path| *path == entry.path);
+        let in_trash = entry.item.is_some();
+        let entry_key = entry.key.clone();
         let entry_path = entry.path.clone();
         let size_text = entry
             .size
             .map(human_size)
             .unwrap_or_else(|| String::from("folder"));
 
-        let base = div()
+        let mut base = div()
             .id(ix)
             .flex()
             .items_center()
@@ -385,8 +821,9 @@ impl Browser {
             })
             .hover(|this| this.bg(theme::row_hover()))
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                if event.click_count() >= 2 {
+                if event.click_count() >= 2 && !in_trash {
                     if let Some(found) = this
+                        .tab()
                         .entries
                         .iter()
                         .find(|e| e.path == entry_path)
@@ -396,19 +833,59 @@ impl Browser {
                     }
                     return;
                 }
+                let tab = this.tab_mut();
                 if event.modifiers().control {
-                    if this.selection.contains(&entry_path) {
-                        this.selection.remove(&entry_path);
+                    if tab.selection.contains(&entry_key) {
+                        tab.selection.remove(&entry_key);
                     } else {
-                        this.selection.insert(entry_path.clone());
+                        tab.selection.insert(entry_key.clone());
                     }
                 } else {
-                    this.selection.clear();
-                    this.selection.insert(entry_path.clone());
+                    tab.selection.clear();
+                    tab.selection.insert(entry_key.clone());
                 }
-                this.cursor = Some(ix);
+                tab.cursor = Some(ix);
+                this.purge_armed = None;
                 cx.notify();
-            }))
+            }));
+
+        if in_trash {
+            let origin = entry.path.display().to_string();
+            base = base
+                .drag_over::<DragEntry>(|style, _, _, _| style.bg(theme::drag_over()))
+                .on_drop(cx.listener(move |this, _: &ExternalPaths, _, cx| {
+                    this.status = "trash rows do not accept drops".into();
+                    cx.notify();
+                }));
+            base = base
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .gap_3()
+                        .child(entry.name.clone())
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme::text_dim())
+                                .truncate()
+                                .child(format!("from {}", origin)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_dim())
+                        .child(size_text),
+                );
+            return base;
+        }
+
+        let dragged = DragEntry {
+            path: entry.path.clone(),
+            is_dir: entry.is_dir,
+        };
+        base = base
             .on_drag(dragged.clone(), |dragged: &DragEntry, position, _, cx| {
                 let name = dragged
                     .path
@@ -432,7 +909,7 @@ impl Browser {
                 .border_color(theme::accent())
                 .rounded_sm()
                 .px_1()
-                .child(format!("{}▏", self.rename_buffer))
+                .child(format!("{}▏", tab.rename_buffer))
         } else {
             div().flex_1().truncate().child(entry.name.clone())
         };
@@ -445,27 +922,25 @@ impl Browser {
                 .on_drop(cx.listener(move |this, dragged: &DragEntry, _, cx| {
                     this.internal_move(dragged, &target, cx);
                 }))
-                .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
-                    let list = paths
-                        .paths()
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    log::info!("external drop onto folder {target_name}: {list}");
-                    this.status = format!("external drop onto {target_name} (not imported yet)");
+                .on_drop(cx.listener(move |this, _paths: &ExternalPaths, _, cx| {
+                    this.status =
+                        format!("external drop onto {target_name}: imports land with the queue");
                     cx.notify();
                 }))
         } else {
             base
         };
 
-        base.child(name_child)
-            .child(div().text_size(px(12.)).text_color(theme::text_dim()).child(size_text))
+        base.child(name_child).child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme::text_dim())
+                .child(size_text),
+        )
     }
 
     fn place_row(&self, ix: usize, place: &Place, cx: &mut Context<Self>) -> Stateful<Div> {
-        let here = place.path == self.dir;
+        let here = self.tab().current_dir() == Some(place.path.as_path());
         let path = place.path.clone();
         div()
             .id(format!("place-{ix}"))
@@ -474,20 +949,71 @@ impl Browser {
             .rounded_sm()
             .text_size(px(13.))
             .cursor_pointer()
-            .text_color(if here { theme::accent() } else { theme::text_dim() })
-            .bg(if here { theme::row_selected() } else { theme::clear() })
+            .text_color(if here {
+                theme::accent()
+            } else {
+                theme::text_dim()
+            })
+            .bg(if here {
+                theme::row_selected()
+            } else {
+                theme::clear()
+            })
             .hover(|this| this.bg(theme::row_hover()))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.load(path.clone(), cx);
+                this.load_source(Source::Dir(path.clone()), cx);
             }))
             .child(place.name.clone())
+    }
+
+    fn tab_bar_row(&self, ix: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+        let label = self.tabs[ix].source.label();
+        let active = ix == self.active;
+        div()
+            .id(format!("tab-{ix}"))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .rounded_t_sm()
+            .text_size(px(12.))
+            .cursor_pointer()
+            .bg(if active {
+                theme::row()
+            } else {
+                theme::clear()
+            })
+            .text_color(if active {
+                theme::text()
+            } else {
+                theme::text_dim()
+            })
+            .hover(|this| this.text_color(theme::text()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.active = ix;
+                cx.notify();
+            }))
+            .child(label)
+            .child(
+                div()
+                    .id(format!("tab-close-{ix}"))
+                    .cursor_pointer()
+                    .text_color(theme::text_dim())
+                    .hover(|this| this.text_color(theme::error()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_tab(ix, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child("×"),
+            )
     }
 }
 
 impl Render for Browser {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut rows: Vec<Stateful<Div>> = Vec::new();
-        for (ix, entry) in self.entries.iter().take(200).enumerate() {
+        for (ix, entry) in self.tab().entries.iter().take(200).enumerate() {
             rows.push(self.row(ix, entry, cx));
         }
 
@@ -496,8 +1022,28 @@ impl Render for Browser {
             places.push(self.place_row(ix, place, cx));
         }
 
-        let status_color = if self.status.contains("failed") || self.status.contains("cannot") {
+        let mut tabs: Vec<Stateful<Div>> = Vec::new();
+        for ix in 0..self.tabs.len() {
+            tabs.push(self.tab_bar_row(ix, cx));
+        }
+
+        let in_trash = self.tab().source == Source::Trash;
+        let error_status = self.status.contains("failed") || self.status.contains("cannot");
+        let purge_armed = self
+            .purge_armed
+            .is_some_and(|armed| armed.elapsed() <= PURGE_ARM);
+
+        let status_text = if self.busy {
+            self.progress.clone()
+        } else if purge_armed {
+            "press Delete again to purge permanently (no undo)".into()
+        } else {
+            self.status.clone()
+        };
+        let status_color = if error_status {
             theme::error()
+        } else if self.busy || purge_armed {
+            theme::accent()
         } else {
             theme::text_dim()
         };
@@ -522,7 +1068,29 @@ impl Render for Browser {
                     .bg(theme::sidebar())
                     .border_r_1()
                     .border_color(theme::border())
-                    .children(places),
+                    .children(places)
+                    .child(
+                        div()
+                            .id("place-trash")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .text_size(px(13.))
+                            .cursor_pointer()
+                            .text_color(if in_trash {
+                                theme::accent()
+                            } else {
+                                theme::text_dim()
+                            })
+                            .bg(if in_trash {
+                                theme::row_selected()
+                            } else {
+                                theme::clear()
+                            })
+                            .hover(|this| this.bg(theme::row_hover()))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_trash(cx)))
+                            .child("Trash"),
+                    ),
             )
             .child(
                 div()
@@ -531,6 +1099,27 @@ impl Render for Browser {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .border_b_1()
+                            .border_color(theme::border())
+                            .children(tabs)
+                            .child(
+                                div()
+                                    .id("tab-new")
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .text_size(px(13.))
+                                    .text_color(theme::text_dim())
+                                    .hover(|this| this.text_color(theme::text()))
+                                    .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
+                                    .child("+"),
+                            ),
+                    )
                     .child(
                         div()
                             .flex()
@@ -571,7 +1160,10 @@ impl Render for Browser {
                                     .flex_1()
                                     .truncate()
                                     .text_color(theme::text())
-                                    .child(self.dir.display().to_string()),
+                                    .child(match self.tab().current_dir() {
+                                        Some(dir) => dir.display().to_string(),
+                                        None => "Trash".into(),
+                                    }),
                             ),
                     )
                     .child(
@@ -590,6 +1182,7 @@ impl Render for Browser {
                         div()
                             .flex()
                             .justify_between()
+                            .gap_4()
                             .px_3()
                             .py_1()
                             .border_t_1()
@@ -598,13 +1191,14 @@ impl Render for Browser {
                             .text_color(status_color)
                             .child(format!(
                                 "{} items, {} selected",
-                                self.entries.len(),
-                                self.selection.len()
+                                self.tab().entries.len(),
+                                self.tab().selection.len()
                             ))
+                            .child(div().flex_1().truncate().child(status_text))
                             .child(
                                 div()
-                                    .truncate()
-                                    .child(self.status.clone()),
+                                    .text_color(theme::text_dim())
+                                    .child("Enter open · F2 rename · Del trash · Ctrl+C/X/V · Ctrl+Z undo · Alt+arrows"),
                             ),
                     ),
             )
