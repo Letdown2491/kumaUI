@@ -1,0 +1,15 @@
+[package]
+name = "kuma-files"
+version = "0.1.0"
+edition = "2024"
+description = "Koguma, kumaOS's file manager (starts as the gpui DnD spike for issue #25)"
+license = "MIT"
+repository = "https://github.com/Letdown2491/kumaUI"
+
+[dependencies]
+gpui = { workspace = true }
+gpui_platform = { workspace = true }
+log = "0.4"
+env_logger = "0.11"
+trash = "5"
+dirs = "7"

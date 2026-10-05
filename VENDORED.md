@@ -46,6 +46,12 @@ local patches, which should be recorded here.
   layer surfaces the compositor immediately closes (a 2s create/close
   spin against a displayless compositor); retired outputs make
   `cx.displays()` truthful so the watch can idle.
+- `crates/gpui_linux/src/linux/wayland/client.rs`: outbound drag
+  (`start_external_drag`) advertises `DndAction::Copy` only, where
+  upstream advertises `Copy | Move`. Real targets (Nautilus) pick Move
+  when given the choice, so a dragged file silently left its folder on
+  drop; a file manager's outbound drags default to the non-destructive
+  action. Found by the kuma-files DnD spike (issue #25).
 - `crates/gpui_linux/src/linux/wayland/window.rs`: `set_size_and_scale`
   skips `wp_viewport::set_destination` when the size is zero. Layer
   surfaces start at zero size and get their real size from the layer
