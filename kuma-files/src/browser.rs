@@ -2427,7 +2427,12 @@ impl Render for Browser {
                                     .child(empty_space)
                             }
                             ViewMode::Icons => {
-                                let empty_space = div()
+                                // a catcher under the grid: in a wrap
+                                // container a grown spacer only fills its
+                                // own line, so the open space below the
+                                // last row must be a real flex_grow child
+                                // of this column
+                                let catcher = div()
                                     .id("list-empty")
                                     .flex_grow_1()
                                     .min_h(px(24.))
@@ -2455,9 +2460,9 @@ impl Render for Browser {
                                         }),
                                     );
 
-                                // the selection band, drawn in grid-local
-                                // coordinates; hit testing happens against
-                                // the same pinned geometry at drop
+                                // the selection band, drawn over the grid;
+                                // hit testing happens against the same
+                                // pinned geometry at drop
                                 let overlay = match (
                                     self.rubber_origin,
                                     self.rubber_current,
@@ -2487,14 +2492,19 @@ impl Render for Browser {
 
                                 list_box
                                     .flex()
-                                    .flex_wrap()
-                                    .content_start()
+                                    .flex_col()
                                     .p(px(8. * s))
-                                    .gap(px(4. * s))
                                     .relative()
                                     .children(overlay)
-                                    .children(rows)
-                                    .child(empty_space)
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .content_start()
+                                            .gap(px(4. * s))
+                                            .children(rows),
+                                    )
+                                    .child(catcher)
                                     .on_drag_move::<RubberSelect>(cx.listener(
                                         |this, event: &DragMoveEvent<RubberSelect>, _, cx| {
                                             this.rubber_current = Some(event.event.position);
