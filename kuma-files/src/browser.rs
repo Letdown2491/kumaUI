@@ -345,6 +345,8 @@ pub(crate) struct Browser {
     conflict_dialog: Option<ConflictDialog>,
     /// Info rail on the right, following the cursor entry.
     inspector: bool,
+    /// Info rail docked to the bottom edge instead of the right.
+    inspector_bottom: bool,
     /// Text snippet for the rail, when the focused entry is textual.
     text_preview: Option<String>,
     preview_key: Option<PathBuf>,
@@ -400,6 +402,7 @@ impl Browser {
             undo: Vec::new(),
             conflict_dialog: None,
             inspector: false,
+            inspector_bottom: false,
             text_preview: None,
             preview_key: None,
             preview_inflight: HashSet::new(),
@@ -1287,6 +1290,7 @@ impl Browser {
         }
         self.show_hidden = text.contains("hidden=true");
         self.inspector = text.contains("inspector=true");
+        self.inspector_bottom = text.contains("inspector-bottom=true");
         if let Some(scale) = text
             .lines()
             .find_map(|l| l.strip_prefix("scale="))
@@ -1313,7 +1317,7 @@ impl Browser {
             SortKey::Modified => "modified",
         };
         let text = format!(
-            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\nscale={}\n",
+            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\nscale={}\n",
             if tab.view_mode == ViewMode::Icons {
                 "icons"
             } else {
@@ -1323,6 +1327,7 @@ impl Browser {
             tab.sort_asc,
             self.show_hidden,
             self.inspector,
+            self.inspector_bottom,
             self.scale,
         );
         if let Err(err) = fs::write(path, text) {
@@ -1417,6 +1422,13 @@ impl Browser {
                 self.status = format!("new file failed: {err}");
             }
         }
+        cx.notify();
+    }
+
+    /// Move the info panel between the right edge and the bottom edge.
+    fn flip_inspector(&mut self, cx: &mut Context<Self>) {
+        self.inspector_bottom = !self.inspector_bottom;
+        self.save_state();
         cx.notify();
     }
 
@@ -2541,10 +2553,11 @@ impl Browser {
 
     /// The modal overlay for unresolved paste conflicts. `None` (rendered
     /// as no child) when no paste is waiting on a decision.
-    /// The docked info rail: preview on top, metadata under it. It
-    /// follows the cursor entry, so there is nothing to snapshot; the
-    /// metadata is read fresh each render (one stat syscall while open).
-    fn inspector_rail(&self, cx: &mut Context<Self>) -> Div {
+    /// The info panel: preview plus metadata, following the cursor
+    /// entry. Nothing is snapshotted; metadata is read fresh each
+    /// render (one stat syscall while open). Docked right by default,
+    /// or along the bottom edge when the user prefers landscape room.
+    fn inspector_panel(&self, bottom: bool, cx: &mut Context<Self>) -> Div {
         let entry = self
             .tab()
             .cursor
@@ -2596,38 +2609,66 @@ impl Browser {
             div().into_any_element()
         };
 
-        div()
-            .w(px(280.))
+        let preview_box = div()
             .flex_none()
-            .h_full()
             .flex()
-            .flex_col()
-            .p_3()
-            .gap_3()
-            .bg(theme::sidebar())
-            .border_l_1()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .bg(theme::row())
+            .border_1()
             .border_color(theme::border())
+            .p_2()
+            .overflow_hidden()
+            .child(preview);
+
+        let header = div()
+            .flex()
+            .items_start()
+            .justify_between()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(14.))
+                    .text_color(theme::text())
+                    .child(entry.map_or_else(
+                        || "No selection".to_string(),
+                        |e| e.name.clone(),
+                    )),
+            )
             .child(
                 div()
                     .flex()
-                    .items_start()
-                    .justify_between()
+                    .flex_none()
+                    .gap_1()
                     .child(
+                        // dock the panel on the other edge
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(14.))
-                            .text_color(theme::text())
-                            .child(entry.map_or_else(
-                                || "No selection".to_string(),
-                                |e| e.name.clone(),
-                            )),
+                            .id("inspector-dock")
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(theme::text_dim())
+                            .hover(|this| {
+                                this.text_color(theme::text()).bg(theme::row_hover())
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.flip_inspector(cx)))
+                            .child(
+                                svg()
+                                    .path(if bottom {
+                                        "icons/chevron_right.svg"
+                                    } else {
+                                        "icons/chevron_down.svg"
+                                    })
+                                    .size(px(14.))
+                                    .text_color(theme::text_dim()),
+                            ),
                     )
                     .child(
                         div()
                             .id("inspector-close")
-                            .flex_none()
                             .px_1()
                             .rounded_sm()
                             .cursor_pointer()
@@ -2638,23 +2679,13 @@ impl Browser {
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx)))
                             .child("×"),
                     ),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .h(px(200.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .bg(theme::row())
-                    .border_1()
-                    .border_color(theme::border())
-                    .p_2()
-                    .overflow_hidden()
-                    .child(preview),
-            )
+            );
+
+        let rows = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .min_w_0()
             .children(entry.map(|_| prop_row("kind", if is_dir { "folder".into() } else { "file".into() })))
             .children(entry.map(|e| prop_row("path", e.path.display().to_string())))
             .children(entry.map(|_| {
@@ -2672,7 +2703,46 @@ impl Browser {
                         .unwrap_or_default(),
                 )
             }))
-            .children(entry.map(|_| prop_row("permissions", mode.map(mode_string).unwrap_or_default())))
+            .children(entry.map(|_| prop_row("permissions", mode.map(mode_string).unwrap_or_default())));
+
+        if bottom {
+            div()
+                .w_full()
+                .flex_none()
+                .h(px(220.))
+                .flex()
+                .gap_3()
+                .p_3()
+                .bg(theme::sidebar())
+                .border_t_1()
+                .border_color(theme::border())
+                .child(preview_box.w(px(280.)).h_full())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(header)
+                        .child(rows),
+                )
+        } else {
+            div()
+                .w(px(280.))
+                .flex_none()
+                .h_full()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_3()
+                .bg(theme::sidebar())
+                .border_l_1()
+                .border_color(theme::border())
+                .child(header)
+                .child(preview_box.w_full().h(px(200.)))
+                .child(rows)
+        }
     }
 
     /// The right-click menu: a backdrop that eats the next click (and
@@ -3525,6 +3595,11 @@ impl Render for Browser {
                             }
                         }
                     })
+                    .child(if self.inspector && self.inspector_bottom {
+                        self.inspector_panel(true, cx)
+                    } else {
+                        div()
+                    })
                     .child(
                         div()
                             .flex()
@@ -3568,8 +3643,8 @@ impl Render for Browser {
                             ),
                     ),
             )
-            .child(if self.inspector {
-                self.inspector_rail(cx)
+            .child(if self.inspector && !self.inspector_bottom {
+                self.inspector_panel(false, cx)
             } else {
                 div()
             })
