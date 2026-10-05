@@ -343,7 +343,8 @@ pub(crate) struct Browser {
     clipboard: Option<(bool, Vec<PathBuf>)>,
     undo: Vec<Op>,
     conflict_dialog: Option<ConflictDialog>,
-    /// Info rail on the right, following the cursor entry.
+    /// Info rail on the right, following the cursor entry. On by
+    /// default; it only shows while an entry is selected.
     inspector: bool,
     /// Info rail docked to the bottom edge instead of the right.
     inspector_bottom: bool,
@@ -403,7 +404,7 @@ impl Browser {
             clipboard: None,
             undo: Vec::new(),
             conflict_dialog: None,
-            inspector: false,
+            inspector: true,
             inspector_bottom: false,
             text_preview: None,
             preview_key: None,
@@ -1278,6 +1279,11 @@ impl Browser {
             return;
         };
 
+        // parse everything first: the view knobs must apply AFTER the
+        // tabs are resolved, not to a placeholder that gets thrown away
+        let mut view: Option<ViewMode> = None;
+        let mut sort: Option<SortKey> = None;
+        let mut sort_asc = true;
         let mut saved_tabs: Vec<(usize, PathBuf)> = Vec::new();
         let mut saved_active: Option<usize> = None;
         for line in text.lines() {
@@ -1285,16 +1291,18 @@ impl Browser {
                 continue;
             };
             match (key, value) {
-                ("view", "icons") => self.tab_mut().view_mode = ViewMode::Icons,
-                ("view", "list") => self.tab_mut().view_mode = ViewMode::List,
-                ("sort", "name") => self.tab_mut().sort_key = SortKey::Name,
-                ("sort", "size") => self.tab_mut().sort_key = SortKey::Size,
-                ("sort", "modified") => self.tab_mut().sort_key = SortKey::Modified,
-                ("asc", "true") => self.tab_mut().sort_asc = true,
-                ("asc", "false") => self.tab_mut().sort_asc = false,
+                ("view", "icons") => view = Some(ViewMode::Icons),
+                ("view", "list") => view = Some(ViewMode::List),
+                ("sort", "name") => sort = Some(SortKey::Name),
+                ("sort", "size") => sort = Some(SortKey::Size),
+                ("sort", "modified") => sort = Some(SortKey::Modified),
+                ("asc", "true") => sort_asc = true,
+                ("asc", "false") => sort_asc = false,
                 ("hidden", "true") => self.show_hidden = true,
                 ("inspector", "true") => self.inspector = true,
+                ("inspector", "false") => self.inspector = false,
                 ("inspector-bottom", "true") => self.inspector_bottom = true,
+                ("inspector-bottom", "false") => self.inspector_bottom = false,
                 ("active", _) => saved_active = value.parse().ok(),
                 ("scale", _) => {
                     if let Ok(parsed) = value.parse::<f32>() {
@@ -1323,8 +1331,18 @@ impl Browser {
                 self.active = active.min(self.tabs.len() - 1);
             }
         } else if let Some(dir) = cli_dir {
-            let tab = self.tab_mut();
-            tab.source = Source::Dir(dir.to_path_buf());
+            self.tab_mut().source = Source::Dir(dir.to_path_buf());
+        }
+
+        // the knobs belong to every tab we ended up with
+        for tab in &mut self.tabs {
+            if let Some(view_mode) = view {
+                tab.view_mode = view_mode;
+            }
+            if let Some(sort_key) = sort {
+                tab.sort_key = sort_key;
+            }
+            tab.sort_asc = sort_asc;
         }
     }
 
@@ -3070,7 +3088,11 @@ impl Render for Browser {
         self.arm_watcher();
 
         // the info rail follows the cursor entry; keep its preview fed
-        if self.inspector {
+        // the panel only shows while an entry is selected: the knob
+        // says the user wants it, the cursor says there is something
+        // to show
+        let show_panel = self.inspector && self.tab().cursor.is_some();
+        if show_panel {
             let focus = self
                 .tab()
                 .cursor
@@ -3620,7 +3642,7 @@ impl Render for Browser {
                             }
                         }
                     })
-                    .child(if self.inspector && self.inspector_bottom {
+                    .child(if show_panel && self.inspector_bottom {
                         self.inspector_panel(true, cx)
                     } else {
                         div()
@@ -3668,7 +3690,7 @@ impl Render for Browser {
                             ),
                     ),
             )
-            .child(if self.inspector && !self.inspector_bottom {
+            .child(if show_panel && !self.inspector_bottom {
                 self.inspector_panel(false, cx)
             } else {
                 div()
