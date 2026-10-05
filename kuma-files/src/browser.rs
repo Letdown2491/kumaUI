@@ -630,8 +630,94 @@ impl Browser {
         self.load_source(Source::Trash, cx);
     }
 
-    fn start_path_edit(&mut self, cx: &mut Context<Self>) {
+    /// The path bar as clickable crumbs: every ancestor is a jump
+    /// target, the current segment opens the path editor. A
+    /// home-prefixed path renders from ~ onward.
+    fn path_crumbs(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+            return div()
+                .id("path-bar")
+                .flex_1()
+                .min_w_0()
+                .text_color(theme::text())
+                .child("Trash");
+        };
+
+        let home = dirs::home_dir();
+        let display = match home.as_ref() {
+            Some(home) if dir.as_path() == home.as_path() => Some(PathBuf::from("~")),
+            Some(home) if dir.starts_with(home) => dir
+                .strip_prefix(home)
+                .ok()
+                .map(|rest| PathBuf::from("~").join(rest)),
+            _ => None,
+        }
+        .unwrap_or_else(|| dir.clone());
+        let home_rel = display.starts_with("~");
+
+        let mut row = div()
+            .id("path-bar")
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .text_color(theme::text());
+
+        let count = display.components().count();
+        let mut acc = PathBuf::new();
+        for (ix, component) in display.components().enumerate() {
+            let last = ix + 1 == count;
+            let seg = component.as_os_str().to_string_lossy().into_owned();
+            acc.push(component.as_os_str());
+
+            // the absolute location this crumb jumps to
+            let target = if home_rel {
+                match (home.as_ref(), acc.strip_prefix("~")) {
+                    (Some(home), Ok(rest)) => home.join(rest),
+                    (Some(home), Err(_)) => home.clone(),
+                    _ => acc.clone(),
+                }
+            } else {
+                acc.clone()
+            };
+
+            let is_edit = last;
+            let mut crumb = div()
+                .id(format!("crumb-{ix}"))
+                .flex_none()
+                .cursor_pointer()
+                .text_color(if last {
+                    theme::text()
+                } else {
+                    theme::text_dim()
+                })
+                .hover(|this| this.text_color(theme::accent()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if is_edit {
+                        this.start_path_edit(cx);
+                    } else {
+                        this.load_source(Source::Dir(target.clone()), cx);
+                    }
+                }));
+            if last {
+                crumb = crumb.truncate();
+            }
+            row = row.child(crumb.child(seg));
+            if !last {
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .text_color(theme::text_dim())
+                        .child("/"),
+                );
+            }
+        }
+        row
+    }
+
+    fn start_path_edit(&mut self, cx: &mut Context<Self>) {        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
             return;
         };
         self.path_editing = true;
@@ -2128,6 +2214,23 @@ impl Render for Browser {
             theme::text_dim()
         };
 
+        // what the keyboard cursor sits on: name, size, age
+        let cursor_info = self
+            .tab()
+            .cursor
+            .and_then(|ix| self.tab().entries.get(ix))
+            .map(|entry| {
+                let size = entry
+                    .size
+                    .map(human_size)
+                    .unwrap_or_else(|| if entry.is_dir { "folder".into() } else { String::new() });
+                let age = entry
+                    .modified
+                    .map(|secs| relative_time(secs, now_secs()))
+                    .unwrap_or_default();
+                format!("{} · {} · {}", entry.name, size, age)
+            });
+
         div()
             .size_full()
             .relative()
@@ -2214,6 +2317,23 @@ impl Render for Browser {
                                     .hover(|this| this.text_color(theme::text()))
                                     .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx)))
                                     .child("+"),
+                            )
+                            .child(
+                                // double-click anywhere right of the tabs
+                                // opens a new one; a sibling spacer, never a
+                                // handler on this row (parent-first dispatch
+                                // would eat the tabs' own clicks)
+                                div()
+                                    .id("tab-bar-empty")
+                                    .flex_grow_1()
+                                    .min_h(px(8.))
+                                    .on_click(cx.listener(
+                                        |this, event: &ClickEvent, _, cx| {
+                                            if event.click_count() >= 2 {
+                                                this.new_tab(cx);
+                                            }
+                                        },
+                                    )),
                             ),
                     )
                     .child(
@@ -2298,20 +2418,7 @@ impl Render for Browser {
                                     .text_color(theme::text())
                                     .child(format!("{before}▏{after}"))
                             } else {
-                                div()
-                                    .id("path-bar")
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme::text())
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.start_path_edit(cx)
-                                    }))
-                                    .child(match self.tab().current_dir() {
-                                        Some(dir) => dir.display().to_string(),
-                                        None => "Trash".into(),
-                                    })
+                                self.path_crumbs(cx)
                             })
                             .child(
                                 div()
@@ -2548,8 +2655,18 @@ impl Render for Browser {
                                 self.tab().selection.len()
                             ))
                             .child(div().flex_1().truncate().child(status_text))
+                            .child(match cursor_info {
+                                Some(info) => div()
+                                    .flex_none()
+                                    .max_w(px(360.))
+                                    .text_color(theme::text_dim())
+                                    .truncate()
+                                    .child(info),
+                                None => div(),
+                            })
                             .child(
                                 div()
+                                    .flex_none()
                                     .text_color(theme::text_dim())
                                     .child("Enter open · F2 rename · Del trash · Ctrl+C/X/V · Ctrl+Z undo · Ctrl+H hidden · Ctrl+1/2 views"),
                             ),
