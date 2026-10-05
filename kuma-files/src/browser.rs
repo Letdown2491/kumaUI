@@ -2625,19 +2625,8 @@ impl Browser {
         let header = div()
             .flex()
             .items_start()
-            .justify_between()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(14.))
-                    .text_color(theme::text())
-                    .child(entry.map_or_else(
-                        || "No selection".to_string(),
-                        |e| e.name.clone(),
-                    )),
-            )
+            .justify_end()
+            .gap_1()
             .child(
                 div()
                     .flex()
@@ -2686,6 +2675,7 @@ impl Browser {
             .flex_col()
             .gap_2()
             .min_w_0()
+            .children(entry.map(|e| prop_row("name", e.name.clone())))
             .children(entry.map(|_| prop_row("kind", if is_dir { "folder".into() } else { "file".into() })))
             .children(entry.map(|e| prop_row("path", e.path.display().to_string())))
             .children(entry.map(|_| {
