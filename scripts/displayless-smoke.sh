@@ -66,11 +66,13 @@ unplug_all_outputs() {
 }
 # poll the shell's log for a line after a marker: the wayland roundtrip
 # that carries a hotplug has compositor-dependent lag, so assert the
-# transition happens, not that it beats a fixed sleep
+# transition happens, not that it beats a fixed sleep. grep runs without
+# -q on purpose: -q exits at the first match, sed dies of SIGPIPE on the
+# rest of the log, and pipefail turns the match into a failed poll.
 await_log() {
 	local marker=$1 pattern=$2 timeout=$3
 	for _ in $(seq "$timeout"); do
-		sed -n "/--- $marker/,\$p" /tmp/kuma-shell.log | grep -q "$pattern" && return 0
+		sed -n "/--- $marker/,\$p" /tmp/kuma-shell.log | grep "$pattern" >/dev/null && return 0
 		sleep 1
 	done
 	return 1
