@@ -13,6 +13,8 @@ use gpui::{
 };
 use trash::{os_limited, TrashItem};
 
+use notify::Watcher as _;
+
 use crate::{icons, theme};
 
 /// One drag origin. The external payload resolver needs the path plus
@@ -321,6 +323,10 @@ pub(crate) struct Browser {
     path_cursor: usize,
     /// Content zoom, 1.0 = normal; clamped to 0.75..=2.0.
     scale: f32,
+    watcher: Option<notify::RecommendedWatcher>,
+    watched: Option<PathBuf>,
+    /// Current-name filter, typed straight into the listing.
+    filter: String,
     /// Where the icon-grid rubber band started and now sits, in window
     /// coordinates, plus the grid's own bounds for local conversion.
     rubber_origin: Option<Point<Pixels>>,
@@ -361,6 +367,9 @@ impl Browser {
             path_buffer: String::new(),
             path_cursor: 0,
             scale: 1.0,
+            watcher: None,
+            watched: None,
+            filter: String::new(),
             rubber_origin: None,
             rubber_current: None,
             rubber_bounds: None,
@@ -369,6 +378,7 @@ impl Browser {
         };
         let show_hidden = browser.show_hidden;
         browser.tab_mut().reload(show_hidden);
+        browser.start_dir_watch(cx);
         browser
     }
 
@@ -498,17 +508,20 @@ impl Browser {
         let per_line = (((f32::from(bounds.size.width) - 2. * pad) / (cell_w + gap)).floor())
             .max(1.) as i32;
 
+        let visible = self.visible_indices();
         let tab = self.tab_mut();
         if !ctrl {
             tab.selection.clear();
         }
-        for (ix, entry) in tab.entries.iter().enumerate() {
-            let row = (ix as i32 / per_line) as f32;
-            let col = (ix as i32 % per_line) as f32;
+        // with a filter on, the grid shows only visible entries and the
+        // band selects their grid positions
+        for (pos, &entry_ix) in visible.iter().enumerate() {
+            let row = (pos as i32 / per_line) as f32;
+            let col = (pos as i32 % per_line) as f32;
             let x0 = pad + col * (cell_w + gap);
             let y0 = pad + row * (cell_h + gap);
             if x0 < right && x0 + cell_w > left && y0 < bottom && y0 + cell_h > top {
-                tab.selection.insert(entry.key.clone());
+                tab.selection.insert(tab.entries[entry_ix].key.clone());
             }
         }
         cx.notify();
@@ -715,6 +728,141 @@ impl Browser {
             }
         }
         row
+    }
+
+    /// The listing the user sees: all entries, or the nucleo matches
+    /// for the type-in filter, best score first.
+    fn visible_indices(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.tab().entries.len()).collect();
+        }
+        use nucleo::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+        use nucleo::{Config, Matcher, Utf32String};
+
+        let pattern = Pattern::new(
+            &self.filter,
+            CaseMatching::Smart,
+            Normalization::Smart,
+            AtomKind::Fuzzy,
+        );
+        let mut matcher = Matcher::new(Config::DEFAULT);
+        let mut scored: Vec<(u32, usize)> = self
+            .tab()
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, entry)| {
+                let haystack = Utf32String::from(entry.name.as_str());
+                pattern
+                    .score(haystack.slice(..), &mut matcher)
+                    .map(|score| (score, ix))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, ix)| ix).collect()
+    }
+
+    /// After a filter edit the cursor must sit on a visible entry.
+    fn snap_cursor_visible(&mut self) {
+        let visible = self.visible_indices();
+        let tab = self.tab_mut();
+        match tab.cursor {
+            Some(ix) if visible.contains(&ix) => {}
+            _ => tab.cursor = visible.first().copied(),
+        }
+    }
+
+    /// Watch the active tab's directory so external changes (other apps,
+    /// other windows, mounts) show up without touching anything. One
+    /// watcher for the app's lifetime; paths are swapped on navigation.
+    /// The raw notify channel is pumped by a plain thread that forwards
+    /// coalesced batches over an async channel into the UI.
+    fn start_dir_watch(&mut self, cx: &mut Context<Self>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        match notify::recommended_watcher(tx) {
+            Ok(watcher) => self.watcher = Some(watcher),
+            Err(err) => {
+                log::error!("notify watcher: {err}");
+                return;
+            }
+        }
+
+        let (batch_tx, mut batch_rx) = futures::channel::mpsc::unbounded();
+        std::thread::Builder::new()
+            .name("kuma-files-watch".into())
+            .spawn(move || loop {
+                // the channel carries Result<Event, Error>; notify
+                // errors are per-event noise, skip them
+                let first = match rx.recv() {
+                    Ok(Ok(event)) => event,
+                    Ok(Err(_)) => continue,
+                    Err(_) => return,
+                };
+                let mut batch = vec![first];
+                // events arrive in bursts (create + metadata + writes);
+                // wait out the burst, then deliver once
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(Ok(event)) => batch.push(event),
+                        Ok(Err(_)) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                if batch_tx.unbounded_send(batch).is_err() {
+                    return;
+                }
+            })
+            .expect("spawn watch pump");
+
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt;
+            while let Some(batch) = batch_rx.next().await {
+                let update = this.update(cx, |this, cx| {
+                    let current = this.tab().current_dir().map(Path::to_path_buf);
+                    let relevant = batch.iter().flat_map(|event| event.paths.iter()).any(|p| {
+                        matches!(&p.parent(), Some(parent) if Some(*parent) == current.as_deref())
+                    });
+                    if relevant {
+                        let show_hidden = this.show_hidden;
+                        this.tab_mut().reload(show_hidden);
+                        log::info!("dir changed externally, reloaded");
+                        cx.notify();
+                    }
+                });
+                if update.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Point the watcher at the active tab's directory. Called from
+    /// render, so it stays correct through any navigation path.
+    fn arm_watcher(&mut self) {
+        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+            return;
+        };
+        if self.watched.as_ref() == Some(&dir) {
+            return;
+        }
+        if let Some(old) = self.watched.take()
+            && let Some(watcher) = self.watcher.as_mut()
+            && let Err(err) = watcher.unwatch(&old)
+        {
+            log::error!("unwatch {}: {err}", old.display());
+        }
+        let Some(watcher) = self.watcher.as_mut() else {
+            return;
+        };
+        match watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                self.watched = Some(dir.clone());
+                log::info!("watching {}", dir.display());
+            }
+            Err(err) => log::error!("watch {}: {err}", dir.display()),
+        }
     }
 
     fn start_path_edit(&mut self, cx: &mut Context<Self>) {        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
@@ -1188,6 +1336,7 @@ impl Tab {
 impl Browser {
     fn route_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let keystroke = event.keystroke.clone();
+        let filtering = !self.filter.is_empty();
 
         if self.conflict_dialog.is_some() {
             match keystroke.key.as_str() {
@@ -1338,12 +1487,28 @@ impl Browser {
 
         match keystroke.key.as_str() {
             "enter" => self.open_selection(cx),
-            "backspace" => self.go_up(cx),
+            // Backspace edits the filter while one is active, otherwise
+            // it goes to the parent directory
+            "backspace" => {
+                if filtering {
+                    self.filter.pop();
+                    self.snap_cursor_visible();
+                    cx.notify();
+                } else {
+                    self.go_up(cx);
+                }
+            }
             "escape" => {
-                tab.selection.clear();
-                tab.cursor = None;
-                self.purge_armed = None;
-                cx.notify();
+                if filtering {
+                    self.filter.clear();
+                    self.snap_cursor_visible();
+                    cx.notify();
+                } else {
+                    tab.selection.clear();
+                    tab.cursor = None;
+                    self.purge_armed = None;
+                    cx.notify();
+                }
             }
             "delete" => self.trash_selection(cx),
             "f2" => self.start_rename(cx),
@@ -1351,10 +1516,17 @@ impl Browser {
             "right" if keystroke.modifiers.alt => self.go_forward(cx),
             "down" => self.move_cursor(1, cx),
             "up" => self.move_cursor(-1, cx),
-            "home" => self.jump_cursor(0, cx),
+            "home" => {
+                let first = self.visible_indices().first().copied();
+                if let Some(entry_ix) = first {
+                    self.jump_cursor(entry_ix, cx);
+                }
+            }
             "end" => {
-                let last = self.tab().entries.len().saturating_sub(1);
-                self.jump_cursor(last, cx);
+                let last = self.visible_indices().into_iter().next_back();
+                if let Some(entry_ix) = last {
+                    self.jump_cursor(entry_ix, cx);
+                }
             },
             "a" if keystroke.modifiers.control => {
                 tab.selection = tab.entries.iter().map(|e| e.key.clone()).collect();
@@ -1380,20 +1552,40 @@ impl Browser {
             "n" if keystroke.modifiers.control && keystroke.modifiers.shift => {
                 self.new_folder(cx)
             }
+            // bare single characters feed the type-in filter; shift is
+            // allowed (uppercase), everything else filters it out
+            _ if !keystroke.modifiers.control
+                && !keystroke.modifiers.alt
+                && !keystroke.modifiers.platform
+                && !keystroke.modifiers.function
+                && keystroke.key.chars().count() == 1
+                && !keystroke.key.chars().all(|ch| ch.is_control()) =>
+            {
+                self.filter.push_str(&keystroke.key);
+                self.snap_cursor_visible();
+                cx.notify();
+            }
             _ => {}
         }
     }
 
     fn move_cursor(&mut self, step: isize, cx: &mut Context<Self>) {
-        let tab = self.tab_mut();
-        if tab.entries.is_empty() {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
             return;
         }
-        let count = tab.entries.len() as isize;
-        let current = tab.cursor.map_or(-1, |ix| ix as isize);
-        let next = (current + step).clamp(0, count - 1);
-        tab.cursor = Some(next as usize);
-        let key = tab.entries[next as usize].key.clone();
+        let current_pos = self
+            .tab()
+            .cursor
+            .and_then(|ix| visible.iter().position(|&v| v == ix));
+        let next_pos = match current_pos {
+            Some(pos) => (pos as isize + step).clamp(0, visible.len() as isize - 1) as usize,
+            None => 0,
+        };
+        let entry_ix = visible[next_pos];
+        let tab = self.tab_mut();
+        tab.cursor = Some(entry_ix);
+        let key = tab.entries[entry_ix].key.clone();
         tab.selection.clear();
         tab.selection.insert(key);
         cx.notify();
@@ -2171,15 +2363,19 @@ impl Browser {
 impl Render for Browser {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_places();
+        self.arm_watcher();
 
         // owned so the icon cells can kick off thumbnail decodes (which
-        // need &mut self) while iterating
-        let entries: Vec<Entry> = self.tab().entries.iter().take(200).cloned().collect();
+        // need &mut self) while iterating; rows keep their entry index
+        // so element state and cursor stay entry-keyed
+        let entries: Vec<Entry> = self.tab().entries.clone();
+        let visible = self.visible_indices();
         let mut rows: Vec<Stateful<Div>> = Vec::new();
-        for (ix, entry) in entries.iter().enumerate() {
+        for &entry_ix in visible.iter().take(200) {
+            let entry = &entries[entry_ix];
             match self.tab().view_mode {
-                ViewMode::List => rows.push(self.row(ix, entry, cx)),
-                ViewMode::Icons => rows.push(self.icon_cell(ix, entry, cx)),
+                ViewMode::List => rows.push(self.row(entry_ix, entry, cx)),
+                ViewMode::Icons => rows.push(self.icon_cell(entry_ix, entry, cx)),
             }
         }
 
@@ -2655,6 +2851,15 @@ impl Render for Browser {
                                 self.tab().selection.len()
                             ))
                             .child(div().flex_1().truncate().child(status_text))
+                            .child(if self.filter.is_empty() {
+                                div()
+                            } else {
+                                div()
+                                    .flex_none()
+                                    .text_color(theme::accent())
+                                    .truncate()
+                                    .child(format!("filter: {} (Esc clears)", self.filter))
+                            })
                             .child(match cursor_info {
                                 Some(info) => div()
                                     .flex_none()
