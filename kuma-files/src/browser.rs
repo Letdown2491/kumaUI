@@ -375,6 +375,38 @@ impl Browser {
         push("Music", dirs::audio_dir());
         push("Pictures", dirs::picture_dir());
         push("Videos", dirs::video_dir());
+
+        // removable and remote mounts: udisks2 mount points, then the
+        // gvfs-FUSE bridges that back samba, MTP, phones, and friends.
+        // Mounted volumes appear here without any protocol code on our
+        // side (gio mount / the desktop session do that part).
+        let mount_root = |root: PathBuf, places: &mut Vec<Place>| {
+            let Ok(read) = fs::read_dir(&root) else {
+                return;
+            };
+            let mut mounts: Vec<Place> = read
+                .flatten()
+                .map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    Place {
+                        name,
+                        path: entry.path(),
+                    }
+                })
+                .collect();
+            mounts.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            places.extend(mounts);
+        };
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let mut gvfs = PathBuf::from(&runtime);
+            gvfs.push("gvfs");
+            mount_root(gvfs, &mut places);
+        }
+        if let Some(user) = std::env::var_os("USER") {
+            let mut media = PathBuf::from("/run/media");
+            media.push(user);
+            mount_root(media, &mut places);
+        }
         places
     }
 
@@ -560,9 +592,16 @@ impl Browser {
         cx.notify();
     }
 
+    /// New tabs start at home but keep the working view: the active
+    /// tab's view mode and sort carry over.
     fn new_tab(&mut self, cx: &mut Context<Self>) {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        self.tabs.push(Tab::new(Source::Dir(home)));
+        let mut tab = Tab::new(Source::Dir(home));
+        let current = self.tab();
+        tab.view_mode = current.view_mode;
+        tab.sort_key = current.sort_key;
+        tab.sort_asc = current.sort_asc;
+        self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.tabs.last_mut().unwrap().reload(self.show_hidden);
         self.status.clear();
@@ -573,7 +612,12 @@ impl Browser {
         if self.tabs.len() == 1 {
             // the last tab becomes a fresh home tab rather than closing
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            self.tabs[0] = Tab::new(Source::Dir(home));
+            let mut tab = Tab::new(Source::Dir(home));
+            let current = self.tab();
+            tab.view_mode = current.view_mode;
+            tab.sort_key = current.sort_key;
+            tab.sort_asc = current.sort_asc;
+            self.tabs[0] = tab;
             self.tabs[0].reload(self.show_hidden);
         } else {
             self.tabs.remove(ix);
