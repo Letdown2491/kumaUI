@@ -6,8 +6,8 @@ use std::{fs, io};
 
 use gpui::{
     App, AppContext, ClickEvent, Context, Div, ExternalDragPayload, ExternalPaths, FileDragPaths,
-    FocusHandle, Focusable, KeyDownEvent, Pixels, Point, Render, Stateful, Window, div, prelude::*,
-    px, rgb,
+    FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels, Point, Render, Stateful, Window,
+    div, prelude::*, px, rgba, rgb,
 };
 use trash::{os_limited, TrashItem};
 
@@ -72,18 +72,22 @@ struct Tab {
     forward: Vec<Source>,
     renaming: Option<PathBuf>,
     rename_buffer: String,
+    /// Byte offset into rename_buffer; stays on char boundaries.
+    rename_cursor: usize,
 }
 
 /// A queued file operation. `run` executes it and returns its inverse,
 /// so the undo stack is the same type and Ctrl+Z walks it back.
 #[derive(Clone, Debug)]
 enum Op {
-    Copy { from: PathBuf, to: PathBuf },
-    Move { from: PathBuf, to: PathBuf },
+    Copy { from: PathBuf, to: PathBuf, replace: bool },
+    Move { from: PathBuf, to: PathBuf, replace: bool },
     Remove { path: PathBuf, is_dir: bool },
     Trash { paths: Vec<PathBuf> },
     Restore { items: Vec<TrashItem> },
     Purge { items: Vec<TrashItem> },
+    /// A conflict resolved as Skip: filtered out before the queue runs.
+    Nop,
 }
 
 impl Op {
@@ -95,13 +99,15 @@ impl Op {
             Op::Trash { .. } => "trashing",
             Op::Restore { .. } => "restoring",
             Op::Purge { .. } => "purging",
+            Op::Nop => "skipping",
         }
     }
 
     fn run(&self) -> Result<Option<Op>, String> {
         match self {
-            Op::Copy { from, to } => {
-                if to.exists() {
+            Op::Nop => Ok(None),
+            Op::Copy { from, to, replace } => {
+                if to.exists() && !replace {
                     return Err(format!("{} already exists", to.display()));
                 }
                 if from.is_dir() {
@@ -114,14 +120,24 @@ impl Op {
                     is_dir: from.is_dir(),
                 }))
             }
-            Op::Move { from, to } => {
+            Op::Move { from, to, replace } => {
                 if to.exists() {
-                    return Err(format!("{} already exists", to.display()));
+                    if !replace {
+                        return Err(format!("{} already exists", to.display()));
+                    }
+                    // rename will not replace, so clear the way first
+                    let removed = if to.is_dir() {
+                        fs::remove_dir_all(to)
+                    } else {
+                        fs::remove_file(to)
+                    };
+                    removed.map_err(|err| format!("move: {err}"))?;
                 }
                 fs::rename(from, to).map_err(|err| format!("move: {err}"))?;
                 Ok(Some(Op::Move {
                     from: to.clone(),
                     to: from.clone(),
+                    replace: false,
                 }))
             }
             Op::Remove { path, is_dir } => {
@@ -175,11 +191,101 @@ struct Place {
     path: PathBuf,
 }
 
+/// A paste that may collide with an existing file, resolved by the
+/// conflict dialog before the queue runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpKind {
+    Copy,
+    Move,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlanState {
+    Ready,
+    Conflict,
+    Skipped,
+}
+
+struct PlannedOp {
+    kind: OpKind,
+    from: PathBuf,
+    to: PathBuf,
+    replace: bool,
+    state: PlanState,
+}
+
+impl PlannedOp {
+    fn into_op(self) -> Op {
+        match self.state {
+            PlanState::Skipped | PlanState::Conflict => Op::Nop,
+            PlanState::Ready => match self.kind {
+                OpKind::Copy => Op::Copy {
+                    from: self.from,
+                    to: self.to,
+                    replace: self.replace,
+                },
+                OpKind::Move => Op::Move {
+                    from: self.from,
+                    to: self.to,
+                    replace: self.replace,
+                },
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConflictDecision {
+    Replace,
+    KeepBoth,
+    Skip,
+}
+
+struct ConflictDialog {
+    ops: Vec<PlannedOp>,
+    /// Indices into `ops` of the entries that collided.
+    conflicts: Vec<usize>,
+    /// Replace is only offered when both sides are plain files.
+    can_replace_all: bool,
+    ix: usize,
+    apply_all: bool,
+}
+
+/// "name (copy).ext", then "name (copy 2).ext", and so on. After 999
+/// colliding copies this gives up and returns `to` itself; the queue
+/// reports the "already exists" error, which is honest enough.
+fn unique_dest(to: &Path) -> PathBuf {
+    let stem = to
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = to
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned());
+    for n in 1..1000 {
+        let suffix = if n == 1 {
+            " (copy)".to_string()
+        } else {
+            format!(" (copy {n})")
+        };
+        let name = match &ext {
+            Some(ext) => format!("{stem}{suffix}.{ext}"),
+            None => format!("{stem}{suffix}"),
+        };
+        let candidate = to.with_file_name(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    to.to_path_buf()
+}
+
 pub(crate) struct Browser {
     tabs: Vec<Tab>,
     active: usize,
     clipboard: Option<(bool, Vec<PathBuf>)>,
     undo: Vec<Op>,
+    conflict_dialog: Option<ConflictDialog>,
     status: String,
     progress: String,
     busy: bool,
@@ -205,6 +311,7 @@ impl Browser {
             active: 0,
             clipboard: None,
             undo: Vec::new(),
+            conflict_dialog: None,
             status: String::new(),
             progress: String::new(),
             busy: false,
@@ -294,6 +401,7 @@ impl Browser {
     }
 
     fn enqueue(&mut self, mut ops: Vec<Op>, cx: &mut Context<Self>) {
+        ops.retain(|op| !matches!(op, Op::Nop));
         if ops.is_empty() {
             return;
         }
@@ -393,28 +501,96 @@ impl Browser {
             cx.notify();
             return;
         };
-        let ops = paths
-            .iter()
-            .map(|path| {
-                let name = path.file_name().unwrap_or_default();
-                let to = dest_dir.join(name);
-                if is_copy {
-                    Op::Copy {
-                        from: path.clone(),
-                        to,
-                    }
+        let mut ops = Vec::new();
+        let mut conflicts = Vec::new();
+        let mut can_replace_all = true;
+        for path in paths {
+            let name = path.file_name().unwrap_or_default();
+            let to = dest_dir.join(name);
+            let conflict = to.exists();
+            let can_replace = path.is_file() && to.is_file();
+            can_replace_all &= !conflict || can_replace;
+            ops.push(PlannedOp {
+                kind: if is_copy { OpKind::Copy } else { OpKind::Move },
+                from: path,
+                to,
+                replace: false,
+                state: if conflict {
+                    PlanState::Conflict
                 } else {
-                    Op::Move {
-                        from: path.clone(),
-                        to,
-                    }
-                }
-            })
-            .collect();
+                    PlanState::Ready
+                },
+            });
+            if conflict {
+                conflicts.push(ops.len() - 1);
+            }
+        }
         if !is_copy {
             self.clipboard = None;
         }
-        self.enqueue(ops, cx);
+        if conflicts.is_empty() {
+            self.enqueue(ops.into_iter().map(PlannedOp::into_op).collect(), cx);
+        } else {
+            self.conflict_dialog = Some(ConflictDialog {
+                ops,
+                conflicts,
+                can_replace_all,
+                ix: 0,
+                apply_all: false,
+            });
+            self.status = "a file with that name already exists".into();
+            cx.notify();
+        }
+    }
+
+    /// Resolve the conflict under the cursor with Replace / Keep both /
+    /// Skip, or all of them at once when "apply to all" is checked.
+    fn conflict_decide(&mut self, decision: ConflictDecision, cx: &mut Context<Self>) {
+        let Some(mut dialog) = self.conflict_dialog.take() else {
+            return;
+        };
+        let count = if dialog.apply_all {
+            dialog.conflicts.len() - dialog.ix
+        } else {
+            1
+        };
+        for _ in 0..count {
+            if dialog.ix >= dialog.conflicts.len() {
+                break;
+            }
+            let op_ix = dialog.conflicts[dialog.ix];
+            let op = &mut dialog.ops[op_ix];
+            match decision {
+                ConflictDecision::Replace => {
+                    op.replace = true;
+                    op.state = PlanState::Ready;
+                }
+                ConflictDecision::Skip => op.state = PlanState::Skipped,
+                ConflictDecision::KeepBoth => {
+                    op.to = unique_dest(&op.to);
+                    op.state = PlanState::Ready;
+                }
+            }
+            dialog.ix += 1;
+        }
+        if dialog.ix < dialog.conflicts.len() {
+            self.conflict_dialog = Some(dialog);
+        } else {
+            self.enqueue(dialog.ops.into_iter().map(PlannedOp::into_op).collect(), cx);
+        }
+        cx.notify();
+    }
+
+    /// Esc during a conflict means skip the lot.
+    fn conflict_skip_all(&mut self, cx: &mut Context<Self>) {
+        let Some(mut dialog) = self.conflict_dialog.take() else {
+            return;
+        };
+        while dialog.ix < dialog.conflicts.len() {
+            dialog.ops[dialog.conflicts[dialog.ix]].state = PlanState::Skipped;
+            dialog.ix += 1;
+        }
+        self.enqueue(dialog.ops.into_iter().map(PlannedOp::into_op).collect(), cx);
     }
 
     fn undo_last(&mut self, cx: &mut Context<Self>) {
@@ -485,6 +661,7 @@ impl Tab {
             forward: Vec::new(),
             renaming: None,
             rename_buffer: String::new(),
+            rename_cursor: 0,
         }
     }
 
@@ -577,6 +754,15 @@ impl Tab {
 impl Browser {
     fn route_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let keystroke = event.keystroke.clone();
+
+        if self.conflict_dialog.is_some() {
+            match keystroke.key.as_str() {
+                "escape" => self.conflict_skip_all(cx),
+                _ => {}
+            }
+            return;
+        }
+
         let tab = self.tab_mut();
 
         if tab.renaming.is_some() {
@@ -587,7 +773,49 @@ impl Browser {
                     cx.notify();
                 }
                 "backspace" => {
-                    tab.rename_buffer.pop();
+                    if tab.rename_cursor > 0 {
+                        let head = &tab.rename_buffer[..tab.rename_cursor];
+                        if let Some((prev, _)) = head.char_indices().next_back() {
+                            tab.rename_buffer.remove(prev);
+                            tab.rename_cursor = prev;
+                        }
+                    }
+                    cx.notify();
+                }
+                "delete" => {
+                    if tab.rename_buffer.is_char_boundary(tab.rename_cursor)
+                        && tab.rename_cursor < tab.rename_buffer.len()
+                    {
+                        tab.rename_buffer.remove(tab.rename_cursor);
+                    }
+                    cx.notify();
+                }
+                "left" => {
+                    if tab.rename_cursor > 0 {
+                        let head = &tab.rename_buffer[..tab.rename_cursor];
+                        if let Some((prev, _)) = head.char_indices().next_back() {
+                            tab.rename_cursor = prev;
+                        }
+                    }
+                    cx.notify();
+                }
+                "right" => {
+                    if tab.rename_buffer.is_char_boundary(tab.rename_cursor)
+                        && tab.rename_cursor < tab.rename_buffer.len()
+                    {
+                        let tail = &tab.rename_buffer[tab.rename_cursor..];
+                        if let Some(ch) = tail.chars().next() {
+                            tab.rename_cursor += ch.len_utf8();
+                        }
+                    }
+                    cx.notify();
+                }
+                "home" => {
+                    tab.rename_cursor = 0;
+                    cx.notify();
+                }
+                "end" => {
+                    tab.rename_cursor = tab.rename_buffer.len();
                     cx.notify();
                 }
                 _ if !keystroke.modifiers.control
@@ -596,7 +824,13 @@ impl Browser {
                     && !keystroke.modifiers.function =>
                 {
                     if let Some(character) = keystroke.key_char.as_deref() {
-                        tab.rename_buffer.push_str(character);
+                        let cursor = if tab.rename_buffer.is_char_boundary(tab.rename_cursor) {
+                            tab.rename_cursor
+                        } else {
+                            tab.rename_buffer.len()
+                        };
+                        tab.rename_buffer.insert_str(cursor, character);
+                        tab.rename_cursor = cursor + character.len();
                         cx.notify();
                     }
                 }
@@ -620,6 +854,11 @@ impl Browser {
             "right" if keystroke.modifiers.alt => self.go_forward(cx),
             "down" => self.move_cursor(1, cx),
             "up" => self.move_cursor(-1, cx),
+            "home" => self.jump_cursor(0, cx),
+            "end" => {
+                let last = self.tab().entries.len().saturating_sub(1);
+                self.jump_cursor(last, cx);
+            },
             "a" if keystroke.modifiers.control => {
                 tab.selection = tab.entries.iter().map(|e| e.key.clone()).collect();
                 cx.notify();
@@ -647,6 +886,20 @@ impl Browser {
         let next = (current + step).clamp(0, count - 1);
         tab.cursor = Some(next as usize);
         let key = tab.entries[next as usize].key.clone();
+        tab.selection.clear();
+        tab.selection.insert(key);
+        cx.notify();
+    }
+
+    /// Home/End: jump to first/last entry. A no-op on an empty listing.
+    fn jump_cursor(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.tab().entries.is_empty() {
+            return;
+        }
+        let tab = self.tab_mut();
+        let ix = ix.min(tab.entries.len() - 1);
+        tab.cursor = Some(ix);
+        let key = tab.entries[ix].key.clone();
         tab.selection.clear();
         tab.selection.insert(key);
         cx.notify();
@@ -695,6 +948,7 @@ impl Browser {
         };
         tab.renaming = Some(entry.path.clone());
         tab.rename_buffer = entry.name.clone();
+        tab.rename_cursor = tab.rename_buffer.len();
         cx.notify();
     }
 
@@ -783,6 +1037,7 @@ impl Browser {
             vec![Op::Move {
                 from: dragged.path.clone(),
                 to: dest,
+                replace: false,
             }],
             cx,
         );
@@ -903,13 +1158,21 @@ impl Browser {
             });
 
         let name_child = if renaming {
+            // the caret sits at rename_cursor (a byte offset on a char
+            // boundary); render the buffer split around it
+            let cursor = if tab.rename_buffer.is_char_boundary(tab.rename_cursor) {
+                tab.rename_cursor
+            } else {
+                tab.rename_buffer.len()
+            };
+            let (before, after) = tab.rename_buffer.split_at(cursor);
             div()
                 .flex_1()
                 .border_1()
                 .border_color(theme::accent())
                 .rounded_sm()
                 .px_1()
-                .child(format!("{}▏", tab.rename_buffer))
+                .child(format!("{before}▏{after}"))
         } else {
             div().flex_1().truncate().child(entry.name.clone())
         };
@@ -966,8 +1229,142 @@ impl Browser {
             .child(place.name.clone())
     }
 
-    fn tab_bar_row(&self, ix: usize, cx: &mut Context<Self>) -> Stateful<Div> {
-        let label = self.tabs[ix].source.label();
+    /// The modal overlay for unresolved paste conflicts. `None` (rendered
+    /// as no child) when no paste is waiting on a decision.
+    fn conflict_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let dialog = self.conflict_dialog.as_ref()?;
+        let op_ix = dialog.conflicts.get(dialog.ix).copied()?;
+        let op = &dialog.ops[op_ix];
+        let name = op
+            .to
+            .file_name()
+            .map_or_else(|| op.to.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let can_replace = op.from.is_file() && op.to.is_file();
+        let total = dialog.conflicts.len();
+        let current = dialog.ix + 1;
+        let verb = match op.kind {
+            OpKind::Copy => "paste",
+            OpKind::Move => "move",
+        };
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                .child(
+                    div()
+                        .w(px(420.))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .rounded_md()
+                        .bg(theme::sidebar())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .text_size(px(13.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(14.))
+                                        .text_color(theme::text())
+                                        .child(format!("\"{name}\" already exists here")),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(theme::text_dim())
+                                        .child(format!(
+                                            "conflict {current} of {total} for this {verb}"
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .children(can_replace.then(|| {
+                                    div()
+                                        .id("conflict-replace")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .bg(theme::row_hover())
+                                        .text_color(theme::error())
+                                        .hover(|this| this.bg(theme::drag_over()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.conflict_decide(
+                                                ConflictDecision::Replace,
+                                                cx,
+                                            )
+                                        }))
+                                        .child("Replace")
+                                }))
+                                .child(
+                                    div()
+                                        .id("conflict-keep")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .bg(theme::row_hover())
+                                        .hover(|this| this.bg(theme::drag_over()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.conflict_decide(
+                                                ConflictDecision::KeepBoth,
+                                                cx,
+                                            )
+                                        }))
+                                        .child("Keep both"),
+                                )
+                                .child(
+                                    div()
+                                        .id("conflict-skip")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .bg(theme::row_hover())
+                                        .hover(|this| this.bg(theme::drag_over()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.conflict_decide(ConflictDecision::Skip, cx)
+                                        }))
+                                        .child("Skip"),
+                                ),
+                        )
+                        .children((total > 1 && dialog.can_replace_all).then(|| {
+                            let apply_all = dialog.apply_all;
+                            div()
+                                .id("conflict-all")
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .text_color(theme::text_dim())
+                                .hover(|this| this.text_color(theme::text()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(dialog) = &mut this.conflict_dialog {
+                                        dialog.apply_all = apply_all;
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(if apply_all { "[x]" } else { "[ ]" })
+                                .child("apply to all conflicts in this paste")
+                        })),
+                ),
+        )
+    }
+
+    fn tab_bar_row(&self, ix: usize, cx: &mut Context<Self>) -> Stateful<Div> {        let label = self.tabs[ix].source.label();
         let active = ix == self.active;
         div()
             .id(format!("tab-{ix}"))
@@ -993,6 +1390,9 @@ impl Browser {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active = ix;
                 cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, _, cx| {
+                this.close_tab(ix, cx);
             }))
             .child(label)
             .child(
@@ -1050,6 +1450,7 @@ impl Render for Browser {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -1057,6 +1458,7 @@ impl Render for Browser {
             }))
             .bg(theme::bg())
             .text_color(theme::text())
+            .children(self.conflict_overlay(cx))
             .child(
                 div()
                     .w(px(170.))

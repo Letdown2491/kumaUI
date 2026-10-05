@@ -60,8 +60,12 @@ local patches, which should be recorded here.
   memfd-backed `wl_shm` pool, attached to a `wl_surface` created from
   the shared `wl_compositor`. The `DragIcon` object (file, pool,
   buffer, surface) rides on `ExternalDrag` and its `Drop` destroys all
-  four when the drag finishes or cancels. Found by the kuma-files DnD
-  spike (issue #25).
+  four when the drag finishes or cancels. The pill carries the file
+  name (or an "N items" count), rasterized CPU-side with zed-font-kit's
+  freetype loader, one A8 canvas per glyph; that adds two dependencies
+  to `gpui_linux` (`font-kit`, already in the build via gpui_wgpu, and
+  `pathfinder_geometry`, both from the vendored workspace). Found by
+  the kuma-files DnD spike (issue #25).
 - `crates/gpui_linux/src/linux/wayland/window.rs`: `set_size_and_scale`
   skips `wp_viewport::set_destination` when the size is zero. Layer
   surfaces start at zero size and get their real size from the layer
