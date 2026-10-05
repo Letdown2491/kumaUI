@@ -392,11 +392,13 @@ impl Focusable for Browser {
 const PURGE_ARM: Duration = Duration::from_secs(5);
 
 impl Browser {
-    pub(crate) fn new(dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(cli_dir: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let mut browser = Self {
-            tabs: vec![Tab::new(Source::Dir(dir))],
+            tabs: vec![Tab::new(Source::Dir(dirs::home_dir().unwrap_or_else(
+                || PathBuf::from("."),
+            )))],
             active: 0,
             clipboard: None,
             undo: Vec::new(),
@@ -431,7 +433,7 @@ impl Browser {
             rubber_ctrl: false,
             places_refresh: Instant::now(),
         };
-        browser.load_state();
+        browser.load_state(cli_dir.as_deref());
         let show_hidden = browser.show_hidden;
         browser.tab_mut().reload(show_hidden);
         browser.start_dir_watch(cx);
@@ -986,6 +988,7 @@ impl Browser {
         tab.reload(show_hidden);
         self.status.clear();
         self.disarm();
+        self.save_state();
         cx.notify();
     }
 
@@ -1002,6 +1005,7 @@ impl Browser {
         self.active = self.tabs.len() - 1;
         self.tabs.last_mut().unwrap().reload(self.show_hidden);
         self.status.clear();
+        self.save_state();
         cx.notify();
     }
 
@@ -1024,6 +1028,7 @@ impl Browser {
                 self.active -= 1;
             }
         }
+        self.save_state();
         cx.notify();
     }
 
@@ -1265,38 +1270,61 @@ impl Browser {
         Some(path)
     }
 
-    fn load_state(&mut self) {
+    fn load_state(&mut self, cli_dir: Option<&Path>) {
         let Some(path) = Self::state_path() else {
             return;
         };
         let Ok(text) = fs::read_to_string(path) else {
             return;
         };
-        let tab = self.tab_mut();
+
+        let mut saved_tabs: Vec<(usize, PathBuf)> = Vec::new();
+        let mut saved_active: Option<usize> = None;
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
             match (key, value) {
-                ("view", "icons") => tab.view_mode = ViewMode::Icons,
-                ("view", "list") => tab.view_mode = ViewMode::List,
-                ("sort", "name") => tab.sort_key = SortKey::Name,
-                ("sort", "size") => tab.sort_key = SortKey::Size,
-                ("sort", "modified") => tab.sort_key = SortKey::Modified,
-                ("asc", "true") => tab.sort_asc = true,
-                ("asc", "false") => tab.sort_asc = false,
-                _ => {}
+                ("view", "icons") => self.tab_mut().view_mode = ViewMode::Icons,
+                ("view", "list") => self.tab_mut().view_mode = ViewMode::List,
+                ("sort", "name") => self.tab_mut().sort_key = SortKey::Name,
+                ("sort", "size") => self.tab_mut().sort_key = SortKey::Size,
+                ("sort", "modified") => self.tab_mut().sort_key = SortKey::Modified,
+                ("asc", "true") => self.tab_mut().sort_asc = true,
+                ("asc", "false") => self.tab_mut().sort_asc = false,
+                ("hidden", "true") => self.show_hidden = true,
+                ("inspector", "true") => self.inspector = true,
+                ("inspector-bottom", "true") => self.inspector_bottom = true,
+                ("active", _) => saved_active = value.parse().ok(),
+                ("scale", _) => {
+                    if let Ok(parsed) = value.parse::<f32>() {
+                        self.scale = parsed.clamp(0.75, 2.0);
+                    }
+                }
+                _ => {
+                    if let Some(index) = key.strip_prefix("tab").and_then(|n| n.parse().ok())
+                        && !value.is_empty()
+                    {
+                        saved_tabs.push((index, PathBuf::from(value)));
+                    }
+                }
             }
         }
-        self.show_hidden = text.contains("hidden=true");
-        self.inspector = text.contains("inspector=true");
-        self.inspector_bottom = text.contains("inspector-bottom=true");
-        if let Some(scale) = text
-            .lines()
-            .find_map(|l| l.strip_prefix("scale="))
-            .and_then(|v| v.parse::<f32>().ok())
-        {
-            self.scale = scale.clamp(0.75, 2.0);
+
+        // an explicit CLI dir always wins; otherwise reopen the folders
+        // that were open last time (trash tabs are not persisted)
+        saved_tabs.sort_by_key(|(index, _)| *index);
+        if cli_dir.is_none() && !saved_tabs.is_empty() {
+            self.tabs = saved_tabs
+                .into_iter()
+                .map(|(_, dir)| Tab::new(Source::Dir(dir)))
+                .collect();
+            if let Some(active) = saved_active {
+                self.active = active.min(self.tabs.len() - 1);
+            }
+        } else if let Some(dir) = cli_dir {
+            let tab = self.tab_mut();
+            tab.source = Source::Dir(dir.to_path_buf());
         }
     }
 
@@ -1330,6 +1358,13 @@ impl Browser {
             self.inspector_bottom,
             self.scale,
         );
+        let mut text = text;
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if let Some(dir) = tab.current_dir() {
+                text.push_str(&format!("tab{}={}\n", i, dir.display()));
+            }
+        }
+        text.push_str(&format!("active={}\n", self.active));
         if let Err(err) = fs::write(path, text) {
             log::error!("save state: {err}");
         }
@@ -2018,6 +2053,7 @@ impl Browser {
         tab.cursor = None;
         tab.renaming = None;
         tab.reload(show_hidden);
+        self.save_state();
         cx.notify();
     }
 
@@ -2033,6 +2069,7 @@ impl Browser {
         tab.cursor = None;
         tab.renaming = None;
         tab.reload(show_hidden);
+        self.save_state();
         cx.notify();
     }
 
@@ -2624,50 +2661,47 @@ impl Browser {
 
         let header = div()
             .flex()
-            .items_start()
+            .items_center()
             .justify_end()
             .gap_1()
             .child(
+                // dock the panel on the other edge
                 div()
+                    .id("inspector-dock")
                     .flex()
-                    .flex_none()
-                    .gap_1()
+                    .h(px(20.))
+                    .items_center()
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(theme::text_dim())
+                    .hover(|this| this.text_color(theme::text()).bg(theme::row_hover()))
+                    .on_click(cx.listener(|this, _, _, cx| this.flip_inspector(cx)))
                     .child(
-                        // dock the panel on the other edge
-                        div()
-                            .id("inspector-dock")
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_color(theme::text_dim())
-                            .hover(|this| {
-                                this.text_color(theme::text()).bg(theme::row_hover())
+                        svg()
+                            .path(if bottom {
+                                "icons/chevron_right.svg"
+                            } else {
+                                "icons/chevron_down.svg"
                             })
-                            .on_click(cx.listener(|this, _, _, cx| this.flip_inspector(cx)))
-                            .child(
-                                svg()
-                                    .path(if bottom {
-                                        "icons/chevron_right.svg"
-                                    } else {
-                                        "icons/chevron_down.svg"
-                                    })
-                                    .size(px(14.))
-                                    .text_color(theme::text_dim()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("inspector-close")
-                            .px_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_color(theme::text_dim())
-                            .hover(|this| {
-                                this.text_color(theme::text()).bg(theme::row_hover())
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx)))
-                            .child("×"),
+                            .size(px(14.))
+                            .text_color(theme::text_dim()),
                     ),
+            )
+            .child(
+                div()
+                    .id("inspector-close")
+                    .flex()
+                    .h(px(20.))
+                    .items_center()
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(theme::text_dim())
+                    .hover(|this| this.text_color(theme::text()).bg(theme::row_hover()))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx)))
+                    .text_size(px(14.))
+                    .child("×"),
             );
 
         let rows = div()
@@ -3008,6 +3042,7 @@ impl Browser {
             .hover(|this| this.text_color(theme::text()))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active = ix;
+                this.save_state();
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, _, cx| {

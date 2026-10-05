@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use std::io::Write as _;
+use std::path::PathBuf;
 
 use gpui::{App, AppContext, WindowBounds, WindowOptions, TitlebarOptions, px, size, SharedString};
 use gpui_platform::application;
@@ -29,11 +29,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    let dir = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir())
-        .unwrap_or_else(|| PathBuf::from("."));
+    // an explicit CLI dir wins over the saved session; nothing passed
+    // means "reopen where I was last time" (falls back to home)
+    let dir = std::env::args().nth(1).map(PathBuf::from);
 
     application()
         .with_assets(icons::Assets)
@@ -49,8 +47,14 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    log::info!("koguma window open, listing {}", dir.display());
-                    cx.new(|cx| Browser::new(dir, window, cx))
+                    log::info!(
+                        "koguma window open, {}",
+                        dir.as_ref().map_or_else(
+                            || "restoring saved session".to_string(),
+                            |d| format!("listing {}", d.display()),
+                        )
+                    );
+                    cx.new(|cx| Browser::new(dir.clone(), window, cx))
                 },
             ) {
                 Ok(_) => {}
