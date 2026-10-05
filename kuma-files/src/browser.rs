@@ -32,6 +32,8 @@ struct Entry {
     name: String,
     is_dir: bool,
     size: Option<u64>,
+    /// mtime as seconds since the epoch, for the details column.
+    modified: Option<i64>,
     item: Option<TrashItem>,
 }
 
@@ -45,6 +47,13 @@ enum Source {
 enum ViewMode {
     List,
     Icons,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    Name,
+    Size,
+    Modified,
 }
 
 impl PartialEq for Source {
@@ -82,6 +91,8 @@ struct Tab {
     /// Byte offset into rename_buffer; stays on char boundaries.
     rename_cursor: usize,
     view_mode: ViewMode,
+    sort_key: SortKey,
+    sort_asc: bool,
 }
 
 /// A queued file operation. `run` executes it and returns its inverse,
@@ -304,6 +315,9 @@ pub(crate) struct Browser {
     /// Decoded thumbnails keyed by path; cleared wholesale when large.
     thumbs: HashMap<PathBuf, Arc<RenderImage>>,
     thumbs_inflight: HashSet<PathBuf>,
+    path_editing: bool,
+    path_buffer: String,
+    path_cursor: usize,
 }
 
 impl Focusable for Browser {
@@ -333,6 +347,9 @@ impl Browser {
             show_hidden: false,
             thumbs: HashMap::new(),
             thumbs_inflight: HashSet::new(),
+            path_editing: false,
+            path_buffer: String::new(),
+            path_cursor: 0,
         };
         let show_hidden = browser.show_hidden;
         browser.tab_mut().reload(show_hidden);
@@ -465,8 +482,64 @@ impl Browser {
         }
     }
 
+    /// Header click: same key flips direction, a new key sorts ascending.
+    fn set_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
+        let show_hidden = self.show_hidden;
+        let tab = self.tab_mut();
+        if tab.sort_key == key {
+            tab.sort_asc = !tab.sort_asc;
+        } else {
+            tab.sort_key = key;
+            tab.sort_asc = true;
+        }
+        tab.reload(show_hidden);
+        cx.notify();
+    }
+
     fn open_trash(&mut self, cx: &mut Context<Self>) {
         self.load_source(Source::Trash, cx);
+    }
+
+    fn start_path_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+            return;
+        };
+        self.path_editing = true;
+        self.path_buffer = dir.display().to_string();
+        self.path_cursor = self.path_buffer.len();
+        cx.notify();
+    }
+
+    fn cancel_path_edit(&mut self, cx: &mut Context<Self>) {
+        self.path_editing = false;
+        cx.notify();
+    }
+
+    /// Enter in the path bar: ~ expands home, existing dirs navigate.
+    fn commit_path_edit(&mut self, cx: &mut Context<Self>) {
+        self.path_editing = false;
+        let mut target = self.path_buffer.trim().to_string();
+        if target == "~" {
+            target = dirs::home_dir()
+                .map(|home| home.display().to_string())
+                .unwrap_or(target);
+        } else if let Some(rest) = target.strip_prefix("~/").or_else(|| target.strip_prefix("~")) {
+            if let Some(home) = dirs::home_dir() {
+                target = home.join(rest).display().to_string();
+            }
+        }
+        let path = PathBuf::from(target);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => self.load_source(Source::Dir(path), cx),
+            Ok(_) => {
+                self.status = format!("{} is not a folder", path.display());
+                cx.notify();
+            }
+            Err(err) => {
+                self.status = format!("no such folder: {err}");
+                cx.notify();
+            }
+        }
     }
 
     fn load_source(&mut self, source: Source, cx: &mut Context<Self>) {
@@ -777,6 +850,8 @@ impl Tab {
             rename_buffer: String::new(),
             rename_cursor: 0,
             view_mode: ViewMode::List,
+            sort_key: SortKey::Name,
+            sort_asc: true,
         }
     }
 
@@ -792,24 +867,32 @@ impl Tab {
                             continue;
                         }
                         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-                        let size = fs::symlink_metadata(&path).ok().and_then(|meta| {
+                        let meta = fs::symlink_metadata(&path).ok();
+                        let size = meta.as_ref().and_then(|meta| {
                             if meta.is_dir() {
                                 None
                             } else {
                                 Some(meta.len())
                             }
                         });
+                        let modified = meta
+                            .and_then(|meta| meta.modified().ok())
+                            .and_then(|time| {
+                                time.duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|d| d.as_secs() as i64)
+                            });
                         entries.push(Entry {
                             key: path.clone(),
                             path,
                             name,
                             is_dir,
                             size,
+                            modified,
                             item: None,
                         });
                     }
-                    entries
-                        .sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+                    sort_entries(&mut entries, self.sort_key, self.sort_asc);
                     self.entries = entries;
                 }
                 Err(err) => {
@@ -842,6 +925,9 @@ impl Tab {
                         name: item.name.to_string_lossy().into_owned(),
                         is_dir,
                         size,
+                        // the Modified column shows when the item was
+                        // trashed
+                        modified: Some(item.time_deleted),
                         item: Some(item),
                     });
                 }
@@ -876,6 +962,69 @@ impl Browser {
         if self.conflict_dialog.is_some() {
             match keystroke.key.as_str() {
                 "escape" => self.conflict_skip_all(cx),
+                _ => {}
+            }
+            return;
+        }
+
+        if self.path_editing {
+            match keystroke.key.as_str() {
+                "enter" => self.commit_path_edit(cx),
+                "escape" => self.cancel_path_edit(cx),
+                "backspace" => {
+                    if self.path_cursor > 0 {
+                        let head = &self.path_buffer[..self.path_cursor];
+                        if let Some((prev, _)) = head.char_indices().next_back() {
+                            self.path_buffer.remove(prev);
+                            self.path_cursor = prev;
+                        }
+                    }
+                    cx.notify();
+                }
+                "left" => {
+                    if self.path_cursor > 0 {
+                        let head = &self.path_buffer[..self.path_cursor];
+                        if let Some((prev, _)) = head.char_indices().next_back() {
+                            self.path_cursor = prev;
+                        }
+                    }
+                    cx.notify();
+                }
+                "right" => {
+                    if self.path_buffer.is_char_boundary(self.path_cursor)
+                        && self.path_cursor < self.path_buffer.len()
+                    {
+                        let tail = &self.path_buffer[self.path_cursor..];
+                        if let Some(ch) = tail.chars().next() {
+                            self.path_cursor += ch.len_utf8();
+                        }
+                    }
+                    cx.notify();
+                }
+                "home" => {
+                    self.path_cursor = 0;
+                    cx.notify();
+                }
+                "end" => {
+                    self.path_cursor = self.path_buffer.len();
+                    cx.notify();
+                }
+                _ if !keystroke.modifiers.control
+                    && !keystroke.modifiers.alt
+                    && !keystroke.modifiers.platform
+                    && !keystroke.modifiers.function =>
+                {
+                    if let Some(character) = keystroke.key_char.as_deref() {
+                        let cursor = if self.path_buffer.is_char_boundary(self.path_cursor) {
+                            self.path_cursor
+                        } else {
+                            self.path_buffer.len()
+                        };
+                        self.path_buffer.insert_str(cursor, character);
+                        self.path_cursor = cursor + character.len();
+                        cx.notify();
+                    }
+                }
                 _ => {}
             }
             return;
@@ -1231,6 +1380,9 @@ impl Browser {
                 tab.cursor = Some(ix);
                 this.purge_armed = None;
                 cx.notify();
+                // keep the list container's double-click-empty-space
+                // handler from seeing row clicks
+                cx.stop_propagation();
             }));
 
         if in_trash {
@@ -1288,26 +1440,6 @@ impl Browser {
                 )])))
             });
 
-        let name_child = if renaming {
-            // the caret sits at rename_cursor (a byte offset on a char
-            // boundary); render the buffer split around it
-            let cursor = if tab.rename_buffer.is_char_boundary(tab.rename_cursor) {
-                tab.rename_cursor
-            } else {
-                tab.rename_buffer.len()
-            };
-            let (before, after) = tab.rename_buffer.split_at(cursor);
-            div()
-                .flex_1()
-                .border_1()
-                .border_color(theme::accent())
-                .rounded_sm()
-                .px_1()
-                .child(format!("{before}▏{after}"))
-        } else {
-            div().flex_1().truncate().child(entry.name.clone())
-        };
-
         let base = if entry.is_dir {
             let target = entry.clone();
             let target_name = entry.name.clone();
@@ -1325,13 +1457,52 @@ impl Browser {
             base
         };
 
+        let name_child = if renaming {
+            // the caret sits at rename_cursor (a byte offset on a char
+            // boundary); render the buffer split around it
+            let cursor = if tab.rename_buffer.is_char_boundary(tab.rename_cursor) {
+                tab.rename_cursor
+            } else {
+                tab.rename_buffer.len()
+            };
+            let (before, after) = tab.rename_buffer.split_at(cursor);
+            div()
+                .flex_1()
+                .min_w_0()
+                .border_1()
+                .border_color(theme::accent())
+                .rounded_sm()
+                .px_1()
+                .child(format!("{before}▏{after}"))
+        } else {
+            div().flex_1().min_w_0().truncate().child(entry.name.clone())
+        };
+
+        let modified_text = entry
+            .modified
+            .map(|secs| relative_time(secs, now_secs()))
+            .unwrap_or_default();
+
         base.child(self.entry_icon(entry, px(16.)))
             .child(name_child)
             .child(
                 div()
+                    .w(px(72.))
+                    .flex_none()
                     .text_size(px(12.))
                     .text_color(theme::text_dim())
+                    .text_right()
                     .child(size_text),
+            )
+            .child(
+                div()
+                    .w(px(110.))
+                    .flex_none()
+                    .text_size(px(12.))
+                    .text_color(theme::text_dim())
+                    .text_right()
+                    .truncate()
+                    .child(modified_text),
             )
     }
 
@@ -1440,6 +1611,9 @@ impl Browser {
                 tab.cursor = Some(ix);
                 this.purge_armed = None;
                 cx.notify();
+                // keep the list container's double-click-empty-space
+                // handler from seeing cell clicks
+                cx.stop_propagation();
             }))
             .on_drag(
                 DragEntry {
@@ -1503,7 +1677,83 @@ impl Browser {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.load_source(Source::Dir(path.clone()), cx);
             }))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                svg()
+                    .path("icons/folder.svg")
+                    .size(px(14.))
+                    .flex_none()
+                    .text_color(if here {
+                        theme::accent()
+                    } else {
+                        theme::text_dim()
+                    }),
+            )
             .child(place.name.clone())
+    }
+
+    /// The details header for list view: click a column to sort, click
+    /// again to flip. Directories stay first in every sort.
+    fn sort_header(&self, cx: &mut Context<Self>) -> Div {
+        let tab = self.tab();
+        let arrow = |key: SortKey| {
+            if tab.sort_key != key {
+                String::new()
+            } else if tab.sort_asc {
+                " ▲".into()
+            } else {
+                " ▼".into()
+            }
+        };
+        div()
+            .flex()
+            .items_center()
+            .px_3()
+            .py_1()
+            .text_size(px(12.))
+            .text_color(theme::text_dim())
+            .child(
+                div()
+                    .id("sort-name")
+                    .flex_1()
+                    .cursor_pointer()
+                    .hover(|this| this.text_color(theme::text()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_sort(SortKey::Name, cx);
+                    }))
+                    .child(format!("Name{}", arrow(SortKey::Name))),
+            )
+            .child(
+                div()
+                    .id("sort-size")
+                    .w(px(72.))
+                    .flex_none()
+                    .text_right()
+                    .cursor_pointer()
+                    .hover(|this| this.text_color(theme::text()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_sort(SortKey::Size, cx);
+                    }))
+                    .child(format!("Size{}", arrow(SortKey::Size))),
+            )
+            .child(
+                div()
+                    .id("sort-modified")
+                    .w(px(110.))
+                    .flex_none()
+                    .text_right()
+                    .cursor_pointer()
+                    .hover(|this| this.text_color(theme::text()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_sort(SortKey::Modified, cx);
+                    }))
+                    .child(format!("Modified{}", arrow(SortKey::Modified))),
+            )
     }
 
     /// The modal overlay for unresolved paste conflicts. `None` (rendered
@@ -1774,6 +2024,20 @@ impl Render for Browser {
                             })
                             .hover(|this| this.bg(theme::row_hover()))
                             .on_click(cx.listener(|this, _, _, cx| this.open_trash(cx)))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                svg()
+                                    .path("icons/trash.svg")
+                                    .size(px(14.))
+                                    .flex_none()
+                                    .text_color(if in_trash {
+                                        theme::accent()
+                                    } else {
+                                        theme::text_dim()
+                                    }),
+                            )
                             .child("Trash"),
                     ),
             )
@@ -1868,16 +2132,40 @@ impl Render for Browser {
                                             .text_color(theme::text_dim()),
                                     ),
                             )
-                            .child(
+                            .child(if self.path_editing {
+                                let cursor =
+                                    if self.path_buffer.is_char_boundary(self.path_cursor) {
+                                        self.path_cursor
+                                    } else {
+                                        self.path_buffer.len()
+                                    };
+                                let (before, after) = self.path_buffer.split_at(cursor);
                                 div()
+                                    .id("path-edit")
                                     .flex_1()
+                                    .min_w_0()
+                                    .border_1()
+                                    .border_color(theme::accent())
+                                    .rounded_sm()
+                                    .px_1()
+                                    .text_color(theme::text())
+                                    .child(format!("{before}▏{after}"))
+                            } else {
+                                div()
+                                    .id("path-bar")
+                                    .flex_1()
+                                    .min_w_0()
                                     .truncate()
                                     .text_color(theme::text())
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.start_path_edit(cx)
+                                    }))
                                     .child(match self.tab().current_dir() {
                                         Some(dir) => dir.display().to_string(),
                                         None => "Trash".into(),
-                                    }),
-                            )
+                                    })
+                            })
                             .child(
                                 div()
                                     .id("view-list")
@@ -1949,19 +2237,30 @@ impl Render for Browser {
                             ),
                     )
                     .child({
-                        // list flows as rows, icons as a wrapping grid
+                        // list flows as rows under sortable headers, icons
+                        // as a wrapping grid; double-clicking empty space
+                        // goes up one folder
                         let list_box = div()
                             .id("list")
                             .flex_1()
                             .min_h_0()
                             .p_2()
-                            .overflow_y_scroll();
+                            .overflow_y_scroll()
+                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                if event.click_count() >= 2 {
+                                    this.go_up(cx);
+                                }
+                            }));
                         match self.tab().view_mode {
-                            ViewMode::List => list_box
-                                .flex()
-                                .flex_col()
-                                .gap_px()
-                                .children(rows),
+                            ViewMode::List => {
+                                let header = self.sort_header(cx);
+                                list_box
+                                    .flex()
+                                    .flex_col()
+                                    .gap_px()
+                                    .child(header)
+                                    .children(rows)
+                            }
                             ViewMode::Icons => list_box
                                 .flex()
                                 .flex_wrap()
@@ -1995,6 +2294,61 @@ impl Render for Browser {
                     ),
             )
     }
+}
+
+fn sort_entries(entries: &mut [Entry], key: SortKey, asc: bool) {
+    entries.sort_by(|a, b| {
+        // directories always first, then the chosen key
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            let ord = match key {
+                SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortKey::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
+                SortKey::Modified => a.modified.unwrap_or(0).cmp(&b.modified.unwrap_or(0)),
+            };
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        })
+    });
+}
+
+/// Relative mtime for the details column: minutes/hours/days ago, then
+/// a plain UTC date (no tz dep; good enough for a listing).
+fn relative_time(secs: i64, now: i64) -> String {
+    let delta = now - secs;
+    match delta {
+        ..0 => "in the future".into(),
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", delta / 60),
+        3600..=86399 => format!("{}h ago", delta / 3600),
+        86400..=604799 => format!("{}d ago", delta / 86400),
+        _ => utc_date(secs),
+    }
+}
+
+/// Days-since-epoch to "YYYY-MM-DD" (Howard Hinnant's civil_from_days).
+fn utc_date(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn human_size(size: u64) -> String {
