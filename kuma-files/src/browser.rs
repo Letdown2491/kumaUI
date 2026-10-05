@@ -1332,10 +1332,7 @@ impl Browser {
         let in_trash = entry.item.is_some();
         let entry_key = entry.key.clone();
         let entry_path = entry.path.clone();
-        let size_text = entry
-            .size
-            .map(human_size)
-            .unwrap_or_else(|| String::from("folder"));
+        let size_text = entry.size.map(human_size).unwrap_or_default();
 
         let mut base = div()
             .id(ix)
@@ -1380,9 +1377,6 @@ impl Browser {
                 tab.cursor = Some(ix);
                 this.purge_armed = None;
                 cx.notify();
-                // keep the list container's double-click-empty-space
-                // handler from seeing row clicks
-                cx.stop_propagation();
             }));
 
         if in_trash {
@@ -1611,9 +1605,6 @@ impl Browser {
                 tab.cursor = Some(ix);
                 this.purge_armed = None;
                 cx.notify();
-                // keep the list container's double-click-empty-space
-                // handler from seeing cell clicks
-                cx.stop_propagation();
             }))
             .on_drag(
                 DragEntry {
@@ -1721,7 +1712,6 @@ impl Browser {
                     .cursor_pointer()
                     .hover(|this| this.text_color(theme::text()))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
                         this.set_sort(SortKey::Name, cx);
                     }))
                     .child(format!("Name{}", arrow(SortKey::Name))),
@@ -1735,7 +1725,6 @@ impl Browser {
                     .cursor_pointer()
                     .hover(|this| this.text_color(theme::text()))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
                         this.set_sort(SortKey::Size, cx);
                     }))
                     .child(format!("Size{}", arrow(SortKey::Size))),
@@ -1749,7 +1738,6 @@ impl Browser {
                     .cursor_pointer()
                     .hover(|this| this.text_color(theme::text()))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
                         this.set_sort(SortKey::Modified, cx);
                     }))
                     .child(format!("Modified{}", arrow(SortKey::Modified))),
@@ -2238,17 +2226,31 @@ impl Render for Browser {
                     )
                     .child({
                         // list flows as rows under sortable headers, icons
-                        // as a wrapping grid; double-clicking empty space
-                        // goes up one folder
+                        // as a wrapping grid. Empty space is a dedicated
+                        // sibling spacer, never a handler on this ancestor:
+                        // bubble dispatch runs parent-first, so an ancestor
+                        // on_click would fire before the rows' own and eat
+                        // their double-clicks.
                         let list_box = div()
                             .id("list")
                             .flex_1()
                             .min_h_0()
                             .p_2()
-                            .overflow_y_scroll()
+                            .overflow_y_scroll();
+                        let empty_space = div()
+                            .id("list-empty")
+                            .flex_grow_1()
+                            .min_h(px(24.))
+                            .w_full()
                             .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
                                 if event.click_count() >= 2 {
                                     this.go_up(cx);
+                                } else {
+                                    let tab = this.tab_mut();
+                                    tab.selection.clear();
+                                    tab.cursor = None;
+                                    this.purge_armed = None;
+                                    cx.notify();
                                 }
                             }));
                         match self.tab().view_mode {
@@ -2260,13 +2262,15 @@ impl Render for Browser {
                                     .gap_px()
                                     .child(header)
                                     .children(rows)
+                                    .child(empty_space)
                             }
                             ViewMode::Icons => list_box
                                 .flex()
                                 .flex_wrap()
                                 .content_start()
                                 .gap_1()
-                                .children(rows),
+                                .children(rows)
+                                .child(empty_space),
                         }
                     })
                     .child(
