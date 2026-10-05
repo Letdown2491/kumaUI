@@ -12,6 +12,7 @@ use gpui::{
     RenderImage, Stateful, Window, div, img, prelude::*, px, relative, rgba, rgb, svg,
 };
 use trash::{os_limited, TrashItem};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use notify::Watcher as _;
 use std::os::unix::fs::PermissionsExt;
@@ -354,6 +355,9 @@ pub(crate) struct Browser {
     preview_inflight: HashSet<PathBuf>,
     /// Hand-rolled right-click menu: position plus a flat item list.
     menu: Option<ContextMenu>,
+    /// Cells in the first grid row, captured at paint time; 0 means
+    /// unknown (list view, or nothing rendered yet).
+    grid_row_len: Arc<AtomicUsize>,
     status: String,
     progress: String,
     busy: bool,
@@ -410,6 +414,7 @@ impl Browser {
             preview_key: None,
             preview_inflight: HashSet::new(),
             menu: None,
+            grid_row_len: Arc::new(AtomicUsize::new(0)),
             status: String::new(),
             progress: String::new(),
             busy: false,
@@ -1882,8 +1887,34 @@ impl Browser {
 
             "left" if keystroke.modifiers.alt => self.go_back(cx),
             "right" if keystroke.modifiers.alt => self.go_forward(cx),
-            "down" => self.move_cursor(1, cx),
-            "up" => self.move_cursor(-1, cx),
+            "down" => {
+                let per_line = self.grid_per_line();
+                if per_line > 1 {
+                    self.move_cursor_grid(0, 1, per_line, cx)
+                } else {
+                    self.move_cursor(1, cx)
+                }
+            }
+            "up" => {
+                let per_line = self.grid_per_line();
+                if per_line > 1 {
+                    self.move_cursor_grid(0, -1, per_line, cx)
+                } else {
+                    self.move_cursor(-1, cx)
+                }
+            }
+            "left" => {
+                let per_line = self.grid_per_line();
+                if per_line > 1 {
+                    self.move_cursor_grid(-1, 0, per_line, cx)
+                }
+            }
+            "right" => {
+                let per_line = self.grid_per_line();
+                if per_line > 1 {
+                    self.move_cursor_grid(1, 0, per_line, cx)
+                }
+            }
             "home" => {
                 let first = self.visible_indices().first().copied();
                 if let Some(entry_ix) = first {
@@ -1953,7 +1984,60 @@ impl Browser {
             Some(pos) => (pos as isize + step).clamp(0, visible.len() as isize - 1) as usize,
             None => 0,
         };
-        let entry_ix = visible[next_pos];
+        self.focus_visible(visible, next_pos, cx);
+    }
+
+    /// Cells per grid row from the last paint; 0 when unknown.
+    fn grid_per_line(&self) -> usize {
+        if self.tab().view_mode != ViewMode::Icons {
+            return 0;
+        }
+        let count = self.grid_row_len.load(Ordering::Relaxed);
+        if count > 1 {
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Grid navigation for icon view. Horizontal steps stay inside the
+    /// row; vertical steps jump a full row and clamp at the ends.
+    fn move_cursor_grid(
+        &mut self,
+        d_col: isize,
+        d_row: isize,
+        per_line: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            return;
+        }
+        let next_pos = match self
+            .tab()
+            .cursor
+            .and_then(|ix| visible.iter().position(|&v| v == ix))
+        {
+            Some(pos) => {
+                if d_row == 0 {
+                    let col = (pos % per_line) as isize + d_col;
+                    if col < 0 || col as usize >= per_line {
+                        return;
+                    }
+                    (pos / per_line) * per_line + col as usize
+                } else {
+                    (pos as isize + d_row * per_line as isize)
+                        .clamp(0, visible.len() as isize - 1) as usize
+                }
+            }
+            None => 0,
+        };
+        self.focus_visible(visible, next_pos, cx);
+    }
+
+    /// Put the cursor on `visible[target]`, selecting just that entry.
+    fn focus_visible(&mut self, visible: Vec<usize>, target: usize, cx: &mut Context<Self>) {
+        let entry_ix = visible[target];
         let tab = self.tab_mut();
         tab.cursor = Some(entry_ix);
         let key = tab.entries[entry_ix].key.clone();
@@ -3620,6 +3704,26 @@ impl Render for Browser {
                                             .flex_wrap()
                                             .content_start()
                                             .gap(px(4. * s))
+                                            // count the first row at paint
+                                            // time: arrow-key navigation
+                                            // uses the real grid shape
+                                            .on_children_prepainted({
+                                                let row_len = self.grid_row_len.clone();
+                                                move |children, _, _| {
+                                                    let Some(first) = children.first() else {
+                                                        return;
+                                                    };
+                                                    let y = first.origin.y;
+                                                    let count = children
+                                                        .iter()
+                                                        .filter(|b| b.origin.y == y)
+                                                        .count();
+                                                    row_len.store(
+                                                        count as usize,
+                                                        Ordering::Relaxed,
+                                                    );
+                                                }
+                                            })
                                             .children(rows),
                                     )
                                     .child(catcher)
