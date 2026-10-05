@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use std::{collections::HashMap, fs, io};
 
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, Context, Div, ExternalDragPayload, ExternalPaths,
-    FileDragPaths, FocusHandle, Focusable, ImageSource, KeyDownEvent, MouseButton, ObjectFit,
-    Pixels, Point, Render, RenderImage, Stateful, Window, div, img, prelude::*, px, rgba, rgb, svg,
+    AnyElement, App, AppContext, Bounds, ClickEvent, Context, Div, DragMoveEvent,
+    ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, ImageSource,
+    KeyDownEvent, MouseDownEvent, MouseButton, MouseUpEvent, ObjectFit, Pixels, Point, Render,
+    RenderImage, Stateful, Window, div, img, prelude::*, px, relative, rgba, rgb, svg,
 };
 use trash::{os_limited, TrashItem};
 
@@ -318,6 +319,15 @@ pub(crate) struct Browser {
     path_editing: bool,
     path_buffer: String,
     path_cursor: usize,
+    /// Content zoom, 1.0 = normal; clamped to 0.75..=2.0.
+    scale: f32,
+    /// Where the icon-grid rubber band started and now sits, in window
+    /// coordinates, plus the grid's own bounds for local conversion.
+    rubber_origin: Option<Point<Pixels>>,
+    rubber_current: Option<Point<Pixels>>,
+    rubber_bounds: Option<Bounds<Pixels>>,
+    rubber_ctrl: bool,
+    places_refresh: Instant,
 }
 
 impl Focusable for Browser {
@@ -350,6 +360,12 @@ impl Browser {
             path_editing: false,
             path_buffer: String::new(),
             path_cursor: 0,
+            scale: 1.0,
+            rubber_origin: None,
+            rubber_current: None,
+            rubber_bounds: None,
+            rubber_ctrl: false,
+            places_refresh: Instant::now(),
         };
         let show_hidden = browser.show_hidden;
         browser.tab_mut().reload(show_hidden);
@@ -416,6 +432,84 @@ impl Browser {
 
     fn tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    /// Mounts come and go without us doing anything; re-scan the places
+    /// roots at most every couple of seconds.
+    fn refresh_places(&mut self) {
+        if self.places_refresh.elapsed() >= Duration::from_secs(2) {
+            self.places = Self::places();
+            self.places_refresh = Instant::now();
+        }
+    }
+
+    fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        self.scale = ((self.scale * 1.25 * 100.).round() / 100.).min(2.0);
+        self.status = format!("zoom {}%", (self.scale * 100.) as i32);
+        cx.notify();
+    }
+
+    fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.scale = ((self.scale / 1.25 * 100.).round() / 100.).max(0.75);
+        self.status = format!("zoom {}%", (self.scale * 100.) as i32);
+        cx.notify();
+    }
+
+    fn zoom_reset(&mut self, cx: &mut Context<Self>) {
+        self.scale = 1.0;
+        self.status = "zoom 100%".into();
+        cx.notify();
+    }
+
+    /// Mouse up over the grid with a rubber band active: every cell
+    /// intersecting the band becomes selected (union with the old
+    /// selection when Ctrl was held). Cell geometry is pinned, so the
+    /// layout math is exact.
+    fn finish_rubber(&mut self, cx: &mut Context<Self>) {
+        let band = match (self.rubber_origin, self.rubber_current, self.rubber_bounds) {
+            (Some(origin), Some(current), Some(bounds)) => Some((origin, current, bounds)),
+            _ => None,
+        };
+        self.rubber_current = None;
+        let Some((origin, current, bounds)) = band else {
+            cx.notify();
+            return;
+        };
+
+        let ctrl = self.rubber_ctrl;
+        let scale = self.scale;
+        let to_local = |p: Point<Pixels>| {
+            (
+                f32::from(p.x - bounds.origin.x),
+                f32::from(p.y - bounds.origin.y),
+            )
+        };
+        let (ax, ay) = to_local(origin);
+        let (bx, by) = to_local(current);
+        let (left, right) = if ax < bx { (ax, bx) } else { (bx, ax) };
+        let (top, bottom) = if ay < by { (ay, by) } else { (by, ay) };
+
+        let cell_w = 112. * scale;
+        let cell_h = 116. * scale;
+        let gap = 4. * scale;
+        let pad = 8. * scale;
+        let per_line = (((f32::from(bounds.size.width) - 2. * pad) / (cell_w + gap)).floor())
+            .max(1.) as i32;
+
+        let tab = self.tab_mut();
+        if !ctrl {
+            tab.selection.clear();
+        }
+        for (ix, entry) in tab.entries.iter().enumerate() {
+            let row = (ix as i32 / per_line) as f32;
+            let col = (ix as i32 % per_line) as f32;
+            let x0 = pad + col * (cell_w + gap);
+            let y0 = pad + row * (cell_h + gap);
+            if x0 < right && x0 + cell_w > left && y0 < bottom && y0 + cell_h > top {
+                tab.selection.insert(entry.key.clone());
+            }
+        }
+        cx.notify();
     }
 
     /// Kick off a background decode for an image file; the cached result
@@ -510,6 +604,8 @@ impl Browser {
         let tab = self.tab_mut();
         if tab.view_mode != mode {
             tab.view_mode = mode;
+            self.rubber_origin = None;
+            self.rubber_current = None;
             cx.notify();
         }
     }
@@ -576,6 +672,8 @@ impl Browser {
 
     fn load_source(&mut self, source: Source, cx: &mut Context<Self>) {
         let show_hidden = self.show_hidden;
+        self.rubber_origin = None;
+        self.rubber_current = None;
         let tab = self.tab_mut();
         if tab.source == source {
             return;
@@ -1188,6 +1286,9 @@ impl Browser {
             }
             "1" if keystroke.modifiers.control => self.set_view_mode(ViewMode::List, cx),
             "2" if keystroke.modifiers.control => self.set_view_mode(ViewMode::Icons, cx),
+            "=" | "+" if keystroke.modifiers.control => self.zoom_in(cx),
+            "-" | "_" if keystroke.modifiers.control => self.zoom_out(cx),
+            "0" if keystroke.modifiers.control => self.zoom_reset(cx),
             "n" if keystroke.modifiers.control && keystroke.modifiers.shift => {
                 self.new_folder(cx)
             }
@@ -1370,6 +1471,7 @@ impl Browser {
     }
 
     fn row(&self, ix: usize, entry: &Entry, cx: &mut Context<Self>) -> Stateful<Div> {
+        let s = self.scale;
         let selected = self.tab().selection.contains(&entry.key);
         let tab = self.tab();
         let renaming = tab.renaming.as_ref().is_some_and(|path| *path == entry.path);
@@ -1386,7 +1488,7 @@ impl Browser {
             .px_3()
             .py_1()
             .rounded_sm()
-            .text_size(px(14.))
+            .text_size(px(14. * s))
             .cursor_pointer()
             .bg(if selected {
                 theme::row_selected()
@@ -1521,22 +1623,22 @@ impl Browser {
             .map(|secs| relative_time(secs, now_secs()))
             .unwrap_or_default();
 
-        base.child(self.entry_icon(entry, px(16.)))
+        base.child(self.entry_icon(entry, px(16. * s)))
             .child(name_child)
             .child(
                 div()
-                    .w(px(72.))
+                    .w(px(72. * s))
                     .flex_none()
-                    .text_size(px(12.))
+                    .text_size(px(12. * s))
                     .text_color(theme::text_dim())
                     .text_right()
                     .child(size_text),
             )
             .child(
                 div()
-                    .w(px(110.))
+                    .w(px(110. * s))
                     .flex_none()
-                    .text_size(px(12.))
+                    .text_size(px(12. * s))
                     .text_color(theme::text_dim())
                     .text_right()
                     .truncate()
@@ -1563,6 +1665,9 @@ impl Browser {
     /// One cell in the icon grid: preview (thumbnail when decodable),
     /// name underneath.
     fn icon_cell(&mut self, ix: usize, entry: &Entry, cx: &mut Context<Self>) -> Stateful<Div> {
+        // pinned, scaled geometry: 8 pad + 80 preview + 4 gap + 16 name
+        // + 8 pad = 116; the rubber band's hit math depends on this
+        let s = self.scale;
         let selected = self.tab().selection.contains(&entry.key);
         let entry_key = entry.key.clone();
         let entry_path = entry.path.clone();
@@ -1580,7 +1685,7 @@ impl Browser {
 
         let preview: AnyElement = match thumb {
             Some(render) => img(ImageSource::Render(render))
-                .size(px(76.))
+                .size(px(76. * s))
                 .object_fit(ObjectFit::Contain)
                 .into_any_element(),
             None => {
@@ -1600,7 +1705,7 @@ impl Browser {
                 };
                 svg()
                     .path(icon)
-                    .size(px(if entry.is_dir { 56. } else { 44. }))
+                    .size(px(if entry.is_dir { 56. * s } else { 44. * s }))
                     .text_color(color)
                     .into_any_element()
             }
@@ -1608,12 +1713,13 @@ impl Browser {
 
         div()
             .id(ix)
-            .w(px(112.))
+            .w(px(112. * s))
+            .h(px(116. * s))
             .flex()
             .flex_col()
             .items_center()
-            .gap_1()
-            .p_2()
+            .gap(px(4. * s))
+            .p(px(8. * s))
             .rounded_sm()
             .cursor_pointer()
             .bg(if selected {
@@ -1673,7 +1779,7 @@ impl Browser {
             })
             .child(
                 div()
-                    .h(px(80.))
+                    .h(px(80. * s))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1681,8 +1787,12 @@ impl Browser {
             )
             .child(
                 div()
-                    .max_w_full()
-                    .text_size(px(12.))
+                    .h(px(16. * s))
+                    .w_full()
+                    .text_size(px(12. * s))
+                    .line_height(relative(1.3))
+                    .overflow_hidden()
+                    .text_center()
                     .truncate()
                     .child(entry.name.clone()),
             )
@@ -1732,6 +1842,7 @@ impl Browser {
     /// The details header for list view: click a column to sort, click
     /// again to flip. Directories stay first in every sort.
     fn sort_header(&self, cx: &mut Context<Self>) -> Div {
+        let s = self.scale;
         let tab = self.tab();
         let arrow = |key: SortKey| {
             if tab.sort_key != key {
@@ -1747,7 +1858,7 @@ impl Browser {
             .items_center()
             .px_3()
             .py_1()
-            .text_size(px(12.))
+            .text_size(px(12. * s))
             .text_color(theme::text_dim())
             .child(
                 div()
@@ -1763,7 +1874,7 @@ impl Browser {
             .child(
                 div()
                     .id("sort-size")
-                    .w(px(72.))
+                    .w(px(72. * s))
                     .flex_none()
                     .text_right()
                     .cursor_pointer()
@@ -1776,7 +1887,7 @@ impl Browser {
             .child(
                 div()
                     .id("sort-modified")
-                    .w(px(110.))
+                    .w(px(110. * s))
                     .flex_none()
                     .text_right()
                     .cursor_pointer()
@@ -1971,6 +2082,8 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.refresh_places();
+
         // owned so the icon cells can kick off thumbnail decodes (which
         // need &mut self) while iterating
         let entries: Vec<Entry> = self.tab().entries.iter().take(200).cloned().collect();
@@ -2274,19 +2387,16 @@ impl Render for Browser {
                         // sibling spacer, never a handler on this ancestor:
                         // bubble dispatch runs parent-first, so an ancestor
                         // on_click would fire before the rows' own and eat
-                        // their double-clicks.
+                        // their double-clicks. In icon view the spacer also
+                        // starts the rubber band drag.
+                        let s = self.scale;
                         let list_box = div()
                             .id("list")
                             .flex_1()
                             .min_h_0()
-                            .p_2()
                             .overflow_y_scroll();
-                        let empty_space = div()
-                            .id("list-empty")
-                            .flex_grow_1()
-                            .min_h(px(24.))
-                            .w_full()
-                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        let clear_on_click = cx.listener(
+                            |this, event: &ClickEvent, _, cx| {
                                 if event.click_count() >= 2 {
                                     this.go_up(cx);
                                 } else {
@@ -2296,25 +2406,108 @@ impl Render for Browser {
                                     this.purge_armed = None;
                                     cx.notify();
                                 }
-                            }));
+                            },
+                        );
                         match self.tab().view_mode {
                             ViewMode::List => {
                                 let header = self.sort_header(cx);
+                                let empty_space = div()
+                                    .id("list-empty")
+                                    .flex_grow_1()
+                                    .min_h(px(24.))
+                                    .w_full()
+                                    .on_click(clear_on_click);
                                 list_box
                                     .flex()
                                     .flex_col()
                                     .gap_px()
+                                    .p_2()
                                     .child(header)
                                     .children(rows)
                                     .child(empty_space)
                             }
-                            ViewMode::Icons => list_box
-                                .flex()
-                                .flex_wrap()
-                                .content_start()
-                                .gap_1()
-                                .children(rows)
-                                .child(empty_space),
+                            ViewMode::Icons => {
+                                let empty_space = div()
+                                    .id("list-empty")
+                                    .flex_grow_1()
+                                    .min_h(px(24.))
+                                    .w_full()
+                                    .on_click(clear_on_click)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            |this, event: &MouseDownEvent, _, cx| {
+                                                this.rubber_origin = Some(event.position);
+                                                this.rubber_current = None;
+                                                cx.notify();
+                                            },
+                                        ),
+                                    )
+                                    .on_drag(RubberSelect, |_, _, _, cx| {
+                                        cx.new(|_| RubberGhost)
+                                    })
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                            if this.rubber_current.take().is_some() {
+                                                cx.notify();
+                                            }
+                                        }),
+                                    );
+
+                                // the selection band, drawn in grid-local
+                                // coordinates; hit testing happens against
+                                // the same pinned geometry at drop
+                                let overlay = match (
+                                    self.rubber_origin,
+                                    self.rubber_current,
+                                    self.rubber_bounds,
+                                ) {
+                                    (Some(origin), Some(current), Some(bounds)) => {
+                                        let ax = f32::from(origin.x - bounds.origin.x);
+                                        let ay = f32::from(origin.y - bounds.origin.y);
+                                        let bx = f32::from(current.x - bounds.origin.x);
+                                        let by = f32::from(current.y - bounds.origin.y);
+                                        let (x0, x1) = if ax < bx { (ax, bx) } else { (bx, ax) };
+                                        let (y0, y1) = if ay < by { (ay, by) } else { (by, ay) };
+                                        Some(
+                                            div()
+                                                .absolute()
+                                                .left(px(x0))
+                                                .top(px(y0))
+                                                .w(px(x1 - x0))
+                                                .h(px(y1 - y0))
+                                                .border_1()
+                                                .border_color(theme::accent())
+                                                .bg(theme::rubber_band()),
+                                        )
+                                    }
+                                    _ => None,
+                                };
+
+                                list_box
+                                    .flex()
+                                    .flex_wrap()
+                                    .content_start()
+                                    .p(px(8. * s))
+                                    .gap(px(4. * s))
+                                    .relative()
+                                    .children(overlay)
+                                    .children(rows)
+                                    .child(empty_space)
+                                    .on_drag_move::<RubberSelect>(cx.listener(
+                                        |this, event: &DragMoveEvent<RubberSelect>, _, cx| {
+                                            this.rubber_current = Some(event.event.position);
+                                            this.rubber_bounds = Some(event.bounds);
+                                            this.rubber_ctrl =
+                                                event.event.modifiers.control;
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .on_drop(cx.listener(|this, _: &RubberSelect, _, cx| {
+                                        this.finish_rubber(cx);
+                                    }))
+                            }
                         }
                     })
                     .child(
@@ -2416,6 +2609,19 @@ fn human_size(size: u64) -> String {
 struct Ghost {
     name: String,
     position: Point<Pixels>,
+}
+
+/// Marker payload for the icon-grid rubber band drag.
+struct RubberSelect;
+
+/// The drag ghost for a rubber band: nothing, the band itself is the
+/// feedback.
+struct RubberGhost;
+
+impl Render for RubberGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
 }
 
 impl Render for Ghost {

@@ -39,3 +39,7 @@ pub(crate) fn error() -> Rgba {
 pub(crate) fn clear() -> Rgba {
     rgba(0x00000000)
 }
+/// The rubber selection band fill: a whisper of accent over the grid.
+pub(crate) fn rubber_band() -> Rgba {
+    rgba(0x6ea5fa26)
+}
