@@ -336,6 +336,7 @@ pub(crate) struct Browser {
     path_cursor: usize,
     /// Content zoom, 1.0 = normal; clamped to 0.75..=2.0.
     scale: f32,
+    titled: Option<PathBuf>,
     watcher: Option<notify::RecommendedWatcher>,
     watched: Option<PathBuf>,
     /// Current-name filter, typed straight into the listing.
@@ -382,6 +383,7 @@ impl Browser {
             path_buffer: String::new(),
             path_cursor: 0,
             scale: 1.0,
+            titled: None,
             watcher: None,
             watched: None,
             filter: String::new(),
@@ -391,6 +393,7 @@ impl Browser {
             rubber_ctrl: false,
             places_refresh: Instant::now(),
         };
+        browser.load_state();
         let show_hidden = browser.show_hidden;
         browser.tab_mut().reload(show_hidden);
         browser.start_dir_watch(cx);
@@ -470,18 +473,21 @@ impl Browser {
 
     fn zoom_in(&mut self, cx: &mut Context<Self>) {
         self.scale = ((self.scale * 1.25 * 100.).round() / 100.).min(2.0);
+        self.save_state();
         self.status = format!("zoom {}%", (self.scale * 100.) as i32);
         cx.notify();
     }
 
     fn zoom_out(&mut self, cx: &mut Context<Self>) {
         self.scale = ((self.scale / 1.25 * 100.).round() / 100.).max(0.75);
+        self.save_state();
         self.status = format!("zoom {}%", (self.scale * 100.) as i32);
         cx.notify();
     }
 
     fn zoom_reset(&mut self, cx: &mut Context<Self>) {
         self.scale = 1.0;
+        self.save_state();
         self.status = "zoom 100%".into();
         cx.notify();
     }
@@ -618,6 +624,7 @@ impl Browser {
 
     fn toggle_hidden(&mut self, cx: &mut Context<Self>) {
         self.show_hidden = !self.show_hidden;
+        self.save_state();
         let show_hidden = self.show_hidden;
         for tab in &mut self.tabs {
             tab.reload(show_hidden);
@@ -636,6 +643,7 @@ impl Browser {
             tab.view_mode = mode;
             self.rubber_origin = None;
             self.rubber_current = None;
+            self.save_state();
             cx.notify();
         }
     }
@@ -651,6 +659,7 @@ impl Browser {
             tab.sort_asc = true;
         }
         tab.reload(show_hidden);
+        self.save_state();
         cx.notify();
     }
 
@@ -1206,6 +1215,81 @@ impl Browser {
     fn disarm(&mut self) {
         self.purge_armed = None;
         self.delete_armed = None;
+    }
+
+    /// View state across restarts: one tiny key=value file under
+    /// ~/.config. Not a settings system, just the knobs you set once
+    /// and expect to keep.
+    fn state_path() -> Option<PathBuf> {
+        let mut path = dirs::config_dir()?;
+        path.push("kuma-files/state");
+        Some(path)
+    }
+
+    fn load_state(&mut self) {
+        let Some(path) = Self::state_path() else {
+            return;
+        };
+        let Ok(text) = fs::read_to_string(path) else {
+            return;
+        };
+        let tab = self.tab_mut();
+        for line in text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match (key, value) {
+                ("view", "icons") => tab.view_mode = ViewMode::Icons,
+                ("view", "list") => tab.view_mode = ViewMode::List,
+                ("sort", "name") => tab.sort_key = SortKey::Name,
+                ("sort", "size") => tab.sort_key = SortKey::Size,
+                ("sort", "modified") => tab.sort_key = SortKey::Modified,
+                ("asc", "true") => tab.sort_asc = true,
+                ("asc", "false") => tab.sort_asc = false,
+                _ => {}
+            }
+        }
+        self.show_hidden = text.contains("hidden=true");
+        if let Some(scale) = text
+            .lines()
+            .find_map(|l| l.strip_prefix("scale="))
+            .and_then(|v| v.parse::<f32>().ok())
+        {
+            self.scale = scale.clamp(0.75, 2.0);
+        }
+    }
+
+    fn save_state(&self) {
+        let Some(path) = Self::state_path() else {
+            return;
+        };
+        if let Some(dir) = path.parent()
+            && let Err(err) = fs::create_dir_all(dir)
+        {
+            log::error!("state dir: {err}");
+            return;
+        }
+        let tab = self.tab();
+        let sort = match tab.sort_key {
+            SortKey::Name => "name",
+            SortKey::Size => "size",
+            SortKey::Modified => "modified",
+        };
+        let text = format!(
+            "view={}\nsort={}\nasc={}\nhidden={}\nscale={}\n",
+            if tab.view_mode == ViewMode::Icons {
+                "icons"
+            } else {
+                "list"
+            },
+            sort,
+            tab.sort_asc,
+            self.show_hidden,
+            self.scale,
+        );
+        if let Err(err) = fs::write(path, text) {
+            log::error!("save state: {err}");
+        }
     }
 
     /// Shift+Delete in a directory view: skip the trash entirely. Same
@@ -2581,9 +2665,21 @@ impl Browser {
 }
 
 impl Render for Browser {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_places();
         self.arm_watcher();
+
+        // the titlebar follows the active folder
+        let current = self.tab().current_dir().map(Path::to_path_buf);
+        if current != self.titled {
+            self.titled = current.clone();
+            let name = current
+                .as_deref()
+                .and_then(Path::file_name)
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Koguma".into());
+            window.set_window_title(&format!("Koguma: {name}"));
+        }
 
         // owned so the icon cells can kick off thumbnail decodes (which
         // need &mut self) while iterating; rows keep their entry index
