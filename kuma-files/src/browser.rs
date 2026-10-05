@@ -1,17 +1,18 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{fs, io};
+use std::{collections::HashMap, fs, io};
 
 use gpui::{
-    App, AppContext, ClickEvent, Context, Div, ExternalDragPayload, ExternalPaths, FileDragPaths,
-    FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels, Point, Render, Stateful, Window,
-    div, prelude::*, px, rgba, rgb,
+    AnyElement, App, AppContext, ClickEvent, Context, Div, ExternalDragPayload, ExternalPaths,
+    FileDragPaths, FocusHandle, Focusable, ImageSource, KeyDownEvent, MouseButton, ObjectFit,
+    Pixels, Point, Render, RenderImage, Stateful, Window, div, img, prelude::*, px, rgba, rgb, svg,
 };
 use trash::{os_limited, TrashItem};
 
-use crate::theme;
+use crate::{icons, theme};
 
 /// One drag origin. The external payload resolver needs the path plus
 /// whether it is a directory, so the platform drag advertises both.
@@ -38,6 +39,12 @@ struct Entry {
 enum Source {
     Dir(PathBuf),
     Trash,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    List,
+    Icons,
 }
 
 impl PartialEq for Source {
@@ -74,6 +81,7 @@ struct Tab {
     rename_buffer: String,
     /// Byte offset into rename_buffer; stays on char boundaries.
     rename_cursor: usize,
+    view_mode: ViewMode,
 }
 
 /// A queued file operation. `run` executes it and returns its inverse,
@@ -292,6 +300,10 @@ pub(crate) struct Browser {
     focus: FocusHandle,
     places: Vec<Place>,
     purge_armed: Option<Instant>,
+    show_hidden: bool,
+    /// Decoded thumbnails keyed by path; cleared wholesale when large.
+    thumbs: HashMap<PathBuf, Arc<RenderImage>>,
+    thumbs_inflight: HashSet<PathBuf>,
 }
 
 impl Focusable for Browser {
@@ -318,8 +330,12 @@ impl Browser {
             focus,
             places: Self::places(),
             purge_armed: None,
+            show_hidden: false,
+            thumbs: HashMap::new(),
+            thumbs_inflight: HashSet::new(),
         };
-        browser.tab_mut().reload();
+        let show_hidden = browser.show_hidden;
+        browser.tab_mut().reload(show_hidden);
         browser
     }
 
@@ -353,11 +369,108 @@ impl Browser {
         &mut self.tabs[self.active]
     }
 
+    /// Kick off a background decode for an image file; the cached result
+    /// arrives with a notify. Safe to call every render: inflight and
+    /// cached paths are no-ops.
+    fn request_thumb(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.thumbs.contains_key(&path) || self.thumbs_inflight.contains(&path) {
+            return;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            return;
+        };
+        // decoding cost is in the file read, not the resize; cap it
+        if meta.len() > 32 * 1024 * 1024 {
+            return;
+        }
+        self.thumbs_inflight.insert(path.clone());
+        if self.thumbs.len() > 300 {
+            self.thumbs.clear();
+        }
+        cx.spawn(async move |this, cx| {
+            let bg_path = path.clone();
+            let render = cx
+                .background_spawn(async move {
+                    std::panic::catch_unwind(|| {
+                        icons::decode_thumbnail(&bg_path, 256, 256)
+                    })
+                    .unwrap_or(None)
+                })
+                .await;
+            let update = this.update(cx, |this, cx| {
+                this.thumbs_inflight.remove(&path);
+                if let Some(render) = render {
+                    this.thumbs.insert(path, Arc::new(render));
+                    cx.notify();
+                }
+            });
+            if let Err(err) = update {
+                log::error!("thumbnail update failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// New folder in the current directory, named to not collide.
+    fn new_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+            return;
+        };
+        let mut name = "New Folder".to_string();
+        let mut n = 2;
+        while dir.join(&name).exists() {
+            name = format!("New Folder {n}");
+            n += 1;
+        }
+        match fs::create_dir(dir.join(&name)) {
+            Ok(()) => {
+                self.status = format!("created {name}");
+                let show_hidden = self.show_hidden;
+                let tab = self.tab_mut();
+                tab.reload(show_hidden);
+                let new_path = dir.join(&name);
+                if let Some(entry) = tab.entries.iter().position(|e| e.path == new_path) {
+                    tab.cursor = Some(entry);
+                    tab.selection.clear();
+                    tab.selection.insert(new_path);
+                }
+            }
+            Err(err) => {
+                log::error!("create_dir: {err}");
+                self.status = format!("new folder failed: {err}");
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_hidden(&mut self, cx: &mut Context<Self>) {
+        self.show_hidden = !self.show_hidden;
+        let show_hidden = self.show_hidden;
+        for tab in &mut self.tabs {
+            tab.reload(show_hidden);
+        }
+        self.status = if self.show_hidden {
+            "hidden files shown".into()
+        } else {
+            "hidden files hidden".into()
+        };
+        cx.notify();
+    }
+
+    fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
+        let tab = self.tab_mut();
+        if tab.view_mode != mode {
+            tab.view_mode = mode;
+            cx.notify();
+        }
+    }
+
     fn open_trash(&mut self, cx: &mut Context<Self>) {
         self.load_source(Source::Trash, cx);
     }
 
     fn load_source(&mut self, source: Source, cx: &mut Context<Self>) {
+        let show_hidden = self.show_hidden;
         let tab = self.tab_mut();
         if tab.source == source {
             return;
@@ -368,7 +481,7 @@ impl Browser {
         tab.selection.clear();
         tab.cursor = None;
         tab.renaming = None;
-        tab.reload();
+        tab.reload(show_hidden);
         self.status.clear();
         self.purge_armed = None;
         cx.notify();
@@ -378,7 +491,7 @@ impl Browser {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         self.tabs.push(Tab::new(Source::Dir(home)));
         self.active = self.tabs.len() - 1;
-        self.tabs.last_mut().unwrap().reload();
+        self.tabs.last_mut().unwrap().reload(self.show_hidden);
         self.status.clear();
         cx.notify();
     }
@@ -388,7 +501,7 @@ impl Browser {
             // the last tab becomes a fresh home tab rather than closing
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
             self.tabs[0] = Tab::new(Source::Dir(home));
-            self.tabs[0].reload();
+            self.tabs[0].reload(self.show_hidden);
         } else {
             self.tabs.remove(ix);
             if self.active >= self.tabs.len() {
@@ -450,7 +563,8 @@ impl Browser {
                     }
                     None => {}
                 }
-                this.tab_mut().reload();
+                let show_hidden = this.show_hidden;
+                this.tab_mut().reload(show_hidden);
                 cx.notify();
             });
             if let Err(err) = update {
@@ -662,16 +776,21 @@ impl Tab {
             renaming: None,
             rename_buffer: String::new(),
             rename_cursor: 0,
+            view_mode: ViewMode::List,
         }
     }
 
-    fn reload(&mut self) {
+    fn reload(&mut self, show_hidden: bool) {
         match &self.source {
             Source::Dir(dir) => match fs::read_dir(dir) {
                 Ok(read) => {
                     let mut entries = Vec::new();
                     for entry in read.flatten() {
                         let path = entry.path();
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if !show_hidden && name.starts_with('.') {
+                            continue;
+                        }
                         let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
                         let size = fs::symlink_metadata(&path).ok().and_then(|meta| {
                             if meta.is_dir() {
@@ -680,7 +799,6 @@ impl Tab {
                                 Some(meta.len())
                             }
                         });
-                        let name = entry.file_name().to_string_lossy().into_owned();
                         entries.push(Entry {
                             key: path.clone(),
                             path,
@@ -872,6 +990,14 @@ impl Browser {
                 let active = self.active;
                 self.close_tab(active, cx);
             }
+            "h" if keystroke.modifiers.control && !keystroke.modifiers.shift => {
+                self.toggle_hidden(cx)
+            }
+            "1" if keystroke.modifiers.control => self.set_view_mode(ViewMode::List, cx),
+            "2" if keystroke.modifiers.control => self.set_view_mode(ViewMode::Icons, cx),
+            "n" if keystroke.modifiers.control && keystroke.modifiers.shift => {
+                self.new_folder(cx)
+            }
             _ => {}
         }
     }
@@ -983,11 +1109,13 @@ impl Browser {
                 self.status = format!("rename failed: {err}");
             }
         }
-        self.tab_mut().reload();
+        let show_hidden = self.show_hidden;
+        self.tab_mut().reload(show_hidden);
         cx.notify();
     }
 
     fn go_back(&mut self, cx: &mut Context<Self>) {
+        let show_hidden = self.show_hidden;
         let tab = self.tab_mut();
         let Some(previous) = tab.history.pop() else {
             return;
@@ -997,11 +1125,12 @@ impl Browser {
         tab.selection.clear();
         tab.cursor = None;
         tab.renaming = None;
-        tab.reload();
+        tab.reload(show_hidden);
         cx.notify();
     }
 
     fn go_forward(&mut self, cx: &mut Context<Self>) {
+        let show_hidden = self.show_hidden;
         let tab = self.tab_mut();
         let Some(next) = tab.forward.pop() else {
             return;
@@ -1011,7 +1140,7 @@ impl Browser {
         tab.selection.clear();
         tab.cursor = None;
         tab.renaming = None;
-        tab.reload();
+        tab.reload(show_hidden);
         cx.notify();
     }
 
@@ -1117,7 +1246,9 @@ impl Browser {
                     div()
                         .flex_1()
                         .flex()
+                        .items_center()
                         .gap_3()
+                        .child(self.entry_icon(entry, px(16.)))
                         .child(entry.name.clone())
                         .child(
                             div()
@@ -1194,12 +1325,158 @@ impl Browser {
             base
         };
 
-        base.child(name_child).child(
-            div()
-                .text_size(px(12.))
-                .text_color(theme::text_dim())
-                .child(size_text),
-        )
+        base.child(self.entry_icon(entry, px(16.)))
+            .child(name_child)
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme::text_dim())
+                    .child(size_text),
+            )
+    }
+
+    /// The tinted type icon for an entry, at any size.
+    fn entry_icon(&self, entry: &Entry, size: Pixels) -> AnyElement {
+        let icon_path = icons::icon_path_for(&entry.name, entry.is_dir);
+        let color = match icons::ink_for(icon_path) {
+            icons::IconInk::Folder => theme::accent(),
+            icons::IconInk::Doc => theme::text(),
+            icons::IconInk::Plain => theme::text_dim(),
+        };
+        svg()
+            .path(icon_path)
+            .size(size)
+            .flex_none()
+            .text_color(color)
+            .into_any_element()
+    }
+
+    /// One cell in the icon grid: preview (thumbnail when decodable),
+    /// name underneath.
+    fn icon_cell(&mut self, ix: usize, entry: &Entry, cx: &mut Context<Self>) -> Stateful<Div> {
+        let selected = self.tab().selection.contains(&entry.key);
+        let entry_key = entry.key.clone();
+        let entry_path = entry.path.clone();
+        let in_trash = entry.item.is_some();
+
+        // thumbnails only for local image files: trash entries point at
+        // paths that no longer exist
+        let show_thumb = !in_trash && !entry.is_dir && icons::is_image(&entry.name);
+        let thumb = if show_thumb {
+            self.request_thumb(entry.path.clone(), cx);
+            self.thumbs.get(&entry.path).cloned()
+        } else {
+            None
+        };
+
+        let preview: AnyElement = match thumb {
+            Some(render) => img(ImageSource::Render(render))
+                .size(px(76.))
+                .object_fit(ObjectFit::Contain)
+                .into_any_element(),
+            None => {
+                let (icon, ink) = if in_trash {
+                    let icon = icons::icon_path_for(&entry.name, entry.is_dir);
+                    (icon, icons::ink_for(icon))
+                } else if show_thumb {
+                    ("icons/image.svg", icons::IconInk::Plain)
+                } else {
+                    let icon = icons::icon_path_for(&entry.name, entry.is_dir);
+                    (icon, icons::ink_for(icon))
+                };
+                let color = match ink {
+                    icons::IconInk::Folder => theme::accent(),
+                    icons::IconInk::Doc => theme::text(),
+                    icons::IconInk::Plain => theme::text_dim(),
+                };
+                svg()
+                    .path(icon)
+                    .size(px(if entry.is_dir { 56. } else { 44. }))
+                    .text_color(color)
+                    .into_any_element()
+            }
+        };
+
+        div()
+            .id(ix)
+            .w(px(112.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .p_2()
+            .rounded_sm()
+            .cursor_pointer()
+            .bg(if selected {
+                theme::row_selected()
+            } else {
+                theme::clear()
+            })
+            .hover(|this| this.bg(theme::row_hover()))
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if event.click_count() >= 2 && !in_trash {
+                    if let Some(found) = this
+                        .tab()
+                        .entries
+                        .iter()
+                        .find(|e| e.path == entry_path)
+                        .cloned()
+                    {
+                        this.open(&found, cx);
+                    }
+                    return;
+                }
+                let tab = this.tab_mut();
+                if event.modifiers().control {
+                    if tab.selection.contains(&entry_key) {
+                        tab.selection.remove(&entry_key);
+                    } else {
+                        tab.selection.insert(entry_key.clone());
+                    }
+                } else {
+                    tab.selection.clear();
+                    tab.selection.insert(entry_key.clone());
+                }
+                tab.cursor = Some(ix);
+                this.purge_armed = None;
+                cx.notify();
+            }))
+            .on_drag(
+                DragEntry {
+                    path: entry.path.clone(),
+                    is_dir: entry.is_dir,
+                },
+                |dragged: &DragEntry, position, _, cx| {
+                    let name = dragged
+                        .path
+                        .file_name()
+                        .map_or_else(|| "unnamed".into(), |n| n.to_string_lossy().into_owned());
+                    log::info!("drag start: {}", dragged.path.display());
+                    cx.new(|_| Ghost { name, position })
+                },
+            )
+            .external_drag_payload::<DragEntry>(|dragged: &DragEntry, _, _| {
+                log::info!("external payload resolved: {}", dragged.path.display());
+                Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                    dragged.path.clone(),
+                    dragged.is_dir,
+                )])))
+            })
+            .child(
+                div()
+                    .h(px(80.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(preview),
+            )
+            .child(
+                div()
+                    .max_w_full()
+                    .text_size(px(12.))
+                    .truncate()
+                    .child(entry.name.clone()),
+            )
     }
 
     fn place_row(&self, ix: usize, place: &Place, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -1412,9 +1689,15 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // owned so the icon cells can kick off thumbnail decodes (which
+        // need &mut self) while iterating
+        let entries: Vec<Entry> = self.tab().entries.iter().take(200).cloned().collect();
         let mut rows: Vec<Stateful<Div>> = Vec::new();
-        for (ix, entry) in self.tab().entries.iter().take(200).enumerate() {
-            rows.push(self.row(ix, entry, cx));
+        for (ix, entry) in entries.iter().enumerate() {
+            match self.tab().view_mode {
+                ViewMode::List => rows.push(self.row(ix, entry, cx)),
+                ViewMode::Icons => rows.push(self.icon_cell(ix, entry, cx)),
+            }
         }
 
         let mut places: Vec<Stateful<Div>> = Vec::new();
@@ -1539,7 +1822,12 @@ impl Render for Browser {
                                     .cursor_pointer()
                                     .hover(|this| this.text_color(theme::text()))
                                     .on_click(cx.listener(|this, _, _, cx| this.go_back(cx)))
-                                    .child("◀"),
+                                    .child(
+                                        svg()
+                                            .path("icons/arrow_left.svg")
+                                            .size(px(16.))
+                                            .text_color(theme::text_dim()),
+                                    ),
                             )
                             .child(
                                 div()
@@ -1547,7 +1835,12 @@ impl Render for Browser {
                                     .cursor_pointer()
                                     .hover(|this| this.text_color(theme::text()))
                                     .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx)))
-                                    .child("▶"),
+                                    .child(
+                                        svg()
+                                            .path("icons/arrow_right.svg")
+                                            .size(px(16.))
+                                            .text_color(theme::text_dim()),
+                                    ),
                             )
                             .child(
                                 div()
@@ -1555,7 +1848,25 @@ impl Render for Browser {
                                     .cursor_pointer()
                                     .hover(|this| this.text_color(theme::text()))
                                     .on_click(cx.listener(|this, _, _, cx| this.go_up(cx)))
-                                    .child("↑"),
+                                    .child(
+                                        svg()
+                                            .path("icons/arrow_up.svg")
+                                            .size(px(16.))
+                                            .text_color(theme::text_dim()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("new-folder")
+                                    .cursor_pointer()
+                                    .hover(|this| this.text_color(theme::text()))
+                                    .on_click(cx.listener(|this, _, _, cx| this.new_folder(cx)))
+                                    .child(
+                                        svg()
+                                            .path("icons/folder_add.svg")
+                                            .size(px(16.))
+                                            .text_color(theme::text_dim()),
+                                    ),
                             )
                             .child(
                                 div()
@@ -1566,20 +1877,99 @@ impl Render for Browser {
                                         Some(dir) => dir.display().to_string(),
                                         None => "Trash".into(),
                                     }),
+                            )
+                            .child(
+                                div()
+                                    .id("view-list")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(12.))
+                                    .text_color(if self.tab().view_mode == ViewMode::List {
+                                        theme::accent()
+                                    } else {
+                                        theme::text_dim()
+                                    })
+                                    .bg(if self.tab().view_mode == ViewMode::List {
+                                        theme::row()
+                                    } else {
+                                        theme::clear()
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_view_mode(ViewMode::List, cx)
+                                    }))
+                                    .child("List"),
+                            )
+                            .child(
+                                div()
+                                    .id("view-icons")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(12.))
+                                    .text_color(if self.tab().view_mode == ViewMode::Icons {
+                                        theme::accent()
+                                    } else {
+                                        theme::text_dim()
+                                    })
+                                    .bg(if self.tab().view_mode == ViewMode::Icons {
+                                        theme::row()
+                                    } else {
+                                        theme::clear()
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_view_mode(ViewMode::Icons, cx)
+                                    }))
+                                    .child("Icons"),
+                            )
+                            .child(
+                                div()
+                                    .id("toggle-hidden")
+                                    .cursor_pointer()
+                                    .hover(|this| this.text_color(theme::text()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_hidden(cx)
+                                    }))
+                                    .child(
+                                        svg()
+                                            .path(if self.show_hidden {
+                                                "icons/eye.svg"
+                                            } else {
+                                                "icons/eye_off.svg"
+                                            })
+                                            .size(px(16.))
+                                            .text_color(if self.show_hidden {
+                                                theme::accent()
+                                            } else {
+                                                theme::text_dim()
+                                            }),
+                                    ),
                             ),
                     )
-                    .child(
-                        div()
+                    .child({
+                        // list flows as rows, icons as a wrapping grid
+                        let list_box = div()
                             .id("list")
                             .flex_1()
                             .min_h_0()
-                            .flex()
-                            .flex_col()
-                            .gap_px()
                             .p_2()
-                            .overflow_y_scroll()
-                            .children(rows),
-                    )
+                            .overflow_y_scroll();
+                        match self.tab().view_mode {
+                            ViewMode::List => list_box
+                                .flex()
+                                .flex_col()
+                                .gap_px()
+                                .children(rows),
+                            ViewMode::Icons => list_box
+                                .flex()
+                                .flex_wrap()
+                                .content_start()
+                                .gap_1()
+                                .children(rows),
+                        }
+                    })
                     .child(
                         div()
                             .flex()
@@ -1600,7 +1990,7 @@ impl Render for Browser {
                             .child(
                                 div()
                                     .text_color(theme::text_dim())
-                                    .child("Enter open · F2 rename · Del trash · Ctrl+C/X/V · Ctrl+Z undo · Alt+arrows"),
+                                    .child("Enter open · F2 rename · Del trash · Ctrl+C/X/V · Ctrl+Z undo · Ctrl+H hidden · Ctrl+1/2 views"),
                             ),
                     ),
             )

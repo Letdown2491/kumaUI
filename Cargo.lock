@@ -2183,6 +2183,7 @@ dependencies = [
  "oo7",
  "open",
  "parking_lot",
+ "pathfinder_geometry",
  "raw-window-handle",
  "smallvec",
  "smol",
@@ -2196,6 +2197,7 @@ dependencies = [
  "wayland-protocols-plasma",
  "wayland-protocols-wlr",
  "xkbcommon",
+ "zed-font-kit",
 ]
 
 [[package]]
@@ -2900,11 +2902,14 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 name = "kuma-files"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "dirs 7.0.0",
  "env_logger",
  "gpui",
  "gpui_platform",
+ "image",
  "log",
+ "smallvec",
  "trash",
 ]
 

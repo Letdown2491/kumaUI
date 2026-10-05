@@ -5,6 +5,7 @@ use gpui::{App, AppContext, WindowBounds, WindowOptions, TitlebarOptions, px, si
 use gpui_platform::application;
 
 mod browser;
+mod icons;
 mod theme;
 
 use browser::Browser;
@@ -34,25 +35,27 @@ fn main() {
         .or_else(|| dirs::home_dir())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    application().run(move |cx: &mut App| {
-        let bounds = gpui::Bounds::centered(None, size(px(960.), px(640.)), cx);
-        match cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from("Koguma")),
+    application()
+        .with_assets(icons::Assets)
+        .run(move |cx: &mut App| {
+            let bounds = gpui::Bounds::centered(None, size(px(960.), px(640.)), cx);
+            match cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(SharedString::from("Koguma")),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |window, cx| {
-                log::info!("koguma window open, listing {}", dir.display());
-                cx.new(|cx| Browser::new(dir, window, cx))
-            },
-        ) {
-            Ok(_) => {}
-            Err(err) => log::error!("open_window failed: {err:#}"),
-        }
-        cx.activate(true);
-    });
+                },
+                |window, cx| {
+                    log::info!("koguma window open, listing {}", dir.display());
+                    cx.new(|cx| Browser::new(dir, window, cx))
+                },
+            ) {
+                Ok(_) => {}
+                Err(err) => log::error!("open_window failed: {err:#}"),
+            }
+            cx.activate(true);
+        });
 }
