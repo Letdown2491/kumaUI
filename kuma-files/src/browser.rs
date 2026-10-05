@@ -215,13 +215,37 @@ struct Place {
 }
 
 /// Snapshot for the properties dialog.
-struct PropInfo {
-    name: String,
-    path: PathBuf,
-    is_dir: bool,
-    size: Option<u64>,
-    modified: Option<i64>,
-    mode: Option<u32>,
+/// The right-click menu: where it opened plus a flat item list.
+struct ContextMenu {
+    x: f32,
+    y: f32,
+    items: Vec<MenuItem>,
+}
+
+#[derive(Clone, Copy)]
+struct MenuItem {
+    label: &'static str,
+    action: MenuAction,
+}
+
+/// What a menu item does when clicked. Dispatched through
+/// `run_menu_action`, so the menu and the keyboard share handlers.
+#[derive(Clone, Copy, PartialEq)]
+enum MenuAction {
+    Open,
+    Rename,
+    Copy,
+    Cut,
+    Paste,
+    Trash,
+    Delete,
+    Info,
+    NewFolder,
+    NewFile,
+    SortName,
+    SortSize,
+    SortModified,
+    ToggleHidden,
 }
 
 /// A paste that may collide with an existing file, resolved by the
@@ -319,7 +343,14 @@ pub(crate) struct Browser {
     clipboard: Option<(bool, Vec<PathBuf>)>,
     undo: Vec<Op>,
     conflict_dialog: Option<ConflictDialog>,
-    props: Option<PropInfo>,
+    /// Info rail on the right, following the cursor entry.
+    inspector: bool,
+    /// Text snippet for the rail, when the focused entry is textual.
+    text_preview: Option<String>,
+    preview_key: Option<PathBuf>,
+    preview_inflight: HashSet<PathBuf>,
+    /// Hand-rolled right-click menu: position plus a flat item list.
+    menu: Option<ContextMenu>,
     status: String,
     progress: String,
     busy: bool,
@@ -368,7 +399,11 @@ impl Browser {
             clipboard: None,
             undo: Vec::new(),
             conflict_dialog: None,
-            props: None,
+            inspector: false,
+            text_preview: None,
+            preview_key: None,
+            preview_inflight: HashSet::new(),
+            menu: None,
             status: String::new(),
             progress: String::new(),
             busy: false,
@@ -934,6 +969,7 @@ impl Browser {
         let show_hidden = self.show_hidden;
         self.rubber_origin = None;
         self.rubber_current = None;
+        self.menu = None;
         let tab = self.tab_mut();
         if tab.source == source {
             return;
@@ -1250,6 +1286,7 @@ impl Browser {
             }
         }
         self.show_hidden = text.contains("hidden=true");
+        self.inspector = text.contains("inspector=true");
         if let Some(scale) = text
             .lines()
             .find_map(|l| l.strip_prefix("scale="))
@@ -1276,7 +1313,7 @@ impl Browser {
             SortKey::Modified => "modified",
         };
         let text = format!(
-            "view={}\nsort={}\nasc={}\nhidden={}\nscale={}\n",
+            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\nscale={}\n",
             if tab.view_mode == ViewMode::Icons {
                 "icons"
             } else {
@@ -1285,6 +1322,7 @@ impl Browser {
             sort,
             tab.sort_asc,
             self.show_hidden,
+            self.inspector,
             self.scale,
         );
         if let Err(err) = fs::write(path, text) {
@@ -1382,36 +1420,63 @@ impl Browser {
         cx.notify();
     }
 
-    /// Alt+Enter on the cursor entry: a snapshot of its metadata.
-    fn open_props(&mut self, cx: &mut Context<Self>) {
-        let Some(entry) = self
-            .tab()
-            .cursor
-            .and_then(|ix| self.tab().entries.get(ix))
-        else {
+    /// Alt+Enter: show or hide the info rail.
+    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
+        self.inspector = !self.inspector;
+        if !self.inspector {
+            self.preview_key = None;
+            self.text_preview = None;
+        }
+        self.save_state();
+        cx.notify();
+    }
+
+    /// Load the rail's text snippet in the background: first lines of a
+    /// small file that does not smell binary (no NUL in the head).
+    fn request_text_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.preview_inflight.contains(&path) {
+            return;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
             return;
         };
-        match fs::symlink_metadata(&entry.path) {
-            Ok(meta) => {
-                self.props = Some(PropInfo {
-                    name: entry.name.clone(),
-                    path: entry.path.clone(),
-                    is_dir: entry.is_dir,
-                    size: if entry.is_dir { None } else { Some(meta.len()) },
-                    modified: meta.modified().ok().and_then(|t| {
-                        t.duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_secs() as i64)
-                    }),
-                    mode: Some(meta.permissions().mode()),
-                });
-                cx.notify();
-            }
-            Err(err) => {
-                self.status = format!("no info: {err}");
-                cx.notify();
-            }
+        if meta.len() > 1024 * 1024 {
+            return;
         }
+        self.preview_inflight.insert(path.clone());
+        let bg_path = path.clone();
+        cx.spawn(async move |this, cx| {
+            let lines = cx
+                .background_spawn(async move {
+                    let mut file = fs::File::open(&bg_path).ok()?;
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut filled = 0;
+                    while filled < buf.len() {
+                        let n = io::Read::read(&mut file, &mut buf[filled..]).ok()?;
+                        if n == 0 {
+                            break;
+                        }
+                        filled += n;
+                    }
+                    if buf[..filled].contains(&0) {
+                        return None;
+                    }
+                    let text = String::from_utf8_lossy(&buf[..filled]);
+                    Some(text.lines().take(48).collect::<Vec<_>>().join("\n"))
+                })
+                .await;
+            let update = this.update(cx, |this, cx| {
+                this.preview_inflight.remove(&path);
+                if this.preview_key.as_ref() == Some(&path) {
+                    this.text_preview = lines;
+                    cx.notify();
+                }
+            });
+            if let Err(err) = update {
+                log::error!("preview update failed: {err:#}");
+            }
+        })
+        .detach();
     }
 
     /// Purge is the one act with no inverse, so it wears the shell's
@@ -1573,9 +1638,9 @@ impl Browser {
             return;
         }
 
-        if self.props.is_some() {
+        if self.menu.is_some() {
             if keystroke.key == "escape" {
-                self.props = None;
+                self.menu = None;
                 cx.notify();
             }
             return;
@@ -1721,7 +1786,7 @@ impl Browser {
         }
 
         match keystroke.key.as_str() {
-            "enter" if keystroke.modifiers.alt => self.open_props(cx),
+            "enter" if keystroke.modifiers.alt => self.toggle_inspector(cx),
             "enter" => self.open_selection(cx),
             // Backspace edits the filter while one is active, otherwise
             // it goes to the parent directory
@@ -2000,6 +2065,7 @@ impl Browser {
         let entry_key = entry.key.clone();
         let entry_path = entry.path.clone();
         let size_text = entry.size.map(human_size).unwrap_or_default();
+        let menu_key = entry_key.clone();
 
         let mut base = div()
             .id(ix)
@@ -2044,7 +2110,33 @@ impl Browser {
                 tab.cursor = Some(ix);
                 this.disarm();
                 cx.notify();
-            }));
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    // Explorer convention: right-click selects the row
+                    // unless it is already part of the selection
+                    {
+                        let tab = this.tab_mut();
+                        if !tab.selection.contains(&menu_key) {
+                            tab.selection.clear();
+                            tab.selection.insert(menu_key.clone());
+                        }
+                        tab.cursor = Some(ix);
+                    }
+                    let items = if in_trash {
+                        Self::trash_menu_items()
+                    } else {
+                        Self::row_menu_items()
+                    };
+                    this.open_menu(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        items,
+                    );
+                    cx.notify();
+                }),
+            );
 
         if in_trash {
             let origin = entry.path.display().to_string();
@@ -2192,6 +2284,7 @@ impl Browser {
         let selected = self.tab().selection.contains(&entry.key);
         let entry_key = entry.key.clone();
         let entry_path = entry.path.clone();
+        let menu_key = entry_key.clone();
         let in_trash = entry.item.is_some();
 
         // thumbnails only for local image files: trash entries point at
@@ -2277,6 +2370,32 @@ impl Browser {
                 this.disarm();
                 cx.notify();
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    // Explorer convention: right-click selects the cell
+                    // unless it is already part of the selection
+                    {
+                        let tab = this.tab_mut();
+                        if !tab.selection.contains(&menu_key) {
+                            tab.selection.clear();
+                            tab.selection.insert(menu_key.clone());
+                        }
+                        tab.cursor = Some(ix);
+                    }
+                    let items = if in_trash {
+                        Self::trash_menu_items()
+                    } else {
+                        Self::row_menu_items()
+                    };
+                    this.open_menu(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        items,
+                    );
+                    cx.notify();
+                }),
+            )
             .on_drag(
                 DragEntry {
                     path: entry.path.clone(),
@@ -2422,68 +2541,254 @@ impl Browser {
 
     /// The modal overlay for unresolved paste conflicts. `None` (rendered
     /// as no child) when no paste is waiting on a decision.
-    /// The properties card: a snapshot of one entry's metadata.
-    fn props_overlay(&self, _cx: &mut Context<Self>) -> Option<Div> {
-        let props = self.props.as_ref()?;
-        let kind = if props.is_dir { "folder" } else { "file" };
-        let size = props
-            .size
-            .map(human_size)
-            .unwrap_or_else(|| if props.is_dir { "folder".into() } else { "0 B".into() });
-        let modified = props
-            .modified
-            .map(|secs| relative_time(secs, now_secs()))
-            .unwrap_or_default();
-        let mode = props.mode.map(mode_string).unwrap_or_default();
+    /// The docked info rail: preview on top, metadata under it. It
+    /// follows the cursor entry, so there is nothing to snapshot; the
+    /// metadata is read fresh each render (one stat syscall while open).
+    fn inspector_rail(&self, cx: &mut Context<Self>) -> Div {
+        let entry = self
+            .tab()
+            .cursor
+            .and_then(|ix| self.tab().entries.get(ix));
+        let meta = entry.and_then(|e| fs::symlink_metadata(&e.path).ok());
+        let mode = meta.as_ref().map(|m| m.permissions().mode());
+        let modified = meta.as_ref().and_then(|m| {
+            m.modified().ok().and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs() as i64)
+            })
+        });
+        let is_dir = entry.is_some_and(|e| e.is_dir);
+        let size = entry.and_then(|e| {
+            if e.is_dir {
+                None
+            } else {
+                meta.as_ref().map(|m| m.len())
+            }
+        });
 
-        Some(
+        // preview: image thumb, text snippet, or the type icon
+        let preview: AnyElement = if let Some(render) =
+            entry.and_then(|e| self.thumbs.get(&e.path).cloned())
+        {
+            img(ImageSource::Render(render))
+                .size_full()
+                .object_fit(ObjectFit::Contain)
+                .into_any_element()
+        } else if let (Some(entry), Some(text)) = (&entry, &self.text_preview)
+            && self.preview_key.as_ref() == Some(&entry.key)
+        {
             div()
-                .absolute()
-                .inset_0()
+                .w_full()
+                .h_full()
                 .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgba(0x00000066))
-                .child(
-                    div()
-                        .w(px(420.))
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .p_4()
-                        .rounded_md()
-                        .bg(theme::sidebar())
-                        .border_1()
-                        .border_color(theme::border())
-                        .shadow_lg()
-                        .text_size(px(13.))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_size(px(14.))
-                                        .text_color(theme::text())
-                                        .truncate()
-                                        .child(props.name.clone()),
-                                )
-                                .child(
-                                    div().text_color(theme::text_dim()).child(kind),
-                                ),
-                        )
-                        .child(prop_row("path", props.path.display().to_string()))
-                        .child(prop_row("size", size))
-                        .child(prop_row("modified", modified))
-                        .child(prop_row("permissions", mode))
-                        .child(
-                            div()
-                                .text_color(theme::text_dim())
-                                .child("Esc to close"),
-                        ),
-                ),
-        )
+                .flex_col()
+                .gap_px()
+                .overflow_hidden()
+                .text_size(px(11.))
+                .text_color(theme::text())
+                .font_family("monospace")
+                .children(text.lines().map(|line| div().truncate().child(line.to_string())))
+                .into_any_element()
+        } else if let Some(entry) = entry {
+            self.entry_icon(entry, px(56.))
+        } else {
+            div().into_any_element()
+        };
+
+        div()
+            .w(px(280.))
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_col()
+            .p_3()
+            .gap_3()
+            .bg(theme::sidebar())
+            .border_l_1()
+            .border_color(theme::border())
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(14.))
+                            .text_color(theme::text())
+                            .child(entry.map_or_else(
+                                || "No selection".to_string(),
+                                |e| e.name.clone(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("inspector-close")
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .text_color(theme::text_dim())
+                            .hover(|this| {
+                                this.text_color(theme::text()).bg(theme::row_hover())
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx)))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .h(px(200.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .bg(theme::row())
+                    .border_1()
+                    .border_color(theme::border())
+                    .p_2()
+                    .overflow_hidden()
+                    .child(preview),
+            )
+            .children(entry.map(|_| prop_row("kind", if is_dir { "folder".into() } else { "file".into() })))
+            .children(entry.map(|e| prop_row("path", e.path.display().to_string())))
+            .children(entry.map(|_| {
+                prop_row(
+                    "size",
+                    size.map(human_size)
+                        .unwrap_or_else(|| if is_dir { "folder".into() } else { "0 B".into() }),
+                )
+            }))
+            .children(entry.map(|_| {
+                prop_row(
+                    "modified",
+                    modified
+                        .map(|secs| relative_time(secs, now_secs()))
+                        .unwrap_or_default(),
+                )
+            }))
+            .children(entry.map(|_| prop_row("permissions", mode.map(mode_string).unwrap_or_default())))
+    }
+
+    /// The right-click menu: a backdrop that eats the next click (and
+    /// closes) plus the panel itself, siblings so the backdrop never
+    /// swallows an item's click through parent-first bubbling.
+    fn menu_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        let menu = self.menu.as_ref()?;
+        let viewport = window.viewport_size();
+        // keep the panel inside the window: rough height math, 26px a row
+        let max_x = f32::from(viewport.width) - 200.;
+        let max_y = f32::from(viewport.height) - (menu.items.len() as f32 * 26. + 8.);
+        let x = menu.x.min(max_x.max(0.));
+        let y = menu.y.min(max_y.max(0.));
+
+        let close_left = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.menu = None;
+            cx.notify();
+        });
+        let close_right = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            this.menu = None;
+            cx.notify();
+        });
+        let backdrop = div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(MouseButton::Left, close_left)
+            .on_mouse_down(MouseButton::Right, close_right);
+
+        let mut panel = div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .min_w(px(180.))
+            .flex()
+            .flex_col()
+            .py_1()
+            .rounded_md()
+            .bg(theme::sidebar())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .text_size(px(13.));
+        for (i, item) in menu.items.iter().enumerate() {
+            let action = item.action;
+            panel = panel.child(
+                div()
+                    .id(i)
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_color(theme::text())
+                    .hover(|this| this.bg(theme::row_hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.run_menu_action(action, cx)
+                    }))
+                    .child(item.label),
+            );
+        }
+
+        Some(div().absolute().inset_0().child(backdrop).child(panel))
+    }
+
+    fn run_menu_action(&mut self, action: MenuAction, cx: &mut Context<Self>) {
+        self.menu = None;
+        match action {
+            MenuAction::Open => self.open_selection(cx),
+            MenuAction::Rename => self.start_rename(cx),
+            MenuAction::Copy => self.copy_selection(cx),
+            MenuAction::Cut => self.cut_selection(cx),
+            MenuAction::Paste => self.paste(cx),
+            MenuAction::Trash => self.trash_selection(cx),
+            MenuAction::Delete => self.delete_selection(cx),
+            MenuAction::Info => self.toggle_inspector(cx),
+            MenuAction::NewFolder => self.new_folder(cx),
+            MenuAction::NewFile => self.new_file(cx),
+            MenuAction::SortName => self.set_sort(SortKey::Name, cx),
+            MenuAction::SortSize => self.set_sort(SortKey::Size, cx),
+            MenuAction::SortModified => self.set_sort(SortKey::Modified, cx),
+            MenuAction::ToggleHidden => self.toggle_hidden(cx),
+        }
+    }
+
+    fn open_menu(&mut self, x: f32, y: f32, items: Vec<MenuItem>) {
+        self.menu = Some(ContextMenu { x, y, items });
+    }
+
+    fn row_menu_items() -> Vec<MenuItem> {
+        vec![
+            MenuItem { label: "Open", action: MenuAction::Open },
+            MenuItem { label: "Rename", action: MenuAction::Rename },
+            MenuItem { label: "Copy", action: MenuAction::Copy },
+            MenuItem { label: "Cut", action: MenuAction::Cut },
+            MenuItem { label: "Trash", action: MenuAction::Trash },
+            MenuItem { label: "Delete permanently", action: MenuAction::Delete },
+            MenuItem { label: "Properties", action: MenuAction::Info },
+        ]
+    }
+
+    fn trash_menu_items() -> Vec<MenuItem> {
+        vec![
+            MenuItem { label: "Restore", action: MenuAction::Open },
+            MenuItem { label: "Delete permanently", action: MenuAction::Delete },
+            MenuItem { label: "Properties", action: MenuAction::Info },
+        ]
+    }
+
+    fn empty_menu_items() -> Vec<MenuItem> {
+        vec![
+            MenuItem { label: "New Folder", action: MenuAction::NewFolder },
+            MenuItem { label: "New File", action: MenuAction::NewFile },
+            MenuItem { label: "Paste", action: MenuAction::Paste },
+            MenuItem { label: "Sort by Name", action: MenuAction::SortName },
+            MenuItem { label: "Sort by Size", action: MenuAction::SortSize },
+            MenuItem { label: "Sort by Date", action: MenuAction::SortModified },
+            MenuItem { label: "Show Hidden", action: MenuAction::ToggleHidden },
+        ]
     }
 
     fn conflict_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {        let dialog = self.conflict_dialog.as_ref()?;
@@ -2669,6 +2974,35 @@ impl Render for Browser {
         self.refresh_places();
         self.arm_watcher();
 
+        // the info rail follows the cursor entry; keep its preview fed
+        if self.inspector {
+            let focus = self
+                .tab()
+                .cursor
+                .and_then(|ix| self.tab().entries.get(ix))
+                .map(|e| e.key.clone());
+            match focus {
+                Some(key) => {
+                    if self.preview_key.as_ref() != Some(&key) {
+                        self.preview_key = Some(key.clone());
+                        self.text_preview = None;
+                        let entry = self.tab().entries.iter().find(|e| e.key == key).cloned();
+                        if let Some(entry) = entry.filter(|e| e.item.is_none()) {
+                            if !entry.is_dir && icons::is_image(&entry.name) {
+                                self.request_thumb(entry.path.clone(), cx);
+                            } else if !entry.is_dir {
+                                self.request_text_preview(entry.path.clone(), cx);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    self.preview_key = None;
+                    self.text_preview = None;
+                }
+            }
+        }
+
         // the titlebar follows the active folder
         let current = self.tab().current_dir().map(Path::to_path_buf);
         if current != self.titled {
@@ -2759,7 +3093,7 @@ impl Render for Browser {
             .bg(theme::bg())
             .text_color(theme::text())
             .children(self.conflict_overlay(cx))
-            .children(self.props_overlay(cx))
+            .children(self.menu_overlay(window, cx))
             .child(
                 div()
                     .w(px(170.))
@@ -3056,7 +3390,18 @@ impl Render for Browser {
                                     .flex_grow_1()
                                     .min_h(px(24.))
                                     .w_full()
-                                    .on_click(clear_on_click);
+                                    .on_click(clear_on_click)
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            this.open_menu(
+                                                f32::from(event.position.x),
+                                                f32::from(event.position.y),
+                                                Self::empty_menu_items(),
+                                            );
+                                            cx.notify();
+                                        }),
+                                    );
                                 list_box
                                     .flex()
                                     .flex_col()
@@ -3078,6 +3423,17 @@ impl Render for Browser {
                                     .min_h(px(24.))
                                     .w_full()
                                     .on_click(clear_on_click)
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            this.open_menu(
+                                                f32::from(event.position.x),
+                                                f32::from(event.position.y),
+                                                Self::empty_menu_items(),
+                                            );
+                                            cx.notify();
+                                        }),
+                                    )
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
@@ -3208,10 +3564,15 @@ impl Render for Browser {
                                 div()
                                     .flex_none()
                                     .text_color(theme::text_dim())
-                                    .child("Enter open · F2 rename · Del trash · Shift+Del delete · Alt+Enter info · Ctrl+C/X/V/Z · Ctrl+H hidden · Ctrl+1/2 views · type to filter"),
+                                    .child("Enter open · F2 rename · Del trash · Shift+Del delete · Alt+Enter info · right-click menu · Ctrl+C/X/V/Z · Ctrl+H hidden · Ctrl+1/2 views · type to filter"),
                             ),
                     ),
             )
+            .child(if self.inspector {
+                self.inspector_rail(cx)
+            } else {
+                div()
+            })
     }
 }
 
