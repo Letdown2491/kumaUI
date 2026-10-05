@@ -14,6 +14,7 @@ use gpui::{
 use trash::{os_limited, TrashItem};
 
 use notify::Watcher as _;
+use std::os::unix::fs::PermissionsExt;
 
 use crate::{icons, theme};
 
@@ -213,6 +214,16 @@ struct Place {
     path: PathBuf,
 }
 
+/// Snapshot for the properties dialog.
+struct PropInfo {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    size: Option<u64>,
+    modified: Option<i64>,
+    mode: Option<u32>,
+}
+
 /// A paste that may collide with an existing file, resolved by the
 /// conflict dialog before the queue runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -308,12 +319,14 @@ pub(crate) struct Browser {
     clipboard: Option<(bool, Vec<PathBuf>)>,
     undo: Vec<Op>,
     conflict_dialog: Option<ConflictDialog>,
+    props: Option<PropInfo>,
     status: String,
     progress: String,
     busy: bool,
     focus: FocusHandle,
     places: Vec<Place>,
     purge_armed: Option<Instant>,
+    delete_armed: Option<Instant>,
     show_hidden: bool,
     /// Decoded thumbnails keyed by path; cleared wholesale when large.
     thumbs: HashMap<PathBuf, Arc<RenderImage>>,
@@ -354,12 +367,14 @@ impl Browser {
             clipboard: None,
             undo: Vec::new(),
             conflict_dialog: None,
+            props: None,
             status: String::new(),
             progress: String::new(),
             busy: false,
             focus,
             places: Self::places(),
             purge_armed: None,
+            delete_armed: None,
             show_hidden: false,
             thumbs: HashMap::new(),
             thumbs_inflight: HashSet::new(),
@@ -922,7 +937,7 @@ impl Browser {
         tab.renaming = None;
         tab.reload(show_hidden);
         self.status.clear();
-        self.purge_armed = None;
+        self.disarm();
         cx.notify();
     }
 
@@ -975,7 +990,7 @@ impl Browser {
             return;
         }
         self.busy = true;
-        self.purge_armed = None;
+        self.disarm();
         let total = ops.len();
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -1187,6 +1202,134 @@ impl Browser {
         self.enqueue(vec![Op::Trash { paths }], cx);
     }
 
+    /// Disarm any armed destructive op when the context moves on.
+    fn disarm(&mut self) {
+        self.purge_armed = None;
+        self.delete_armed = None;
+    }
+
+    /// Shift+Delete in a directory view: skip the trash entirely. Same
+    /// arm-then-confirm pattern as purge, because it is just as final.
+    fn delete_selection(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .tab()
+            .entries
+            .iter()
+            .filter(|entry| self.tab().selection.contains(&entry.key))
+            .map(|entry| entry.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        match self.delete_armed {
+            Some(armed) if armed.elapsed() <= PURGE_ARM => {
+                self.delete_armed = None;
+                cx.spawn(async move |this, cx| {
+                    let failure = cx
+                        .background_spawn(async move {
+                            for path in &paths {
+                                let outcome = if path.is_dir() {
+                                    fs::remove_dir_all(path)
+                                } else {
+                                    fs::remove_file(path)
+                                };
+                                if let Err(err) = outcome {
+                                    return Some(format!("{}: {err}", path.display()));
+                                }
+                            }
+                            None
+                        })
+                        .await;
+                    let update = this.update(cx, |this, cx| {
+                        match failure {
+                            Some(err) => {
+                                log::error!("delete: {err}");
+                                this.status = format!("delete failed: {err}");
+                            }
+                            None => this.status = "deleted permanently (no undo)".into(),
+                        }
+                        let show_hidden = this.show_hidden;
+                        this.tab_mut().reload(show_hidden);
+                        cx.notify();
+                    });
+                    if let Err(err) = update {
+                        log::error!("delete update failed: {err:#}");
+                    }
+                })
+                .detach();
+            }
+            _ => {
+                self.delete_armed = Some(Instant::now());
+                self.status = "press Shift+Delete again to delete permanently (no undo)".into();
+                cx.notify();
+            }
+        }
+    }
+
+    /// New empty file next to New Folder, same collision-free naming.
+    fn new_file(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+            return;
+        };
+        let mut name = "New File".to_string();
+        let mut n = 2;
+        while dir.join(&name).exists() {
+            name = format!("New File {n}");
+            n += 1;
+        }
+        match fs::File::create(dir.join(&name)) {
+            Ok(_) => {
+                self.status = format!("created {name}");
+                let show_hidden = self.show_hidden;
+                let tab = self.tab_mut();
+                tab.reload(show_hidden);
+                let new_path = dir.join(&name);
+                if let Some(ix) = tab.entries.iter().position(|e| e.path == new_path) {
+                    tab.cursor = Some(ix);
+                    tab.selection.clear();
+                    tab.selection.insert(new_path);
+                }
+            }
+            Err(err) => {
+                log::error!("create file: {err}");
+                self.status = format!("new file failed: {err}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// Alt+Enter on the cursor entry: a snapshot of its metadata.
+    fn open_props(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .tab()
+            .cursor
+            .and_then(|ix| self.tab().entries.get(ix))
+        else {
+            return;
+        };
+        match fs::symlink_metadata(&entry.path) {
+            Ok(meta) => {
+                self.props = Some(PropInfo {
+                    name: entry.name.clone(),
+                    path: entry.path.clone(),
+                    is_dir: entry.is_dir,
+                    size: if entry.is_dir { None } else { Some(meta.len()) },
+                    modified: meta.modified().ok().and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs() as i64)
+                    }),
+                    mode: Some(meta.permissions().mode()),
+                });
+                cx.notify();
+            }
+            Err(err) => {
+                self.status = format!("no info: {err}");
+                cx.notify();
+            }
+        }
+    }
+
     /// Purge is the one act with no inverse, so it wears the shell's
     /// arm-then-confirm pattern: the first Delete arms for 5s, the second
     /// within the window goes through.
@@ -1203,7 +1346,7 @@ impl Browser {
         }
         match self.purge_armed {
             Some(armed) if armed.elapsed() <= PURGE_ARM => {
-                self.purge_armed = None;
+                self.disarm();
                 self.enqueue(vec![Op::Purge { items }], cx);
             }
             _ => {
@@ -1342,6 +1485,14 @@ impl Browser {
             match keystroke.key.as_str() {
                 "escape" => self.conflict_skip_all(cx),
                 _ => {}
+            }
+            return;
+        }
+
+        if self.props.is_some() {
+            if keystroke.key == "escape" {
+                self.props = None;
+                cx.notify();
             }
             return;
         }
@@ -1486,6 +1637,7 @@ impl Browser {
         }
 
         match keystroke.key.as_str() {
+            "enter" if keystroke.modifiers.alt => self.open_props(cx),
             "enter" => self.open_selection(cx),
             // Backspace edits the filter while one is active, otherwise
             // it goes to the parent directory
@@ -1506,12 +1658,14 @@ impl Browser {
                 } else {
                     tab.selection.clear();
                     tab.cursor = None;
-                    self.purge_armed = None;
+                    self.disarm();
                     cx.notify();
                 }
             }
+            "delete" if keystroke.modifiers.shift => self.delete_selection(cx),
             "delete" => self.trash_selection(cx),
             "f2" => self.start_rename(cx),
+
             "left" if keystroke.modifiers.alt => self.go_back(cx),
             "right" if keystroke.modifiers.alt => self.go_forward(cx),
             "down" => self.move_cursor(1, cx),
@@ -1551,6 +1705,9 @@ impl Browser {
             "0" if keystroke.modifiers.control => self.zoom_reset(cx),
             "n" if keystroke.modifiers.control && keystroke.modifiers.shift => {
                 self.new_folder(cx)
+            }
+            "n" if keystroke.modifiers.control && keystroke.modifiers.alt => {
+                self.new_file(cx)
             }
             // bare single characters feed the type-in filter; shift is
             // allowed (uppercase), everything else filters it out
@@ -1801,7 +1958,7 @@ impl Browser {
                     tab.selection.insert(entry_key.clone());
                 }
                 tab.cursor = Some(ix);
-                this.purge_armed = None;
+                this.disarm();
                 cx.notify();
             }));
 
@@ -2033,7 +2190,7 @@ impl Browser {
                     tab.selection.insert(entry_key.clone());
                 }
                 tab.cursor = Some(ix);
-                this.purge_armed = None;
+                this.disarm();
                 cx.notify();
             }))
             .on_drag(
@@ -2181,8 +2338,71 @@ impl Browser {
 
     /// The modal overlay for unresolved paste conflicts. `None` (rendered
     /// as no child) when no paste is waiting on a decision.
-    fn conflict_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let dialog = self.conflict_dialog.as_ref()?;
+    /// The properties card: a snapshot of one entry's metadata.
+    fn props_overlay(&self, _cx: &mut Context<Self>) -> Option<Div> {
+        let props = self.props.as_ref()?;
+        let kind = if props.is_dir { "folder" } else { "file" };
+        let size = props
+            .size
+            .map(human_size)
+            .unwrap_or_else(|| if props.is_dir { "folder".into() } else { "0 B".into() });
+        let modified = props
+            .modified
+            .map(|secs| relative_time(secs, now_secs()))
+            .unwrap_or_default();
+        let mode = props.mode.map(mode_string).unwrap_or_default();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                .child(
+                    div()
+                        .w(px(420.))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .rounded_md()
+                        .bg(theme::sidebar())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .text_size(px(13.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(14.))
+                                        .text_color(theme::text())
+                                        .truncate()
+                                        .child(props.name.clone()),
+                                )
+                                .child(
+                                    div().text_color(theme::text_dim()).child(kind),
+                                ),
+                        )
+                        .child(prop_row("path", props.path.display().to_string()))
+                        .child(prop_row("size", size))
+                        .child(prop_row("modified", modified))
+                        .child(prop_row("permissions", mode))
+                        .child(
+                            div()
+                                .text_color(theme::text_dim())
+                                .child("Esc to close"),
+                        ),
+                ),
+        )
+    }
+
+    fn conflict_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {        let dialog = self.conflict_dialog.as_ref()?;
         let op_ix = dialog.conflicts.get(dialog.ix).copied()?;
         let op = &dialog.ops[op_ix];
         let name = op
@@ -2394,17 +2614,22 @@ impl Render for Browser {
         let purge_armed = self
             .purge_armed
             .is_some_and(|armed| armed.elapsed() <= PURGE_ARM);
+        let delete_armed = self
+            .delete_armed
+            .is_some_and(|armed| armed.elapsed() <= PURGE_ARM);
 
         let status_text = if self.busy {
             self.progress.clone()
         } else if purge_armed {
             "press Delete again to purge permanently (no undo)".into()
+        } else if delete_armed {
+            "press Shift+Delete again to delete permanently (no undo)".into()
         } else {
             self.status.clone()
         };
         let status_color = if error_status {
             theme::error()
-        } else if self.busy || purge_armed {
+        } else if self.busy || purge_armed || delete_armed {
             theme::accent()
         } else {
             theme::text_dim()
@@ -2438,6 +2663,7 @@ impl Render for Browser {
             .bg(theme::bg())
             .text_color(theme::text())
             .children(self.conflict_overlay(cx))
+            .children(self.props_overlay(cx))
             .child(
                 div()
                     .w(px(170.))
@@ -2595,6 +2821,19 @@ impl Render for Browser {
                                             .text_color(theme::text_dim()),
                                     ),
                             )
+                            .child(
+                                div()
+                                    .id("new-file")
+                                    .cursor_pointer()
+                                    .hover(|this| this.text_color(theme::text()))
+                                    .on_click(cx.listener(|this, _, _, cx| this.new_file(cx)))
+                                    .child(
+                                        svg()
+                                            .path("icons/square_plus.svg")
+                                            .size(px(16.))
+                                            .text_color(theme::text_dim()),
+                                    ),
+                            )
                             .child(if self.path_editing {
                                 let cursor =
                                     if self.path_buffer.is_char_boundary(self.path_cursor) {
@@ -2708,7 +2947,7 @@ impl Render for Browser {
                                     let tab = this.tab_mut();
                                     tab.selection.clear();
                                     tab.cursor = None;
-                                    this.purge_armed = None;
+                                    this.disarm();
                                     cx.notify();
                                 }
                             },
@@ -2873,7 +3112,7 @@ impl Render for Browser {
                                 div()
                                     .flex_none()
                                     .text_color(theme::text_dim())
-                                    .child("Enter open · F2 rename · Del trash · Ctrl+C/X/V · Ctrl+Z undo · Ctrl+H hidden · Ctrl+1/2 views"),
+                                    .child("Enter open · F2 rename · Del trash · Shift+Del delete · Alt+Enter info · Ctrl+C/X/V/Z · Ctrl+H hidden · Ctrl+1/2 views · type to filter"),
                             ),
                     ),
             )
@@ -2926,6 +3165,39 @@ fn utc_date(secs: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// One label/value line in the properties card.
+fn prop_row(label: &str, value: String) -> Div {
+    div()
+        .flex()
+        .gap_3()
+        .child(
+            div()
+                .w(px(90.))
+                .flex_none()
+                .text_color(theme::text_dim())
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(theme::text())
+                .child(value),
+        )
+}
+
+fn mode_string(mode: u32) -> String {
+    let mut out = String::with_capacity(9);
+    for shift in [6, 3, 0] {
+        let bits = (mode >> shift) & 7;
+        out.push(if bits & 4 != 0 { 'r' } else { '-' });
+        out.push(if bits & 2 != 0 { 'w' } else { '-' });
+        out.push(if bits & 1 != 0 { 'x' } else { '-' });
+    }
+    out
 }
 
 fn now_secs() -> i64 {
