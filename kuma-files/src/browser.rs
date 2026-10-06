@@ -234,7 +234,7 @@ struct MenuItem {
 
 /// What a menu item does when clicked. Dispatched through
 /// `run_menu_action`, so the menu and the keyboard share handlers.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuAction {
     Open,
     Rename,
@@ -2375,7 +2375,14 @@ impl Browser {
             self.load_source(Source::Dir(entry.path.clone()), cx);
         } else {
             match Command::new("xdg-open").arg(&entry.path).spawn() {
-                Ok(_) => self.status = format!("opened {}", entry.name),
+                Ok(mut child) => {
+                    // reap from a throwaway thread so the opener never
+                    // lingers as a zombie under our pid
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    self.status = format!("opened {}", entry.name);
+                }
                 Err(err) => {
                     log::error!("xdg-open {}: {err}", entry.path.display());
                     self.status = format!("open failed: {err}");
@@ -3247,6 +3254,13 @@ impl Browser {
                     .cursor_pointer()
                     .text_color(theme::text())
                     .hover(|this| this.bg(theme::row_hover()))
+                    // eat the downs so the backdrop behind does not
+                    // close the menu mid-click: gpui dispatches bubble
+                    // handlers last-painted first, so the item's own
+                    // down runs before the backdrop's and stopping
+                    // here keeps the menu open until the click lands
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.run_menu_action(action, cx)
                     }))
