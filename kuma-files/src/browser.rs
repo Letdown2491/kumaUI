@@ -49,6 +49,8 @@ struct Entry {
 enum Source {
     Dir(PathBuf),
     Trash,
+    /// Virtual listing backed by ~/.local/share/recently-used.xbel
+    Recent,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,6 +71,7 @@ impl PartialEq for Source {
         match (self, other) {
             (Source::Dir(a), Source::Dir(b)) => a == b,
             (Source::Trash, Source::Trash) => true,
+            (Source::Recent, Source::Recent) => true,
             _ => false,
         }
     }
@@ -83,6 +86,7 @@ impl Source {
                     |n| n.to_string_lossy().into_owned(),
                 ),
             Source::Trash => "Trash".into(),
+            Source::Recent => "Recent".into(),
         }
     }
 }
@@ -389,6 +393,8 @@ fn copy_dir_all(from: &Path, to: &Path) -> io::Result<()> {
 struct Place {
     name: String,
     path: PathBuf,
+    /// pinned through the GTK bookmarks file (removable)
+    bookmark: bool,
 }
 
 /// Snapshot for the properties dialog.
@@ -425,7 +431,7 @@ impl MenuItem {
 
 /// What a menu item does when clicked. Dispatched through
 /// `run_menu_action`, so the menu and the keyboard share handlers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum MenuAction {
     Open,
     OpenWith,
@@ -449,6 +455,12 @@ enum MenuAction {
     SortSize,
     SortModified,
     ToggleHidden,
+    /// Pin a folder in the GTK bookmarks file.
+    Bookmark(PathBuf),
+    /// Unpin a bookmarked folder.
+    Unbookmark(PathBuf),
+    /// Drop a file from the recency list.
+    Forget,
 }
 
 /// A paste that may collide with an existing file, resolved by the
@@ -689,6 +701,7 @@ impl Browser {
                 places.push(Place {
                     name: name.into(),
                     path,
+                    bookmark: false,
                 });
             }
         };
@@ -715,6 +728,7 @@ impl Browser {
                     Place {
                         name,
                         path: entry.path(),
+                        bookmark: false,
                     }
                 })
                 .collect();
@@ -730,6 +744,24 @@ impl Browser {
             let mut media = PathBuf::from("/run/media");
             media.push(user);
             mount_root(media, &mut places);
+        }
+
+        // pinned folders ride the GTK bookmarks file, so Thunar and
+        // Nautilus agree with us about what is pinned
+        for (path, name) in Self::read_bookmarks() {
+            if !path.is_dir() {
+                continue;
+            }
+            let name = name.unwrap_or_else(|| {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            });
+            places.push(Place {
+                name,
+                path,
+                bookmark: true,
+            });
         }
         places
     }
@@ -952,6 +984,140 @@ impl Browser {
         self.load_source(Source::Trash, cx);
     }
 
+    fn open_recent(&mut self, cx: &mut Context<Self>) {
+        self.load_source(Source::Recent, cx);
+    }
+
+    /// The GTK bookmarks file, parsed. Missing file just means none.
+    fn read_bookmarks() -> Vec<(PathBuf, Option<String>)> {
+        match bookmarks_path().and_then(|path| fs::read_to_string(path).ok()) {
+            Some(text) => parse_bookmarks(&text),
+            None => Vec::new(),
+        }
+    }
+
+    /// Pin a folder. Existing pin for the same dir is a no-op.
+    fn add_bookmark(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let mut marks = Self::read_bookmarks();
+        if marks.iter().any(|(path, _)| *path == dir) {
+            self.status = "already bookmarked".into();
+            cx.notify();
+            return;
+        }
+        marks.push((dir.clone(), None));
+        if let Err(err) = Self::write_bookmarks(&marks) {
+            log::error!("bookmark write: {err}");
+            self.status = format!("bookmark failed: {err}");
+        } else {
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string());
+            self.status = format!("bookmarked {name}");
+        }
+        self.refresh_places_now();
+        cx.notify();
+    }
+
+    /// Unpin a folder pinned through the bookmarks file.
+    fn remove_bookmark(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let marks: Vec<_> = Self::read_bookmarks()
+            .into_iter()
+            .filter(|(path, _)| *path != dir)
+            .collect();
+        if let Err(err) = Self::write_bookmarks(&marks) {
+            log::error!("bookmark write: {err}");
+            self.status = format!("bookmark failed: {err}");
+        } else {
+            self.status = "bookmark removed".into();
+        }
+        self.refresh_places_now();
+        cx.notify();
+    }
+
+    /// Rewrite the bookmarks file, preserving custom names. Other
+    /// apps' non-file lines (sftp and friends) are kept untouched.
+    fn write_bookmarks(marks: &[(PathBuf, Option<String>)]) -> std::io::Result<()> {
+        let Some(path) = bookmarks_path() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut text = String::new();
+        for (path, name) in marks {
+            text.push_str(&path_uri(path));
+            if let Some(name) = name {
+                text.push(' ');
+                text.push_str(name);
+            }
+            text.push('\n');
+        }
+        fs::write(path, text)
+    }
+
+    fn refresh_places_now(&mut self) {
+        self.places = Self::places();
+        self.places_refresh = Instant::now();
+    }
+
+    /// The recency list from the xbel store, newest first.
+    fn read_recents() -> Vec<RecentEntry> {
+        match recent_xbel_path().and_then(|path| fs::read_to_string(path).ok()) {
+            Some(text) => parse_xbel(&text),
+            None => Vec::new(),
+        }
+    }
+
+    /// Record an opened file in the xbel store, newest first, capped.
+    fn note_recent(&mut self, path: &Path) {
+        let Some(store) = recent_xbel_path() else {
+            return;
+        };
+        let entries = Self::read_recents();
+        let entries = merge_recent(entries, path.to_path_buf(), now_secs(), 1000);
+        if let Some(parent) = store.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            log::error!("recent dir: {err}");
+            return;
+        }
+        if let Err(err) = fs::write(&store, xbel_text(&entries)) {
+            log::error!("recent write: {err}");
+        }
+        // viewing the Recent list should reflect the open right away
+        if self.tab().source == Source::Recent {
+            let show_hidden = self.show_hidden;
+            self.tab_mut().reload(show_hidden);
+        }
+    }
+
+    /// Drop one file from the recency list (the Recent row menu's
+    /// "Forget").
+    fn forget_recent(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .tab()
+            .cursor
+            .and_then(|ix| self.tab().entries.get(ix))
+            .map(|entry| entry.path.clone())
+        else {
+            return;
+        };
+        let entries: Vec<_> = Self::read_recents()
+            .into_iter()
+            .filter(|entry| entry.path != path)
+            .collect();
+        if let Some(store) = recent_xbel_path()
+            && let Err(err) = fs::write(&store, xbel_text(&entries))
+        {
+            log::error!("recent write: {err}");
+        }
+        let show_hidden = self.show_hidden;
+        self.tab_mut().reload(show_hidden);
+        self.status = "forgotten".into();
+        cx.notify();
+    }
+
     /// The path bar as clickable crumbs: every ancestor is a jump
     /// target, the current segment opens the path editor. A
     /// home-prefixed path renders from ~ onward.
@@ -962,7 +1128,7 @@ impl Browser {
                 .flex_1()
                 .min_w_0()
                 .text_color(theme::text())
-                .child("Trash");
+                .child(self.tab().source.label());
         };
 
         let home = dirs::home_dir();
@@ -1261,6 +1427,26 @@ impl Browser {
         self.active = self.tabs.len() - 1;
         self.tabs.last_mut().unwrap().reload(self.show_hidden);
         self.status.clear();
+        self.save_state();
+        cx.notify();
+    }
+
+    /// A dir request from a second launch: open it as a new tab in
+    /// the first window.
+    pub(crate) fn open_dir_in_new_tab(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if !dir.is_dir() {
+            self.status = format!("not a directory: {}", dir.display());
+            cx.notify();
+            return;
+        }
+        let mut tab = Tab::new(Source::Dir(dir));
+        let current = self.tab();
+        tab.view_mode = current.view_mode;
+        tab.sort_key = current.sort_key;
+        tab.sort_asc = current.sort_asc;
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        self.tabs.last_mut().unwrap().reload(self.show_hidden);
         self.save_state();
         cx.notify();
     }
@@ -1660,7 +1846,7 @@ impl Browser {
     /// Open the compress dialog over the current selection.
     fn open_compress_dialog(&mut self, cx: &mut Context<Self>) {
         self.menu = None;
-        if self.tab().source != Source::Trash && !self.tab().selection.is_empty() {
+        if matches!(self.tab().source, Source::Dir(_)) && !self.tab().selection.is_empty() {
             let default_name = self
                 .tab()
                 .entries
@@ -2394,6 +2580,38 @@ impl Tab {
                     self.entries.clear();
                 }
             },
+            Source::Recent => {
+                // the xbel store is the listing, newest first; capped
+                // well below what the store may hold so we do not stat
+                // thousands of dead screenshots
+                let mut recents = Browser::read_recents();
+                recents.sort_by(|a, b| b.modified.cmp(&a.modified));
+                recents.truncate(200);
+                let mut entries = Vec::new();
+                for recent in recents {
+                    // gone files do not belong in the listing
+                    let Ok(meta) = fs::symlink_metadata(&recent.path) else {
+                        continue;
+                    };
+                    let name = recent
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| recent.path.display().to_string());
+                    entries.push(Entry {
+                        key: recent.path.clone(),
+                        path: recent.path,
+                        name,
+                        // recent files are files; pinned dirs live in
+                        // the bookmarks section of the sidebar
+                        is_dir: false,
+                        size: Some(meta.len()),
+                        modified: Some(recent.modified),
+                        item: None,
+                    });
+                }
+                self.entries = entries;
+            }
             Source::Trash => {
                 let items = match os_limited::list() {
                     Ok(items) => items,
@@ -2444,7 +2662,7 @@ impl Tab {
     fn current_dir(&self) -> Option<&Path> {
         match &self.source {
             Source::Dir(dir) => Some(dir.as_path()),
-            Source::Trash => None,
+            Source::Trash | Source::Recent => None,
         }
     }
 }
@@ -2930,6 +3148,9 @@ impl Browser {
                         let _ = child.wait();
                     });
                     self.status = format!("opened {}", entry.name);
+                    // freedesktop recency: other file managers and the
+                    // shell read the same store
+                    self.note_recent(&entry.path);
                 }
                 Err(err) => {
                     log::error!("xdg-open {}: {err}", entry.path.display());
@@ -2941,7 +3162,7 @@ impl Browser {
     }
 
     fn start_rename(&mut self, cx: &mut Context<Self>) {
-        if self.tab().source == Source::Trash {
+        if !matches!(self.tab().source, Source::Dir(_)) {
             return;
         }
         let tab = self.tab_mut();
@@ -3129,8 +3350,10 @@ impl Browser {
                     }
                     let items = if in_trash {
                         Self::trash_menu_items()
+                    } else if this.tab().source == Source::Recent {
+                        Self::recent_menu_items()
                     } else {
-                        Self::row_menu_items(entry_is_dir, entry_is_archive)
+                        Self::row_menu_items(entry_is_dir, entry_is_archive, &menu_key)
                     };
                     this.open_menu(
                         f32::from(event.position.x),
@@ -3390,8 +3613,10 @@ impl Browser {
                     }
                     let items = if in_trash {
                         Self::trash_menu_items()
+                    } else if this.tab().source == Source::Recent {
+                        Self::recent_menu_items()
                     } else {
-                        Self::row_menu_items(entry_is_dir, entry_is_archive)
+                        Self::row_menu_items(entry_is_dir, entry_is_archive, &menu_key)
                     };
                     this.open_menu(
                         f32::from(event.position.x),
@@ -3446,6 +3671,8 @@ impl Browser {
     fn place_row(&self, ix: usize, place: &Place, cx: &mut Context<Self>) -> Stateful<Div> {
         let here = self.tab().current_dir() == Some(place.path.as_path());
         let path = place.path.clone();
+        let unbookmark_path = place.path.clone();
+        let bookmarked = place.bookmark;
         div()
             .id(format!("place-{ix}"))
             .px_3()
@@ -3467,7 +3694,23 @@ impl Browser {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.load_source(Source::Dir(path.clone()), cx);
             }))
-            .flex()
+            // pinned places can be unpinned from their row menu
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    if bookmarked {
+                        this.open_menu(
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                            vec![MenuItem::new(
+                                "Remove Bookmark",
+                                MenuAction::Unbookmark(unbookmark_path.clone()),
+                            )],
+                        );
+                        cx.notify();
+                    }
+                }),
+            )            .flex()
             .items_center()
             .gap_2()
             .child(
@@ -3797,7 +4040,7 @@ impl Browser {
             .shadow_lg()
             .text_size(px(13.));
         for (i, item) in menu.items.iter().enumerate() {
-            let action = item.action;
+            let action = item.action.clone();
             let mut row = div()
                 .id(format!("menu-item-{i}"))
                 .debug_selector(|| "menu-item-row".into())
@@ -3820,7 +4063,11 @@ impl Browser {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
             // in the open-with picker, right-click makes the app the
             // default handler for the file's type (mimeapps.list)
-            if let MenuAction::OpenWithApp(ix) = action {
+            let open_with_ix = match &action {
+                MenuAction::OpenWithApp(ix) => Some(*ix),
+                _ => None,
+            };
+            if let Some(ix) = open_with_ix {
                 row = row.on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -3841,7 +4088,7 @@ impl Browser {
             }
             panel = panel.child(
                 row.child(item.label.clone()).on_click(
-                    cx.listener(move |this, _, _, cx| this.run_menu_action(action, cx)),
+                    cx.listener(move |this, _, _, cx| this.run_menu_action(action.clone(), cx)),
                 ),
             );
         }
@@ -4063,6 +4310,9 @@ impl Browser {
             MenuAction::SortSize => self.set_sort(SortKey::Size, cx),
             MenuAction::SortModified => self.set_sort(SortKey::Modified, cx),
             MenuAction::ToggleHidden => self.toggle_hidden(cx),
+            MenuAction::Bookmark(dir) => self.add_bookmark(dir, cx),
+            MenuAction::Unbookmark(dir) => self.remove_bookmark(dir, cx),
+            MenuAction::Forget => self.forget_recent(cx),
         }
     }
 
@@ -4070,7 +4320,7 @@ impl Browser {
         self.menu = Some(ContextMenu { x, y, items, hint: None });
     }
 
-    fn row_menu_items(is_dir: bool, archive: bool) -> Vec<MenuItem> {
+    fn row_menu_items(is_dir: bool, archive: bool, path: &Path) -> Vec<MenuItem> {
         let mut items = vec![MenuItem::new("Open", MenuAction::Open)];
         if !is_dir {
             items.push(MenuItem::new("Open With…", MenuAction::OpenWith));
@@ -4084,6 +4334,15 @@ impl Browser {
             MenuItem::new("Cut", MenuAction::Cut),
             MenuItem::new("Copy Path", MenuAction::CopyPath),
             MenuItem::new("Copy URI", MenuAction::CopyUri),
+        ]);
+        // pinning only means something for directories
+        if is_dir {
+            items.push(MenuItem::new(
+                "Add Bookmark",
+                MenuAction::Bookmark(path.to_path_buf()),
+            ));
+        }
+        items.extend([
             MenuItem::new("Compress…", MenuAction::Compress),
             MenuItem::new("Trash", MenuAction::Trash),
             MenuItem::new("Delete permanently", MenuAction::Delete),
@@ -4100,15 +4359,39 @@ impl Browser {
         ]
     }
 
-    fn empty_menu_items(in_trash: bool) -> Vec<MenuItem> {
-        let mut items = vec![
-            MenuItem::new("New Folder", MenuAction::NewFolder),
-            MenuItem::new("New File", MenuAction::NewFile),
-            MenuItem::new("Paste", MenuAction::Paste),
-        ];
-        // a terminal has no meaning in the trash listing
-        if !in_trash {
-            items.push(MenuItem::new("Open Terminal Here", MenuAction::Terminal));
+    fn recent_menu_items() -> Vec<MenuItem> {
+        vec![
+            MenuItem::new("Open", MenuAction::Open),
+            MenuItem::new("Open With…", MenuAction::OpenWith),
+            MenuItem::new("Copy", MenuAction::Copy),
+            MenuItem::new("Copy Path", MenuAction::CopyPath),
+            MenuItem::new("Copy URI", MenuAction::CopyUri),
+            MenuItem::new("Forget", MenuAction::Forget),
+            MenuItem::new("Properties", MenuAction::Info),
+        ]
+    }
+
+    fn empty_menu_items(source: &Source) -> Vec<MenuItem> {
+        let mut items = Vec::new();
+        match source {
+            Source::Dir(dir) => items.extend([
+                MenuItem::new("New Folder", MenuAction::NewFolder),
+                MenuItem::new("New File", MenuAction::NewFile),
+                MenuItem::new("Paste", MenuAction::Paste),
+                MenuItem::new(
+                    "Bookmark This Folder",
+                    MenuAction::Bookmark(dir.to_path_buf()),
+                ),
+                MenuItem::new("Open Terminal Here", MenuAction::Terminal),
+            ]),
+            // preserve the long-standing trash behavior: the file ops
+            // target the selection, paste is inert without a clipboard
+            Source::Trash => items.extend([
+                MenuItem::new("New Folder", MenuAction::NewFolder),
+                MenuItem::new("New File", MenuAction::NewFile),
+                MenuItem::new("Paste", MenuAction::Paste),
+            ]),
+            Source::Recent => {}
         }
         items.extend([
             MenuItem::new("Sort by Name", MenuAction::SortName),
@@ -4376,6 +4659,7 @@ impl Render for Browser {
         }
 
         let in_trash = self.tab().source == Source::Trash;
+        let in_recent = self.tab().source == Source::Recent;
         let error_status = self.status.contains("failed") || self.status.contains("cannot");
         let purge_armed = self
             .purge_armed
@@ -4471,6 +4755,42 @@ impl Render for Browser {
                     .border_r_1()
                     .border_color(theme::border())
                     .children(places)
+                    .child(
+                        div()
+                            .id("place-recent")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .text_size(px(13.))
+                            .cursor_pointer()
+                            .text_color(if in_recent {
+                                theme::accent()
+                            } else {
+                                theme::text_dim()
+                            })
+                            .bg(if in_recent {
+                                theme::row_selected()
+                            } else {
+                                theme::clear()
+                            })
+                            .hover(|this| this.bg(theme::row_hover()))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_recent(cx)))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                svg()
+                                    .path("icons/clock.svg")
+                                    .size(px(14.))
+                                    .flex_none()
+                                    .text_color(if in_recent {
+                                        theme::accent()
+                                    } else {
+                                        theme::text_dim()
+                                    }),
+                            )
+                            .child("Recent"),
+                    )
                     .child(
                         div()
                             .id("place-trash")
@@ -4813,12 +5133,11 @@ impl Render for Browser {
                                     .on_mouse_down(
                                         MouseButton::Right,
                                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            let source = this.tab().source.clone();
                                             this.open_menu(
                                                 f32::from(event.position.x),
                                                 f32::from(event.position.y),
-                                                Self::empty_menu_items(
-                                                    this.tab().source == Source::Trash,
-                                                ),
+                                                Self::empty_menu_items(&source),
                                             );
                                             cx.notify();
                                         }),
@@ -4847,12 +5166,11 @@ impl Render for Browser {
                                     .on_mouse_down(
                                         MouseButton::Right,
                                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            let source = this.tab().source.clone();
                                             this.open_menu(
                                                 f32::from(event.position.x),
                                                 f32::from(event.position.y),
-                                                Self::empty_menu_items(
-                                                    this.tab().source == Source::Trash,
-                                                ),
+                                                Self::empty_menu_items(&source),
                                             );
                                             cx.notify();
                                         }),
@@ -5369,6 +5687,230 @@ fn path_uri(path: &Path) -> String {
         }
     }
     uri
+}
+
+/// The inverse of path_uri for file:// URIs from gtk bookmarks and
+/// recent-files xbel. Undecodable bytes become replacement chars.
+fn uri_decode(uri: &str) -> PathBuf {
+    let uri = uri.strip_prefix("file://").unwrap_or(uri);
+    let mut out: Vec<u8> = Vec::with_capacity(uri.len());
+    let mut chars = uri.as_bytes().iter().copied();
+    while let Some(byte) = chars.next() {
+        if byte == b'%' {
+            let hex = [chars.next(), chars.next()];
+            if let [Some(hi), Some(lo)] = hex {
+                if let Some(value) = (hi as char).to_digit(16).and_then(|hi| {
+                    (lo as char).to_digit(16).map(|lo| hi * 16 + lo)
+                }) {
+                    out.push(value as u8);
+                    continue;
+                }
+            }
+            out.push(byte);
+        } else {
+            out.push(byte);
+        }
+    }
+    PathBuf::from(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Escape text for XML attribute/character data (xbel hrefs).
+fn xml_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// One recently-used file: where it lives and when we last opened it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecentEntry {
+    path: PathBuf,
+    modified: i64,
+}
+
+/// The recently-used store: the freedesktop xbel other GTK apps write.
+fn recent_xbel_path() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("recently-used.xbel"))
+}
+
+/// Days since 1970-01-01 from a civil date (Howard Hinnant's
+/// days_from_civil); the arithmetic works for all of the common era.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The inverse: a civil date from days since the epoch.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// ISO 8601 UTC ("2026-10-06T09:15:00Z") to unix seconds. Fractional
+/// seconds and offsets are tolerated by taking the fields literally.
+fn iso_to_secs(text: &str) -> Option<i64> {
+    let text = text.trim().trim_end_matches('Z');
+    let (date, time) = text.split_once('T')?;
+    let time = time.split('.').next()?.trim_end_matches('Z');
+    let mut date = date.split('-');
+    let year: i64 = date.next()?.parse().ok()?;
+    let month: i64 = date.next()?.parse().ok()?;
+    let day: i64 = date.next()?.parse().ok()?;
+    let mut time = time.split(':');
+    let hour: i64 = time.next()?.parse().ok()?;
+    let minute: i64 = time.next()?.parse().ok()?;
+    let second: i64 = time.next().unwrap_or("0").parse().ok()?;
+    Some(days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Unix seconds back to ISO 8601 UTC, the shape GTK writes.
+fn secs_to_iso(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+/// Parse the bookmark entries out of an xbel document. Tolerant of
+/// single-line or multi-line forms: each <bookmark ...> starts a
+/// segment whose attributes run to the first '>'. Timestamps come
+/// from the spec's `visited` ISO attribute, falling back to a unix
+/// `timestamp` some writers use.
+fn parse_xbel(text: &str) -> Vec<RecentEntry> {
+    let mut out: Vec<RecentEntry> = Vec::new();
+    for segment in text.split("<bookmark ").skip(1) {
+        let Some((attrs, _)) = segment.split_once('>') else {
+            continue;
+        };
+        let Some(href) = attr_value(attrs, "href") else {
+            continue;
+        };
+        let Some(path) = href.strip_prefix("file://").map(uri_decode) else {
+            continue;
+        };
+        let modified = attr_value(attrs, "visited")
+            .and_then(|ts| iso_to_secs(&ts))
+            .or_else(|| {
+                attr_value(attrs, "timestamp").and_then(|ts| ts.parse::<i64>().ok())
+            })
+            .unwrap_or(0);
+        // a file may appear more than once (appended by different
+        // apps); keep the newest visit
+        match out.iter_mut().find(|entry| entry.path == path) {
+            Some(existing) => existing.modified = existing.modified.max(modified),
+            None => out.push(RecentEntry {
+                path,
+                modified,
+            }),
+        }
+    }
+    out
+}
+
+/// One attribute out of a tag's attribute text: name="value".
+fn attr_value(attrs: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = attrs.find(&needle)? + needle.len();
+    let rest = &attrs[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Merge one open into the recency list: bump to front, newest
+/// first, capped so our writes stay bounded (the store may hold
+/// thousands of entries other apps put there).
+fn merge_recent(
+    mut entries: Vec<RecentEntry>,
+    path: PathBuf,
+    timestamp: i64,
+    cap: usize,
+) -> Vec<RecentEntry> {
+    entries.retain(|entry| entry.path != path);
+    entries.insert(0, RecentEntry {
+        path,
+        modified: timestamp,
+    });
+    entries.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.path.cmp(&b.path)));
+    entries.truncate(cap);
+    entries
+}
+
+/// Serialize recency entries back to the xbel shape GTK expects:
+/// ISO `visited` on the bookmark, plus a bookmark:application child
+/// carrying the same time in `modified`.
+fn xbel_text(entries: &[RecentEntry]) -> String {
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n\
+         <xbel version=\"1.0\"\n\
+         \x20     xmlns:bookmark=\"http://www.freedesktop.org/standards/desktop-bookmarks\"\n\
+         \x20     xmlns:mime=\"http://www.freedesktop.org/standards/thumbnail-module\">\n",
+    );
+    for entry in entries {
+        let iso = secs_to_iso(entry.modified);
+        out.push_str(&format!(
+            "  <bookmark href=\"{}\" visited=\"{}\">\n    <info>\n      <metadata owner=\"http://freedesktop.org\">\n        <bookmark:applications>\n          <bookmark:application name=\"kuma-files\" exec=\"&apos;kuma-files&apos; %u\" modified=\"{}\" count=\"1\"/>\n        </bookmark:applications>\n      </metadata>\n    </info>\n  </bookmark>\n",
+            xml_escape(&path_uri(&entry.path)),
+            iso,
+            iso,
+        ));
+    }
+    out.push_str("</xbel>\n");
+    out
+}
+
+/// The GTK bookmarks file: one file:// URI per line, optional custom
+/// name after a space.
+fn bookmarks_path() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("gtk-3.0/bookmarks"))
+}
+
+/// Parse bookmarks lines into (path, custom name) pairs. Non-file
+/// URIs (sftp and friends from other apps) are kept out; we only pin
+/// local dirs.
+fn parse_bookmarks(text: &str) -> Vec<(PathBuf, Option<String>)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let (uri, name) = match line.split_once(' ') {
+                Some((uri, name)) => (uri, Some(name.trim().to_string()).filter(|n| !n.is_empty())),
+                None => (line, None),
+            };
+            if !uri.starts_with("file://") {
+                return None;
+            }
+            let path = uri_decode(uri);
+            Some((path, name))
+        })
+        .collect()
 }
 
 /// A human kind for the info panel: folder, or an extension-mapped
@@ -6179,6 +6721,109 @@ mod tests {
         Browser::set_zip_format(&mut dialog, false);
         assert_eq!(dialog.name, "backup 2026");
     }
+    #[test]
+    fn bookmarks_parse_custom_names_and_uris() {
+        let text = "\
+file:///home/martin/Documents
+file:///home/martin/My%20Projects pen
+sftp://remote/share skip-me
+";
+        let marks = parse_bookmarks(text);
+        assert_eq!(marks.len(), 2, "non-file lines are kept out");
+        assert_eq!(marks[0].0, PathBuf::from("/home/martin/Documents"));
+        assert_eq!(marks[0].1, None);
+        assert_eq!(marks[1].0, PathBuf::from("/home/martin/My Projects"));
+        assert_eq!(marks[1].1, Some("pen".into()));
+    }
+
+    #[test]
+    fn bookmarks_round_trip_through_the_file_format() {
+        let dir = PathBuf::from("/home/martin/My Projects");
+        let marks: Vec<(PathBuf, Option<String>)> = vec![
+            (dir.clone(), Some("projects".to_string())),
+            (PathBuf::from("/tmp"), None),
+        ];
+        let text = marks
+            .iter()
+            .map(|(path, name)| match name {
+                Some(name) => format!("{} {name}", path_uri(path)),
+                None => path_uri(path),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = parse_bookmarks(&text);
+        assert_eq!(parsed[0], (dir, Some("projects".into())));
+        assert_eq!(parsed[1], (PathBuf::from("/tmp"), None));
+    }
+
+    #[test]
+    fn xbel_parses_gtk_style_documents() {
+        let text = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n\
+<xbel version=\"1.0\"\n\
+      xmlns:bookmark=\"http://www.freedesktop.org/standards/desktop-bookmarks\">\n\
+  <bookmark href=\"file:///home/martin/notes.md\" visited=\"2026-10-05T09:30:00Z\">\n\
+    <info>\n\
+      <metadata owner=\"http://freedesktop.org\">\n\
+        <bookmark:application name=\"kuma-files\" exec=\"&apos;kuma-files&apos; %u\" modified=\"2026-10-05T09:30:00Z\" count=\"1\"/>\n\
+      </metadata>\n\
+    </info>\n\
+  </bookmark>\n\
+  <bookmark href=\"file:///home/martin/My%20Reports/q1.odt\" timestamp=\"1700000100\">\n\
+    <info>\n\
+      <metadata owner=\"http://freedesktop.org\"/>\n\
+    </info>\n\
+  </bookmark>\n\
+</xbel>\n";
+        let entries = parse_xbel(text);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, PathBuf::from("/home/martin/notes.md"));
+        // 2026-10-05T09:30:00Z as unix seconds
+        assert_eq!(entries[0].modified, 1791192600);
+        assert_eq!(entries[1].path, PathBuf::from("/home/martin/My Reports/q1.odt"));
+        // unix timestamps still parse for older writers
+        assert_eq!(entries[1].modified, 1700000100);
+    }
+
+    #[test]
+    fn iso_timestamps_round_trip() {
+        for secs in [0i64, 1700000100, 1791287000, 253402300799] {
+            assert_eq!(iso_to_secs(&secs_to_iso(secs)), Some(secs));
+        }
+        assert_eq!(iso_to_secs("not a date"), None);
+        // gnome-shell writes fractional seconds
+        assert_eq!(
+            iso_to_secs("2026-05-23T21:55:35.626342Z"),
+            iso_to_secs("2026-05-23T21:55:35Z")
+        );
+    }
+
+    #[test]
+    fn recent_merge_bumps_to_front_and_caps() {
+        let a = PathBuf::from("/tmp/a.txt");
+        let b = PathBuf::from("/tmp/b.txt");
+        let c = PathBuf::from("/tmp/c.txt");
+        let entries = merge_recent(Vec::new(), a.clone(), 1, 3);
+        let entries = merge_recent(entries, b.clone(), 2, 3);
+        let entries = merge_recent(entries, a.clone(), 9, 3);
+        // a moved to the front, not duplicated
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, a);
+        assert_eq!(entries[0].modified, 9);
+        let entries = merge_recent(entries, c.clone(), 10, 3);
+        let entries = merge_recent(entries, b.clone(), 11, 3);
+        assert_eq!(entries.len(), 3, "cap holds");
+        assert_eq!(entries[0].path, b);
+        assert_eq!(entries[1].path, c, "ties and order fall out of the sort");
+        // serializing and re-parsing gives the same list back
+        let round = parse_xbel(&xbel_text(&entries));
+        assert_eq!(round, entries);
+    }
+
+    #[test]
+    fn uri_decode_undoes_path_uri() {
+        let path = PathBuf::from("/tmp/opencode/my files/report 2026é.md");
+        assert_eq!(uri_decode(&path_uri(&path)), path);
+    }
 }
 
 /// Minimal harness for the menu dispatch question: does a left click
@@ -6297,7 +6942,7 @@ mod overlay_click_repro {
 #[cfg(test)]
 mod browser_menu_repro {
     use super::*;
-    use gpui::{point, TestApp};
+    use gpui::point;
 
     #[test]
     fn menu_item_click_dispatches_action() {
