@@ -1216,6 +1216,7 @@ impl Browser {
         }
         candidates.extend([
             "xdg-terminal-exec".into(),
+            "ptyxis".into(),
             "kgx".into(),
             "gnome-terminal".into(),
             "konsole".into(),
@@ -1227,6 +1228,7 @@ impl Browser {
         for name in candidates {
             match Command::new(&name).current_dir(&dir).spawn() {
                 Ok(mut child) => {
+                    log::info!("terminal: spawned {name} in {}", dir.display());
                     // reap from a throwaway thread so the shell never
                     // lingers as a zombie under our pid
                     std::thread::spawn(move || {
@@ -1236,8 +1238,12 @@ impl Browser {
                     cx.notify();
                     return;
                 }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    log::info!("terminal: {name} not found");
+                    continue;
+                }
                 Err(err) => {
+                    log::info!("terminal: {name} failed: {err}");
                     self.status = format!("terminal: {err}");
                     cx.notify();
                     return;
@@ -1258,8 +1264,9 @@ impl Browser {
             .empty_armed
             .is_some_and(|armed| armed.elapsed() <= PURGE_ARM);
         if !armed {
+            // the button itself turns red and asks; nothing in the
+            // status bar, so it never lingers after the arm window
             self.empty_armed = Some(Instant::now());
-            self.status = "click again to empty the trash (no undo)".into();
             cx.notify();
             return;
         }
@@ -3942,7 +3949,7 @@ impl Render for Browser {
                                         this.run_menu_action(MenuAction::EmptyTrash, cx)
                                     }))
                                     .child(if armed {
-                                        "confirm: empty trash"
+                                        "Are you sure?"
                                     } else {
                                         "Empty Trash"
                                     })
@@ -4196,13 +4203,6 @@ impl Render for Browser {
                                     .truncate()
                                     .child(format!("filter: {} (Esc clears)", self.filter))
                             })
-                            .child(match &free_text {
-                                Some(text) => div()
-                                    .flex_none()
-                                    .text_color(theme::text_dim())
-                                    .child(text.clone()),
-                                None => div(),
-                            })
                             .child(match cursor_info {
                                 Some(info) => div()
                                     .flex_none()
@@ -4210,6 +4210,14 @@ impl Render for Browser {
                                     .text_color(theme::text_dim())
                                     .truncate()
                                     .child(info),
+                                None => div(),
+                            })
+                            .child(match &free_text {
+                                Some(text) => div()
+                                    .flex_none()
+                                    .pl_3()
+                                    .text_color(theme::text_dim())
+                                    .child(text.clone()),
                                 None => div(),
                             }),
                     ),
