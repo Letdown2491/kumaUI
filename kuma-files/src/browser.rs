@@ -113,6 +113,10 @@ enum Op {
     Trash { paths: Vec<PathBuf> },
     Restore { items: Vec<TrashItem> },
     Purge { items: Vec<TrashItem> },
+    /// Unpack an archive into its own folder next to it.
+    Extract { archive: PathBuf, dest: PathBuf },
+    /// Pack the selection into a new archive.
+    Compress { files: Vec<PathBuf>, archive: PathBuf },
     /// A conflict resolved as Skip: filtered out before the queue runs.
     Nop,
 }
@@ -126,6 +130,8 @@ impl Op {
             Op::Trash { .. } => "trashing",
             Op::Restore { .. } => "restoring",
             Op::Purge { .. } => "purging",
+            Op::Extract { .. } => "extracting",
+            Op::Compress { .. } => "compressing",
             Op::Nop => "skipping",
         }
     }
@@ -195,6 +201,169 @@ impl Op {
                 os_limited::purge_all(items.clone()).map_err(|err| format!("purge: {err}"))?;
                 Ok(None)
             }
+            Op::Extract { archive, dest } => Self::run_extract(archive.clone(), dest.clone()),
+            Op::Compress { files, archive } => {
+                Self::run_compress(files.clone(), archive.clone())
+            }
+        }
+    }
+
+    /// Unpack an archive. Tool order: tar first (covers every tar.*),
+    /// unzip for zip, single-file decompressors for lone .gz/.bz2/...,
+    /// file-roller as the catch-all for 7z, rar, and friends.
+    fn run_extract(archive: PathBuf, dest: PathBuf) -> Result<Option<Op>, String> {
+        fs::create_dir_all(&dest).map_err(|err| format!("extract: {err}"))?;
+        let name = archive
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        let kind =
+            archive_kind(name).ok_or_else(|| format!("{name} is not an archive"))?;
+        let waited = |out: Result<std::process::Output, io::Error>,
+                      tool: &str|
+         -> Result<(), String> {
+            match out {
+                Ok(out) if out.status.success() => Ok(()),
+                Ok(out) => {
+                    let noise = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    Err(if noise.is_empty() {
+                        format!("{tool} exited with an error")
+                    } else {
+                        format!("{tool}: {noise}")
+                    })
+                }
+                Err(err) => Err(format!("{tool}: {err}")),
+            }
+        };
+        match kind {
+            "gz" | "bz2" | "xz" | "zst" => {
+                let tool = match kind {
+                    "gz" => "gzip",
+                    "bz2" => "bzip2",
+                    "xz" => "xz",
+                    _ => "zstd",
+                };
+                if have_tool(tool) {
+                    // decompress the single file into dest/<stem>
+                    let inner = dest.join(archive_stem(name).unwrap_or_else(|| name.to_string()));
+                    let file = fs::File::create(&inner)
+                        .map_err(|err| format!("extract: {err}"))?;
+                    waited(
+                        Command::new(tool)
+                            .arg("-dc")
+                            .arg(&archive)
+                            .stdout(file)
+                            .output(),
+                        tool,
+                    )?;
+                } else if have_tool("file-roller") {
+                    waited(
+                        Command::new("file-roller")
+                            .arg(format!("--extract-to={}", dest.display()))
+                            .arg("--force")
+                            .arg(&archive)
+                            .output(),
+                        "file-roller",
+                    )?;
+                } else {
+                    return Err("no extractor for this archive".into());
+                }
+            }
+            kind if kind.starts_with("tar") && have_tool("tar") => {
+                waited(
+                    Command::new("tar")
+                        .arg("-xf")
+                        .arg(&archive)
+                        .arg("-C")
+                        .arg(&dest)
+                        .output(),
+                    "tar",
+                )?;
+            }
+            "zip" if have_tool("unzip") => {
+                waited(
+                    Command::new("unzip")
+                        .args(["-oq"])
+                        .arg(&archive)
+                        .arg("-d")
+                        .arg(&dest)
+                        .output(),
+                    "unzip",
+                )?;
+            }
+            _ => {
+                if have_tool("file-roller") {
+                    waited(
+                        Command::new("file-roller")
+                            .arg(format!("--extract-to={}", dest.display()))
+                            .arg("--force")
+                            .arg(&archive)
+                            .output(),
+                        "file-roller",
+                    )?;
+                } else {
+                    return Err("no extractor for this archive".into());
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Pack the selection. tar.gz rides the universal tar; zip needs
+    /// file-roller, whose add-to infers the format from the extension.
+    fn run_compress(files: Vec<PathBuf>, archive: PathBuf) -> Result<Option<Op>, String> {
+        if files.is_empty() {
+            return Err("nothing to compress".into());
+        }
+        if archive.exists() {
+            return Err(format!("{} already exists", archive.display()));
+        }
+        let is_zip = archive
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_lowercase().ends_with(".zip"))
+            .unwrap_or(false);
+        let dir = archive
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let out = if is_zip {
+            if !have_tool("file-roller") {
+                return Err("creating zip needs file-roller".into());
+            }
+            Command::new("file-roller")
+                .arg(format!("--add-to={}", archive.display()))
+                .args(&files)
+                .output()
+        } else {
+            let basenames: Vec<&std::ffi::OsStr> = files
+                .iter()
+                .filter_map(|f| f.file_name())
+                .collect();
+            if basenames.len() != files.len() {
+                return Err("compress: bad path".into());
+            }
+            // run from the target dir so both the archive name and the
+            // source basenames resolve there: tar opens the archive
+            // relative to its own cwd before any -C takes effect
+            Command::new("tar")
+                .arg("-czf")
+                .arg(archive.file_name().unwrap_or_default())
+                .args(basenames)
+                .current_dir(&dir)
+                .output()
+        };
+        match out {
+            Ok(out) if out.status.success() => Ok(None),
+            Ok(out) => {
+                let noise = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                Err(if noise.is_empty() {
+                    "compress exited with an error".into()
+                } else {
+                    format!("compress: {noise}")
+                })
+            }
+            Err(err) => Err(format!("compress: {err}")),
         }
     }
 }
@@ -226,9 +395,9 @@ struct ContextMenu {
     items: Vec<MenuItem>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MenuItem {
-    label: &'static str,
+    label: String,
     action: MenuAction,
 }
 
@@ -237,11 +406,15 @@ struct MenuItem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuAction {
     Open,
+    OpenWith,
+    OpenWithApp(usize),
+    Extract,
     Rename,
     Copy,
     Cut,
     CopyPath,
     CopyUri,
+    Compress,
     Paste,
     Terminal,
     Trash,
@@ -316,6 +489,15 @@ struct ConflictDialog {
     apply_all: bool,
 }
 
+/// Compress dialog: target archive name, caret, format choice, and
+/// whether the zip option has a tool behind it on this machine.
+struct CompressDialog {
+    name: String,
+    cursor: usize,
+    zip: bool,
+    zip_available: bool,
+}
+
 /// "name (copy).ext", then "name (copy 2).ext", and so on. After 999
 /// colliding copies this gives up and returns `to` itself; the queue
 /// reports the "already exists" error, which is honest enough.
@@ -351,6 +533,12 @@ pub(crate) struct Browser {
     clipboard: Option<(bool, Vec<PathBuf>)>,
     undo: Vec<Op>,
     conflict_dialog: Option<ConflictDialog>,
+    /// Compress dialog state: target name, caret, and format.
+    compress: Option<CompressDialog>,
+    /// Installed applications, scanned once on first Open With.
+    desktop_apps: Option<Arc<Vec<DesktopApp>>>,
+    /// The apps listed in the open-with picker, indexed by item action.
+    openwith_apps: Vec<DesktopApp>,
     /// Info rail on the right, following the cursor entry. On by
     /// default; it only shows while an entry is selected.
     inspector: bool,
@@ -423,6 +611,9 @@ impl Browser {
             clipboard: None,
             undo: Vec::new(),
             conflict_dialog: None,
+            compress: None,
+            desktop_apps: None,
+            openwith_apps: Vec::new(),
             inspector: true,
             inspector_bottom: false,
             keys_open: false,
@@ -1254,6 +1445,169 @@ impl Browser {
         cx.notify();
     }
 
+    /// Swap the menu for the open-with picker: apps claiming the
+    /// entry's mime type, name order. The apps vec is cached.
+    fn open_with_menu(&mut self, cx: &mut Context<Self>) {
+        let (x, y) = match &self.menu {
+            Some(menu) => (menu.x, menu.y),
+            None => return,
+        };
+        let entry = self
+            .tab()
+            .cursor
+            .and_then(|ix| self.tab().entries.get(ix))
+            .cloned();
+        let Some(entry) = entry.filter(|e| !e.is_dir && e.item.is_none()) else {
+            return;
+        };
+        if self.desktop_apps.is_none() {
+            self.desktop_apps = Some(Arc::new(scan_desktop_apps()));
+        }
+        let ext = Path::new(&entry.name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        let mime = mime_for_ext(&ext);
+        self.openwith_apps = self
+            .desktop_apps
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|app| app.mimes.iter().any(|m| m == mime))
+            .cloned()
+            .collect();
+        if self.openwith_apps.is_empty() {
+            self.menu = None;
+            self.status = format!("no apps claim {mime}");
+            cx.notify();
+            return;
+        }
+        self.menu = Some(ContextMenu {
+            x,
+            y,
+            items: (0..self.openwith_apps.len())
+                .map(|ix| MenuItem {
+                    label: self.openwith_apps[ix].name.clone(),
+                    action: MenuAction::OpenWithApp(ix),
+                })
+                .collect(),
+        });
+        cx.notify();
+    }
+
+    /// Launch a picked application on the cursor entry's path.
+    fn launch_app(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.menu = None;
+        let Some(app) = self.openwith_apps.get(ix).cloned() else {
+            return;
+        };
+        let Some(entry) = self
+            .tab()
+            .cursor
+            .and_then(|entry_ix| self.tab().entries.get(entry_ix))
+            .cloned()
+        else {
+            return;
+        };
+        let argv = exec_argv(&app.exec, &entry.path, &app.name);
+        let Some((program, args)) = argv.split_first() else {
+            return;
+        };
+        match Command::new(program).args(args).spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                self.status = format!("opened with {}", app.name);
+            }
+            Err(err) => {
+                log::error!("launch {}: {err}", app.name);
+                self.status = format!("could not launch {}: {err}", app.name);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Extract the cursor entry's archive into a folder named after
+    /// it, via the op queue so busy/progress come for free.
+    fn extract_selection(&mut self, cx: &mut Context<Self>) {
+        self.menu = None;
+        let entry = self
+            .tab()
+            .cursor
+            .and_then(|ix| self.tab().entries.get(ix))
+            .cloned();
+        let Some(entry) = entry.filter(|e| !e.is_dir && e.item.is_none()) else {
+            return;
+        };
+        let Some(stem) = archive_stem(&entry.name) else {
+            self.status = "not an archive".into();
+            cx.notify();
+            return;
+        };
+        let Some(dest) = entry.path.parent().map(|dir| dir.join(stem)) else {
+            return;
+        };
+        self.enqueue(
+            vec![Op::Extract {
+                archive: entry.path.clone(),
+                dest,
+            }],
+            cx,
+        );
+    }
+
+    /// Open the compress dialog over the current selection.
+    fn open_compress_dialog(&mut self, cx: &mut Context<Self>) {
+        self.menu = None;
+        if self.tab().source != Source::Trash && !self.tab().selection.is_empty() {
+            let default_name = self
+                .tab()
+                .entries
+                .iter()
+                .find(|e| self.tab().selection.contains(&e.key))
+                .and_then(|e| e.path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "archive".into());
+            self.compress = Some(CompressDialog {
+                name: format!("{default_name}.tar.gz"),
+                cursor: 0,
+                zip: false,
+                zip_available: have_tool("file-roller"),
+            });
+            cx.notify();
+        }
+    }
+
+    /// Build the archive from the dialog: name, format, selection.
+    fn compress_create(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.compress.take() else {
+            return;
+        };
+        let name = dialog.name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+            return;
+        };
+        let archive = dir.join(&name);
+        let suffix = if dialog.zip { ".zip" } else { ".tar.gz" };
+        let archive = if name.to_lowercase().ends_with(suffix) {
+            archive
+        } else {
+            dir.join(format!("{name}{suffix}"))
+        };
+        let files: Vec<PathBuf> = self
+            .tab()
+            .entries
+            .iter()
+            .filter(|e| self.tab().selection.contains(&e.key))
+            .map(|e| e.path.clone())
+            .collect();
+        self.enqueue(vec![Op::Compress { files, archive }], cx);
+    }
+
     /// Empty the trash: purge every item. Armed like row purges:
     /// first click asks, second click within the arm window does it.
     fn empty_trash(&mut self, cx: &mut Context<Self>) {
@@ -1975,6 +2329,67 @@ impl Browser {
             return;
         }
 
+        if self.compress.is_some() {
+            let mut dialog = self.compress.take().unwrap();
+            match keystroke.key.as_str() {
+                "enter" => {
+                    self.compress = Some(dialog);
+                    self.compress_create(cx);
+                    return;
+                }
+                "escape" => {
+                    cx.notify();
+                    return;
+                }
+                "backspace" => {
+                    if dialog.cursor > 0 {
+                        let head = &dialog.name[..dialog.cursor];
+                        if let Some((prev, _)) = head.char_indices().next_back() {
+                            dialog.name.remove(prev);
+                            dialog.cursor = prev;
+                        }
+                    }
+                }
+                "left" => {
+                    if dialog.cursor > 0 {
+                        let head = &dialog.name[..dialog.cursor];
+                        if let Some((prev, _)) = head.char_indices().next_back() {
+                            dialog.cursor = prev;
+                        }
+                    }
+                }
+                "right" => {
+                    if dialog.name.is_char_boundary(dialog.cursor)
+                        && dialog.cursor < dialog.name.len()
+                    {
+                        let tail = &dialog.name[dialog.cursor..];
+                        if let Some(ch) = tail.chars().next() {
+                            dialog.cursor += ch.len_utf8();
+                        }
+                    }
+                }
+                _ if !keystroke.modifiers.control
+                    && !keystroke.modifiers.alt
+                    && !keystroke.modifiers.platform
+                    && !keystroke.modifiers.function =>
+                {
+                    if let Some(character) = keystroke.key_char.as_deref() {
+                        let cursor = if dialog.name.is_char_boundary(dialog.cursor) {
+                            dialog.cursor
+                        } else {
+                            dialog.name.len()
+                        };
+                        dialog.name.insert_str(cursor, character);
+                        dialog.cursor = cursor + character.len();
+                    }
+                }
+                _ => {}
+            }
+            self.compress = Some(dialog);
+            cx.notify();
+            return;
+        }
+
         if self.menu.is_some() {
             if keystroke.key == "escape" {
                 self.menu = None;
@@ -2519,6 +2934,8 @@ impl Browser {
         let entry_path = entry.path.clone();
         let size_text = entry.size.map(human_size).unwrap_or_default();
         let menu_key = entry_key.clone();
+        let entry_is_dir = entry.is_dir;
+        let entry_is_archive = is_archive(&entry.name);
 
         let mut base = div()
             .id(ix)
@@ -2580,7 +2997,7 @@ impl Browser {
                     let items = if in_trash {
                         Self::trash_menu_items()
                     } else {
-                        Self::row_menu_items()
+                        Self::row_menu_items(entry_is_dir, entry_is_archive)
                     };
                     this.open_menu(
                         f32::from(event.position.x),
@@ -2738,6 +3155,8 @@ impl Browser {
         let entry_key = entry.key.clone();
         let entry_path = entry.path.clone();
         let menu_key = entry_key.clone();
+        let entry_is_dir = entry.is_dir;
+        let entry_is_archive = is_archive(&entry.name);
         let in_trash = entry.item.is_some();
 
         // thumbnails only for local image files: trash entries point at
@@ -2839,7 +3258,7 @@ impl Browser {
                     let items = if in_trash {
                         Self::trash_menu_items()
                     } else {
-                        Self::row_menu_items()
+                        Self::row_menu_items(entry_is_dir, entry_is_archive)
                     };
                     this.open_menu(
                         f32::from(event.position.x),
@@ -3264,17 +3683,179 @@ impl Browser {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.run_menu_action(action, cx)
                     }))
-                    .child(item.label),
+                    .child(item.label.clone()),
             );
         }
 
         Some(div().absolute().inset_0().child(backdrop).child(panel))
     }
 
+    /// The compress dialog: name field, format choice, create/cancel.
+    /// Painted last so it sits above the listing.
+    fn compress_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let dialog = self.compress.as_ref()?;
+        let count = self.tab().selection.len();
+        let cursor = if dialog.name.is_char_boundary(dialog.cursor) {
+            dialog.cursor
+        } else {
+            dialog.name.len()
+        };
+        let (before, after) = dialog.name.split_at(cursor);
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                .child(
+                    div()
+                        .w(px(380.))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .rounded_md()
+                        .bg(theme::sidebar())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .text_size(px(13.))
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .text_color(theme::text())
+                                .child(format!(
+                                    "Compress {} item{} into an archive",
+                                    count,
+                                    if count == 1 { "" } else { "s" }
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .border_1()
+                                .border_color(theme::accent())
+                                .rounded_sm()
+                                .px_1()
+                                .py_0p5()
+                                .text_color(theme::text())
+                                .child(format!("{before}▏{after}")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .id("fmt-tgz")
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(if dialog.zip {
+                                            theme::text_dim()
+                                        } else {
+                                            theme::accent()
+                                        })
+                                        .bg(if dialog.zip {
+                                            theme::clear()
+                                        } else {
+                                            theme::row()
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(dialog) = this.compress.as_mut() {
+                                                dialog.zip = false;
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .child("tar.gz"),
+                                )
+                                .child(if dialog.zip_available {
+                                    div()
+                                        .id("fmt-zip")
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(if dialog.zip {
+                                            theme::accent()
+                                        } else {
+                                            theme::text_dim()
+                                        })
+                                        .bg(if dialog.zip {
+                                            theme::row()
+                                        } else {
+                                            theme::clear()
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(dialog) = this.compress.as_mut() {
+                                                dialog.zip = true;
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .child("zip")
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .text_color(theme::text_dim())
+                                        .child("zip needs file-roller")
+                                        .into_any_element()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("compress-cancel")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(theme::text_dim())
+                                        .hover(|this| this.text_color(theme::text()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.compress = None;
+                                            cx.notify();
+                                        }))
+                                        .child("Cancel"),
+                                )
+                                .child(
+                                    div()
+                                        .id("compress-create")
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .cursor_pointer()
+                                        .text_color(theme::accent())
+                                        .bg(theme::row())
+                                        .hover(|this| this.bg(theme::row_hover()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.compress_create(cx)
+                                        }))
+                                        .child("Create"),
+                                ),
+                        ),
+                ),
+        )
+    }
+
     fn run_menu_action(&mut self, action: MenuAction, cx: &mut Context<Self>) {
         self.menu = None;
         match action {
             MenuAction::Open => self.open_selection(cx),
+            MenuAction::OpenWith => self.open_with_menu(cx),
+            MenuAction::OpenWithApp(ix) => self.launch_app(ix, cx),
+            MenuAction::Extract => self.extract_selection(cx),
+            MenuAction::Compress => self.open_compress_dialog(cx),
             MenuAction::Rename => self.start_rename(cx),
             MenuAction::Copy => self.copy_selection(cx),
             MenuAction::Cut => self.cut_selection(cx),
@@ -3299,43 +3880,51 @@ impl Browser {
         self.menu = Some(ContextMenu { x, y, items });
     }
 
-    fn row_menu_items() -> Vec<MenuItem> {
-        vec![
-            MenuItem { label: "Open", action: MenuAction::Open },
-            MenuItem { label: "Rename", action: MenuAction::Rename },
-            MenuItem { label: "Copy", action: MenuAction::Copy },
-            MenuItem { label: "Cut", action: MenuAction::Cut },
-            MenuItem { label: "Copy Path", action: MenuAction::CopyPath },
-            MenuItem { label: "Copy URI", action: MenuAction::CopyUri },
-            MenuItem { label: "Trash", action: MenuAction::Trash },
-            MenuItem { label: "Delete permanently", action: MenuAction::Delete },
-            MenuItem { label: "Properties", action: MenuAction::Info },
-        ]
+    fn row_menu_items(is_dir: bool, archive: bool) -> Vec<MenuItem> {
+        let mut items = vec![MenuItem { label: "Open".into(), action: MenuAction::Open }];
+        if !is_dir {
+            items.push(MenuItem { label: "Open With…".into(), action: MenuAction::OpenWith });
+        }
+        if archive {
+            items.push(MenuItem { label: "Extract Here".into(), action: MenuAction::Extract });
+        }
+        items.extend([
+            MenuItem { label: "Rename".into(), action: MenuAction::Rename },
+            MenuItem { label: "Copy".into(), action: MenuAction::Copy },
+            MenuItem { label: "Cut".into(), action: MenuAction::Cut },
+            MenuItem { label: "Copy Path".into(), action: MenuAction::CopyPath },
+            MenuItem { label: "Copy URI".into(), action: MenuAction::CopyUri },
+            MenuItem { label: "Compress…".into(), action: MenuAction::Compress },
+            MenuItem { label: "Trash".into(), action: MenuAction::Trash },
+            MenuItem { label: "Delete permanently".into(), action: MenuAction::Delete },
+            MenuItem { label: "Properties".into(), action: MenuAction::Info },
+        ]);
+        items
     }
 
     fn trash_menu_items() -> Vec<MenuItem> {
         vec![
-            MenuItem { label: "Restore", action: MenuAction::Open },
-            MenuItem { label: "Delete permanently", action: MenuAction::Delete },
-            MenuItem { label: "Properties", action: MenuAction::Info },
+            MenuItem { label: "Restore".into(), action: MenuAction::Open },
+            MenuItem { label: "Delete permanently".into(), action: MenuAction::Delete },
+            MenuItem { label: "Properties".into(), action: MenuAction::Info },
         ]
     }
 
     fn empty_menu_items(in_trash: bool) -> Vec<MenuItem> {
         let mut items = vec![
-            MenuItem { label: "New Folder", action: MenuAction::NewFolder },
-            MenuItem { label: "New File", action: MenuAction::NewFile },
-            MenuItem { label: "Paste", action: MenuAction::Paste },
+            MenuItem { label: "New Folder".into(), action: MenuAction::NewFolder },
+            MenuItem { label: "New File".into(), action: MenuAction::NewFile },
+            MenuItem { label: "Paste".into(), action: MenuAction::Paste },
         ];
         // a terminal has no meaning in the trash listing
         if !in_trash {
-            items.push(MenuItem { label: "Open Terminal Here", action: MenuAction::Terminal });
+            items.push(MenuItem { label: "Open Terminal Here".into(), action: MenuAction::Terminal });
         }
         items.extend([
-            MenuItem { label: "Sort by Name", action: MenuAction::SortName },
-            MenuItem { label: "Sort by Size", action: MenuAction::SortSize },
-            MenuItem { label: "Sort by Date", action: MenuAction::SortModified },
-            MenuItem { label: "Show Hidden", action: MenuAction::ToggleHidden },
+            MenuItem { label: "Sort by Name".into(), action: MenuAction::SortName },
+            MenuItem { label: "Sort by Size".into(), action: MenuAction::SortSize },
+            MenuItem { label: "Sort by Date".into(), action: MenuAction::SortModified },
+            MenuItem { label: "Show Hidden".into(), action: MenuAction::ToggleHidden },
         ]);
         items
     }
@@ -4248,8 +4837,259 @@ impl Render for Browser {
             // gpui paints children in tree order and absolute position
             // does not lift an element above later siblings
             .children(self.conflict_overlay(cx))
+            .children(self.compress_overlay(cx))
             .children(self.menu_overlay(window, cx))
     }
+}
+
+/// Is `name` on PATH?
+fn have_tool(name: &str) -> bool {
+    env::var_os("PATH").is_some_and(|paths| {
+        env::split_paths(&paths).any(|dir| {
+            let candidate = dir.join(name);
+            candidate.is_file()
+        })
+    })
+}
+
+/// What kind of archive is this file name, if any?
+fn archive_kind(name: &str) -> Option<&'static str> {
+    let lower = name.to_lowercase();
+    let ends = |suffix: &str| lower.ends_with(suffix);
+    if ends(".tar.gz") || ends(".tgz") {
+        Some("tar.gz")
+    } else if ends(".tar.bz2") || ends(".tbz2") {
+        Some("tar.bz2")
+    } else if ends(".tar.xz") || ends(".txz") {
+        Some("tar.xz")
+    } else if ends(".tar.zst") || ends(".tzst") {
+        Some("tar.zst")
+    } else if ends(".tar") {
+        Some("tar")
+    } else if ends(".zip") {
+        Some("zip")
+    } else if ends(".7z") {
+        Some("7z")
+    } else if ends(".rar") {
+        Some("rar")
+    } else if ends(".gz") {
+        Some("gz")
+    } else if ends(".bz2") {
+        Some("bz2")
+    } else if ends(".xz") {
+        Some("xz")
+    } else if ends(".zst") {
+        Some("zst")
+    } else {
+        None
+    }
+}
+
+fn is_archive(name: &str) -> bool {
+    archive_kind(name).is_some()
+}
+
+/// The file name with its archive suffix stripped, for the folder an
+/// extraction unpacks into.
+fn archive_stem(name: &str) -> Option<String> {
+    let kind = archive_kind(name)?;
+    let suffix = match kind {
+        "tar.gz" => ".tar.gz",
+        "tar.bz2" => ".tar.bz2",
+        "tar.xz" => ".tar.xz",
+        "tar.zst" => ".tar.zst",
+        "tar" => ".tar",
+        "zip" => ".zip",
+        "7z" => ".7z",
+        "rar" => ".rar",
+        "gz" => ".gz",
+        "bz2" => ".bz2",
+        "xz" => ".xz",
+        "zst" => ".zst",
+        _ => return None,
+    };
+    Some(name[..name.len() - suffix.len()].to_string())
+}
+
+/// The mime type for a common extension; the fallback is the
+/// everything-blob, which still matches "open with anything" apps.
+fn mime_for_ext(ext: &str) -> &'static str {
+    match ext.to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "gz" => "application/gzip",
+        "bz2" => "application/x-bzip2",
+        "xz" => "application/x-xz",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "mp3" => "audio/mpeg",
+        "flac" => "audio/flac",
+        "ogg" | "opus" => "audio/ogg",
+        "wav" => "audio/x-wav",
+        "m4a" => "audio/mp4",
+        "mp4" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        "html" => "text/html",
+        "css" => "text/css",
+        "js" => "text/javascript",
+        "json" => "application/json",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/yaml",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "md" | "markdown" => "text/markdown",
+        "sh" | "bash" => "text/x-shellscript",
+        "py" => "text/x-python",
+        "rs" => "text/rust",
+        "c" | "h" => "text/x-csrc",
+        "cpp" | "hpp" => "text/x-c++src",
+        "txt" | "log" | "conf" | "ini" | "kdl" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// One installed application from the freedesktop .desktop files.
+#[derive(Clone)]
+struct DesktopApp {
+    name: String,
+    exec: String,
+    mimes: Vec<String>,
+}
+
+/// Scan the standard applications directories. Runs once per session
+/// and is cached; a few hundred small INI files read in milliseconds.
+fn scan_desktop_apps() -> Vec<DesktopApp> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(data_home) = env::var("XDG_DATA_HOME") {
+        dirs.push(PathBuf::from(data_home).join("applications"));
+    } else if let Ok(home) = env::var("HOME") {
+        dirs.push(PathBuf::from(home).join(".local/share/applications"));
+    }
+    dirs.push(PathBuf::from("/usr/share/applications"));
+    if let Ok(data_dirs) = env::var("XDG_DATA_DIRS") {
+        for dir in env::split_paths(&data_dirs) {
+            dirs.push(dir.join("applications"));
+        }
+    }
+
+    let mut apps: Vec<DesktopApp> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for dir in dirs {
+        let Ok(listing) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for file in listing.flatten() {
+            let path = file.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let (mut name, mut exec, mut mimes) = (String::new(), String::new(), Vec::new());
+            let (mut hidden, mut nodisplay, mut is_app) = (false, false, false);
+            let mut in_entry = false;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with('[') {
+                    in_entry = line == "[Desktop Entry]";
+                    continue;
+                }
+                if !in_entry {
+                    continue;
+                }
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                match key {
+                    "Name" => name = value.to_string(),
+                    "Exec" => exec = value.to_string(),
+                    "MimeType" => {
+                        mimes = value
+                            .split(';')
+                            .filter(|m| !m.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    }
+                    "NoDisplay" => nodisplay = value == "true",
+                    "Hidden" => hidden = value == "true",
+                    "Type" => is_app = value == "Application",
+                    _ => {}
+                }
+            }
+            if !is_app || hidden || nodisplay || exec.is_empty() {
+                continue;
+            }
+            let label = if name.is_empty() { exec.clone() } else { name };
+            if seen.insert(label.clone()) {
+                apps.push(DesktopApp {
+                    name: label,
+                    exec,
+                    mimes,
+                });
+            }
+        }
+    }
+    apps
+}
+
+/// Turn a .desktop Exec line into an argv for one path: tokenize with
+/// quote awareness, substitute the field codes, and append the path
+/// when the line names none.
+fn exec_argv(exec: &str, path: &Path, app_name: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = exec.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(&next) = chars.peek() {
+                    cur.push(next);
+                    chars.next();
+                }
+            }
+            '\'' | '"' if quote.is_none() => quote = Some(ch),
+            ending if Some(ending) == quote => quote = None,
+            split if quote.is_none() && split.is_whitespace() => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            other => cur.push(other),
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+
+    let mut argv: Vec<String> = Vec::new();
+    let mut has_file = false;
+    for token in tokens {
+        match token.as_str() {
+            "%f" | "%u" | "%F" | "%U" | "%d" | "%D" | "%n" | "%N" => {
+                argv.push(path.display().to_string());
+                has_file = true;
+            }
+            "%c" => argv.push(app_name.to_string()),
+            "%i" | "%k" | "%v" | "%m" => {}
+            field if field.starts_with('%') => {}
+            plain => argv.push(plain.to_string()),
+        }
+    }
+    if !has_file {
+        argv.push(path.display().to_string());
+    }
+    argv
 }
 
 /// Free bytes on the volume holding dir, via libc statvfs (already in
@@ -4938,6 +5778,72 @@ mod tests {
     fn path_uri_escapes_spaces() {
         assert_eq!(path_uri(Path::new("/tmp/a b/c.txt")), "file:///tmp/a%20b/c.txt");
         assert_eq!(path_uri(Path::new("/tmp/plain")), "file:///tmp/plain");
+    }
+
+    #[test]
+    fn archive_detection_and_stems() {
+        assert_eq!(archive_kind("backup.tar.gz"), Some("tar.gz"));
+        assert_eq!(archive_kind("PHOTO.ZIP"), Some("zip"));
+        assert_eq!(archive_kind("readme.md"), None);
+        assert_eq!(archive_stem("backup.tar.gz").as_deref(), Some("backup"));
+        assert_eq!(archive_stem("site.tar.xz").as_deref(), Some("site"));
+        assert_eq!(archive_stem("notes.zip").as_deref(), Some("notes"));
+    }
+
+    #[test]
+    fn exec_field_codes_substitute() {
+        let path = Path::new("/tmp/a b/f.txt");
+        assert_eq!(
+            exec_argv("gedit %F", path, "gedit"),
+            vec!["gedit", "/tmp/a b/f.txt"]
+        );
+        // no field code means the path is appended
+        assert_eq!(
+            exec_argv("eogui --loose", path, "eogui"),
+            vec!["eogui", "--loose", "/tmp/a b/f.txt"]
+        );
+        assert_eq!(exec_argv("%c %u", path, "Editor"), vec!["Editor", "/tmp/a b/f.txt"]);
+    }
+
+    #[test]
+    fn mime_table_covers_common() {
+        assert_eq!(mime_for_ext("png"), "image/png");
+        assert_eq!(mime_for_ext("PDF"), "application/pdf");
+        assert_eq!(mime_for_ext("???"), "application/octet-stream");
+    }
+
+    #[test]
+    fn extract_and_compress_round_trip() {
+        // only when tar exists (it does in the build container)
+        if !have_tool("tar") {
+            return;
+        }
+        let room = std::env::temp_dir().join(format!("koguma-test-{}", std::process::id()));
+        fs::create_dir_all(&room).unwrap();
+        let src = room.join("hello.txt");
+        fs::write(&src, "hi there\n").unwrap();
+        let archive = room.join("bundle.tar.gz");
+
+        let made = Op::Compress {
+            files: vec![src.clone()],
+            archive: archive.clone(),
+        };
+        if let Err(err) = made.run() {
+            panic!("compress failed: {err}");
+        }
+        assert!(archive.exists(), "archive should exist after compress");
+
+        fs::remove_file(&src).unwrap();
+        let op = Op::Extract {
+            archive: archive.clone(),
+            dest: room.join("bundle"),
+        };
+        op.run().unwrap();
+        let restored = room.join("bundle/hello.txt");
+        assert!(restored.exists(), "extract should restore the file");
+        assert_eq!(fs::read_to_string(&restored).unwrap(), "hi there\n");
+
+        let _ = fs::remove_dir_all(&room);
     }
 
     #[test]
