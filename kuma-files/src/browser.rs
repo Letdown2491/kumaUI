@@ -651,6 +651,17 @@ fn mount_label(raw: &str) -> String {
     }
 }
 
+/// Insert text at the cursor (paste, or one typed character).
+fn insert_text(buf: &mut String, cursor: &mut usize, text: &str) {
+    let pos = if buf.is_char_boundary(*cursor) {
+        *cursor
+    } else {
+        buf.len()
+    };
+    buf.insert_str(pos, text);
+    *cursor = pos + text.len();
+}
+
 /// One-line text-buffer editing shared by the connect dialog's two
 /// fields (URI field, credential answer). Returns false for keys it
 /// does not handle.
@@ -690,13 +701,7 @@ fn edit_line(buf: &mut String, cursor: &mut usize, key: &str, keystroke: &gpui::
             && !keystroke.modifiers.function =>
         {
             if let Some(character) = keystroke.key_char.as_deref() {
-                let cursor_pos = if buf.is_char_boundary(*cursor) {
-                    *cursor
-                } else {
-                    buf.len()
-                };
-                buf.insert_str(cursor_pos, character);
-                *cursor = cursor_pos + character.len();
+                insert_text(buf, cursor, character);
             }
             true
         }
@@ -743,6 +748,7 @@ fn child_cell_lock_kill(cell: &Mutex<Option<std::process::Child>>) {
 fn run_mount_process(
     mut stdin: std::process::ChildStdin,
     stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
     child: Arc<Mutex<Option<std::process::Child>>>,
     gvfs_dir: PathBuf,
     ev: mpsc::Sender<ConnectEvent>,
@@ -758,6 +764,32 @@ fn run_mount_process(
             .unwrap_or_default()
     };
     let before = snapshot();
+
+    // gio reports failures on stderr (prompts ride stdout); a thread
+    // relays each line live and the last one names the failure in the
+    // Done message ("Hostname not known" instead of a bare "failed")
+    let last_err = Arc::new(Mutex::new(String::new()));
+    {
+        let last_err = last_err.clone();
+        let ev = ev.clone();
+        std::thread::spawn(move || {
+            let mut err = io::BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match err.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                *last_err.lock().unwrap() = line.clone();
+                let _ = ev.send(ConnectEvent::Note(line));
+            }
+        });
+    }
 
     let mut reader = io::BufReader::new(stdout);
     let mut carry = String::new();
@@ -812,6 +844,11 @@ fn run_mount_process(
         .and_then(|mut cell| cell.take())
         .and_then(|mut child| child.wait().ok());
     let ok = child.map(|status| status.success()).unwrap_or(false);
+    // give the stderr relay a beat to catch the final lines (they are
+    // usually printed just before exit)
+    if !ok {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     // the new gvfs entry is the mount's FUSE path; a failed run
     // changes nothing
     let mount = if ok {
@@ -828,7 +865,12 @@ fn run_mount_process(
         message: if ok {
             "connected".into()
         } else {
-            "connection failed".into()
+            let err = last_err.lock().unwrap().clone();
+            if err.is_empty() {
+                "connection failed".into()
+            } else {
+                err
+            }
         },
         mount,
     });
@@ -2488,10 +2530,12 @@ impl Browser {
             .arg(&uri)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
         {
             Ok(child) => child,
             Err(_) => {
+                log::error!("connect: could not spawn gio");
                 dialog.status = "gio not found".into();
                 self.connect = Some(dialog);
                 cx.notify();
@@ -2500,12 +2544,14 @@ impl Browser {
         };
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
-        let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+        let stderr = child.stderr.take();
+        let (Some(stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
             dialog.status = "could not pipe gio's stdio".into();
             self.connect = Some(dialog);
             cx.notify();
             return;
         };
+        log::info!("connect: gio mount {uri}");
         let child_cell = Arc::new(Mutex::new(Some(child)));
         dialog.session = Some(ConnectSession {
             answers: ans_tx,
@@ -2519,7 +2565,7 @@ impl Browser {
 
         // pump: drive gio to completion in the background
         let _pump = cx.background_spawn(async move {
-            run_mount_process(stdin, stdout, child_cell, gvfs_dir, ev_tx, ans_rx);
+            run_mount_process(stdin, stdout, stderr, child_cell, gvfs_dir, ev_tx, ans_rx);
         });
 
         // event relay: block a pool thread per recv, wake the view
@@ -2554,6 +2600,7 @@ impl Browser {
                 let Some(dialog) = self.connect.as_mut() else {
                     return false;
                 };
+                log::info!("connect: prompt '{text}' (masked: {mask})");
                 dialog.prompt = Some(text);
                 dialog.mask = mask;
                 dialog.input.clear();
@@ -2573,6 +2620,13 @@ impl Browser {
                 let Some(dialog) = self.connect.take() else {
                     return false;
                 };
+                log::info!(
+                    "connect: done ok={ok} mount={} ({message})",
+                    mount
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "none".into())
+                );
                 if ok {
                     self.status = format!("{}: {}", message, dialog.uri.trim());
                     if let Some(path) = mount {
@@ -2608,6 +2662,7 @@ impl Browser {
         };
         let answer = dialog.input.clone();
         if session.answers.send(answer).is_ok() {
+            log::info!("connect: answer sent ({} chars)", dialog.input.len());
             dialog.prompt = None;
             dialog.mask = false;
             dialog.input.clear();
@@ -2621,6 +2676,7 @@ impl Browser {
     fn cancel_connect(&mut self, cx: &mut Context<Self>) {
         if let Some(dialog) = self.connect.take() {
             if let Some(session) = dialog.session {
+                log::info!("connect: cancelled");
                 if let Ok(mut cell) = session.child.lock() {
                     if let Some(child) = cell.as_mut() {
                         let _ = child.kill();
@@ -3589,6 +3645,24 @@ impl Browser {
                         self.connect_start(cx);
                     }
                     return;
+                }
+                "v" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                    // paste into the active field: the URI before the
+                    // pump runs, the credential answer at a prompt
+                    if let Some(item) = cx.read_from_clipboard() {
+                        // a URI or a credential is one line; pasted
+                        // newlines would corrupt the stdin protocol
+                        let text = item
+                            .text()
+                            .unwrap_or_default()
+                            .trim_matches(|c: char| c == '\r' || c == '\n')
+                            .to_string();
+                        if at_prompt {
+                            insert_text(&mut dialog.input, &mut dialog.input_cursor, &text);
+                        } else if dialog.session.is_none() {
+                            insert_text(&mut dialog.uri, &mut dialog.uri_cursor, &text);
+                        }
+                    }
                 }
                 key => {
                     // two buffers: the URI before the pump runs, the
@@ -8771,8 +8845,8 @@ mod browser_ux_keys {
     use super::*;
     use gpui::Keystroke;
 
-    struct Lab {
-        dir: PathBuf,
+    pub(crate) struct Lab {
+        pub(crate) dir: PathBuf,
         src: PathBuf,
     }
 
@@ -8780,7 +8854,7 @@ mod browser_ux_keys {
         /// dir holds the browser's listing (a.txt, b.txt, c.txt, sub),
         /// src holds the clipboard payloads of the same names. The
         /// name keeps parallel tests out of each other's dirs.
-        fn new(name: &str) -> Self {
+        pub(crate) fn new(name: &str) -> Self {
             let base =
                 std::env::temp_dir().join(format!("koguma-ux-{name}-{}", std::process::id()));
             let dir = base.join("dir");
@@ -8804,7 +8878,7 @@ mod browser_ux_keys {
         }
     }
 
-    fn key(k: &str) -> KeyDownEvent {
+    pub(crate) fn key(k: &str) -> KeyDownEvent {
         KeyDownEvent {
             keystroke: Keystroke::parse(k).unwrap(),
             is_held: false,
@@ -8812,7 +8886,10 @@ mod browser_ux_keys {
         }
     }
 
-    fn open_browser(app: &mut gpui::TestApp, dir: &Path) -> gpui::TestAppWindow<Browser> {
+    pub(crate) fn open_browser(
+        app: &mut gpui::TestApp,
+        dir: &Path,
+    ) -> gpui::TestAppWindow<Browser> {
         let window =
             app.open_window(|window, cx| Browser::new(Some(dir.to_path_buf()), window, cx));
         app.run_until_parked();
@@ -9171,6 +9248,7 @@ mod browser_rename {
 
 #[cfg(test)]
 mod connect_tests {
+    use super::browser_ux_keys::{key, open_browser, Lab};
     use super::*;
 
     #[test]
@@ -9203,6 +9281,57 @@ mod connect_tests {
         assert!(!mask_prompt("Domain [WORKGROUP]"));
     }
 
+    /// The dialog wiring, without a subprocess: a prompt arriving from
+    /// the pump shows in the view, the typed answer routes to the pump
+    /// channel on Enter, and Esc closes the dialog.
+    #[test]
+    fn connect_dialog_prompt_submit_routes_to_the_pump() {
+        fn typed(k: &str) -> KeyDownEvent {
+            let mut ev = key(k);
+            ev.keystroke.key_char = Some(k.to_string());
+            ev
+        }
+        let lab = Lab::new("connect-dialog");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        let (ans_tx, ans_rx) = mpsc::channel::<String>();
+        window.update(|browser, _, cx| {
+            browser.open_connect_dialog(cx);
+            let dialog = browser.connect.as_mut().unwrap();
+            dialog.session = Some(ConnectSession {
+                answers: ans_tx,
+                // no child: Cancel's kill is a no-op on a taken cell
+                child: Arc::new(Mutex::new(None)),
+            });
+            browser
+                .connect_event(ConnectEvent::Prompt {
+                    text: "User".into(),
+                    mask: false,
+                }, cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, cx| {
+            for ch in ["b", "o", "b"] {
+                browser.route_key(&typed(ch), cx);
+            }
+            browser.route_key(&key("enter"), cx);
+        });
+        app.run_until_parked();
+        assert_eq!(ans_rx.recv_timeout(std::time::Duration::from_secs(5)).as_deref(), Ok("bob"));
+        window.update(|browser, _, cx| {
+            let dialog = browser.connect.as_ref().unwrap();
+            assert!(dialog.prompt.is_none(), "prompt consumed");
+            assert!(dialog.input.is_empty(), "answer buffer cleared");
+            // Esc at this point (no prompt up) still tears the dialog down
+            browser.route_key(&key("escape"), cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| assert!(browser.connect.is_none(), "Esc closes"));
+    }
+
     /// The full pump loop against a scripted child that mimics gio's
     /// prompt protocol (context lines with newlines, prompts ending
     /// bare at the colon).
@@ -9223,17 +9352,18 @@ mod connect_tests {
             .env("TESTDIR", &dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
         let child = Arc::new(Mutex::new(Some(child)));
         let (ev_tx, ev_rx) = mpsc::channel::<ConnectEvent>();
         let (ans_tx, ans_rx) = mpsc::channel::<String>();
         let pump_dir = dir.clone();
         let handle = std::thread::spawn(move || {
-            run_mount_process(stdin, stdout, child, pump_dir, ev_tx, ans_rx)
+            run_mount_process(stdin, stdout, stderr, child, pump_dir, ev_tx, ans_rx)
         });
 
         let mut notes = Vec::new();
@@ -9281,17 +9411,18 @@ mod connect_tests {
             .arg(script)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
         let child = Arc::new(Mutex::new(Some(child)));
         let (ev_tx, ev_rx) = mpsc::channel::<ConnectEvent>();
         let (ans_tx, ans_rx) = mpsc::channel::<String>();
         let pump_dir = dir.clone();
         let handle = std::thread::spawn(move || {
-            run_mount_process(stdin, stdout, child, pump_dir, ev_tx, ans_rx)
+            run_mount_process(stdin, stdout, stderr, child, pump_dir, ev_tx, ans_rx)
         });
         let mut answered = 0;
         loop {
