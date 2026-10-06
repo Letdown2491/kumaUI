@@ -19,7 +19,6 @@ use gpui::{
 use crate::panel::PanelHost;
 use crate::settings::Settings;
 use crate::sysmon::{Brightness, Mic, PowerProfile, SysMon, Volume};
-use crate::theme::*;
 
 /// How long the OSD hangs after the last change.
 const OSD_DURATION: Duration = Duration::from_millis(1500);

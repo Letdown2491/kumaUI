@@ -5,7 +5,6 @@ use gpui::{
 use crate::controls;
 use crate::panel_kit as kit;
 use crate::sysmon::{AccessPoint, SysMon};
-use crate::theme::*;
 
 /// The Wi-Fi panel: the radio toggle, the network we are on, and the
 /// visible APs. Opens from the Internet widget; the scan rides the

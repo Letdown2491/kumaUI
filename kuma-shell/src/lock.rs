@@ -23,7 +23,6 @@ use smol::channel::{Receiver, Sender, unbounded};
 
 use crate::imaging;
 use crate::settings::Settings;
-use crate::theme::*;
 
 /// The PAM service chain, first that starts wins: a distro-provided
 /// `kuma-lock` (someday), swaylock's (if installed), vlock's (on kumaOS

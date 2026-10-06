@@ -13,7 +13,6 @@ use gpui::{
     ParentElement, Render, SharedString, Window, anchored, deferred, div, px, rgb, rgba,
 };
 
-use crate::theme::*;
 
 /// The card: a column wearing fill and radius, with an id (the
 /// reconciler's identity), so a list whose cards come and go reuses

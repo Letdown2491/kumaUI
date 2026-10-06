@@ -2,7 +2,6 @@ use chrono::{Datelike, Local, NaiveDate};
 use gpui::{App, Context, Div, Render, SharedString, Window, div, prelude::*, px, rgb, size};
 
 use crate::panel_kit as kit;
-use crate::theme::*;
 
 /// A month view. `month_offset` navigates away from the month containing
 /// today; today's date is highlighted wherever it actually falls. The panel's

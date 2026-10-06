@@ -9,7 +9,6 @@ use crate::controls::{self, TrackStash};
 use crate::imaging::{IconImage, build_icon_index, decode_icon_file, icon_roots};
 use crate::panel_kit as kit;
 use crate::sysmon::{Stream, SysMon};
-use crate::theme::*;
 
 /// One widget, one control: the mini panel a value widget opens under
 /// itself. Volume adds a mute toggle; the microphone is the capture

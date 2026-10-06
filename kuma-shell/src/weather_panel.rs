@@ -2,7 +2,6 @@ use gpui::{Context, Entity, Render, Window, div, prelude::*, px, rgb, rgba, size
 
 use crate::panel_kit as kit;
 use crate::settings::Settings;
-use crate::theme::*;
 use crate::weather::{Current, WeatherState};
 
 /// The weather panel: current conditions up top, the five-day strip

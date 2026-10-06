@@ -402,7 +402,7 @@ impl Render for GreeterView {
         use gpui::{img, ObjectFit};
 
         let state = self.state.read(cx);
-        let theme = theme::current();
+        let _theme = theme::current();
         let wallpaper = state.wallpaper.clone();
         let theme = theme::current();
         let username = state.username.clone();

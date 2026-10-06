@@ -6,7 +6,7 @@
 
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 
-use gpui::{App, AppContext, Entity};
+use gpui::{App, Entity};
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
     globals::{GlobalListContents, registry_queue_init},
@@ -34,7 +34,7 @@ const APPLY_TICK_SECS: u64 = 60;
 /// would drop the output's exclusive gamma control for a moment,
 /// and niri restores neutral gamma in that gap: a visible flicker).
 pub fn run(settings: &Entity<Settings>, cx: &mut App) {
-    use gpui::{AppContext, Entity};
+    use gpui::Entity;
     let shared = NightShared {
         config: std::sync::Mutex::new(settings.read(cx).night_light.clone()),
         version: std::sync::atomic::AtomicU64::new(0),
@@ -79,7 +79,7 @@ use std::sync::atomic::Ordering;
 
 fn apply_loop(shared: SharedConfig) -> anyhow::Result<()> {
     let mut last_version = shared.version.load(Ordering::Relaxed);
-    let config = shared.config.lock().unwrap().clone();
+    let _config = shared.config.lock().unwrap().clone();
     let connection = Connection::connect_to_env()?;
     let (globals, mut queue) = registry_queue_init::<NightApp>(&connection)?;
     let qh = queue.handle();

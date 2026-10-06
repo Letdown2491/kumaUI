@@ -5,7 +5,6 @@ use gpui::{
 use crate::controls;
 use crate::panel_kit as kit;
 use crate::sysmon::{BluetoothAct, BluetoothDevice, SysMon};
-use crate::theme::*;
 
 /// The Bluetooth panel: the radio toggle, and every device the
 /// controller knows, paired ones first. Opens from the bar widget;

@@ -19,7 +19,6 @@ use crate::imaging::IconImage;
 use crate::launcher::{AppEntry, launch, load_apps};
 use crate::session::{SessionState, SessionWindow};
 use crate::settings::{DockPosition, Settings};
-use crate::theme::*;
 
 /// Icon cell and gutter: the dock's size language.
 const CELL: f32 = 48.;
@@ -736,6 +735,8 @@ mod tests {
     fn app(desktop_path: &str, name: &str, exec: &str) -> AppEntry {
         AppEntry {
             name: name.to_string(),
+            generic: String::new(),
+            keywords: String::new(),
             exec: exec.to_string(),
             terminal: false,
             icon: String::new(),

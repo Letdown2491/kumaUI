@@ -14,8 +14,6 @@ use crate::settings::{
     WidgetKind, WidgetMode,
 };
 use crate::sysmon::{Playback, RecordingState, SysMon};
-use crate::theme;
-use crate::theme::*;
 use crate::weather::WeatherState;
 
 // transparent headroom below the bar content so tooltips have room to render

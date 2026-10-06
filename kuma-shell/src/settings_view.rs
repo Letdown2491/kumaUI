@@ -10,8 +10,6 @@ use crate::panel_kit::{self as kit, ButtonVariant};
 use crate::settings::{
     BarAlign, BarRadius, BarWidth, Corner, SECTIONS, Section, Settings, WidgetMode,
 };
-use crate::theme;
-use crate::theme::*;
 
 const HEIGHTS: [f32; 6] = [24., 28., 32., 36., 40., 48.];
 const OFFSETS: [f32; 5] = [0., 4., 8., 12., 16.];

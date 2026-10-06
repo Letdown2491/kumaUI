@@ -23,7 +23,6 @@ use crate::imaging::IconImage;
 use crate::nostr::{self, NostrState, PairedApp, Prompt, VaultFact};
 use crate::panel::PanelGeometry;
 use crate::panel_kit::{self as kit, ButtonVariant};
-use crate::theme::*;
 
 /// The pane's poll cadence while the panel is open: an ask arriving
 /// mid-read belongs in the list the person is looking at, not behind a

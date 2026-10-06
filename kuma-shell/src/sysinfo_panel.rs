@@ -2,7 +2,6 @@ use gpui::{Context, Entity, Render, Window, div, prelude::*, px, rgb, size};
 
 use crate::panel_kit as kit;
 use crate::sysmon::SysMon;
-use crate::theme::*;
 
 /// Which sysinfo mini panel to render: one view, four tunings. The
 /// bar's CPU, RAM, temperature, and disk widgets all open one of

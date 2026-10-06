@@ -2,7 +2,6 @@ use gpui::{Context, Entity, Render, SharedString, Window, div, prelude::*, px, r
 
 use crate::panel_kit as kit;
 use crate::sysmon::{PROFILES, SysMon};
-use crate::theme::*;
 
 /// The power profile popup: the mini panel the Power profile bar widget
 /// opens under itself. One row per profile, the active one checked;

@@ -17,7 +17,6 @@ use crate::notifications::{Notification, NotificationState, time_ago};
 use crate::panel::PanelGeometry;
 use crate::panel_kit as kit;
 use crate::settings::Settings;
-use crate::theme::*;
 
 /// The toast card's corner radius: the drain bar insets itself by this so
 /// it stays inside the rounded corners (gpui's overflow clip is rectangular).

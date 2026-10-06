@@ -9,7 +9,6 @@ use gpui::{
     quad, rgb, size, svg,
 };
 
-use crate::theme::*;
 
 /// Per-frame track-bounds stash, shared between the canvas (writer) and the
 /// drag handlers (reader).

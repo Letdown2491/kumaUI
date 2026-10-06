@@ -8,11 +8,14 @@ use gpui::{
 
 use crate::imaging::{IconImage, decode_icon_file, icon_roots};
 use crate::panel_kit as kit;
-use crate::theme::*;
 
 #[derive(Clone, Debug)]
 pub struct AppEntry {
     pub name: String,
+    /// GenericName from the desktop entry, e.g. "File Manager".
+    pub generic: String,
+    /// Keywords from the desktop entry, semicolon separated.
+    pub keywords: String,
     pub exec: String,
     pub terminal: bool,
     pub icon: String,
@@ -150,6 +153,8 @@ fn record_usage(desktop_path: &str) {
 
 fn parse_desktop_entry(text: &str) -> Option<AppEntry> {
     let mut name = None;
+    let mut generic = None;
+    let mut keywords = None;
     let mut exec = None;
     let mut icon = None;
     let mut terminal = false;
@@ -161,6 +166,8 @@ fn parse_desktop_entry(text: &str) -> Option<AppEntry> {
         if let Some((key, value)) = line.split_once('=') {
             match key.trim() {
                 "Name" => name = Some(value.trim().to_string()),
+                "GenericName" => generic = Some(value.trim().to_string()),
+                "Keywords" => keywords = Some(value.trim().to_string()),
                 "Exec" => exec = Some(value.trim().to_string()),
                 "Icon" => icon = Some(value.trim().to_string()),
                 "Terminal" => terminal = value.trim() == "true",
@@ -176,6 +183,8 @@ fn parse_desktop_entry(text: &str) -> Option<AppEntry> {
     Some(AppEntry {
         icon: icon.unwrap_or_default().to_lowercase(),
         name: name.unwrap_or_else(|| "Unnamed".to_string()),
+        generic: generic.unwrap_or_default(),
+        keywords: keywords.unwrap_or_default(),
         desktop_path: String::new(),
         usage: 0,
         exec: exec
@@ -293,7 +302,16 @@ impl LauncherView {
             .iter()
             .enumerate()
             .filter_map(|(index, app)| {
-                fuzzy_score(&query, &app.name.to_lowercase()).map(|score| (score, index))
+                // name hits rank first; generic name and keywords also
+                // match, with a penalty so "Koguma" beats "File Manager"
+                fuzzy_score(&query, &app.name.to_lowercase())
+                    .or_else(|| {
+                        fuzzy_score(&query, &app.generic.to_lowercase()).map(|score| score - 20)
+                    })
+                    .or_else(|| {
+                        fuzzy_score(&query, &app.keywords.to_lowercase()).map(|score| score - 30)
+                    })
+                    .map(|score| (score, index))
             })
             .collect();
         scored.sort_by(|a, b| {
@@ -573,5 +591,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entry.icon, "org.gnome.nautilus");
+    }
+
+    #[test]
+    fn desktop_entry_captures_generic_and_keywords() {
+        let entry = parse_desktop_entry(
+            "[Desktop Entry]\nName=Koguma\nGenericName=File Manager\nKeywords=files;folders;\nExec=kuma-files\n",
+        )
+        .unwrap();
+        assert_eq!(entry.generic, "File Manager");
+        assert_eq!(entry.keywords, "files;folders;");
+        // entries without them just score empty, never panic
+        let bare = parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\n").unwrap();
+        assert_eq!(bare.generic, "");
+        assert_eq!(bare.keywords, "");
+    }
+
+    #[test]
+    fn keyword_match_ranks_below_name_match() {
+        let koguma = AppEntry {
+            name: "Koguma".into(),
+            generic: "File Manager".into(),
+            keywords: "files;folders;".into(),
+            ..parse_desktop_entry("[Desktop Entry]\nName=x\nExec=x\n").unwrap()
+        };
+        let mut renamed = koguma.clone();
+        renamed.name = "Archive Files".into();
+        // "file" hits all three fields: the name match outranks the
+        // generic-name match, which outranks keywords
+        let query = "file";
+        let by_name = fuzzy_score(query, &renamed.name.to_lowercase()).unwrap();
+        let by_generic = fuzzy_score(query, &koguma.generic.to_lowercase()).map(|s| s - 20);
+        let by_keywords = fuzzy_score(query, &koguma.keywords.to_lowercase()).map(|s| s - 30);
+        assert!(by_generic.unwrap() > by_keywords.unwrap());
+        assert!(by_name > by_generic.unwrap());
+        // "files" is not a subsequence of "file manager" (manager has
+        // no s); the keywords field is what catches the plural
+        assert!(fuzzy_score("files", &koguma.generic.to_lowercase()).is_none());
+        assert!(fuzzy_score("files", &koguma.keywords.to_lowercase()).is_some());
     }
 }
