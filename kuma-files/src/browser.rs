@@ -572,6 +572,11 @@ struct ConnectDialog {
     /// password-style prompts render the buffer as bullets
     mask: bool,
     status: String,
+    /// gio's non-prompt output (identity text, [1]/[2] choices,
+    /// errors), newest last
+    notes: Vec<String>,
+    /// when the current gio run started, for the elapsed counter
+    since: Option<std::time::Instant>,
     session: Option<ConnectSession>,
 }
 
@@ -717,6 +722,7 @@ fn is_prompt(text: &str) -> bool {
     let last = text.rsplit('\n').next().unwrap_or("").trim().to_lowercase();
     last == "user"
         || last == "login"
+        || last == "choice"
         || last.starts_with("password")
         || last.starts_with("passphrase")
         || last.starts_with("domain")
@@ -804,7 +810,16 @@ fn run_mount_process(
         let ends_colon = chunk.ends_with(':');
         carry.push_str(chunk.trim_end_matches(':'));
         if ends_colon && is_prompt(&carry) {
+            // the last fragment is the prompt; the lines above it are
+            // context the user needs (identity text, [1]/[2] choices)
             let text = carry.rsplit('\n').next().unwrap_or("").trim().to_string();
+            if let Some(pos) = carry.rfind('\n') {
+                for line in carry[..pos].lines() {
+                    if !line.trim().is_empty() {
+                        let _ = ev.send(ConnectEvent::Note(line.to_string()));
+                    }
+                }
+            }
             let mask = mask_prompt(&text);
             carry.clear();
             if ev.send(ConnectEvent::Prompt { text, mask }).is_err() {
@@ -1054,7 +1069,21 @@ impl Browser {
                 let update = this.update(cx, |this, cx| {
                     let palette = this.refresh_palette(cx);
                     let places = this.refresh_places();
-                    if palette || places {
+                    // a running connect shows its elapsed seconds: a
+                    // silent server (slow banner, filtered port) looks
+                    // alive instead of hung
+                    let mut connect_tick = false;
+                    if let Some(dialog) = this.connect.as_mut() {
+                        if dialog.session.is_some() {
+                            if let Some(since) = dialog.since {
+                                let uri = dialog.uri.trim().to_string();
+                                dialog.status =
+                                    format!("connecting to {uri}… {}s", since.elapsed().as_secs());
+                                connect_tick = true;
+                            }
+                        }
+                    }
+                    if palette || places || connect_tick {
                         cx.notify();
                     }
                 });
@@ -2495,6 +2524,8 @@ impl Browser {
             prompt: None,
             mask: false,
             status: String::new(),
+            notes: Vec::new(),
+            since: None,
             session: None,
         });
         cx.notify();
@@ -2559,7 +2590,9 @@ impl Browser {
         });
         dialog.prompt = None;
         dialog.mask = false;
+        dialog.notes.clear();
         dialog.status = format!("connecting to {uri}…");
+        dialog.since = Some(std::time::Instant::now());
         self.connect = Some(dialog);
         cx.notify();
 
@@ -2609,9 +2642,12 @@ impl Browser {
                 true
             }
             ConnectEvent::Note(line) => {
-                // non-prompt output is context for a later failure
+                // gio's context: identity text, [1]/[2] choices, errors
                 if let Some(dialog) = self.connect.as_mut() {
-                    dialog.status = line;
+                    dialog.notes.push(line);
+                    if dialog.notes.len() > 6 {
+                        dialog.notes.remove(0);
+                    }
                     cx.notify();
                 }
                 true
@@ -2635,6 +2671,7 @@ impl Browser {
                     self.refresh_places_now();
                 } else {
                     // keep the dialog up: the URI is editable for a retry
+                    log::info!("connect: failed ({message})");
                     self.connect = Some(ConnectDialog {
                         uri: dialog.uri,
                         uri_cursor: dialog.uri_cursor,
@@ -2643,6 +2680,8 @@ impl Browser {
                         prompt: None,
                         mask: false,
                         status: message,
+                        notes: dialog.notes,
+                        since: None,
                         session: None,
                     });
                 }
@@ -5436,6 +5475,19 @@ impl Browser {
                 .text_color(theme::text_dim())
                 .child(dialog.status.clone())
         });
+        let notes = dialog
+            .notes
+            .iter()
+            .rev()
+            .take(4)
+            .rev()
+            .map(|line| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme::text_dim())
+                    .child(line.clone())
+            })
+            .collect::<Vec<_>>();
         Some(
             div()
                 .absolute()
@@ -5459,6 +5511,7 @@ impl Browser {
                         .shadow_lg()
                         .text_size(px(13.))
                         .child(label)
+                        .children(notes)
                         .child(
                             div()
                                 .flex()
@@ -9267,6 +9320,8 @@ mod connect_tests {
         assert!(is_prompt("Password for bob@host"));
         assert!(is_prompt("Domain [WORKGROUP]"));
         assert!(is_prompt("passphrase"));
+        // gvfs host-key questions ask for a numbered choice
+        assert!(is_prompt("Choice"));
         // prose ending in a colon is context, not a prompt
         assert!(!is_prompt("Enter user and password for [localhost]"));
         assert!(!is_prompt("Authentication Required"));
@@ -9396,6 +9451,69 @@ mod connect_tests {
         assert_eq!(prompts[0], ("User".into(), false));
         assert_eq!(prompts[1], ("Password".into(), true));
         assert!(notes.iter().any(|n| n.contains("Authentication Required")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mount_process_relay_host_key_question_with_choices() {
+        let dir = std::env::temp_dir().join(format!("kuma-connect-key-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // gvfs's host-key flow: multi-line context, numbered choices,
+        // then a bare "Choice: " prompt that waits on stdin
+        let script = "echo 'Identity Verification Failed'; \\\n\
+            echo '[1] Log In Anyway'; \\\n\
+            echo '[2] Cancel Login'; \\\n\
+            printf 'Choice: '; read c; \\\n\
+            if [ \"$c\" = 1 ]; then \\\n\
+              mkdir \"$TESTDIR/sftp:host=host\"; exit 0; \\\n\
+            fi; echo 'Error mounting: cancelled'; exit 1";
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("TESTDIR", &dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let child = Arc::new(Mutex::new(Some(child)));
+        let (ev_tx, ev_rx) = mpsc::channel::<ConnectEvent>();
+        let (ans_tx, ans_rx) = mpsc::channel::<String>();
+        let pump_dir = dir.clone();
+        let handle = std::thread::spawn(move || {
+            run_mount_process(stdin, stdout, stderr, child, pump_dir, ev_tx, ans_rx)
+        });
+        let mut notes = Vec::new();
+        loop {
+            match ev_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("pump finished in time")
+            {
+                ConnectEvent::Prompt { text, mask } => {
+                    assert_eq!(text, "Choice");
+                    assert!(!mask);
+                    // the choices must have arrived before the prompt,
+                    // or the user is answering a question they cannot see
+                    assert!(notes.iter().any(|n: &String| n.contains("[1] Log In Anyway")));
+                    assert!(notes.iter().any(|n: &String| n.contains("[2] Cancel Login")));
+                    ans_tx.send("1".into()).unwrap();
+                }
+                ConnectEvent::Note(line) => notes.push(line),
+                ConnectEvent::Done { ok, mount, .. } => {
+                    assert!(ok);
+                    assert_eq!(
+                        mount.as_deref(),
+                        Some(dir.join("sftp:host=host").as_path())
+                    );
+                    break;
+                }
+            }
+        }
+        handle.join().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
