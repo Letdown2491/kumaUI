@@ -105,6 +105,15 @@ pub const SOFT_DIVIDER: u32 = 0x45475A66;
 /// a consumer understands. Values are bare hex; a consumer that
 /// wants alpha finds it on the panel colors it may carry.
 pub fn palette_text(theme: &Theme) -> String {
+    // alpha carriers (panel_bg, divider_soft) fold down to plain RGB:
+    // the file is a handshake for opaque-surface consumers
+    let rgb = |value: u32| {
+        if value > 0xFFFFFF {
+            value >> 8
+        } else {
+            value
+        }
+    };
     let mut out = String::new();
     for (key, value) in [
         ("panel_bg", theme.panel_bg),
@@ -118,7 +127,7 @@ pub fn palette_text(theme: &Theme) -> String {
         ("accent", theme.accent),
         ("accent_text", theme.accent_text),
     ] {
-        out.push_str(&format!("{key}={value:08x}\n"));
+        out.push_str(&format!("{key}={:06x}\n", rgb(value)));
     }
     out
 }
@@ -128,15 +137,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn palette_text_lists_every_field() {
-        let theme = Theme::default();
+    fn palette_text_folds_alpha_carriers_to_rgb() {
+        let theme = Theme {
+            panel_bg: 0x16151EF2, // alpha-carrying
+            divider_soft: 0x3E3C5366,
+            ..Theme::default()
+        };
         let text = palette_text(&theme);
-        assert_eq!(text, format!(
-            "panel_bg={:08x}\nsurface={:08x}\nsurface_hover={:08x}\ninset={:08x}\ndivider={:08x}\ndivider_soft={:08x}\ntext={:08x}\ntext_dim={:08x}\naccent={:08x}\naccent_text={:08x}\n",
-            theme.panel_bg, theme.surface, theme.surface_hover, theme.inset,
-            theme.divider, theme.divider_soft, theme.text, theme.text_dim,
-            theme.accent, theme.accent_text,
-        ));
+        assert!(
+            text.contains("panel_bg=16151e\n"),
+            "alpha folded out: {text}"
+        );
+        assert!(text.contains("divider_soft=3e3c53\n"));
+        assert!(
+            text.contains(&format!("accent={:06x}\n", theme.accent)),
+            "accent line: {text}"
+        );
+        // every line is a 6-digit value
+        for line in text.lines() {
+            let value = line.split_once('=').unwrap().1;
+            assert_eq!(value.len(), 6);
+        }
     }
 }
 

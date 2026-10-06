@@ -6190,7 +6190,10 @@ fn parse_palette(text: &str) -> theme::Palette {
         let Some(hex) = parse_hex_color(value) else {
             continue;
         };
-        let hex = hex & 0xFFFFFF; // the shell's panel colors may carry alpha we do not use
+        // the shell's panel colors arrive as RRGGBBAA (alpha in the
+        // low byte); our surfaces are opaque, so keep the top 24 bits.
+        // Pure RGB values pass through untouched.
+        let hex = if hex > 0xFFFFFF { hex >> 8 } else { hex };
         match key.trim() {
             "panel_bg" => palette.panel_bg = hex,
             "surface" => palette.surface = hex,
@@ -7339,9 +7342,11 @@ sftp://remote/share skip-me
 
     #[test]
     fn palette_parses_shell_key_values() {
-        let text = "panel_bg=0x101014\naccent=#89b4fa\ntext=e0e0e8\nbogus=zz\nfuture=0x123456\n";
+        let text = "panel_bg=16151ef2\naccent=#89b4fa\ntext=e0e0e8\nbogus=zz\nfuture=0x123456\n";
         let palette = parse_palette(text);
-        assert_eq!(palette.panel_bg, 0x101014);
+        // alpha-carrying panel color: RGB is the top 24 bits, not the
+        // bottom (the low-end mask once produced a bright blue rail)
+        assert_eq!(palette.panel_bg, 0x16151e);
         assert_eq!(palette.accent, 0x89b4fa);
         assert_eq!(palette.text, 0xe0e0e8);
         // untouched keys keep the defaults
