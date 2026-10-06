@@ -4203,14 +4203,17 @@ impl Render for Browser {
                                     .truncate()
                                     .child(format!("filter: {} (Esc clears)", self.filter))
                             })
-                            .child(match cursor_info {
-                                Some(info) => div()
+                            .child(match &cursor_info {
+                                // the info panel shows name, size, and
+                                // age whenever it is open, so the footer
+                                // readout is only for panel-closed use
+                                Some(info) if !show_panel => div()
                                     .flex_none()
                                     .max_w(px(360.))
                                     .text_color(theme::text_dim())
                                     .truncate()
-                                    .child(info),
-                                None => div(),
+                                    .child(info.clone()),
+                                _ => div(),
                             })
                             .child(match &free_text {
                                 Some(text) => div()
