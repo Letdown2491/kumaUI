@@ -747,9 +747,10 @@ impl Browser {
         }
 
         // pinned folders ride the GTK bookmarks file, so Thunar and
-        // Nautilus agree with us about what is pinned
+        // Nautilus agree with us about what is pinned; entries the
+        // XDG dirs or mounts already cover are not repeated
         for (path, name) in Self::read_bookmarks() {
-            if !path.is_dir() {
+            if !path.is_dir() || places.iter().any(|place| place.path == path) {
                 continue;
             }
             let name = name.unwrap_or_else(|| {
@@ -988,6 +989,12 @@ impl Browser {
         self.load_source(Source::Recent, cx);
     }
 
+    /// Is this dir already pinned? Menus consult this so "Add
+    /// Bookmark" never offers a duplicate.
+    fn dir_is_bookmarked(path: &Path) -> bool {
+        Self::read_bookmarks().iter().any(|(p, _)| p == path)
+    }
+
     /// The GTK bookmarks file, parsed. Missing file just means none.
     fn read_bookmarks() -> Vec<(PathBuf, Option<String>)> {
         match bookmarks_path().and_then(|path| fs::read_to_string(path).ok()) {
@@ -996,7 +1003,8 @@ impl Browser {
         }
     }
 
-    /// Pin a folder. Existing pin for the same dir is a no-op.
+    /// Pin a folder in the GTK bookmarks file, deduped against the
+    /// rest of the sidebar so XDG dirs never show twice.
     fn add_bookmark(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         let mut marks = Self::read_bookmarks();
         if marks.iter().any(|(path, _)| *path == dir) {
@@ -3353,7 +3361,8 @@ impl Browser {
                     } else if this.tab().source == Source::Recent {
                         Self::recent_menu_items()
                     } else {
-                        Self::row_menu_items(entry_is_dir, entry_is_archive, &menu_key)
+                        let bookmarked = Self::dir_is_bookmarked(&menu_key);
+                        Self::row_menu_items(entry_is_dir, entry_is_archive, &menu_key, bookmarked)
                     };
                     this.open_menu(
                         f32::from(event.position.x),
@@ -3616,7 +3625,8 @@ impl Browser {
                     } else if this.tab().source == Source::Recent {
                         Self::recent_menu_items()
                     } else {
-                        Self::row_menu_items(entry_is_dir, entry_is_archive, &menu_key)
+                        let bookmarked = Self::dir_is_bookmarked(&menu_key);
+                        Self::row_menu_items(entry_is_dir, entry_is_archive, &menu_key, bookmarked)
                     };
                     this.open_menu(
                         f32::from(event.position.x),
@@ -4320,7 +4330,7 @@ impl Browser {
         self.menu = Some(ContextMenu { x, y, items, hint: None });
     }
 
-    fn row_menu_items(is_dir: bool, archive: bool, path: &Path) -> Vec<MenuItem> {
+    fn row_menu_items(is_dir: bool, archive: bool, path: &Path, bookmarked: bool) -> Vec<MenuItem> {
         let mut items = vec![MenuItem::new("Open", MenuAction::Open)];
         if !is_dir {
             items.push(MenuItem::new("Open With…", MenuAction::OpenWith));
@@ -4335,8 +4345,9 @@ impl Browser {
             MenuItem::new("Copy Path", MenuAction::CopyPath),
             MenuItem::new("Copy URI", MenuAction::CopyUri),
         ]);
-        // pinning only means something for directories
-        if is_dir {
+        // pinning only means something for directories, and only
+        // once: a pinned dir offers nothing here
+        if is_dir && !bookmarked {
             items.push(MenuItem::new(
                 "Add Bookmark",
                 MenuAction::Bookmark(path.to_path_buf()),
@@ -4374,16 +4385,20 @@ impl Browser {
     fn empty_menu_items(source: &Source) -> Vec<MenuItem> {
         let mut items = Vec::new();
         match source {
-            Source::Dir(dir) => items.extend([
-                MenuItem::new("New Folder", MenuAction::NewFolder),
-                MenuItem::new("New File", MenuAction::NewFile),
-                MenuItem::new("Paste", MenuAction::Paste),
-                MenuItem::new(
-                    "Bookmark This Folder",
-                    MenuAction::Bookmark(dir.to_path_buf()),
-                ),
-                MenuItem::new("Open Terminal Here", MenuAction::Terminal),
-            ]),
+            Source::Dir(dir) => {
+                items.extend([
+                    MenuItem::new("New Folder", MenuAction::NewFolder),
+                    MenuItem::new("New File", MenuAction::NewFile),
+                    MenuItem::new("Paste", MenuAction::Paste),
+                ]);
+                if !Self::dir_is_bookmarked(dir) {
+                    items.push(MenuItem::new(
+                        "Bookmark This Folder",
+                        MenuAction::Bookmark(dir.to_path_buf()),
+                    ));
+                }
+                items.push(MenuItem::new("Open Terminal Here", MenuAction::Terminal));
+            }
             // preserve the long-standing trash behavior: the file ops
             // target the selection, paste is inert without a clipboard
             Source::Trash => items.extend([
