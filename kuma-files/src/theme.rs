@@ -89,10 +89,10 @@ pub(crate) struct Palette {
 impl Default for Palette {
     fn default() -> Self {
         Palette {
-            panel_bg: 0x14161a,
-            surface: 0x181b21,
+            panel_bg: 0x181b21,
+            surface: 0x1d2129,
             surface_hover: 0x272d38,
-            inset: 0x1d2129,
+            inset: 0x14161a,
             divider: 0x2a2f3a,
             divider_soft: 0x2a2f3a,
             text: 0xd8dce3,
@@ -104,11 +104,14 @@ impl Default for Palette {
 }
 
 /// Swap the chrome for a wallpaper palette (kuma-shell) wholesale:
-/// the session's own look, so the file manager belongs to it.
+/// the session's own look, so the file manager belongs to it. The
+/// mapping follows what each slot means: our window backing is the
+/// shell's darkest inset, the places rail mirrors the bar, listing
+/// rows are cards.
 pub(crate) fn apply_palette(palette: &Palette) {
-    BG.store(palette.panel_bg, Ordering::Relaxed);
-    SIDEBAR.store(palette.surface, Ordering::Relaxed);
-    ROW.store(palette.inset, Ordering::Relaxed);
+    BG.store(palette.inset, Ordering::Relaxed);
+    SIDEBAR.store(palette.panel_bg & 0xFFFFFF, Ordering::Relaxed);
+    ROW.store(palette.surface, Ordering::Relaxed);
     ROW_HOVER.store(palette.surface_hover, Ordering::Relaxed);
     BORDER.store(palette.divider, Ordering::Relaxed);
     TEXT.store(palette.text, Ordering::Relaxed);
