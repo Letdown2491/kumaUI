@@ -5448,7 +5448,10 @@ impl Browser {
     /// answer field. Between prompts: the status line alone.
     fn connect_overlay(&self, _cx: &mut Context<Self>) -> Option<Div> {
         let dialog = self.connect.as_ref()?;
-        let (buffer, cursor, field_label) = if dialog.prompt.is_some() {
+        // two layouts: the URI field before the pump runs, then the
+        // server line locked above whatever gio is asking for
+        let at_prompt = dialog.session.is_some();
+        let (buffer, cursor, _field_label) = if dialog.prompt.is_some() {
             (&dialog.input, dialog.input_cursor, dialog.prompt.clone().unwrap())
         } else {
             (&dialog.uri, dialog.uri_cursor, "server URI".to_string())
@@ -5459,7 +5462,10 @@ impl Browser {
             buffer.len()
         };
         let (before, after) = buffer.split_at(cursor);
-        let shown = if dialog.mask {
+        let shown = if at_prompt && dialog.prompt.is_none() {
+            // no question up: nothing is editable, no caret
+            dialog.uri.clone()
+        } else if dialog.mask {
             format!("{}{}", "\u{2022}".repeat(before.chars().count()), after)
         } else {
             format!("{before}\u{254f}{after}")
@@ -5467,11 +5473,26 @@ impl Browser {
         let label = div()
             .text_size(px(14.))
             .text_color(theme::text())
-            .child(if dialog.prompt.is_some() {
-                format!("{field_label}:")
-            } else {
-                "Connect to Server".to_string()
+            .child(match dialog.prompt.as_ref() {
+                Some(prompt) => format!("{prompt}:"),
+                None if at_prompt => "Connecting".to_string(),
+                None => "Connect to Server".to_string(),
             });
+        // while connecting, the server rides along (dim, locked) so
+        // the one question at a time field has visible context
+        let server_row = at_prompt.then(|| {
+            div()
+                .flex()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(theme::text_dim())
+                .child("server")
+                .child(
+                    div()
+                        .text_color(theme::text())
+                        .child(dialog.uri.trim().to_string()),
+                )
+        });
         let status = (!dialog.status.is_empty()).then(|| {
             div()
                 .text_size(px(12.))
@@ -5514,6 +5535,7 @@ impl Browser {
                         .shadow_lg()
                         .text_size(px(13.))
                         .child(label)
+                        .children(server_row)
                         .children(notes)
                         .child(
                             div()
@@ -5535,7 +5557,7 @@ impl Browser {
                                 .gap_1()
                                 .text_size(px(12.))
                                 .text_color(theme::text_dim())
-                                .child(if dialog.session.is_some() {
+                                .child(if at_prompt {
                                     "Enter submits, Esc cancels"
                                 } else {
                                     "Enter connects, Esc closes"
