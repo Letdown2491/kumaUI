@@ -1421,19 +1421,18 @@ impl Browser {
         }
     }
 
-    /// The filter changed: prune stale deep rows, and while the
-    /// filter is non-empty kick a recursive search of the tab's
-    /// directory subtree. Flat matches are already in place; deep
-    /// results land in the background and only if nothing (filter
-    /// edit, navigation, tab switch) moved on first.
+    /// The filter changed: while the filter is non-empty, kick a
+    /// recursive search of the tab's directory subtree (debounced, so
+    /// fast typing walks once). Deep rows from the previous filter
+    /// stay put until fresh results replace them in one update; the
+    /// visible list re-scores names itself, so stale rows still
+    /// respect the new filter and nothing flashes.
     fn filter_changed(&mut self, cx: &mut Context<Self>) {
         self.search_gen += 1;
-        let pruned = self.prune_deep();
         if self.filter.is_empty() {
-            if pruned {
-                self.snap_cursor_visible();
-                cx.notify();
-            }
+            self.prune_deep();
+            self.snap_cursor_visible();
+            cx.notify();
             return;
         }
         let Source::Dir(root) = self.tab().source.clone() else {
@@ -1443,6 +1442,16 @@ impl Browser {
         let filter = self.filter.clone();
         let show_hidden = self.show_hidden;
         cx.spawn(async move |this, cx| {
+            // coalesce fast typing into one walk
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+            let still_current = this
+                .update(cx, |this, _| this.search_gen == generation)
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
             let matches =
                 cx.background_spawn(async move { search_subtree(&root, &filter, show_hidden) })
                     .await;
@@ -1450,6 +1459,20 @@ impl Browser {
                 if this.search_gen != generation {
                     return; // the listing moved on; results are stale
                 }
+                // replace the deep rows only when the walk brought
+                // something new, or the watcher's re-runs flicker
+                let fresh: Vec<PathBuf> = matches.iter().map(|e| e.key.clone()).collect();
+                let stale: Vec<PathBuf> = this
+                    .tab()
+                    .entries
+                    .iter()
+                    .filter(|e| e.rel.is_some())
+                    .map(|e| e.key.clone())
+                    .collect();
+                if fresh == stale {
+                    return;
+                }
+                this.prune_deep();
                 let deep = matches.len();
                 this.extend_deep(matches);
                 if deep > 0 {
@@ -8261,6 +8284,8 @@ mod browser_search {
             browser.filter = "needle".into();
             browser.filter_changed(cx);
         });
+        // the walker debounces on a simulated 150ms timer
+        app.advance_clock(std::time::Duration::from_millis(200));
         app.run_until_parked();
         window.update(|browser, _, _| {
             let deep: Vec<&Entry> =
