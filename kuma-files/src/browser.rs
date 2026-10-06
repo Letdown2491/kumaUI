@@ -10,6 +10,7 @@ use gpui::{
     ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, ImageSource,
     KeyDownEvent, MouseDownEvent, MouseButton, MouseUpEvent, ObjectFit, Pixels, Point, Render,
     RenderImage, Stateful, Window, div, img, prelude::*, px, relative, rgba, rgb, svg,
+    FontWeight,
 };
 use trash::{os_limited, TrashItem};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -352,7 +353,7 @@ pub(crate) struct Browser {
     /// Keybinding cheatsheet expanded in the places sidebar.
     keys_open: bool,
     /// Text snippet for the rail, when the focused entry is textual.
-    text_preview: Option<String>,
+    text_preview: Option<TextPreview>,
     preview_key: Option<PathBuf>,
     preview_inflight: HashSet<PathBuf>,
     /// Hand-rolled right-click menu: position plus a flat item list.
@@ -1577,7 +1578,8 @@ impl Browser {
     }
 
     /// Load the rail's text snippet in the background: first lines of a
-    /// small file that does not smell binary (no NUL in the head).
+    /// small file that does not smell binary (no NUL in the head). The
+    /// kind comes from the extension; styling happens at render.
     fn request_text_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.preview_inflight.contains(&path) {
             return;
@@ -1589,6 +1591,7 @@ impl Browser {
             return;
         }
         self.preview_inflight.insert(path.clone());
+        let kind = text_kind(&path);
         let bg_path = path.clone();
         cx.spawn(async move |this, cx| {
             let lines = cx
@@ -1607,13 +1610,18 @@ impl Browser {
                         return None;
                     }
                     let text = String::from_utf8_lossy(&buf[..filled]);
-                    Some(text.lines().take(48).collect::<Vec<_>>().join("\n"))
+                    Some(
+                        text.lines()
+                            .take(48)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>(),
+                    )
                 })
                 .await;
             let update = this.update(cx, |this, cx| {
                 this.preview_inflight.remove(&path);
                 if this.preview_key.as_ref() == Some(&path) {
-                    this.text_preview = lines;
+                    this.text_preview = lines.map(|lines| TextPreview { kind, lines });
                     cx.notify();
                 }
             });
@@ -2828,7 +2836,7 @@ impl Browser {
         } else if let (Some(entry), Some(text)) = (&entry, &self.text_preview)
             && self.preview_key.as_ref() == Some(&entry.key)
         {
-            div()
+            let mono = div()
                 .w_full()
                 .h_full()
                 .flex()
@@ -2837,9 +2845,37 @@ impl Browser {
                 .overflow_hidden()
                 .text_size(px(11.))
                 .text_color(theme::text())
-                .font_family("monospace")
-                .children(text.lines().map(|line| div().truncate().child(line.to_string())))
-                .into_any_element()
+                .font_family("monospace");
+            match text.kind {
+                TextKind::Csv => mono.children(csv_lines(&text.lines).iter().map(|line| {
+                    preview_line(line.clone()).text_color(theme::text())
+                })),
+                TextKind::Code => mono.children(
+                    text.lines
+                        .iter()
+                        .map(|line| code_line(line).into_any_element()),
+                ),
+                TextKind::Markdown => div()
+                    .w_full()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .gap_px()
+                    .overflow_hidden()
+                    .text_size(px(11.))
+                    .text_color(theme::text())
+                    .children(
+                        text.lines
+                            .iter()
+                            .map(|line| markdown_line(line)),
+                    ),
+                TextKind::Plain => mono.children(
+                    text.lines
+                        .iter()
+                        .map(|line| preview_line(line.clone()).text_color(theme::text())),
+                ),
+            }
+            .into_any_element()
         } else if let Some(entry) = entry {
             self.entry_icon(entry, px(56.))
         } else {
@@ -3911,6 +3947,171 @@ impl Render for Browser {
             .children(self.conflict_overlay(cx))
             .children(self.menu_overlay(window, cx))
     }
+}
+
+/// How to style a text snippet in the info panel.
+#[derive(Clone, Copy, PartialEq)]
+enum TextKind {
+    Plain,
+    Code,
+    Csv,
+    Markdown,
+}
+
+#[derive(Clone)]
+struct TextPreview {
+    kind: TextKind,
+    lines: Vec<String>,
+}
+
+fn text_kind(path: &Path) -> TextKind {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    match ext {
+        "csv" => TextKind::Csv,
+        "md" | "markdown" => TextKind::Markdown,
+        "json" | "toml" | "yaml" | "yml" | "ini" | "conf" | "kdl" | "sh" | "bash" | "zsh"
+        | "py" | "rs" | "go" | "c" | "h" | "cpp" | "js" | "ts" | "html" | "xml" | "css"
+        | "service" | "desktop" => TextKind::Code,
+        _ => TextKind::Plain,
+    }
+}
+
+/// One styled line for the preview box.
+fn preview_line(line: String) -> Div {
+    div().w_full().truncate().child(line)
+}
+
+/// A code-ish line: keys accented, comments dimmed.
+fn code_line(line: &str) -> Div {
+    let trimmed = line.trim_start();
+    let indent = line.len() - trimmed.len();
+    let line = preview_line(trimmed.to_string()).pl(px(indent as f32 * 6.6));
+    if trimmed.starts_with('#') || trimmed.starts_with("//") {
+        line.text_color(theme::text_dim())
+    } else if trimmed.starts_with('[') {
+        line.text_color(theme::accent())
+    } else if trimmed.starts_with('<') {
+        line.text_color(theme::text())
+    } else if let Some((key, value)) = trimmed
+        .split_once(": ")
+        .or_else(|| trimmed.split_once('='))
+    {
+        div()
+            .w_full()
+            .flex()
+            .gap_1()
+            .pl(px(indent as f32 * 6.6))
+            .child(
+                div()
+                    .truncate()
+                    .text_color(theme::accent())
+                    .child(key.to_string()),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_color(theme::text())
+                    .child(value.to_string()),
+            )
+    } else {
+        line.text_color(theme::text())
+    }
+}
+
+/// A markdown line: headings sized, bullets indented, quotes dimmed.
+fn markdown_line(line: &str) -> AnyElement {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return div().h(px(6.)).into_any_element();
+    }
+    let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if hashes >= 1
+        && hashes <= 6
+        && trimmed[hashes..].starts_with(' ')
+    {
+        let size = match hashes {
+            1 => 15.,
+            2 => 14.,
+            _ => 13.,
+        };
+        let heading = trimmed[hashes..].trim();
+        return preview_line(heading.to_string())
+            .text_size(px(size))
+            .font_weight(FontWeight::BOLD)
+            .text_color(if hashes <= 2 {
+                theme::accent()
+            } else {
+                theme::text()
+            })
+            .into_any_element();
+    }
+    if trimmed.starts_with("```") {
+        return preview_line("⋯".to_string())
+            .text_color(theme::text_dim())
+            .into_any_element();
+    }
+    if trimmed.starts_with('>') {
+        return preview_line(trimmed.trim_start_matches(['>', ' ']).to_string())
+            .italic()
+            .text_color(theme::text_dim())
+            .into_any_element();
+    }
+    if (trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ "))
+        && let Some(rest) = trimmed.get(2..)
+    {
+        return div()
+            .w_full()
+            .flex()
+            .pl_2()
+            .gap_1()
+            .child(div().text_color(theme::accent()).child("·"))
+            .child(preview_line(rest.to_string()).text_color(theme::text()))
+            .into_any_element();
+    }
+    preview_line(trimmed.to_string())
+        .text_color(theme::text())
+        .into_any_element()
+}
+
+/// A csv preview: cells padded into an aligned mono table, first row
+/// as the header. Quote handling is out of scope for a glance.
+fn csv_lines(lines: &[String]) -> Vec<String> {
+    let rows: Vec<Vec<&str>> = lines
+        .iter()
+        .map(|line| line.split(',').collect::<Vec<_>>())
+        .collect();
+    let columns = rows
+        .iter()
+        .map(|row| row.len())
+        .max()
+        .unwrap_or(0)
+        .min(12);
+    let mut widths = vec![0usize; columns];
+    for row in &rows {
+        for (c, cell) in row.iter().enumerate().take(columns) {
+            widths[c] = widths[c].max(cell.len().min(24));
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .take(columns)
+                .map(|(c, cell)| {
+                    let mut cell = cell.to_string();
+                    if cell.len() > 24 {
+                        cell.truncate(23);
+                        cell.push('…');
+                    }
+                    format!("{cell:<width$}", width = widths[c])
+                })
+                .collect::<Vec<_>>()
+                .join("  ")
+        })
+        .collect()
 }
 
 /// The sidebar cheatsheet's lines: key, what it does.
