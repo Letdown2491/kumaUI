@@ -874,11 +874,9 @@ impl Browser {
         };
         self.rubber_current = None;
         let Some((origin, current, bounds)) = band else {
-            log::info!("rubber: drop without full band state");
             cx.notify();
             return;
         };
-        log::info!("rubber: finishing band");
 
         let ctrl = self.rubber_ctrl;
         let scale = self.scale;
@@ -3789,11 +3787,9 @@ impl Browser {
                     .path
                     .file_name()
                     .map_or_else(|| "unnamed".into(), |n| n.to_string_lossy().into_owned());
-                log::info!("drag start: {}", dragged.path.display());
                 cx.new(|_| Ghost { name, position })
             })
             .external_drag_payload::<DragEntry>(|dragged: &DragEntry, _, _| {
-                log::info!("external payload resolved: {}", dragged.path.display());
                 Some(ExternalDragPayload::Files(FileDragPaths::new([(
                     dragged.path.clone(),
                     dragged.is_dir,
@@ -4067,12 +4063,10 @@ impl Browser {
                         .path
                         .file_name()
                         .map_or_else(|| "unnamed".into(), |n| n.to_string_lossy().into_owned());
-                    log::info!("drag start: {}", dragged.path.display());
-                    cx.new(|_| Ghost { name, position })
+                        cx.new(|_| Ghost { name, position })
                 },
             )
             .external_drag_payload::<DragEntry>(|dragged: &DragEntry, _, _| {
-                log::info!("external payload resolved: {}", dragged.path.display());
                 Some(ExternalDragPayload::Files(FileDragPaths::new([(
                     dragged.path.clone(),
                     dragged.is_dir,
@@ -5985,10 +5979,6 @@ impl Render for Browser {
                                         MouseButton::Left,
                                         cx.listener(
                                             |this, event: &MouseDownEvent, _, cx| {
-                                                log::info!(
-                                                    "rubber: mouse down at {}",
-                                                    event.position
-                                                );
                                                 this.rubber_origin = Some(event.position);
                                                 this.rubber_current = None;
                                                 cx.notify();
@@ -5996,7 +5986,6 @@ impl Render for Browser {
                                         ),
                                     )
                                     .on_drag(RubberSelect, |_, _, _, cx| {
-                                        log::info!("rubber: drag started");
                                         cx.new(|_| RubberGhost)
                                     })
                                     .on_mouse_up(
@@ -6080,7 +6069,6 @@ impl Render for Browser {
                                     .on_drag_move::<RubberSelect>(cx.listener(
                                         |this, event: &DragMoveEvent<RubberSelect>, _, cx| {
                                             if this.rubber_current.is_none() {
-                                                log::info!("rubber: first drag move");
                                             }
                                             this.rubber_current = Some(event.event.position);
                                             this.rubber_bounds = Some(event.bounds);
@@ -6090,7 +6078,6 @@ impl Render for Browser {
                                         },
                                     ))
                                     .on_drop(cx.listener(|this, _: &RubberSelect, _, cx| {
-                                        log::info!("rubber: drop");
                                         this.finish_rubber(cx);
                                     }))
                             }
