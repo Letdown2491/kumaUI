@@ -3293,8 +3293,6 @@ impl Render for Browser {
             }))
             .bg(theme::bg())
             .text_color(theme::text())
-            .children(self.conflict_overlay(cx))
-            .children(self.menu_overlay(window, cx))
             .child(
                 div()
                     .w(px(170.))
@@ -3697,7 +3695,6 @@ impl Render for Browser {
                                     .flex_col()
                                     .p(px(8. * s))
                                     .relative()
-                                    .children(overlay)
                                     .child(
                                         div()
                                             .flex()
@@ -3726,6 +3723,11 @@ impl Render for Browser {
                                             })
                                             .children(rows),
                                     )
+                                    // the band paints after the grid so
+                                    // selected-cell backgrounds do not
+                                    // cover it; it has no hitbox, so
+                                    // clicks pass through to the catcher
+                                    .children(overlay)
                                     .child(catcher)
                                     .on_drag_move::<RubberSelect>(cx.listener(
                                         |this, event: &DragMoveEvent<RubberSelect>, _, cx| {
@@ -3799,6 +3801,11 @@ impl Render for Browser {
             } else {
                 div()
             })
+            // overlays paint last so they land on top of the listing:
+            // gpui paints children in tree order and absolute position
+            // does not lift an element above later siblings
+            .children(self.conflict_overlay(cx))
+            .children(self.menu_overlay(window, cx))
     }
 }
 
