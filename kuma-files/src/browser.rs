@@ -30,6 +30,10 @@ pub(crate) struct DragEntry {
     pub(crate) is_dir: bool,
 }
 
+/// A sidebar place row being dragged to a new position.
+#[derive(Clone)]
+struct PlaceDrag(PathBuf);
+
 #[derive(Clone)]
 struct Entry {
     /// Directory view: the file's path. Trash view: the trash item's
@@ -625,6 +629,10 @@ pub(crate) struct Browser {
     rubber_bounds: Option<Bounds<Pixels>>,
     rubber_ctrl: bool,
     places_refresh: Instant,
+    /// Sidebar order the user arranged by dragging; paths not in the
+    /// list (and list entries not in the sidebar) fall back to the
+    /// computed order, so churny mounts stay safe.
+    place_order: Vec<PathBuf>,
 }
 
 impl Focusable for Browser {
@@ -683,13 +691,29 @@ impl Browser {
             rubber_current: None,
             rubber_bounds: None,
             rubber_ctrl: false,
+            place_order: Vec::new(),
             places_refresh: Instant::now(),
         };
         browser.load_state(cli_dir.as_deref());
         let show_hidden = browser.show_hidden;
         browser.tab_mut().reload(show_hidden);
+        browser.places = browser.ordered_places();
         browser.start_dir_watch(cx);
         browser
+    }
+
+    /// The computed place list with the user's drag order applied.
+    /// Unknown paths sort to the end, so a fresh bookmark or a just
+    /// mounted volume shows up at the bottom until it is moved.
+    fn ordered_places(&self) -> Vec<Place> {
+        let mut places = Self::places();
+        places.sort_by_key(|place: &Place| {
+            self.place_order
+                .iter()
+                .position(|path| path == &place.path)
+                .unwrap_or(usize::MAX)
+        });
+        places
     }
 
     /// XDG user directories; missing ones just don't render ("ask, don't
@@ -779,7 +803,7 @@ impl Browser {
     /// roots at most every couple of seconds.
     fn refresh_places(&mut self) {
         if self.places_refresh.elapsed() >= Duration::from_secs(2) {
-            self.places = Self::places();
+            self.places = self.ordered_places();
             self.places_refresh = Instant::now();
         }
     }
@@ -1065,8 +1089,23 @@ impl Browser {
     }
 
     fn refresh_places_now(&mut self) {
-        self.places = Self::places();
+        self.places = self.ordered_places();
         self.places_refresh = Instant::now();
+    }
+
+    /// A dragged place row landed on another: the dragged place takes
+    /// the target's slot. The order is ours (state file), unlike the
+    /// bookmarks file whose order belongs to every GTK app.
+    fn reorder_places(&mut self, dragged: PathBuf, target: PathBuf, cx: &mut Context<Self>) {
+        let live: Vec<PathBuf> = self
+            .places
+            .iter()
+            .map(|place| place.path.clone())
+            .collect();
+        self.place_order = apply_place_order(self.place_order.clone(), &live, &dragged, &target);
+        self.refresh_places_now();
+        self.save_state();
+        cx.notify();
     }
 
     /// The recency list from the xbel store, newest first.
@@ -2159,6 +2198,7 @@ impl Browser {
         let mut sort: Option<SortKey> = None;
         let mut sort_asc = true;
         let mut saved_tabs: Vec<(usize, PathBuf)> = Vec::new();
+        let mut saved_places: Vec<(usize, PathBuf)> = Vec::new();
         let mut saved_active: Option<usize> = None;
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
@@ -2191,6 +2231,12 @@ impl Browser {
                     {
                         saved_tabs.push((index, PathBuf::from(value)));
                     }
+                    if let Some(index) =
+                        key.strip_prefix("place").and_then(|n| n.parse().ok())
+                        && !value.is_empty()
+                    {
+                        saved_places.push((index, PathBuf::from(value)));
+                    }
                 }
             }
         }
@@ -2198,6 +2244,8 @@ impl Browser {
         // an explicit CLI dir always wins; otherwise reopen the folders
         // that were open last time (trash tabs are not persisted)
         saved_tabs.sort_by_key(|(index, _)| *index);
+        saved_places.sort_by_key(|(index, _)| *index);
+        self.place_order = saved_places.into_iter().map(|(_, path)| path).collect();
         if cli_dir.is_none() && !saved_tabs.is_empty() {
             self.tabs = saved_tabs
                 .into_iter()
@@ -2258,6 +2306,9 @@ impl Browser {
             if let Some(dir) = tab.current_dir() {
                 text.push_str(&format!("tab{}={}\n", i, dir.display()));
             }
+        }
+        for (i, path) in self.place_order.iter().enumerate() {
+            text.push_str(&format!("place{}={}\n", i, path.display()));
         }
         text.push_str(&format!("active={}\n", self.active));
         if let Err(err) = fs::write(path, text) {
@@ -3264,12 +3315,19 @@ impl Browser {
     }
 
     fn internal_move(&mut self, dragged: &DragEntry, target: &Entry, cx: &mut Context<Self>) {
+        self.move_into(dragged, &target.path, cx);
+    }
+
+    /// Move a dragged entry into a destination folder. Drops have no
+    /// modifier report in gpui, so drop means move; Cut + Paste is the
+    /// copy path, same convention as the listing rows.
+    fn move_into(&mut self, dragged: &DragEntry, dest_dir: &Path, cx: &mut Context<Self>) {
         let name = dragged
             .path
             .file_name()
             .map_or_else(|| "unnamed".into(), |n| n.to_string_lossy().into_owned());
-        let dest = target.path.join(&name);
-        if dragged.path == dest || dragged.path == target.path {
+        let dest = dest_dir.join(&name);
+        if dragged.path == dest || dragged.path == dest_dir {
             return;
         }
         self.enqueue(
@@ -3683,8 +3741,38 @@ impl Browser {
         let path = place.path.clone();
         let unbookmark_path = place.path.clone();
         let bookmarked = place.bookmark;
+        let place_drag = PlaceDrag(path.clone());
+        let reorder_drag = path.clone();
+        let move_target = path.clone();
+        let external_name = place.name.clone();
         div()
             .id(format!("place-{ix}"))
+            .on_drag(
+                place_drag,
+                |dragged: &PlaceDrag, position, _, cx| {
+                    let name = dragged
+                        .0
+                        .file_name()
+                        .map_or_else(|| "folder".into(), |n| n.to_string_lossy().into_owned());
+                    cx.new(|_| Ghost { name, position })
+                },
+            )
+            .drag_over::<PlaceDrag>(|style, _, _, _| style.bg(theme::drag_over()))
+            .on_drop(cx.listener(move |this, dragged: &PlaceDrag, _, cx| {
+                this.reorder_places(dragged.0.clone(), reorder_drag.clone(), cx);
+            }))
+            // dropping files on a place moves them into that folder,
+            // the same gesture as dropping them on a dir row
+            .drag_over::<DragEntry>(|style, _, _, _| style.bg(theme::drag_over()))
+            .on_drop(cx.listener(move |this, dragged: &DragEntry, _, cx| {
+                this.move_into(dragged, &move_target, cx);
+            }))
+            .on_drop(cx.listener(move |this, _paths: &ExternalPaths, _, cx| {
+                this.status = format!(
+                    "external drop onto {external_name}: imports land with the queue"
+                );
+                cx.notify();
+            }))
             .px_3()
             .py_1()
             .rounded_sm()
@@ -5745,6 +5833,34 @@ fn xml_escape(text: &str) -> String {
     out
 }
 
+/// A dragged place row landed on another: the dragged place takes
+/// the target's slot. The stored order is folded together with the
+/// live sidebar first, so churny mounts and fresh bookmarks keep
+/// their computed position and churned ones drop out.
+fn apply_place_order(
+    mut order: Vec<PathBuf>,
+    live: &[PathBuf],
+    dragged: &Path,
+    target: &Path,
+) -> Vec<PathBuf> {
+    for path in live {
+        if !order.contains(path) {
+            order.push(path.clone());
+        }
+    }
+    order.retain(|path| live.contains(path));
+    if dragged == target {
+        return order;
+    }
+    order.retain(|path| path != dragged);
+    let at = order
+        .iter()
+        .position(|path| path == target)
+        .unwrap_or(order.len());
+    order.insert(at, dragged.to_path_buf());
+    order
+}
+
 /// One recently-used file: where it lives and when we last opened it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RecentEntry {
@@ -6838,6 +6954,51 @@ sftp://remote/share skip-me
     fn uri_decode_undoes_path_uri() {
         let path = PathBuf::from("/tmp/opencode/my files/report 2026é.md");
         assert_eq!(uri_decode(&path_uri(&path)), path);
+    }
+
+    #[test]
+    fn place_reorder_takes_the_target_slot() {
+        let home = PathBuf::from("/home/u");
+        let games = PathBuf::from("/home/u/Games");
+        let docs = PathBuf::from("/home/u/Documents");
+        let music = PathBuf::from("/home/u/Music");
+        let live = vec![home.clone(), docs.clone(), music.clone(), games.clone()];
+
+        // dragging Games onto Documents puts Games before Documents
+        let order = apply_place_order(Vec::new(), &live, &games, &docs);
+        assert_eq!(
+            order,
+            vec![home.clone(), games.clone(), docs.clone(), music.clone()]
+        );
+
+        // reordering is idempotent: saved order plus live list keeps
+        // the arrangement across restarts
+        let again = apply_place_order(order.clone(), &live, &games, &docs);
+        assert_eq!(again, order);
+
+        // dropping a place on itself changes nothing
+        assert_eq!(apply_place_order(order.clone(), &live, &games, &games), order);
+
+        // a mount that disappeared is forgotten, a new one appends
+        let mounts_gone = vec![home.clone(), docs.clone()];
+        let order = apply_place_order(order, &mounts_gone, &music, &docs);
+        assert_eq!(order, vec![home.clone(), music.clone(), docs.clone()]);
+        let with_new = vec![
+            home.clone(),
+            docs.clone(),
+            games.clone(),
+            PathBuf::from("/run/media/u/USB"),
+        ];
+        let order = apply_place_order(order, &with_new, &games, &docs);
+        assert_eq!(
+            order,
+            vec![
+                home.clone(),
+                games,
+                docs,
+                PathBuf::from("/run/media/u/USB")
+            ]
+        );
     }
 }
 
