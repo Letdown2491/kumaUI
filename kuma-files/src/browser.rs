@@ -446,6 +446,8 @@ enum MenuAction {
     Cut,
     CopyPath,
     CopyUri,
+    /// Paste the clipboard into a specific folder (dir-row menu).
+    PasteInto(PathBuf),
     Compress,
     Paste,
     Terminal,
@@ -2132,12 +2134,19 @@ impl Browser {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some((is_copy, paths)) = self.clipboard.clone() else {
-            return;
-        };
         let Source::Dir(dest_dir) = self.tab().source.clone() else {
             self.status = "paste goes to a folder; trash has no paste".into();
             cx.notify();
+            return;
+        };
+        self.paste_into(dest_dir, cx);
+    }
+
+    /// Paste the clipboard into one specific folder: the current dir
+    /// via the empty-space menu, or a row's folder via the dir-row
+    /// "Paste Into Folder" entry.
+    fn paste_into(&mut self, dest_dir: PathBuf, cx: &mut Context<Self>) {
+        let Some((is_copy, paths)) = self.clipboard.clone() else {
             return;
         };
         let mut ops = Vec::new();
@@ -2882,6 +2891,29 @@ impl Browser {
         if self.conflict_dialog.is_some() {
             match keystroke.key.as_str() {
                 "escape" => self.conflict_skip_all(cx),
+                // enter picks the common intent; when the collision is a
+                // folder Replace is not offered, so enter falls back to
+                // Keep both, matching the rendered buttons
+                "enter" => {
+                    let can_replace = self.conflict_dialog.as_ref().is_some_and(|d| {
+                        let op = &d.ops[d.conflicts[d.ix]];
+                        op.from.is_file() && op.to.is_file()
+                    });
+                    if can_replace {
+                        self.conflict_decide(ConflictDecision::Replace, cx);
+                    } else {
+                        self.conflict_decide(ConflictDecision::KeepBoth, cx);
+                    }
+                }
+                "k" => self.conflict_decide(ConflictDecision::KeepBoth, cx),
+                "s" => self.conflict_decide(ConflictDecision::Skip, cx),
+                "a" => {
+                    if let Some(mut dialog) = self.conflict_dialog.take() {
+                        dialog.apply_all = !dialog.apply_all;
+                        self.conflict_dialog = Some(dialog);
+                        cx.notify();
+                    }
+                }
                 _ => {}
             }
             return;
@@ -3576,7 +3608,13 @@ impl Browser {
                         Self::recent_menu_items()
                     } else {
                         let bookmarked = Self::dir_is_bookmarked(&menu_key);
-                        Self::row_menu_items(entry_is_dir, entry_is_archive, &menu_key, bookmarked)
+                        Self::row_menu_items(
+                            entry_is_dir,
+                            entry_is_archive,
+                            &menu_key,
+                            bookmarked,
+                            this.clipboard.is_some(),
+                        )
                     };
                     this.open_menu(
                         f32::from(event.position.x),
@@ -3840,7 +3878,13 @@ impl Browser {
                         Self::recent_menu_items()
                     } else {
                         let bookmarked = Self::dir_is_bookmarked(&menu_key);
-                        Self::row_menu_items(entry_is_dir, entry_is_archive, &menu_key, bookmarked)
+                        Self::row_menu_items(
+                            entry_is_dir,
+                            entry_is_archive,
+                            &menu_key,
+                            bookmarked,
+                            this.clipboard.is_some(),
+                        )
                     };
                     this.open_menu(
                         f32::from(event.position.x),
@@ -4691,6 +4735,7 @@ impl Browser {
             MenuAction::CopyPath => self.copy_paths_to_system(false, cx),
             MenuAction::CopyUri => self.copy_paths_to_system(true, cx),
             MenuAction::Paste => self.paste(cx),
+            MenuAction::PasteInto(dir) => self.paste_into(dir, cx),
             MenuAction::Terminal => self.open_terminal(cx),
             MenuAction::Trash => self.trash_selection(cx),
             MenuAction::Delete => self.delete_selection(cx),
@@ -4717,7 +4762,43 @@ impl Browser {
         self.menu = Some(ContextMenu { x, y, items, hint: None });
     }
 
-    fn row_menu_items(is_dir: bool, archive: bool, path: &Path, bookmarked: bool) -> Vec<MenuItem> {
+    /// Shift+F10 or the Menu key: the row menu for the keyboard
+    /// cursor. The menu system is pointer-coordinate based, so it
+    /// anchors at the current mouse position.
+    fn open_cursor_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entry = self
+            .tab()
+            .cursor
+            .and_then(|ix| self.tab().entries.get(ix).cloned());
+        let Some(entry) = entry else {
+            return;
+        };
+        let items = if self.tab().source == Source::Recent {
+            Self::recent_menu_items()
+        } else if matches!(self.tab().source, Source::Trash) {
+            Self::trash_menu_items()
+        } else {
+            let bookmarked = Self::dir_is_bookmarked(&entry.path);
+            Self::row_menu_items(
+                entry.is_dir,
+                is_archive(&entry.name),
+                &entry.path,
+                bookmarked,
+                self.clipboard.is_some(),
+            )
+        };
+        let pos = window.mouse_position();
+        self.open_menu(f32::from(pos.x), f32::from(pos.y), items);
+        cx.notify();
+    }
+
+    fn row_menu_items(
+        is_dir: bool,
+        archive: bool,
+        path: &Path,
+        bookmarked: bool,
+        has_clipboard: bool,
+    ) -> Vec<MenuItem> {
         let mut items = vec![MenuItem::new("Open", MenuAction::Open)];
         if !is_dir {
             items.push(MenuItem::new("Open With…", MenuAction::OpenWith));
@@ -4729,6 +4810,19 @@ impl Browser {
             MenuItem::new("Rename", MenuAction::Rename),
             MenuItem::new("Copy", MenuAction::Copy),
             MenuItem::new("Cut", MenuAction::Cut),
+        ]);
+        // paste straight into this folder, Explorer style; dimmed
+        // (but present) while the clipboard is empty so the item
+        // stays put between copy and use
+        if is_dir {
+            let mut paste = MenuItem::new(
+                "Paste Into Folder",
+                MenuAction::PasteInto(path.to_path_buf()),
+            );
+            paste.dim = !has_clipboard;
+            items.push(paste);
+        }
+        items.extend([
             MenuItem::new("Copy Path", MenuAction::CopyPath),
             MenuItem::new("Copy URI", MenuAction::CopyUri),
         ]);
@@ -4883,7 +4977,7 @@ impl Browser {
                                                 cx,
                                             )
                                         }))
-                                        .child("Replace")
+                                        .child("Replace (Enter)")
                                 }))
                                 .child(
                                     div()
@@ -4900,7 +4994,7 @@ impl Browser {
                                                 cx,
                                             )
                                         }))
-                                        .child("Keep both"),
+                                        .child("Keep both (K)"),
                                 )
                                 .child(
                                     div()
@@ -4914,7 +5008,7 @@ impl Browser {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.conflict_decide(ConflictDecision::Skip, cx)
                                         }))
-                                        .child("Skip"),
+                                        .child("Skip (S)"),
                                 ),
                         )
                         .children((total > 1 && dialog.can_replace_all).then(|| {
@@ -4928,13 +5022,16 @@ impl Browser {
                                 .text_color(theme::text_dim())
                                 .hover(|this| this.text_color(theme::text()))
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    // toggle, not set: this handler once
+                                    // assigned the captured value back,
+                                    // so clicking the box did nothing
                                     if let Some(dialog) = &mut this.conflict_dialog {
-                                        dialog.apply_all = apply_all;
+                                        dialog.apply_all = !apply_all;
                                     }
                                     cx.notify();
                                 }))
                                 .child(if apply_all { "[x]" } else { "[ ]" })
-                                .child("apply to all conflicts in this paste")
+                                .child("apply to all conflicts in this paste (A)")
                         })),
                 ),
         )
@@ -5145,9 +5242,18 @@ impl Render for Browser {
             .flex()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let keystroke = &event.keystroke;
+                // Shift+F10 / the Menu key: context menu at the
+                // keyboard cursor
+                if (keystroke.key == "f10" && keystroke.modifiers.shift)
+                    || keystroke.key == "menu"
+                {
+                    this.open_cursor_menu(window, cx);
+                    return;
+                }
                 // Ctrl+Q closes the window; everything else flows into
                 // the keymap
-                if event.keystroke.key == "q" && event.keystroke.modifiers.control {
+                if keystroke.key == "q" && keystroke.modifiers.control {
                     window.remove_window();
                     return;
                 }
@@ -6895,6 +7001,7 @@ const KEY_HINTS: &[(&str, &str)] = &[
     ("Shift+Del", "delete"),
     ("Alt+Enter", "info"),
     ("Right-click", "menu"),
+    ("Shift+F10", "menu (keyboard)"),
     ("Ctrl+C/X/V/Z", "clipboard"),
     ("Ctrl+Shift+C", "copy path"),
     ("Ctrl+Left/Right", "back/fwd"),
@@ -7630,5 +7737,178 @@ mod browser_menu_repro {
             );
         });
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Keyboard paths added late 2026: conflict dialog keys, paste into a
+/// folder, and the keyboard-opened context menu. Runs a real Browser
+/// against a real temp dir, same harness as browser_menu_repro.
+#[cfg(test)]
+mod browser_ux_keys {
+    use super::*;
+    use gpui::Keystroke;
+
+    struct Lab {
+        dir: PathBuf,
+        src: PathBuf,
+    }
+
+    impl Lab {
+        /// dir holds the browser's listing (a.txt, b.txt, c.txt, sub),
+        /// src holds the clipboard payloads of the same names. The
+        /// name keeps parallel tests out of each other's dirs.
+        fn new(name: &str) -> Self {
+            let base =
+                std::env::temp_dir().join(format!("koguma-ux-{name}-{}", std::process::id()));
+            let dir = base.join("dir");
+            let src = base.join("src");
+            fs::create_dir_all(&dir).unwrap();
+            fs::create_dir_all(&src).unwrap();
+            fs::write(dir.join("a.txt"), "old-a").unwrap();
+            fs::write(dir.join("b.txt"), "old-b").unwrap();
+            fs::write(dir.join("c.txt"), "old-c").unwrap();
+            fs::create_dir_all(dir.join("sub")).unwrap();
+            fs::write(src.join("a.txt"), "new-a").unwrap();
+            fs::write(src.join("b.txt"), "new-b").unwrap();
+            fs::write(src.join("c.txt"), "new-c").unwrap();
+            Self { dir, src }
+        }
+    }
+
+    impl Drop for Lab {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.dir.parent().unwrap());
+        }
+    }
+
+    fn key(k: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: Keystroke::parse(k).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    fn open_browser(app: &mut gpui::TestApp, dir: &Path) -> gpui::TestAppWindow<Browser> {
+        let window =
+            app.open_window(|window, cx| Browser::new(Some(dir.to_path_buf()), window, cx));
+        app.run_until_parked();
+        window
+    }
+
+    #[test]
+    fn paste_into_folder_targets_the_given_dir() {
+        let lab = Lab::new("paste-into");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.clipboard = Some((true, vec![lab.src.join("a.txt")]));
+            browser.paste_into(lab.dir.join("sub"), cx);
+            assert!(browser.conflict_dialog.is_none(), "empty target dir must not conflict");
+        });
+        app.run_until_parked();
+        assert_eq!(
+            fs::read_to_string(lab.dir.join("sub").join("a.txt")).unwrap(),
+            "new-a"
+        );
+    }
+
+    #[test]
+    fn conflict_dialog_keyboard_decide_and_toggle() {
+        let lab = Lab::new("conflict-keys");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+
+        // "a" toggles apply-to-all without deciding
+        window.update(|browser, _, cx| {
+            browser.clipboard = Some((true, vec![lab.src.join("a.txt")]));
+            browser.paste(cx);
+            assert!(browser.conflict_dialog.is_some());
+            browser.route_key(&key("a"), cx);
+            assert!(browser.conflict_dialog.as_ref().unwrap().apply_all);
+        });
+
+        // enter = Replace, so dir/a.txt ends up with the new content
+        window.update(|browser, _, cx| browser.route_key(&key("enter"), cx));
+        app.run_until_parked();
+        assert_eq!(fs::read_to_string(lab.dir.join("a.txt")).unwrap(), "new-a");
+
+        // "s" skips: dir/b.txt keeps its content
+        window.update(|browser, _, cx| {
+            browser.clipboard = Some((true, vec![lab.src.join("b.txt")]));
+            browser.paste(cx);
+            assert!(browser.conflict_dialog.is_some());
+            browser.route_key(&key("s"), cx);
+        });
+        app.run_until_parked();
+        assert_eq!(fs::read_to_string(lab.dir.join("b.txt")).unwrap(), "old-b");
+
+        // "k" keeps both: the collision lands beside it under a new name
+        window.update(|browser, _, cx| {
+            browser.clipboard = Some((true, vec![lab.src.join("c.txt")]));
+            browser.paste(cx);
+            browser.route_key(&key("k"), cx);
+        });
+        app.run_until_parked();
+        assert_eq!(fs::read_to_string(lab.dir.join("c.txt")).unwrap(), "old-c");
+        assert_eq!(
+            fs::read_to_string(lab.dir.join("c (copy).txt")).unwrap(),
+            "new-c"
+        );
+    }
+
+    #[test]
+    fn keyboard_menu_uses_the_cursor_row() {
+        let lab = Lab::new("kb-menu");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, window, cx| {
+            let sub_ix = browser
+                .tab()
+                .entries
+                .iter()
+                .position(|e| e.name == "sub")
+                .expect("sub dir not in the listing");
+            browser.tab_mut().cursor = Some(sub_ix);
+            browser.open_cursor_menu(window, cx);
+            let menu = browser.menu.as_ref().expect("cursor menu never opened");
+            assert_eq!(menu.items[0].label, "Open");
+            let paste = menu
+                .items
+                .iter()
+                .find(|item| item.label == "Paste Into Folder")
+                .expect("dir row menu must offer Paste Into Folder");
+            assert!(paste.dim, "empty clipboard should render the item dim");
+            assert_eq!(
+                match &paste.action {
+                    MenuAction::PasteInto(dir) => Some(dir.clone()),
+                    _ => None,
+                },
+                Some(lab.dir.join("sub"))
+            );
+        });
+    }
+
+    #[test]
+    fn row_menu_items_offer_paste_into_folder_only_for_dirs() {
+        let file = Path::new("/tmp/koguma-nothing.txt");
+        let items = Browser::row_menu_items(false, false, file, false, true);
+        assert!(!items.iter().any(|item| item.label == "Paste Into Folder"));
+
+        let items = Browser::row_menu_items(true, false, file, false, false);
+        let paste = items
+            .iter()
+            .find(|item| item.label == "Paste Into Folder")
+            .expect("dir row menu must offer Paste Into Folder");
+        assert!(paste.dim, "no clipboard: dim");
     }
 }

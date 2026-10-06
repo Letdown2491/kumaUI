@@ -66,6 +66,9 @@ pub(crate) fn rubber_band() -> Rgba {
     rgba((derive(&ACCENT.load(Ordering::Relaxed), 1.76, 0.706) << 8) | 0x26)
 }
 
+/// Test-only peek at the raw selection color (unit tests assert the
+/// accent-driven hue); the bin build never calls it.
+#[cfg(test)]
 pub(crate) fn row_selected_hex() -> u32 {
     ROW_SELECTED.load(Ordering::Relaxed)
 }
