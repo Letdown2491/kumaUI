@@ -39,11 +39,13 @@ if [ "${1:-}" = "build" ]; then
     cp target/release/kuma-files ~/.local/bin/kuma-files.new
     mv -f ~/.local/bin/kuma-files.new ~/.local/bin/kuma-files
     mkdir -p ~/.local/share/applications \
-      ~/.local/share/icons/hicolor/scalable/apps
+      ~/.local/share/icons/hicolor/256x256/apps
     sed "s|@HOME@|$HOME|" kuma-files/packaging/kuma-files.desktop.in \
       > ~/.local/share/applications/kuma-files.desktop
-    cp kuma-files/packaging/kuma-files.svg \
-      ~/.local/share/icons/hicolor/scalable/apps/kuma-files.svg
+    # png, not svg: the shell tints svg icons with the theme text
+    # color, which eats the bear; raster icons decode true-color
+    cp kuma-files/packaging/kuma-files.png \
+      ~/.local/share/icons/hicolor/256x256/apps/kuma-files.png
     # "Open folder" from other apps lands in Koguma
     if command -v xdg-mime >/dev/null 2>&1; then
       xdg-mime default kuma-files.desktop inode/directory
