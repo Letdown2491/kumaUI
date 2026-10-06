@@ -3829,6 +3829,8 @@ impl Browser {
             div()
                 .flex_1()
                 .min_w_0()
+                .id("rename-box")
+                .debug_selector(|| "rename-box".into())
                 .border_1()
                 .border_color(theme::accent())
                 .rounded_sm()
@@ -3837,6 +3839,7 @@ impl Browser {
         } else if let Some(rel) = &entry.rel {
             // recursive-search hit: name plus where it lives
             div()
+                .id("name-deep")
                 .flex_1()
                 .min_w_0()
                 .flex()
@@ -3856,7 +3859,7 @@ impl Browser {
                         .child(rel.clone()),
                 )
         } else {
-            div().flex_1().min_w_0().truncate().child(entry.name.clone())
+            div().id("name-plain").flex_1().min_w_0().truncate().child(entry.name.clone())
         };
 
         let modified_text = entry
@@ -3916,6 +3919,25 @@ impl Browser {
         let entry_is_dir = entry.is_dir;
         let entry_is_archive = is_archive(&entry.name);
         let in_trash = entry.item.is_some();
+        let renaming = self
+            .tab()
+            .renaming
+            .as_ref()
+            .is_some_and(|path| *path == entry.path);
+        let rename_box = renaming.then(|| {
+            let tab = self.tab();
+            let cursor = if tab.rename_buffer.is_char_boundary(tab.rename_cursor) {
+                tab.rename_cursor
+            } else {
+                tab.rename_buffer.len()
+            };
+            let (before, after) = tab.rename_buffer.split_at(cursor);
+            (
+                before.to_string(),
+                after.to_string(),
+                tab.rename_cursor,
+            )
+        });
 
         // thumbnails only for local image files: trash entries point at
         // paths that no longer exist
@@ -4064,9 +4086,24 @@ impl Browser {
                     .justify_center()
                     .child(preview),
             )
-            .child(if entry.rel.is_some() {
+            .child(if let Some((before, after, _)) = rename_box {
+                // the rename edit box, same as the list row's
+                div()
+                    .id("rename-box")
+                    .debug_selector(|| "rename-box".into())
+                    .w_full()
+                    .h(px(16. * s))
+                    .border_1()
+                    .border_color(theme::accent())
+                    .rounded_sm()
+                    .px_1()
+                    .text_size(px(12. * s))
+                    .overflow_hidden()
+                    .child(format!("{before}▏{after}"))
+            } else if entry.rel.is_some() {
                 // deep search hit: a second dim line under the name
                 div()
+                    .id("tile-name-deep")
                     .w_full()
                     .flex()
                     .flex_col()
@@ -4092,6 +4129,7 @@ impl Browser {
                     )
             } else {
                 div()
+                    .id("tile-name")
                     .h(px(16. * s))
                     .w_full()
                     .text_size(px(12. * s))
@@ -8371,5 +8409,103 @@ mod browser_search {
             );
             assert!(browser.filter.is_empty());
         });
+    }
+}
+
+/// Rename end to end: start (F2 path), type, commit, and the file
+/// actually moving on disk.
+#[cfg(test)]
+mod browser_rename {
+    use super::*;
+    use gpui::{Keystroke, TestApp};
+
+    fn key(k: &str) -> KeyDownEvent {
+        let mut keystroke = Keystroke::parse(k).unwrap();
+        // printable keys arrive with key_char on the real input path;
+        // the rename buffer inserts from key_char
+        if keystroke.key.chars().count() == 1 {
+            keystroke.key_char = Some(keystroke.key.clone().into());
+        }
+        KeyDownEvent {
+            keystroke,
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    #[test]
+    fn rename_commits_to_disk() {
+        let dir =
+            std::env::temp_dir().join(format!("koguma-rename-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), "hello").unwrap();
+
+        let mut app = TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = app.open_window(|window, cx| {
+            Browser::new(Some(dir.clone()), window, cx)
+        });
+        app.run_until_parked();
+        window.update(|browser, _, cx| {
+            browser.tab_mut().cursor = Some(0);
+            browser.start_rename(cx);
+            assert!(browser.tab().renaming.is_some(), "F2 path never entered rename");
+            // append a 2, then commit
+            browser.route_key(&key("2"), cx);
+            assert_eq!(browser.tab().rename_buffer, "notes.txt2");
+            browser.route_key(&key("enter"), cx);
+        });
+        app.run_until_parked();
+        assert!(
+            !dir.join("notes.txt").exists(),
+            "the old name is still there; rename never committed"
+        );
+        assert_eq!(fs::read_to_string(dir.join("notes.txt2")).unwrap(), "hello");
+        window.update(|browser, _, _| {
+            assert!(browser.tab().renaming.is_none());
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_renders_its_box_in_icon_view() {
+        let dir =
+            std::env::temp_dir().join(format!("koguma-rename-icon-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), "hello").unwrap();
+
+        let mut app = TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = app.open_window(|window, cx| {
+            Browser::new(Some(dir.clone()), window, cx)
+        });
+        app.run_until_parked();
+        window.update(|browser, _, cx| {
+            browser.set_view_mode(ViewMode::Icons, cx);
+            browser.tab_mut().cursor = Some(0);
+            browser.start_rename(cx);
+        });
+        app.run_until_parked();
+        // the edit box must actually paint: before this fix, icon view
+        // started renames with no visible box and silently ate keys
+        let painted = window.update(|_, window, _| {
+            window
+                .debug_element_bounds("rename-box")
+                .map(|b| b.size.width > gpui::px(0.))
+                .unwrap_or(false)
+        });
+        assert!(painted, "icon view never painted the rename box");
+        // and the flow still commits
+        window.update(|browser, _, cx| {
+            browser.route_key(&key("2"), cx);
+            browser.route_key(&key("enter"), cx);
+        });
+        app.run_until_parked();
+        assert!(dir.join("notes.txt2").exists(), "icon-view rename never committed");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
