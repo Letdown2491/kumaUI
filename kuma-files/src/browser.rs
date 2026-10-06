@@ -4,8 +4,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, env, fs, io};
+
+use std::io::{BufRead as _, Write as _};
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent,
@@ -411,6 +415,9 @@ struct Place {
     path: PathBuf,
     /// pinned through the GTK bookmarks file (removable)
     bookmark: bool,
+    /// a gvfs-FUSE bridge or udisks mount point: lives in the Network
+    /// section, not pinnable (it appears and disappears on its own)
+    mount: bool,
 }
 
 /// Snapshot for the properties dialog.
@@ -552,6 +559,44 @@ struct CompressDialog {
     zip_available: bool,
 }
 
+/// Connect-to-server state: the URI field before the mount starts,
+/// then whatever the gio pump is asking for.
+struct ConnectDialog {
+    uri: String,
+    uri_cursor: usize,
+    /// credential buffer for the current prompt
+    input: String,
+    input_cursor: usize,
+    /// the prompt gio printed ("User", "Password", "Domain [X]")
+    prompt: Option<String>,
+    /// password-style prompts render the buffer as bullets
+    mask: bool,
+    status: String,
+    session: Option<ConnectSession>,
+}
+
+/// The live `gio mount` pump: answers go down the channel, the child
+/// handle is kept for Cancel (kill).
+struct ConnectSession {
+    answers: std::sync::mpsc::Sender<String>,
+    child: Arc<Mutex<Option<std::process::Child>>>,
+}
+
+/// What the gio pump reports back to the view.
+#[derive(Debug)]
+enum ConnectEvent {
+    /// gio is asking for a credential ("User", "Password", "Domain [W]")
+    Prompt { text: String, mask: bool },
+    /// non-prompt output lines, kept for the error message
+    Note(String),
+    /// process exited; mount is the new gvfs entry when it succeeded
+    Done {
+        ok: bool,
+        message: String,
+        mount: Option<PathBuf>,
+    },
+}
+
 /// "name (copy).ext", then "name (copy 2).ext", and so on. After 999
 /// colliding copies this gives up and returns `to` itself; the queue
 /// reports the "already exists" error, which is honest enough.
@@ -581,12 +626,221 @@ fn unique_dest(to: &Path) -> PathBuf {
     to.to_path_buf()
 }
 
+/// A gvfs mount directory name like `sftp:host=server,user=bob` becomes
+/// a human place label: `server (sftp)`, `server/share (smb)`. Names
+/// without a parseable scheme shape pass through unchanged.
+fn mount_label(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once(':') else {
+        return raw.to_string();
+    };
+    let mut host = None;
+    let mut share = None;
+    for part in rest.split(',') {
+        if let Some((key, value)) = part.split_once('=') {
+            match key {
+                "host" if !value.is_empty() => host = Some(value),
+                "share" if !value.is_empty() => share = Some(value),
+                _ => {}
+            }
+        }
+    }
+    match (host, share) {
+        (Some(host), Some(share)) => format!("{host}/{share} ({scheme})"),
+        (Some(host), None) => format!("{host} ({scheme})"),
+        _ => raw.to_string(),
+    }
+}
+
+/// One-line text-buffer editing shared by the connect dialog's two
+/// fields (URI field, credential answer). Returns false for keys it
+/// does not handle.
+fn edit_line(buf: &mut String, cursor: &mut usize, key: &str, keystroke: &gpui::Keystroke) -> bool {
+    match key {
+        "backspace" => {
+            if *cursor > 0 {
+                let head = &buf[..*cursor];
+                if let Some((prev, _)) = head.char_indices().next_back() {
+                    buf.remove(prev);
+                    *cursor = prev;
+                }
+            }
+            true
+        }
+        "left" => {
+            if *cursor > 0 {
+                let head = &buf[..*cursor];
+                if let Some((prev, _)) = head.char_indices().next_back() {
+                    *cursor = prev;
+                }
+            }
+            true
+        }
+        "right" => {
+            if buf.is_char_boundary(*cursor) && *cursor < buf.len() {
+                let tail = &buf[*cursor..];
+                if let Some(ch) = tail.chars().next() {
+                    *cursor += ch.len_utf8();
+                }
+            }
+            true
+        }
+        _ if !keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.platform
+            && !keystroke.modifiers.function =>
+        {
+            if let Some(character) = keystroke.key_char.as_deref() {
+                let cursor_pos = if buf.is_char_boundary(*cursor) {
+                    *cursor
+                } else {
+                    buf.len()
+                };
+                buf.insert_str(cursor_pos, character);
+                *cursor = cursor_pos + character.len();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Is this gio output chunk (text up to a colon) a credential prompt?
+/// Real prompts are bare words: `User: `, `Password: `, `Domain [X]: `.
+/// Context lines like `Enter user and password for [host]:` end in a
+/// colon too but carry prose, so only exact word prompts qualify.
+fn is_prompt(text: &str) -> bool {
+    let last = text.rsplit('\n').next().unwrap_or("").trim().to_lowercase();
+    last == "user"
+        || last == "login"
+        || last.starts_with("password")
+        || last.starts_with("passphrase")
+        || last.starts_with("domain")
+}
+
+/// Password-style prompts hide the typed characters in the dialog.
+fn mask_prompt(text: &str) -> bool {
+    let last = text.rsplit('\n').next().unwrap_or("").trim().to_lowercase();
+    last.starts_with("password") || last.starts_with("passphrase")
+}
+
+/// Kill the pump's child through its cell; a taken cell means it is
+/// already exiting under the pump's control.
+fn child_cell_lock_kill(cell: &Mutex<Option<std::process::Child>>) {
+    if let Ok(mut guard) = cell.lock() {
+        if let Some(child) = guard.as_mut() {
+            let _ = child.kill();
+        }
+    }
+}
+
+/// Drive one `gio mount` child to completion: pipe its stdout through
+/// the prompt classifier, relay prompts to the dialog and feed the
+/// user's answers back down stdin, then diff the gvfs-FUSE directory
+/// so the view learns where the new mount landed. Runs on the
+/// background pool. The child sits in a cell so Cancel (another
+/// thread) can kill it while this blocks on its stdout; a killed
+/// child surfaces as EOF, a failed wait, and a Done with ok=false.
+fn run_mount_process(
+    mut stdin: std::process::ChildStdin,
+    stdout: std::process::ChildStdout,
+    child: Arc<Mutex<Option<std::process::Child>>>,
+    gvfs_dir: PathBuf,
+    ev: mpsc::Sender<ConnectEvent>,
+    answers: mpsc::Receiver<String>,
+) {
+    let snapshot = || {
+        fs::read_dir(&gvfs_dir)
+            .map(|read| {
+                read.flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let before = snapshot();
+
+    let mut reader = io::BufReader::new(stdout);
+    let mut carry = String::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b':', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let chunk = String::from_utf8_lossy(&buf);
+        let ends_colon = chunk.ends_with(':');
+        carry.push_str(chunk.trim_end_matches(':'));
+        if ends_colon && is_prompt(&carry) {
+            let text = carry.rsplit('\n').next().unwrap_or("").trim().to_string();
+            let mask = mask_prompt(&text);
+            carry.clear();
+            if ev.send(ConnectEvent::Prompt { text, mask }).is_err() {
+                // the view is gone (window closed): kill the child
+                let _ = child_cell_lock_kill(&child);
+                return;
+            }
+            match answers.recv() {
+                Ok(answer) => {
+                    let _ = writeln!(stdin, "{answer}");
+                }
+                Err(_) => {
+                    let _ = child_cell_lock_kill(&child);
+                    return;
+                }
+            }
+            continue;
+        }
+        // flush complete lines, keep the trailing fragment
+        if let Some(pos) = carry.rfind('\n') {
+            for line in carry[..pos].lines() {
+                if !line.trim().is_empty() {
+                    let _ = ev.send(ConnectEvent::Note(line.to_string()));
+                }
+            }
+            carry.drain(..pos + 1);
+        }
+    }
+    if !carry.trim().is_empty() {
+        let _ = ev.send(ConnectEvent::Note(carry.trim().to_string()));
+    }
+    // reap: take the child out of the cell (Cancel may have killed it
+    // already; a taken cell means it is exiting either way)
+    let child = child
+        .lock()
+        .ok()
+        .and_then(|mut cell| cell.take())
+        .and_then(|mut child| child.wait().ok());
+    let ok = child.map(|status| status.success()).unwrap_or(false);
+    // the new gvfs entry is the mount's FUSE path; a failed run
+    // changes nothing
+    let mount = if ok {
+        let after = snapshot();
+        after
+            .iter()
+            .find(|name| !before.contains(name))
+            .map(|name| gvfs_dir.join(name))
+    } else {
+        None
+    };
+    let _ = ev.send(ConnectEvent::Done {
+        ok,
+        message: if ok {
+            "connected".into()
+        } else {
+            "connection failed".into()
+        },
+        mount,
+    });
+}
+
 pub(crate) struct Browser {
     tabs: Vec<Tab>,
     active: usize,
     clipboard: Option<(bool, Vec<PathBuf>)>,
     undo: Vec<Op>,
     conflict_dialog: Option<ConflictDialog>,
+    connect: Option<ConnectDialog>,
     /// Compress dialog state: target name, caret, and format.
     compress: Option<CompressDialog>,
     /// Installed applications, scanned once on first Open With.
@@ -691,6 +945,7 @@ impl Browser {
             clipboard: None,
             undo: Vec::new(),
             conflict_dialog: None,
+            connect: None,
             compress: None,
             desktop_apps: None,
             openwith_apps: Vec::new(),
@@ -794,6 +1049,7 @@ impl Browser {
                     name: name.into(),
                     path,
                     bookmark: false,
+                    mount: false,
                 });
             }
         };
@@ -809,18 +1065,24 @@ impl Browser {
         // gvfs-FUSE bridges that back samba, MTP, phones, and friends.
         // Mounted volumes appear here without any protocol code on our
         // side (gio mount / the desktop session do that part).
-        let mount_root = |root: PathBuf, places: &mut Vec<Place>| {
+        let mount_root = |root: PathBuf, label: bool, places: &mut Vec<Place>| {
             let Ok(read) = fs::read_dir(&root) else {
                 return;
             };
             let mut mounts: Vec<Place> = read
                 .flatten()
                 .map(|entry| {
-                    let name = entry.file_name().to_string_lossy().into_owned();
+                    let raw = entry.file_name().to_string_lossy().into_owned();
+                    let name = if label {
+                        mount_label(&raw)
+                    } else {
+                        raw
+                    };
                     Place {
                         name,
                         path: entry.path(),
                         bookmark: false,
+                        mount: true,
                     }
                 })
                 .collect();
@@ -830,12 +1092,12 @@ impl Browser {
         if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
             let mut gvfs = PathBuf::from(&runtime);
             gvfs.push("gvfs");
-            mount_root(gvfs, &mut places);
+            mount_root(gvfs, true, &mut places);
         }
         if let Some(user) = std::env::var_os("USER") {
             let mut media = PathBuf::from("/run/media");
             media.push(user);
-            mount_root(media, &mut places);
+            mount_root(media, false, &mut places);
         }
 
         // pinned folders ride the GTK bookmarks file, so Thunar and
@@ -854,6 +1116,7 @@ impl Browser {
                 name,
                 path,
                 bookmark: true,
+                mount: false,
             });
         }
         places
@@ -881,7 +1144,10 @@ impl Browser {
             || next
                 .iter()
                 .zip(&self.places)
-                .any(|(a, b)| a.name != b.name || a.path != b.path || a.bookmark != b.bookmark);
+                .any(|(a, b)| {
+                    a.name != b.name || a.path != b.path || a.bookmark != b.bookmark
+                        || a.mount != b.mount
+                });
         if changed {
             self.places = next;
         }
@@ -2175,6 +2441,196 @@ impl Browser {
     }
 
     /// Open the compress dialog over the current selection.
+    /// The sidebar's Connect to Server entry: an empty dialog, the
+    /// pump starts on Enter.
+    fn open_connect_dialog(&mut self, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.connect = Some(ConnectDialog {
+            uri: "sftp://".into(),
+            uri_cursor: 7,
+            input: String::new(),
+            input_cursor: 0,
+            prompt: None,
+            mask: false,
+            status: String::new(),
+            session: None,
+        });
+        cx.notify();
+    }
+
+    /// Enter in the URI field: spawn `gio mount` and start relaying
+    /// its prompts. The pump runs on the background pool; a task
+    /// forwards its events into the view. The piped stdio handles
+    /// belong to the pump; the child itself stays in a mutex so
+    /// Cancel can kill it while the pump is blocked on its stdout.
+    fn connect_start(&mut self, cx: &mut Context<Self>) {
+        let Some(mut dialog) = self.connect.take() else {
+            return;
+        };
+        let uri = dialog.uri.trim().to_string();
+        if !uri.contains("://") {
+            dialog.status = "enter a server URI, e.g. sftp://host".into();
+            self.connect = Some(dialog);
+            cx.notify();
+            return;
+        }
+        let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+            dialog.status = "no session runtime dir".into();
+            self.connect = Some(dialog);
+            cx.notify();
+            return;
+        };
+        let gvfs_dir = PathBuf::from(runtime).join("gvfs");
+        let (ev_tx, ev_rx) = mpsc::channel::<ConnectEvent>();
+        let (ans_tx, ans_rx) = mpsc::channel::<String>();
+        let mut child = match std::process::Command::new("gio")
+            .arg("mount")
+            .arg(&uri)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => {
+                dialog.status = "gio not found".into();
+                self.connect = Some(dialog);
+                cx.notify();
+                return;
+            }
+        };
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+            dialog.status = "could not pipe gio's stdio".into();
+            self.connect = Some(dialog);
+            cx.notify();
+            return;
+        };
+        let child_cell = Arc::new(Mutex::new(Some(child)));
+        dialog.session = Some(ConnectSession {
+            answers: ans_tx,
+            child: child_cell.clone(),
+        });
+        dialog.prompt = None;
+        dialog.mask = false;
+        dialog.status = format!("connecting to {uri}…");
+        self.connect = Some(dialog);
+        cx.notify();
+
+        // pump: drive gio to completion in the background
+        let _pump = cx.background_spawn(async move {
+            run_mount_process(stdin, stdout, child_cell, gvfs_dir, ev_tx, ans_rx);
+        });
+
+        // event relay: block a pool thread per recv, wake the view
+        let events = Arc::new(Mutex::new(ev_rx));
+        cx.spawn(async move |this, cx| {
+            loop {
+                let events = events.clone();
+                let ev = cx
+                    .background_spawn(async move { events.lock().unwrap().recv() })
+                    .await;
+                match ev {
+                    Ok(ev) => {
+                        if !this
+                            .update(cx, |this, cx| this.connect_event(ev, cx))
+                            .unwrap_or(false)
+                        {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Relay one pump event into the dialog. Returns false when the
+    /// pump should stop (dialog closed, view gone, or Done).
+    fn connect_event(&mut self, ev: ConnectEvent, cx: &mut Context<Self>) -> bool {
+        match ev {
+            ConnectEvent::Prompt { text, mask } => {
+                let Some(dialog) = self.connect.as_mut() else {
+                    return false;
+                };
+                dialog.prompt = Some(text);
+                dialog.mask = mask;
+                dialog.input.clear();
+                dialog.input_cursor = 0;
+                cx.notify();
+                true
+            }
+            ConnectEvent::Note(line) => {
+                // non-prompt output is context for a later failure
+                if let Some(dialog) = self.connect.as_mut() {
+                    dialog.status = line;
+                    cx.notify();
+                }
+                true
+            }
+            ConnectEvent::Done { ok, message, mount } => {
+                let Some(dialog) = self.connect.take() else {
+                    return false;
+                };
+                if ok {
+                    self.status = format!("{}: {}", message, dialog.uri.trim());
+                    if let Some(path) = mount {
+                        self.load_source(Source::Dir(path), cx);
+                    }
+                    self.refresh_places_now();
+                } else {
+                    // keep the dialog up: the URI is editable for a retry
+                    self.connect = Some(ConnectDialog {
+                        uri: dialog.uri,
+                        uri_cursor: dialog.uri_cursor,
+                        input: String::new(),
+                        input_cursor: 0,
+                        prompt: None,
+                        mask: false,
+                        status: message,
+                        session: None,
+                    });
+                }
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Enter at a prompt: ship the buffered credential to gio.
+    fn connect_submit(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.connect.as_mut() else {
+            return;
+        };
+        let (Some(session), Some(_)) = (dialog.session.as_ref(), dialog.prompt.as_ref()) else {
+            return;
+        };
+        let answer = dialog.input.clone();
+        if session.answers.send(answer).is_ok() {
+            dialog.prompt = None;
+            dialog.mask = false;
+            dialog.input.clear();
+            dialog.input_cursor = 0;
+            dialog.status = "connecting…".into();
+        }
+        cx.notify();
+    }
+
+    /// Cancel: kill the gio child and close the dialog.
+    fn cancel_connect(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.connect.take() {
+            if let Some(session) = dialog.session {
+                if let Ok(mut cell) = session.child.lock() {
+                    if let Some(child) = cell.as_mut() {
+                        let _ = child.kill();
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
     fn open_compress_dialog(&mut self, cx: &mut Context<Self>) {
         self.menu = None;
         if matches!(self.tab().source, Source::Dir(_)) && !self.tab().selection.is_empty() {
@@ -2762,10 +3218,22 @@ impl Browser {
     /// The collapsible keybinding cheatsheet, pinned to the bottom of
     /// the places sidebar.
     fn keys_section(&self, cx: &mut Context<Self>) -> Div {
+        let connect_row = div()
+            .id("connect-server")
+            .px_3()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_size(px(13.))
+            .text_color(theme::text_dim())
+            .hover(|this| this.bg(theme::row_hover()))
+            .on_click(cx.listener(|this, _, _, cx| this.open_connect_dialog(cx)))
+            .child("Connect to Server");
         let mut section = div()
             .flex()
             .flex_col()
             .gap_px()
+            .child(connect_row)
             .child(
                 div()
                     .id("keys-toggle")
@@ -3101,6 +3569,44 @@ impl Browser {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        if self.connect.is_some() {
+            let mut dialog = self.connect.take().unwrap();
+            let at_prompt = dialog.session.is_some() && dialog.prompt.is_some();
+            match keystroke.key.as_str() {
+                "escape" => {
+                    self.connect = Some(dialog);
+                    self.cancel_connect(cx);
+                    return;
+                }
+                "enter" => {
+                    self.connect = Some(dialog);
+                    if at_prompt {
+                        self.connect_submit(cx);
+                    } else if !self.connect.as_ref().unwrap().session.is_some() {
+                        self.connect_start(cx);
+                    }
+                    return;
+                }
+                key => {
+                    // two buffers: the URI before the pump runs, the
+                    // credential answer while a prompt is up
+                    if at_prompt {
+                        edit_line(
+                            &mut dialog.input,
+                            &mut dialog.input_cursor,
+                            key,
+                            &keystroke,
+                        );
+                    } else if dialog.session.is_none() {
+                        edit_line(&mut dialog.uri, &mut dialog.uri_cursor, key, &keystroke);
+                    }
+                }
+            }
+            self.connect = Some(dialog);
+            cx.notify();
             return;
         }
 
@@ -4821,6 +5327,94 @@ impl Browser {
         )
     }
 
+    /// The Connect to Server dialog. Before the pump runs: the URI
+    /// field. At a prompt: the gio prompt text and a masked (or plain)
+    /// answer field. Between prompts: the status line alone.
+    fn connect_overlay(&self, _cx: &mut Context<Self>) -> Option<Div> {
+        let dialog = self.connect.as_ref()?;
+        let (buffer, cursor, field_label) = if dialog.prompt.is_some() {
+            (&dialog.input, dialog.input_cursor, dialog.prompt.clone().unwrap())
+        } else {
+            (&dialog.uri, dialog.uri_cursor, "server URI".to_string())
+        };
+        let cursor = if buffer.is_char_boundary(cursor) {
+            cursor
+        } else {
+            buffer.len()
+        };
+        let (before, after) = buffer.split_at(cursor);
+        let shown = if dialog.mask {
+            format!("{}{}", "\u{2022}".repeat(before.chars().count()), after)
+        } else {
+            format!("{before}\u{254f}{after}")
+        };
+        let label = div()
+            .text_size(px(14.))
+            .text_color(theme::text())
+            .child(if dialog.prompt.is_some() {
+                format!("{field_label}:")
+            } else {
+                "Connect to Server".to_string()
+            });
+        let status = (!dialog.status.is_empty()).then(|| {
+            div()
+                .text_size(px(12.))
+                .text_color(theme::text_dim())
+                .child(dialog.status.clone())
+        });
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                .child(
+                    div()
+                        .w(px(380.))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .rounded_md()
+                        .bg(theme::sidebar())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .text_size(px(13.))
+                        .child(label)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .border_1()
+                                .border_color(theme::accent())
+                                .rounded_sm()
+                                .px_1()
+                                .py_0p5()
+                                .text_color(theme::text())
+                                .child(shown),
+                        )
+                        .children(status)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_size(px(12.))
+                                .text_color(theme::text_dim())
+                                .child(if dialog.session.is_some() {
+                                    "Enter submits, Esc cancels"
+                                } else {
+                                    "Enter connects, Esc closes"
+                                }),
+                        ),
+                ),
+        )
+    }
+
     fn compress_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {        let dialog = self.compress.as_ref()?;
         let count = self.tab().selection.len();
         let cursor = if dialog.name.is_char_boundary(dialog.cursor) {
@@ -5413,9 +6007,23 @@ impl Render for Browser {
             }
         }
 
-        let mut places: Vec<Stateful<Div>> = Vec::new();
+        let mut places: Vec<AnyElement> = Vec::new();
+        let mut network_started = false;
         for (ix, place) in self.places.iter().enumerate() {
-            places.push(self.place_row(ix, place, cx));
+            if place.mount && !network_started {
+                network_started = true;
+                places.push(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_size(px(11.))
+                        .text_color(theme::text_dim())
+                        .child("Network")
+                        .into_any_element(),
+                );
+            }
+            places.push(self.place_row(ix, place, cx).into_any_element());
         }
 
         let mut tabs: Vec<Stateful<Div>> = Vec::new();
@@ -6196,6 +6804,7 @@ impl Render for Browser {
             // does not lift an element above later siblings
             .children(self.conflict_overlay(cx))
             .children(self.compress_overlay(cx))
+            .children(self.connect_overlay(cx))
             .children(self.accent_overlay(cx))
             .children(self.menu_overlay(window, cx))
     }
@@ -8556,6 +9165,155 @@ mod browser_rename {
         });
         app.run_until_parked();
         assert!(dir.join("notes.txt2").exists(), "icon-view rename never committed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    #[test]
+    fn gvfs_names_become_place_labels() {
+        assert_eq!(mount_label("sftp:host=localhost"), "localhost (sftp)");
+        assert_eq!(mount_label("smb:host=NAS,share=media"), "NAS/media (smb)");
+        // no parseable host: pass the raw name through
+        assert_eq!(mount_label("mtp:[usb:003,004]"), "mtp:[usb:003,004]");
+        assert_eq!(mount_label("External Drive"), "External Drive");
+    }
+
+    #[test]
+    fn prompt_classifier_matches_bare_word_prompts_only() {
+        assert!(is_prompt("User"));
+        assert!(is_prompt("Password"));
+        assert!(is_prompt("Password for bob@host"));
+        assert!(is_prompt("Domain [WORKGROUP]"));
+        assert!(is_prompt("passphrase"));
+        // prose ending in a colon is context, not a prompt
+        assert!(!is_prompt("Enter user and password for [localhost]"));
+        assert!(!is_prompt("Authentication Required"));
+        assert!(!is_prompt("Error mounting gvfs backend"));
+    }
+
+    #[test]
+    fn password_prompts_mask_their_answer() {
+        assert!(mask_prompt("Password"));
+        assert!(mask_prompt("passphrase"));
+        assert!(!mask_prompt("User"));
+        assert!(!mask_prompt("Domain [WORKGROUP]"));
+    }
+
+    /// The full pump loop against a scripted child that mimics gio's
+    /// prompt protocol (context lines with newlines, prompts ending
+    /// bare at the colon).
+    #[test]
+    fn mount_process_relays_prompts_and_answers() {
+        let dir = std::env::temp_dir().join(format!("kuma-connect-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = "echo Authentication Required; \
+            echo 'Enter user and password for [host]:'; \
+            printf 'User: '; read u; printf 'Password: '; read p; \
+            if [ \"$u\" = bob ] && [ \"$p\" = s3cret ]; then \
+              mkdir \"$TESTDIR/sftp:host=host,user=bob\"; exit 0; \
+            else echo 'Error mounting: auth failed'; exit 1; fi";
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("TESTDIR", &dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let child = Arc::new(Mutex::new(Some(child)));
+        let (ev_tx, ev_rx) = mpsc::channel::<ConnectEvent>();
+        let (ans_tx, ans_rx) = mpsc::channel::<String>();
+        let pump_dir = dir.clone();
+        let handle = std::thread::spawn(move || {
+            run_mount_process(stdin, stdout, child, pump_dir, ev_tx, ans_rx)
+        });
+
+        let mut notes = Vec::new();
+        let mut prompts = Vec::new();
+        loop {
+            let ev = ev_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("pump finished in time");
+            match ev {
+                ConnectEvent::Prompt { text, mask } => {
+                    prompts.push((text, mask));
+                    if prompts.len() == 1 {
+                        ans_tx.send("bob".into()).unwrap();
+                    } else {
+                        ans_tx.send("s3cret".into()).unwrap();
+                    }
+                }
+                ConnectEvent::Note(line) => notes.push(line),
+                ConnectEvent::Done { ok, message, mount } => {
+                    assert!(ok, "scripted mount should succeed: {message}");
+                    let expected = dir.join("sftp:host=host,user=bob");
+                    assert_eq!(mount.as_deref(), Some(expected.as_path()));
+                    assert!(expected.is_dir());
+                    break;
+                }
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(prompts.len(), 2, "user and password prompts: {prompts:?}");
+        assert_eq!(prompts[0], ("User".into(), false));
+        assert_eq!(prompts[1], ("Password".into(), true));
+        assert!(notes.iter().any(|n| n.contains("Authentication Required")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mount_process_reports_auth_failure() {
+        let dir = std::env::temp_dir().join(format!("kuma-connect-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = "printf 'User: '; read u; printf 'Password: '; read p; \
+            echo 'Error mounting: auth failed'; exit 1";
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let child = Arc::new(Mutex::new(Some(child)));
+        let (ev_tx, ev_rx) = mpsc::channel::<ConnectEvent>();
+        let (ans_tx, ans_rx) = mpsc::channel::<String>();
+        let pump_dir = dir.clone();
+        let handle = std::thread::spawn(move || {
+            run_mount_process(stdin, stdout, child, pump_dir, ev_tx, ans_rx)
+        });
+        let mut answered = 0;
+        loop {
+            match ev_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("pump finished in time")
+            {
+                ConnectEvent::Prompt { .. } => {
+                    answered += 1;
+                    ans_tx.send(format!("wrong{answered}")).unwrap();
+                }
+                ConnectEvent::Note(_) => {}
+                ConnectEvent::Done { ok, message, mount } => {
+                    assert!(!ok);
+                    assert_eq!(mount, None);
+                    assert_eq!(message, "connection failed");
+                    break;
+                }
+            }
+        }
+        handle.join().unwrap();
+        assert_eq!(answered, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 }
