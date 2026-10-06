@@ -165,7 +165,9 @@ impl NostrState {
     /// The keep-alive, fire and forget: answering a prompt four
     /// minutes in must not race the vault's own lock.
     pub fn touch(&self) {
-        let _ = Command::new("kuma-nostr").arg("touch").spawn();
+        if let Ok(child) = Command::new("kuma-nostr").arg("touch").spawn() {
+            crate::launcher::reap(child);
+        }
     }
 
     /// One act of the panel (approve, deny, revoke, level, rotate),

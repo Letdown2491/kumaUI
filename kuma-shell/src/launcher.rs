@@ -232,17 +232,27 @@ fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
 pub fn launch(exec: &str, terminal: bool) -> anyhow::Result<()> {
     use std::process::Command;
 
-    if terminal {
+    let child = if terminal {
         Command::new("kitty")
             .arg("-e")
             .arg("sh")
             .arg("-c")
             .arg(exec)
-            .spawn()?;
+            .spawn()?
     } else {
-        Command::new("sh").arg("-c").arg(exec).spawn()?;
-    }
+        Command::new("sh").arg("-c").arg(exec).spawn()?
+    };
+    reap(child);
     Ok(())
+}
+
+/// Reap a spawned app on a detached thread: a dropped `Child` never
+/// gets wait()ed, so its zombie would sit in the process table until
+/// the shell exits (one per app launch).
+pub fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 pub struct LauncherView {
