@@ -349,6 +349,8 @@ pub(crate) struct Browser {
     inspector: bool,
     /// Info rail docked to the bottom edge instead of the right.
     inspector_bottom: bool,
+    /// Keybinding cheatsheet expanded in the places sidebar.
+    keys_open: bool,
     /// Text snippet for the rail, when the focused entry is textual.
     text_preview: Option<String>,
     preview_key: Option<PathBuf>,
@@ -410,6 +412,7 @@ impl Browser {
             conflict_dialog: None,
             inspector: true,
             inspector_bottom: false,
+            keys_open: false,
             text_preview: None,
             preview_key: None,
             preview_inflight: HashSet::new(),
@@ -1308,6 +1311,8 @@ impl Browser {
                 ("inspector", "false") => self.inspector = false,
                 ("inspector-bottom", "true") => self.inspector_bottom = true,
                 ("inspector-bottom", "false") => self.inspector_bottom = false,
+                ("keys", "true") => self.keys_open = true,
+                ("keys", "false") => self.keys_open = false,
                 ("active", _) => saved_active = value.parse().ok(),
                 ("scale", _) => {
                     if let Ok(parsed) = value.parse::<f32>() {
@@ -1368,7 +1373,7 @@ impl Browser {
             SortKey::Modified => "modified",
         };
         let text = format!(
-            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\nscale={}\n",
+            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\nkeys={}\nscale={}\n",
             if tab.view_mode == ViewMode::Icons {
                 "icons"
             } else {
@@ -1379,6 +1384,7 @@ impl Browser {
             self.show_hidden,
             self.inspector,
             self.inspector_bottom,
+            self.keys_open,
             self.scale,
         );
         let mut text = text;
@@ -1490,9 +1496,67 @@ impl Browser {
         cx.notify();
     }
 
+    /// Show or hide the keybinding cheatsheet in the sidebar.
+    fn toggle_keys(&mut self, cx: &mut Context<Self>) {
+        self.keys_open = !self.keys_open;
+        self.save_state();
+        cx.notify();
+    }
+
+    /// The collapsible keybinding cheatsheet, pinned to the bottom of
+    /// the places sidebar.
+    fn keys_section(&self, cx: &mut Context<Self>) -> Div {
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .gap_px()
+            .child(
+                div()
+                    .id("keys-toggle")
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(theme::text_dim())
+                    .hover(|this| this.bg(theme::row_hover()))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_keys(cx)))
+                    .child("Keys")
+                    .child(
+                        svg()
+                            .path(if self.keys_open {
+                                "icons/chevron_up.svg"
+                            } else {
+                                "icons/chevron_down.svg"
+                            })
+                            .size(px(12.))
+                            .text_color(theme::text_dim()),
+                    ),
+            );
+
+        if self.keys_open {
+            for (key, action) in KEY_HINTS {
+                section = section.child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .px_3()
+                        .pl_4()
+                        .py_px()
+                        .text_size(px(12.))
+                        .child(div().text_color(theme::text()).child(*key))
+                        .child(div().text_color(theme::text_dim()).child(*action)),
+                );
+            }
+        }
+        section
+    }
+
     /// Alt+Enter: show or hide the info rail.
-    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
-        self.inspector = !self.inspector;
+    fn toggle_inspector(&mut self, cx: &mut Context<Self>) {        self.inspector = !self.inspector;
         if !self.inspector {
             self.preview_key = None;
             self.text_preview = None;
@@ -2836,9 +2900,12 @@ impl Browser {
                 .w_full()
                 .flex_none()
                 .h(px(220.))
+                .min_h_0()
                 .flex()
                 .gap_3()
                 .p_3()
+                .overflow_hidden()
+                .text_size(px(13.))
                 .bg(theme::sidebar())
                 .border_t_1()
                 .border_color(theme::border())
@@ -2847,6 +2914,8 @@ impl Browser {
                     div()
                         .flex_1()
                         .min_w_0()
+                        .min_h_0()
+                        .overflow_hidden()
                         .flex()
                         .flex_col()
                         .gap_3()
@@ -2862,6 +2931,8 @@ impl Browser {
                 .flex_col()
                 .gap_3()
                 .p_3()
+                .overflow_hidden()
+                .text_size(px(13.))
                 .bg(theme::sidebar())
                 .border_l_1()
                 .border_color(theme::border())
@@ -3340,7 +3411,12 @@ impl Render for Browser {
                                     }),
                             )
                             .child("Trash"),
-                    ),
+                    )
+                    .child(
+                        // push the keys section to the bottom edge
+                        div().flex_grow_1(),
+                    )
+                    .child(self.keys_section(cx)),
             )
             .child(
                 div()
@@ -3787,13 +3863,7 @@ impl Render for Browser {
                                     .truncate()
                                     .child(info),
                                 None => div(),
-                            })
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_color(theme::text_dim())
-                                    .child("Enter open · F2 rename · Del trash · Shift+Del delete · Alt+Enter info · right-click menu · Ctrl+C/X/V/Z · Ctrl+H hidden · Ctrl+1/2 views · type to filter"),
-                            ),
+                            }),
                     ),
             )
             .child(if show_panel && !self.inspector_bottom {
@@ -3808,6 +3878,22 @@ impl Render for Browser {
             .children(self.menu_overlay(window, cx))
     }
 }
+
+/// The sidebar cheatsheet's lines: key, what it does.
+const KEY_HINTS: &[(&str, &str)] = &[
+    ("Enter", "open"),
+    ("F2", "rename"),
+    ("Del", "trash"),
+    ("Shift+Del", "delete"),
+    ("Alt+Enter", "info"),
+    ("Right-click", "menu"),
+    ("Ctrl+C/X/V/Z", "clipboard"),
+    ("Ctrl+H", "hidden"),
+    ("Ctrl+1/2", "views"),
+    ("Ctrl+=/-/0", "zoom"),
+    ("Ctrl+T/W", "tabs"),
+    ("Type", "filter"),
+];
 
 fn sort_entries(entries: &mut [Entry], key: SortKey, asc: bool) {
     entries.sort_by(|a, b| {
