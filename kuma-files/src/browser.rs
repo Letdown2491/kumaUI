@@ -2596,10 +2596,13 @@ impl Browser {
         self.connect = Some(dialog);
         cx.notify();
 
-        // pump: drive gio to completion in the background
-        let _pump = cx.background_spawn(async move {
+        // pump: drive gio to completion in the background. Detached:
+        // dropping the Task handle would cancel it before it starts
+        // (the race made rides go silent with just a live counter).
+        cx.background_spawn(async move {
             run_mount_process(stdin, stdout, stderr, child_cell, gvfs_dir, ev_tx, ans_rx);
-        });
+        })
+        .detach();
 
         // event relay: block a pool thread per recv, wake the view
         let events = Arc::new(Mutex::new(ev_rx));
