@@ -21,3 +21,9 @@ nucleo = "0.5"
 futures = "0.3"
 pulldown-cmark = "0.13"
 libc = "0.2"
+
+[dev-dependencies]
+# only test builds pull this in; the release binary stays lean
+gpui = { workspace = true, features = ["test-support"] }
+# real font shaping so text-driven hitboxes have real bounds in tests
+gpui_wgpu = { workspace = true }

@@ -354,9 +354,13 @@ impl Op {
                 .output()
         };
         match out {
-            Ok(out) if out.status.success() => Ok(None),
+            Ok(out) if out.status.success() => {
+                log::info!("compress: {} created", archive.display());
+                Ok(None)
+            }
             Ok(out) => {
                 let noise = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                log::info!("compress: tool failed: {noise}");
                 Err(if noise.is_empty() {
                     "compress exited with an error".into()
                 } else {
@@ -393,12 +397,30 @@ struct ContextMenu {
     x: f32,
     y: f32,
     items: Vec<MenuItem>,
+    /// one dim helper line rendered under the items (used by the
+    /// Open With picker to explain left vs right click)
+    hint: Option<String>,
 }
 
 #[derive(Clone)]
 struct MenuItem {
     label: String,
     action: MenuAction,
+    /// quiet second line, e.g. an app's comment in the Open With picker
+    detail: Option<String>,
+    /// generic fallback entries render quieter than exact matches
+    dim: bool,
+}
+
+impl MenuItem {
+    fn new(label: impl Into<String>, action: MenuAction) -> Self {
+        Self {
+            label: label.into(),
+            action,
+            detail: None,
+            dim: false,
+        }
+    }
 }
 
 /// What a menu item does when clicked. Dispatched through
@@ -538,7 +560,9 @@ pub(crate) struct Browser {
     /// Installed applications, scanned once on first Open With.
     desktop_apps: Option<Arc<Vec<DesktopApp>>>,
     /// The apps listed in the open-with picker, indexed by item action.
-    openwith_apps: Vec<DesktopApp>,
+    /// The bool marks generic fallback entries (claim text/plain or
+    /// octet-stream instead of the file's own type).
+    openwith_apps: Vec<(DesktopApp, bool)>,
     /// Info rail on the right, following the cursor entry. On by
     /// default; it only shows while an entry is selected.
     inspector: bool,
@@ -1447,11 +1471,7 @@ impl Browser {
 
     /// Swap the menu for the open-with picker: apps claiming the
     /// entry's mime type, name order. The apps vec is cached.
-    fn open_with_menu(&mut self, cx: &mut Context<Self>) {
-        let (x, y) = match &self.menu {
-            Some(menu) => (menu.x, menu.y),
-            None => return,
-        };
+    fn open_with_menu(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
         let entry = self
             .tab()
             .cursor
@@ -1469,14 +1489,53 @@ impl Browser {
             .map(str::to_lowercase)
             .unwrap_or_default();
         let mime = mime_for_ext(&ext);
-        self.openwith_apps = self
-            .desktop_apps
-            .as_ref()
-            .unwrap()
-            .iter()
-            .filter(|app| app.mimes.iter().any(|m| m == mime))
-            .cloned()
-            .collect();
+        let apps = self.desktop_apps.as_ref().unwrap();
+        // fallback chain like shared-mime-info intends: apps claiming
+        // the exact type, then plain-text handlers, then anything that
+        // opens unknown files. Fallback entries are flagged so the
+        // picker can render them quieter.
+        let mut ranked: Vec<(DesktopApp, bool)> = Vec::new();
+        let push_ranked =
+            |app: &DesktopApp, fallback: bool, ranked: &mut Vec<(DesktopApp, bool)>| {
+            // the same program often ships several .desktop entries
+            // (kitty vs kitty-open); show it once
+            let program = app.exec.split_whitespace().next().unwrap_or(&app.exec);
+            if !ranked.iter().any(|(seen, _)| {
+                seen.exec.split_whitespace().next() == Some(program)
+            }) {
+                ranked.push((app.clone(), fallback));
+            }
+        };
+        for claimant in apps.iter().filter(|app| app.mimes.iter().any(|m| m == mime)) {
+            push_ranked(claimant, false, &mut ranked);
+        }
+        if mime != "text/plain" && ranked.is_empty() {
+            for claimant in apps
+                .iter()
+                .filter(|app| app.mimes.iter().any(|m| m == "text/plain"))
+            {
+                push_ranked(claimant, true, &mut ranked);
+            }
+        }
+        if ranked.is_empty() {
+            for claimant in apps
+                .iter()
+                .filter(|app| {
+                    app.mimes
+                        .iter()
+                        .any(|m| m == "application/octet-stream")
+                })
+            {
+                push_ranked(claimant, true, &mut ranked);
+            }
+        }
+        log::info!(
+            "open with: {} claims {} ({} total apps)",
+            ranked.len(),
+            mime,
+            apps.len()
+        );
+        self.openwith_apps = ranked;
         if self.openwith_apps.is_empty() {
             self.menu = None;
             self.status = format!("no apps claim {mime}");
@@ -1486,10 +1545,16 @@ impl Browser {
         self.menu = Some(ContextMenu {
             x,
             y,
-            items: (0..self.openwith_apps.len())
-                .map(|ix| MenuItem {
-                    label: self.openwith_apps[ix].name.clone(),
+            hint: Some("click to open, right-click to always use".into()),
+            items: self
+                .openwith_apps
+                .iter()
+                .enumerate()
+                .map(|(ix, (app, fallback))| MenuItem {
+                    label: app.name.clone(),
                     action: MenuAction::OpenWithApp(ix),
+                    detail: app.comment.clone(),
+                    dim: *fallback,
                 })
                 .collect(),
         });
@@ -1499,7 +1564,7 @@ impl Browser {
     /// Launch a picked application on the cursor entry's path.
     fn launch_app(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.menu = None;
-        let Some(app) = self.openwith_apps.get(ix).cloned() else {
+        let Some((app, _)) = self.openwith_apps.get(ix).cloned() else {
             return;
         };
         let Some(entry) = self
@@ -1514,6 +1579,7 @@ impl Browser {
         let Some((program, args)) = argv.split_first() else {
             return;
         };
+        log::info!("open with: launching {program} {args:?} on {}", entry.name);
         match Command::new(program).args(args).spawn() {
             Ok(mut child) => {
                 std::thread::spawn(move || {
@@ -1524,6 +1590,39 @@ impl Browser {
             Err(err) => {
                 log::error!("launch {}: {err}", app.name);
                 self.status = format!("could not launch {}: {err}", app.name);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Right-click in the open-with picker: write the app into
+    /// ~/.config/mimeapps.list so xdg-open (and our own double-click)
+    /// picks it for this file type from now on.
+    fn set_default_app(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let mime = self
+            .tab()
+            .cursor
+            .and_then(|i| self.tab().entries.get(i))
+            .and_then(|entry| Path::new(&entry.name).extension().and_then(|e| e.to_str()))
+            .map(|e| mime_for_ext(e.to_lowercase().as_str()))
+            .unwrap_or_else(|| "application/octet-stream".into());
+        let Some((app, _)) = self.openwith_apps.get(ix) else {
+            return;
+        };
+        let Some(config) = dirs::config_dir() else {
+            self.status = "could not find the config directory".into();
+            cx.notify();
+            return;
+        };
+        let path = config.join("mimeapps.list");
+        match write_mimeapps(&path, &mime, &app.id) {
+            Ok(()) => {
+                self.menu = None;
+                self.status = format!("default for {mime}: {}", app.name);
+            }
+            Err(err) => {
+                log::error!("mimeapps write: {err}");
+                self.status = format!("could not set default: {err}");
             }
         }
         cx.notify();
@@ -1579,6 +1678,26 @@ impl Browser {
         }
     }
 
+    /// Flip the dialog's format and keep the name field honest: a
+    /// trailing .tar.gz becomes .zip and vice versa; custom names
+    /// without the other suffix are left alone.
+    fn set_zip_format(dialog: &mut CompressDialog, zip: bool) {
+        if dialog.zip == zip {
+            return;
+        }
+        let (want, other): (&str, &str) = if zip {
+            (".zip", ".tar.gz")
+        } else {
+            (".tar.gz", ".zip")
+        };
+        if dialog.name.to_lowercase().ends_with(other) {
+            dialog.name =
+                format!("{}{want}", &dialog.name[..dialog.name.len() - other.len()]);
+        }
+        dialog.cursor = dialog.cursor.min(dialog.name.len());
+        dialog.zip = zip;
+    }
+
     /// Build the archive from the dialog: name, format, selection.
     fn compress_create(&mut self, cx: &mut Context<Self>) {
         let Some(dialog) = self.compress.take() else {
@@ -1605,6 +1724,12 @@ impl Browser {
             .filter(|e| self.tab().selection.contains(&e.key))
             .map(|e| e.path.clone())
             .collect();
+        log::info!(
+            "compress: {} item(s) into {} (zip={})",
+            files.len(),
+            archive.display(),
+            dialog.zip
+        );
         self.enqueue(vec![Op::Compress { files, archive }], cx);
     }
 
@@ -1819,10 +1944,18 @@ impl Browser {
     }
 
     fn load_state(&mut self, cli_dir: Option<&Path>) {
+        // no state file (or no config dir): the CLI dir, if any, is
+        // still the whole session, so do not drop it on the floor
         let Some(path) = Self::state_path() else {
+            if let Some(dir) = cli_dir {
+                self.tab_mut().source = Source::Dir(dir.to_path_buf());
+            }
             return;
         };
         let Ok(text) = fs::read_to_string(path) else {
+            if let Some(dir) = cli_dir {
+                self.tab_mut().source = Source::Dir(dir.to_path_buf());
+            }
             return;
         };
 
@@ -3665,29 +3798,77 @@ impl Browser {
             .text_size(px(13.));
         for (i, item) in menu.items.iter().enumerate() {
             let action = item.action;
+            let mut row = div()
+                .id(format!("menu-item-{i}"))
+                .debug_selector(|| "menu-item-row".into())
+                .flex()
+                .flex_col()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .text_color(if item.dim {
+                    theme::text_dim()
+                } else {
+                    theme::text()
+                })
+                .hover(|this| this.bg(theme::row_hover()))
+                // eat the downs so the backdrop behind does not
+                // close the menu mid-click: gpui dispatches bubble
+                // handlers last-painted first, so the item's own
+                // down runs before the backdrop's and stopping
+                // here keeps the menu open until the click lands
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+            // in the open-with picker, right-click makes the app the
+            // default handler for the file's type (mimeapps.list)
+            if let MenuAction::OpenWithApp(ix) = action {
+                row = row.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.set_default_app(ix, cx);
+                    }),
+                );
+            } else {
+                row = row.on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+            }
+            if let Some(detail) = &item.detail {
+                row = row.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_dim())
+                        .child(detail.clone()),
+                );
+            }
+            panel = panel.child(
+                row.child(item.label.clone()).on_click(
+                    cx.listener(move |this, _, _, cx| this.run_menu_action(action, cx)),
+                ),
+            );
+        }
+        if let Some(hint) = &menu.hint {
             panel = panel.child(
                 div()
-                    .id(i)
+                    .mt_1()
                     .px_3()
                     .py_1()
-                    .cursor_pointer()
-                    .text_color(theme::text())
-                    .hover(|this| this.bg(theme::row_hover()))
-                    // eat the downs so the backdrop behind does not
-                    // close the menu mid-click: gpui dispatches bubble
-                    // handlers last-painted first, so the item's own
-                    // down runs before the backdrop's and stopping
-                    // here keeps the menu open until the click lands
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.run_menu_action(action, cx)
-                    }))
-                    .child(item.label.clone()),
+                    .border_t_1()
+                    .border_color(theme::border())
+                    .text_size(px(11.))
+                    .text_color(theme::text_dim())
+                    .child(hint.clone()),
             );
         }
 
-        Some(div().absolute().inset_0().child(backdrop).child(panel))
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                // clicks on the backdrop close the menu via its own
+                // handler and must not rubber-band the listing behind
+                .occlude()
+                .child(backdrop)
+                .child(panel),
+        )
     }
 
     /// The compress dialog: name field, format choice, create/cancel.
@@ -3705,6 +3886,10 @@ impl Browser {
             div()
                 .absolute()
                 .inset_0()
+                // block the listing underneath: without this, clicks on
+                // the dialog's buttons also land on the catcher behind
+                // and wipe the selection (Create then finds nothing)
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -3768,7 +3953,7 @@ impl Browser {
                                         })
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if let Some(dialog) = this.compress.as_mut() {
-                                                dialog.zip = false;
+                                                Self::set_zip_format(dialog, false);
                                             }
                                             cx.notify();
                                         }))
@@ -3793,7 +3978,7 @@ impl Browser {
                                         })
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if let Some(dialog) = this.compress.as_mut() {
-                                                dialog.zip = true;
+                                                Self::set_zip_format(dialog, true);
                                             }
                                             cx.notify();
                                         }))
@@ -3849,10 +4034,15 @@ impl Browser {
     }
 
     fn run_menu_action(&mut self, action: MenuAction, cx: &mut Context<Self>) {
-        self.menu = None;
+        let menu = self.menu.take();
         match action {
             MenuAction::Open => self.open_selection(cx),
-            MenuAction::OpenWith => self.open_with_menu(cx),
+            // the picker replaces this menu in place, so it needs the
+            // position before the menu is dropped
+            MenuAction::OpenWith => {
+                let (x, y) = menu.map(|m| (m.x, m.y)).unwrap_or((120., 120.));
+                self.open_with_menu(x, y, cx);
+            }
             MenuAction::OpenWithApp(ix) => self.launch_app(ix, cx),
             MenuAction::Extract => self.extract_selection(cx),
             MenuAction::Compress => self.open_compress_dialog(cx),
@@ -3877,54 +4067,54 @@ impl Browser {
     }
 
     fn open_menu(&mut self, x: f32, y: f32, items: Vec<MenuItem>) {
-        self.menu = Some(ContextMenu { x, y, items });
+        self.menu = Some(ContextMenu { x, y, items, hint: None });
     }
 
     fn row_menu_items(is_dir: bool, archive: bool) -> Vec<MenuItem> {
-        let mut items = vec![MenuItem { label: "Open".into(), action: MenuAction::Open }];
+        let mut items = vec![MenuItem::new("Open", MenuAction::Open)];
         if !is_dir {
-            items.push(MenuItem { label: "Open With…".into(), action: MenuAction::OpenWith });
+            items.push(MenuItem::new("Open With…", MenuAction::OpenWith));
         }
         if archive {
-            items.push(MenuItem { label: "Extract Here".into(), action: MenuAction::Extract });
+            items.push(MenuItem::new("Extract Here", MenuAction::Extract));
         }
         items.extend([
-            MenuItem { label: "Rename".into(), action: MenuAction::Rename },
-            MenuItem { label: "Copy".into(), action: MenuAction::Copy },
-            MenuItem { label: "Cut".into(), action: MenuAction::Cut },
-            MenuItem { label: "Copy Path".into(), action: MenuAction::CopyPath },
-            MenuItem { label: "Copy URI".into(), action: MenuAction::CopyUri },
-            MenuItem { label: "Compress…".into(), action: MenuAction::Compress },
-            MenuItem { label: "Trash".into(), action: MenuAction::Trash },
-            MenuItem { label: "Delete permanently".into(), action: MenuAction::Delete },
-            MenuItem { label: "Properties".into(), action: MenuAction::Info },
+            MenuItem::new("Rename", MenuAction::Rename),
+            MenuItem::new("Copy", MenuAction::Copy),
+            MenuItem::new("Cut", MenuAction::Cut),
+            MenuItem::new("Copy Path", MenuAction::CopyPath),
+            MenuItem::new("Copy URI", MenuAction::CopyUri),
+            MenuItem::new("Compress…", MenuAction::Compress),
+            MenuItem::new("Trash", MenuAction::Trash),
+            MenuItem::new("Delete permanently", MenuAction::Delete),
+            MenuItem::new("Properties", MenuAction::Info),
         ]);
         items
     }
 
     fn trash_menu_items() -> Vec<MenuItem> {
         vec![
-            MenuItem { label: "Restore".into(), action: MenuAction::Open },
-            MenuItem { label: "Delete permanently".into(), action: MenuAction::Delete },
-            MenuItem { label: "Properties".into(), action: MenuAction::Info },
+            MenuItem::new("Restore", MenuAction::Open),
+            MenuItem::new("Delete permanently", MenuAction::Delete),
+            MenuItem::new("Properties", MenuAction::Info),
         ]
     }
 
     fn empty_menu_items(in_trash: bool) -> Vec<MenuItem> {
         let mut items = vec![
-            MenuItem { label: "New Folder".into(), action: MenuAction::NewFolder },
-            MenuItem { label: "New File".into(), action: MenuAction::NewFile },
-            MenuItem { label: "Paste".into(), action: MenuAction::Paste },
+            MenuItem::new("New Folder", MenuAction::NewFolder),
+            MenuItem::new("New File", MenuAction::NewFile),
+            MenuItem::new("Paste", MenuAction::Paste),
         ];
         // a terminal has no meaning in the trash listing
         if !in_trash {
-            items.push(MenuItem { label: "Open Terminal Here".into(), action: MenuAction::Terminal });
+            items.push(MenuItem::new("Open Terminal Here", MenuAction::Terminal));
         }
         items.extend([
-            MenuItem { label: "Sort by Name".into(), action: MenuAction::SortName },
-            MenuItem { label: "Sort by Size".into(), action: MenuAction::SortSize },
-            MenuItem { label: "Sort by Date".into(), action: MenuAction::SortModified },
-            MenuItem { label: "Show Hidden".into(), action: MenuAction::ToggleHidden },
+            MenuItem::new("Sort by Name", MenuAction::SortName),
+            MenuItem::new("Sort by Size", MenuAction::SortSize),
+            MenuItem::new("Sort by Date", MenuAction::SortModified),
+            MenuItem::new("Show Hidden", MenuAction::ToggleHidden),
         ]);
         items
     }
@@ -3948,6 +4138,9 @@ impl Browser {
             div()
                 .absolute()
                 .inset_0()
+                // same as the compress dialog: keep clicks out of the
+                // listing underneath
+                .occlude()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -4852,6 +5045,55 @@ fn have_tool(name: &str) -> bool {
     })
 }
 
+/// Record the default handler for a mime type in the user's
+/// mimeapps.list (XDG spec): our app goes first, any previous
+/// defaults stay on the line as fallbacks.
+fn write_mimeapps(path: &Path, mime: &str, desktop_id: &str) -> std::io::Result<()> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut out = String::new();
+    let mut in_defaults = false;
+    let mut section_found = false;
+    let mut inserted = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            // leaving the defaults section without having placed our
+            // app: put it at the end of the section
+            if in_defaults && !inserted {
+                out.push_str(&format!("{mime}={desktop_id}\n"));
+                inserted = true;
+            }
+            in_defaults = trimmed == "[Default Applications]";
+            section_found |= in_defaults;
+        } else if in_defaults && !inserted {
+            let ours = trimmed.starts_with(&format!("{mime}="))
+                || trimmed.starts_with(&format!("{mime} "));
+            if ours {
+                let rest = trimmed.split_once('=').map(|(_, v)| v).unwrap_or("");
+                let others: Vec<&str> = rest
+                    .split(';')
+                    .filter(|a| !a.is_empty() && *a != desktop_id)
+                    .collect();
+                out.push_str(&format!("{mime}={desktop_id};{}\n", others.join(";")));
+                inserted = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !inserted {
+        if !section_found {
+            out.push_str("[Default Applications]\n");
+        }
+        out.push_str(&format!("{mime}={desktop_id}\n"));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, out)
+}
+
 /// What kind of archive is this file name, if any?
 fn archive_kind(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();
@@ -4961,8 +5203,12 @@ fn mime_for_ext(ext: &str) -> &'static str {
 #[derive(Clone)]
 struct DesktopApp {
     name: String,
+    /// the .desktop file id, needed to name the app in mimeapps.list
+    id: String,
     exec: String,
     mimes: Vec<String>,
+    /// unlocalized Comment, shown as a quiet line in the Open With picker
+    comment: Option<String>,
 }
 
 /// Scan the standard applications directories. Runs once per session
@@ -4996,8 +5242,12 @@ fn scan_desktop_apps() -> Vec<DesktopApp> {
                 continue;
             };
             let (mut name, mut exec, mut mimes) = (String::new(), String::new(), Vec::new());
+            let (mut comment, mut id) = (None, String::new());
             let (mut hidden, mut nodisplay, mut is_app) = (false, false, false);
             let mut in_entry = false;
+            if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
+                id = fname.to_string();
+            }
             for line in text.lines() {
                 let line = line.trim();
                 if line.starts_with('[') {
@@ -5012,6 +5262,7 @@ fn scan_desktop_apps() -> Vec<DesktopApp> {
                 };
                 match key {
                     "Name" => name = value.to_string(),
+                    "Comment" => comment = Some(value.to_string()),
                     "Exec" => exec = value.to_string(),
                     "MimeType" => {
                         mimes = value
@@ -5033,8 +5284,10 @@ fn scan_desktop_apps() -> Vec<DesktopApp> {
             if seen.insert(label.clone()) {
                 apps.push(DesktopApp {
                     name: label,
+                    id,
                     exec,
                     mimes,
+                    comment,
                 });
             }
         }
@@ -5865,5 +6118,249 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "name  role   city");
         assert_eq!(lines[1], "ada   pilot  berlin");
+    }
+
+    #[test]
+    fn mimeapps_creates_section_and_merges_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "koguma-mimeapps-{}-1.list",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        // fresh file: section + entry appear
+        write_mimeapps(&path, "text/markdown", "app-a.desktop").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[Default Applications]"));
+        assert!(text.contains("text/markdown=app-a.desktop"));
+
+        // second write prepends our app and keeps the old default
+        fs::write(&path, "[Default Applications]\ntext/markdown=old.desktop\n").unwrap();
+        write_mimeapps(&path, "text/markdown", "app-b.desktop").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("text/markdown=app-b.desktop;old.desktop"));
+
+        // other types and sections survive untouched
+        fs::write(
+            &path,
+            "[Added Associations]\nx=y.desktop\n\n[Default Applications]\nimage/png=loupe.desktop\ntext/markdown=old.desktop\n",
+        )
+        .unwrap();
+        write_mimeapps(&path, "text/markdown", "app-c.desktop").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[Added Associations]"));
+        assert!(text.contains("x=y.desktop"));
+        assert!(text.contains("image/png=loupe.desktop"));
+        assert!(text.contains("text/markdown=app-c.desktop;old.desktop"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zip_toggle_swaps_known_suffixes_only() {
+        let mut dialog = CompressDialog {
+            name: "crew.tar.gz".into(),
+            cursor: 4,
+            zip: false,
+            zip_available: true,
+        };
+        Browser::set_zip_format(&mut dialog, true);
+        assert_eq!(dialog.name, "crew.zip");
+        assert!(dialog.zip);
+        Browser::set_zip_format(&mut dialog, false);
+        assert_eq!(dialog.name, "crew.tar.gz");
+
+        // custom names without a known suffix stay as typed; Create
+        // appends the chosen suffix at build time
+        dialog.name = "backup 2026".into();
+        dialog.cursor = 11;
+        Browser::set_zip_format(&mut dialog, true);
+        assert_eq!(dialog.name, "backup 2026");
+        assert!(dialog.zip);
+        Browser::set_zip_format(&mut dialog, false);
+        assert_eq!(dialog.name, "backup 2026");
+    }
+}
+
+/// Minimal harness for the menu dispatch question: does a left click
+/// land on an item inside an occluded overlay, or does it fall through
+/// to the listing underneath?
+#[cfg(test)]
+mod overlay_click_repro {
+    use super::*;
+    use gpui::{point, TestApp};
+    use std::rc::Rc;
+    use std::cell::Cell;
+
+    struct OverlayRepro {
+        menu_open: bool,
+        item_clicked: Rc<Cell<bool>>,
+        catcher_clicked: Rc<Cell<bool>>,
+        backdrop_closed: Rc<Cell<bool>>,
+    }
+
+    impl Render for OverlayRepro {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let catcher_clicked = self.catcher_clicked.clone();
+            let backdrop_closed = self.backdrop_closed.clone();
+            let open_menu = cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.menu_open = true;
+                cx.notify();
+            });
+            let click_item = cx.listener(|this, _, _, cx| {
+                this.item_clicked.set(true);
+                cx.notify();
+            });
+
+            let mut root = div().size_full().child(
+                div()
+                    .id("list")
+                    .size_full()
+                    .bg(rgb(0x222222))
+                    .on_mouse_down(MouseButton::Right, open_menu)
+                    .on_mouse_down(MouseButton::Left, move |_, _, _| {
+                        catcher_clicked.set(true);
+                    }),
+            );
+
+            if self.menu_open {
+                root = root.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .child(div().absolute().inset_0().on_mouse_down(
+                            MouseButton::Left,
+                            move |_, _, _| backdrop_closed.set(true),
+                        ))
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(100.))
+                                .top(px(100.))
+                                .w(px(200.))
+                                .h(px(100.))
+                                .flex()
+                                .flex_col()
+                                .bg(rgb(0x333333))
+                                .child(
+                                    div()
+                                        .id("menu-item-0")
+                                        .flex()
+                                        .flex_col()
+                                        .h(px(50.))
+                                        .px_3()
+                                        .py_1()
+                                        .cursor_pointer()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(click_item)
+                                        .child("Open"),
+                                ),
+                        ),
+                );
+            }
+            root
+        }
+    }
+
+    #[test]
+    fn clicks_land_on_occluded_overlay_items() {
+        let item_clicked = Rc::new(Cell::new(false));
+        let catcher_clicked = Rc::new(Cell::new(false));
+        let backdrop_closed = Rc::new(Cell::new(false));
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| OverlayRepro {
+            menu_open: false,
+            item_clicked: item_clicked.clone(),
+            catcher_clicked: catcher_clicked.clone(),
+            backdrop_closed: backdrop_closed.clone(),
+        });
+        // open the menu with a right click where the listing is, like
+        // the real row menu does
+        window.simulate_mouse_down(point(px(400.), px(300.)), MouseButton::Right);
+        let pos = point(px(150.), px(125.));
+        // a real user moves the mouse onto the item before clicking
+        window.simulate_mouse_move(pos);
+        window.simulate_mouse_down(pos, MouseButton::Left);
+        window.simulate_mouse_up(pos, MouseButton::Left);
+        assert!(item_clicked.get(), "menu item click never fired");
+        assert!(!catcher_clicked.get(), "click fell through to the listing");
+        assert!(!backdrop_closed.get(), "backdrop closed the menu mid-click");
+    }
+}
+
+/// A regression test for the dead-menu bug: the item loop was once
+/// restructured and the `.on_click` fell off the row, leaving every
+/// context-menu item uncapturable (hover worked, clicks did nothing).
+/// Open a one-item menu in a live Browser, click it, expect Rename.
+#[cfg(test)]
+mod browser_menu_repro {
+    use super::*;
+    use gpui::{point, TestApp};
+
+    #[test]
+    fn menu_item_click_dispatches_action() {
+        // a tiny real directory with one file to rename
+        let dir = std::env::temp_dir().join(format!("koguma-menu-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), "hello").unwrap();
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = app.open_window(|window, cx| {
+            Browser::new(Some(dir.clone()), window, cx)
+        });
+        // let the async directory load land before poking at entries
+        app.run_until_parked();
+        window.update(|browser, window, cx| {
+            assert!(
+                !browser.tab().entries.is_empty(),
+                "directory listing never loaded in the test harness (dir: {:?})",
+                browser.tab().current_dir()
+            );
+            // put the cursor on the file so Rename has a target, then
+            // open the same menu the right-click would open
+            browser.tab_mut().cursor = Some(0);
+            browser.open_menu(
+                100.,
+                100.,
+                vec![MenuItem::new("Rename", MenuAction::Rename)],
+            );
+            cx.notify();
+            window.refresh();
+        });
+
+        // where does gpui think the item is? (debug_selector on the row
+        // feeds this; the harness clicks the item's own painted bounds)
+        let pos = window.update(|_, window, _| {
+            let bounds = window
+                .debug_element_bounds("menu-item-row")
+                .expect("menu item never painted");
+            point(
+                bounds.origin.x + bounds.size.width / 2.,
+                bounds.origin.y + bounds.size.height / 2.,
+            )
+        });
+        window.simulate_mouse_move(pos);
+        window.simulate_mouse_down(pos, MouseButton::Left);
+        window.simulate_mouse_up(pos, MouseButton::Left);
+        app.run_until_parked();
+        let renamed = window.update(|browser, _, _| browser.tab().renaming.is_some());
+        assert!(renamed, "click on the item's own bounds never fired Rename");
+
+        window.update(|browser, _, _| {
+            assert!(
+                browser.menu.is_none(),
+                "menu did not close: item click never dispatched"
+            );
+            assert!(
+                browser.tab().renaming.is_some(),
+                "Rename action never ran"
+            );
+        });
+        let _ = fs::remove_dir_all(&dir);
     }
 }
