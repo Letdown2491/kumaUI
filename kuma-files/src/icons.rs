@@ -95,15 +95,71 @@ pub(crate) fn is_image(name: &str) -> bool {
     )
 }
 
+/// Files that get a page-style thumbnail: plain images always, PDFs
+/// when pdftocairo (poppler-utils) is available.
+pub(crate) fn is_thumbable(name: &str) -> bool {
+    is_image(name) || is_pdf(name)
+}
+
+/// PDF files: page 1 rendered by pdftocairo, falling back to the icon.
+pub(crate) fn is_pdf(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase() == "pdf")
+        .unwrap_or(false)
+}
+
 /// Decode a file into a BGRA `RenderImage` no larger than the bounds, the
 /// byte order gpui expects. Same contract as kuma-shell's imaging module.
 pub(crate) fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<gpui::RenderImage> {
     let image = image::ImageReader::open(path).ok()?.decode().ok()?;
+    Some(decode_to_render(image, max_width, max_height))
+}
+
+/// Render a PDF's first page to a thumbnail by shelling out to
+/// pdftocairo (poppler-utils). None when the tool is missing or the
+/// file is not a readable PDF, so callers fall back to the type icon.
+pub(crate) fn decode_pdf_thumbnail(path: &Path, max: u32) -> Option<gpui::RenderImage> {
+    let out = std::process::Command::new("pdftocairo")
+        .args(["-png", "-f", "1", "-l", "1", "-singlefile", "-scale-to"])
+        .arg(max.to_string())
+        .arg(path)
+        .arg("-")
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    let image = image::load_from_memory(&out.stdout).ok()?;
+    Some(decode_to_render(image, max, max))
+}
+
+/// Convert a decoded image into the BGRA `RenderImage` gpui expects.
+fn decode_to_render(image: image::DynamicImage, max_width: u32, max_height: u32) -> gpui::RenderImage {
     let mut thumb = image.thumbnail(max_width, max_height).to_rgba8();
     for pixel in thumb.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    Some(gpui::RenderImage::new(SmallVec::from_buf([
-        image::Frame::new(thumb),
-    ])))
+    gpui::RenderImage::new(SmallVec::from_buf([image::Frame::new(thumb)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pdf_decode_fails_soft() {
+        // a text file is not a pdf: no panic, just None
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert!(decode_pdf_thumbnail(&path, 256).is_none());
+    }
+
+    #[test]
+    fn thumbable_gates() {
+        assert!(is_thumbable("scan.pdf"));
+        assert!(is_thumbable("SCAN.PDF"));
+        assert!(!is_thumbable("notes.pdf.txt"));
+        assert!(is_thumbable("photo.png"));
+        assert!(!is_thumbable("report.docx"));
+    }
 }

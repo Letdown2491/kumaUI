@@ -618,10 +618,15 @@ impl Browser {
         }
         cx.spawn(async move |this, cx| {
             let bg_path = path.clone();
+            let is_pdf = icons::is_pdf(&bg_path.file_name().unwrap_or_default().to_string_lossy());
             let render = cx
                 .background_spawn(async move {
                     std::panic::catch_unwind(|| {
-                        icons::decode_thumbnail(&bg_path, 256, 256)
+                        if is_pdf {
+                            icons::decode_pdf_thumbnail(&bg_path, 256)
+                        } else {
+                            icons::decode_thumbnail(&bg_path, 256, 256)
+                        }
                     })
                     .unwrap_or(None)
                 })
@@ -2557,7 +2562,7 @@ impl Browser {
 
         // thumbnails only for local image files: trash entries point at
         // paths that no longer exist
-        let show_thumb = !in_trash && !entry.is_dir && icons::is_image(&entry.name);
+        let show_thumb = !in_trash && !entry.is_dir && icons::is_thumbable(&entry.name);
         let thumb = if show_thumb {
             self.request_thumb(entry.path.clone(), cx);
             self.thumbs.get(&entry.path).cloned()
@@ -3337,7 +3342,7 @@ impl Render for Browser {
                         self.text_preview = None;
                         let entry = self.tab().entries.iter().find(|e| e.key == key).cloned();
                         if let Some(entry) = entry.filter(|e| e.item.is_none()) {
-                            if !entry.is_dir && icons::is_image(&entry.name) {
+                            if !entry.is_dir && icons::is_thumbable(&entry.name) {
                                 self.request_thumb(entry.path.clone(), cx);
                             } else if !entry.is_dir {
                                 self.request_text_preview(entry.path.clone(), cx);
