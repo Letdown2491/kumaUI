@@ -1001,10 +1001,21 @@ impl Browser {
         cx.notify();
     }
 
+    /// Ctrl+Tab / Ctrl+Shift+Tab: rotate through the tabs.
+    fn cycle_tab(&mut self, step: isize, cx: &mut Context<Self>) {
+        if self.tabs.len() < 2 {
+            return;
+        }
+        let count = self.tabs.len() as isize;
+        let next = (self.active as isize + step).rem_euclid(count);
+        self.active = next as usize;
+        self.save_state();
+        cx.notify();
+    }
+
     /// New tabs start at home but keep the working view: the active
     /// tab's view mode and sort carry over.
-    fn new_tab(&mut self, cx: &mut Context<Self>) {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    fn new_tab(&mut self, cx: &mut Context<Self>) {        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let mut tab = Tab::new(Source::Dir(home));
         let current = self.tab();
         tab.view_mode = current.view_mode;
@@ -1948,6 +1959,25 @@ impl Browser {
             "delete" if keystroke.modifiers.shift => self.delete_selection(cx),
             "delete" => self.trash_selection(cx),
             "f2" => self.start_rename(cx),
+            // path bar: type a location instead of clicking crumbs
+            "l" if keystroke.modifiers.control => self.start_path_edit(cx),
+            "f6" => self.start_path_edit(cx),
+            // tab cycling, browser style
+            "tab" if keystroke.modifiers.control && keystroke.modifiers.shift => {
+                self.cycle_tab(-1, cx)
+            }
+            "tab" if keystroke.modifiers.control => self.cycle_tab(1, cx),
+            "home" if keystroke.modifiers.alt => {
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                self.load_source(Source::Dir(home), cx);
+            }
+            // manual refresh; the watcher usually beats you to it
+            "f5" => {
+                let show_hidden = self.show_hidden;
+                self.tab_mut().reload(show_hidden);
+                self.status = "refreshed".into();
+                cx.notify();
+            }
 
             "left" if keystroke.modifiers.alt => self.go_back(cx),
             "right" if keystroke.modifiers.alt => self.go_forward(cx),
@@ -3894,6 +3924,10 @@ const KEY_HINTS: &[(&str, &str)] = &[
     ("Ctrl+C/X/V/Z", "clipboard"),
     ("Ctrl+Left/Right", "back/fwd"),
     ("Ctrl+Up", "up folder"),
+    ("Ctrl+L/F6", "edit path"),
+    ("Ctrl+Tab", "switch tab"),
+    ("Alt+Home", "home"),
+    ("F5", "refresh"),
     ("Ctrl+H", "hidden"),
     ("Ctrl+1/2", "views"),
     ("Ctrl+=/-/0", "zoom"),
