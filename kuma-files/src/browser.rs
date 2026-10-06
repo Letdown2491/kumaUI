@@ -584,6 +584,9 @@ pub(crate) struct Browser {
     inspector: bool,
     /// Info rail docked to the bottom edge instead of the right.
     inspector_bottom: bool,
+    /// Pinned dock: None follows the window width (auto), Some pins
+    /// bottom or right no matter how the window is resized.
+    inspector_lock: Option<bool>,
     /// Keybinding cheatsheet expanded in the places sidebar.
     keys_open: bool,
     /// Text snippet for the rail, when the focused entry is textual.
@@ -660,6 +663,7 @@ impl Browser {
             openwith_apps: Vec::new(),
             inspector: true,
             inspector_bottom: false,
+            inspector_lock: None,
             keys_open: false,
             text_preview: None,
             preview_key: None,
@@ -2217,6 +2221,9 @@ impl Browser {
                 ("inspector", "false") => self.inspector = false,
                 ("inspector-bottom", "true") => self.inspector_bottom = true,
                 ("inspector-bottom", "false") => self.inspector_bottom = false,
+                ("inspector-lock", "auto") => self.inspector_lock = None,
+                ("inspector-lock", "bottom") => self.inspector_lock = Some(true),
+                ("inspector-lock", "right") => self.inspector_lock = Some(false),
                 ("keys", "true") => self.keys_open = true,
                 ("keys", "false") => self.keys_open = false,
                 ("active", _) => saved_active = value.parse().ok(),
@@ -2287,7 +2294,7 @@ impl Browser {
             SortKey::Modified => "modified",
         };
         let text = format!(
-            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\nkeys={}\nscale={}\n",
+            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\ninspector-lock={}\nkeys={}\nscale={}\n",
             if tab.view_mode == ViewMode::Icons {
                 "icons"
             } else {
@@ -2298,6 +2305,11 @@ impl Browser {
             self.show_hidden,
             self.inspector,
             self.inspector_bottom,
+            match self.inspector_lock {
+                Some(true) => "bottom",
+                Some(false) => "right",
+                None => "auto",
+            },
             self.keys_open,
             self.scale,
         );
@@ -2407,8 +2419,42 @@ impl Browser {
     }
 
     /// Move the info panel between the right edge and the bottom edge.
+    /// Auto dock from the window width, with hysteresis so a window
+    /// resting near the threshold never flickers between docks: right
+    /// at 1024 and up, back to bottom only below 950, unchanged in
+    /// between.
+    fn auto_dock(&mut self, window: &mut Window) {
+        if self.inspector_lock.is_some() {
+            return;
+        }
+        let width = window.viewport_size().width.as_f32();
+        if let Some(bottom) = auto_dock_for(width, self.inspector_bottom) {
+            self.inspector_bottom = bottom;
+        }
+    }
+
     fn flip_inspector(&mut self, cx: &mut Context<Self>) {
         self.inspector_bottom = !self.inspector_bottom;
+        // in auto mode the next render would snap the dock straight
+        // back, so a manual flip pins the panel where it is put
+        self.inspector_lock = Some(self.inspector_bottom);
+        self.save_state();
+        cx.notify();
+    }
+
+    /// The lock between chevron and close: pin the panel to its
+    /// current dock, or release it back to the window-width rule.
+    fn toggle_inspector_lock(&mut self, cx: &mut Context<Self>) {
+        self.inspector_lock = match self.inspector_lock {
+            None => Some(self.inspector_bottom),
+            Some(_) => None,
+        };
+        let status = match self.inspector_lock {
+            Some(true) => "pane pinned to the bottom",
+            Some(false) => "pane pinned to the right",
+            None => "pane follows the window width",
+        };
+        self.status = status.into();
         self.save_state();
         cx.notify();
     }
@@ -3980,6 +4026,7 @@ impl Browser {
             .overflow_hidden()
             .child(preview);
 
+        let locked = self.inspector_lock == Some(bottom);
         let header = div()
             .flex()
             .items_center()
@@ -4007,6 +4054,39 @@ impl Browser {
                             })
                             .size(px(14.))
                             .text_color(theme::text_dim()),
+                    ),
+            )
+            .child(
+                // pin the panel to its current dock, or release it
+                // back to the window-width rule
+                div()
+                    .id("inspector-lock")
+                    .flex()
+                    .h(px(20.))
+                    .items_center()
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(if locked {
+                        theme::accent()
+                    } else {
+                        theme::text_dim()
+                    })
+                    .hover(|this| this.text_color(theme::text()).bg(theme::row_hover()))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector_lock(cx)))
+                    .child(
+                        svg()
+                            .path(if locked {
+                                "icons/lock.svg"
+                            } else {
+                                "icons/lock_open.svg"
+                            })
+                            .size(px(14.))
+                            .text_color(if locked {
+                                theme::accent()
+                            } else {
+                                theme::text_dim()
+                            }),
                     ),
             )
             .child(
@@ -4691,6 +4771,8 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_places();
         self.arm_watcher();
+        self.auto_dock(window);
+        let inspector_docked_bottom = self.inspector_bottom;
 
         // the info rail follows the cursor entry; keep its preview fed
         // the panel only shows while an entry is selected: the knob
@@ -5393,7 +5475,7 @@ impl Render for Browser {
                             }
                         }
                     })
-                    .child(if show_panel && self.inspector_bottom {
+                    .child(if show_panel && inspector_docked_bottom {
                         self.inspector_panel(true, cx)
                     } else {
                         div()
@@ -5442,7 +5524,7 @@ impl Render for Browser {
                             }),
                     ),
             )
-            .child(if show_panel && !self.inspector_bottom {
+            .child(if show_panel && !inspector_docked_bottom {
                 self.inspector_panel(false, cx)
             } else {
                 div()
@@ -5859,6 +5941,20 @@ fn apply_place_order(
         .unwrap_or(order.len());
     order.insert(at, dragged.to_path_buf());
     order
+}
+
+/// The auto-dock rule behind the inspector's responsive pane: right
+/// when the window is wide, bottom when narrow, keep the current dock
+/// in the hysteresis band between the two thresholds.
+fn auto_dock_for(width: f32, current_bottom: bool) -> Option<bool> {
+    if width >= 1024.0 {
+        Some(false)
+    } else if width < 950.0 {
+        Some(true)
+    } else {
+        None
+    }
+    .filter(|bottom| *bottom != current_bottom)
 }
 
 /// One recently-used file: where it lives and when we last opened it.
@@ -6954,6 +7050,21 @@ sftp://remote/share skip-me
     fn uri_decode_undoes_path_uri() {
         let path = PathBuf::from("/tmp/opencode/my files/report 2026é.md");
         assert_eq!(uri_decode(&path_uri(&path)), path);
+    }
+
+    #[test]
+    fn auto_dock_flips_with_hysteresis() {
+        // wide: right; narrow: bottom; the band in between keeps the
+        // current dock so a resting window cannot flicker
+        assert_eq!(auto_dock_for(1200.0, true), Some(false));
+        assert_eq!(auto_dock_for(1024.0, true), Some(false));
+        assert_eq!(auto_dock_for(1000.0, true), None);
+        assert_eq!(auto_dock_for(1000.0, false), None);
+        assert_eq!(auto_dock_for(949.0, false), Some(true));
+        assert_eq!(auto_dock_for(700.0, false), Some(true));
+        // already on the target dock: nothing to change
+        assert_eq!(auto_dock_for(1200.0, false), None);
+        assert_eq!(auto_dock_for(700.0, true), None);
     }
 
     #[test]
