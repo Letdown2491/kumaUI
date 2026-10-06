@@ -6,6 +6,7 @@ use gpui_platform::application;
 
 mod browser;
 mod icons;
+mod input;
 mod theme;
 
 use browser::Browser;

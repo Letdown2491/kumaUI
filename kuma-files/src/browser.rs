@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use notify::Watcher as _;
 use std::os::unix::fs::PermissionsExt;
 
+use crate::input;
+
 /// Thumbnail cache bound. 256x256 RGBA each, so ~300 thumbs is the
 /// most memory the cache can hold (about 75 MiB worst case).
 const THUMB_CACHE_MAX: usize = 300;
@@ -119,9 +121,8 @@ struct Tab {
     history: Vec<Source>,
     forward: Vec<Source>,
     renaming: Option<PathBuf>,
-    rename_buffer: String,
-    /// Byte offset into rename_buffer; stays on char boundaries.
-    rename_cursor: usize,
+    /// the in-place rename editor, live while `renaming` is Some
+    rename_field: input::Field,
     view_mode: ViewMode,
     sort_key: SortKey,
     sort_asc: bool,
@@ -415,9 +416,25 @@ struct Place {
     path: PathBuf,
     /// pinned through the GTK bookmarks file (removable)
     bookmark: bool,
-    /// a gvfs-FUSE bridge or udisks mount point: lives in the Network
-    /// section, not pinnable (it appears and disappears on its own)
-    mount: bool,
+    /// a gvfs-FUSE bridge or udisks mount point: lives under the
+    /// Network or Removable header, not pinnable (it appears and
+    /// disappears on its own)
+    mount: Option<MountKind>,
+    /// a bookmark into the gvfs root whose mount is gone: renders
+    /// dimmed, and clicking opens the connect dialog prefilled with
+    /// the URI parsed from the gvfs dir name
+    stale: bool,
+}
+
+/// What a mount place unplugs as. Both ride `gio mount -u`; the
+/// distinction is the verb the menu shows and the status line speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MountKind {
+    /// a gvfs-FUSE bridge for a network protocol (samba, sftp, webdav)
+    Network,
+    /// a udisks2 mount point or a local-device gvfs backend
+    /// (USB drives, MTP phones, cameras, iPods)
+    Removable,
 }
 
 /// Snapshot for the properties dialog.
@@ -486,6 +503,12 @@ enum MenuAction {
     Unbookmark(PathBuf),
     /// Drop a file from the recency list.
     Forget,
+    /// Disconnect a network mount or eject a removable one:
+    /// `gio mount -u` on the mount point; the kind picks the verb.
+    Unmount(PathBuf, MountKind),
+    /// A stale network place: open the connect dialog prefilled with
+    /// the URI parsed from the gvfs dir name.
+    Reconnect(PathBuf),
     /// Open the accent (highlight color) picker.
     AccentPicker,
 }
@@ -550,23 +573,28 @@ struct ConflictDialog {
     apply_all: bool,
 }
 
-/// Compress dialog: target archive name, caret, format choice, and
-/// whether the zip option has a tool behind it on this machine.
+/// Compress dialog: target archive name, format choice, and whether
+/// the zip option has a tool behind it on this machine.
 struct CompressDialog {
-    name: String,
-    cursor: usize,
+    name: input::Field,
     zip: bool,
     zip_available: bool,
 }
 
-/// Connect-to-server state: the URI field before the mount starts,
-/// then whatever the gio pump is asking for.
+/// Connect-to-server state: the protocol picked and its fields
+/// before the mount starts, then whatever the gio pump is asking for.
 struct ConnectDialog {
+    proto: ConnectProto,
+    /// the per-protocol fields, indexed by FIELD_*; which rows show
+    /// depends on the protocol
+    fields: [input::Field; 5],
+    /// which field the caret sits in (an index into fields)
+    focus: usize,
+    /// the composed URI, set when the pump starts; the locked server
+    /// line during the prompt phase
     uri: String,
-    uri_cursor: usize,
     /// credential buffer for the current prompt
-    input: String,
-    input_cursor: usize,
+    input: input::Field,
     /// the prompt gio printed ("User", "Password", "Domain [X]")
     prompt: Option<String>,
     /// password-style prompts render the buffer as bullets
@@ -578,6 +606,155 @@ struct ConnectDialog {
     /// when the current gio run started, for the elapsed counter
     since: Option<std::time::Instant>,
     session: Option<ConnectSession>,
+    /// the form's password already answered one prompt this run, so
+    /// the next password prompt (it was wrong) surfaces for typing
+    password_tried: bool,
+}
+
+/// The field rows the dialog shows, in tab order. SMB mounts a share
+/// (no port); sftp and ftp take an optional port and no share; every
+/// protocol takes an optional password that pre-answers gio's first
+/// password prompt.
+const FIELD_HOST: usize = 0;
+const FIELD_USER: usize = 1;
+const FIELD_PORT: usize = 2;
+const FIELD_SHARE: usize = 3;
+const FIELD_PASSWORD: usize = 4;
+
+impl ConnectDialog {
+    /// The visible field indexes, in tab order.
+    fn layout(&self) -> [usize; 4] {
+        match self.proto {
+            ConnectProto::Smb => [FIELD_HOST, FIELD_USER, FIELD_SHARE, FIELD_PASSWORD],
+            ConnectProto::Sftp | ConnectProto::Ftp => {
+                [FIELD_HOST, FIELD_USER, FIELD_PORT, FIELD_PASSWORD]
+            }
+        }
+    }
+
+    fn focused_mut(&mut self) -> &mut input::Field {
+        &mut self.fields[self.focus]
+    }
+
+    /// Move the caret one visible field back or forward (wrapping).
+    fn cycle(&mut self, back: bool) {
+        let layout = self.layout();
+        let pos = layout.iter().position(|&ix| ix == self.focus).unwrap_or(0);
+        self.fields[self.focus].collapse();
+        self.focus = layout[if back { (pos + 3) % 4 } else { (pos + 1) % 4 }];
+    }
+
+    fn last_visible(&self) -> usize {
+        self.layout()[3]
+    }
+}
+
+/// The protocols the dialog speaks. Blossom rides here later, as its
+/// own picker entry with its own fields (issue #25 phase 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectProto {
+    Sftp,
+    Ftp,
+    Smb,
+}
+
+impl ConnectProto {
+    const ALL: [ConnectProto; 3] = [ConnectProto::Sftp, ConnectProto::Ftp, ConnectProto::Smb];
+
+    fn scheme(&self) -> &'static str {
+        match self {
+            Self::Sftp => "sftp",
+            Self::Ftp => "ftp",
+            Self::Smb => "smb",
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Sftp => "SFTP",
+            Self::Ftp => "FTP",
+            Self::Smb => "SMB",
+        }
+    }
+}
+
+/// The URI the dialog's fields compose to: scheme from the protocol,
+/// user@ when given, :port for sftp/ftp (digits only), /share for smb.
+fn compose_server_uri(
+    proto: ConnectProto,
+    host: &str,
+    user: &str,
+    port: &str,
+    share: &str,
+) -> String {
+    let mut uri = format!("{}://", proto.scheme());
+    let user = user.trim();
+    if !user.is_empty() {
+        uri.push_str(user);
+        uri.push('@');
+    }
+    uri.push_str(host.trim());
+    let port = port.trim();
+    if proto != ConnectProto::Smb
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+    {
+        uri.push(':');
+        uri.push_str(port);
+    }
+    if proto == ConnectProto::Smb {
+        let share = share.trim().trim_start_matches('/');
+        if !share.is_empty() {
+            uri.push('/');
+            uri.push_str(share);
+        }
+    }
+    uri
+}
+
+/// Split a pasted (or reconnected) server URI into protocol and
+/// fields. A pasted password is dropped: gio re-asks through the
+/// pump. None when the scheme is not one the dialog speaks.
+fn parse_server_uri(uri: &str) -> Option<(ConnectProto, String, String, String, String)> {
+    let (scheme, rest) = uri.split_once("://")?;
+    let proto = match scheme.to_lowercase().as_str() {
+        "smb" => ConnectProto::Smb,
+        "sftp" => ConnectProto::Sftp,
+        "ftp" => ConnectProto::Ftp,
+        _ => return None,
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, path),
+        None => (rest, ""),
+    };
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((userinfo, hostport)) => (userinfo, hostport),
+        None => ("", authority),
+    };
+    // a pasted password rides after ':' in the userinfo; drop it
+    let user = match userinfo.split_once(':') {
+        Some((user, _)) => user.to_string(),
+        None => userinfo.to_string(),
+    };
+    // bracketed IPv6 hosts: the brackets do not compose back
+    let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
+        match inner.split_once(']') {
+            Some((host, tail)) => (host.to_string(), tail.trim_start_matches(':').to_string()),
+            None => (hostport.to_string(), String::new()),
+        }
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((host, port)) => (host.to_string(), port.to_string()),
+            None => (hostport.to_string(), String::new()),
+        }
+    };
+    Some((
+        proto,
+        host,
+        user,
+        port,
+        path.trim_start_matches('/').to_string(),
+    ))
 }
 
 /// The live `gio mount` pump: answers go down the channel, the child
@@ -638,12 +815,20 @@ fn mount_label(raw: &str) -> String {
     let Some((scheme, rest)) = raw.split_once(':') else {
         return raw.to_string();
     };
+    // the smb backend's pseudo-scheme reads plainly in a label
+    let scheme = if scheme == "smb-share" {
+        "smb"
+    } else {
+        scheme
+    };
     let mut host = None;
     let mut share = None;
     for part in rest.split(',') {
         if let Some((key, value)) = part.split_once('=') {
             match key {
-                "host" if !value.is_empty() => host = Some(value),
+                // the smb backend names its mounts
+                // `smb-share:server=X,share=Y`; the others use host=
+                "host" | "server" if !value.is_empty() => host = Some(value),
                 "share" if !value.is_empty() => share = Some(value),
                 _ => {}
             }
@@ -656,62 +841,98 @@ fn mount_label(raw: &str) -> String {
     }
 }
 
-/// Insert text at the cursor (paste, or one typed character).
-fn insert_text(buf: &mut String, cursor: &mut usize, text: &str) {
-    let pos = if buf.is_char_boundary(*cursor) {
-        *cursor
-    } else {
-        buf.len()
-    };
-    buf.insert_str(pos, text);
-    *cursor = pos + text.len();
+/// Is this path inside the session's gvfs-FUSE root?
+fn is_gvfs_path(path: &std::path::Path) -> bool {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|runtime| PathBuf::from(runtime).join("gvfs"))
+        .is_some_and(|gvfs| path.starts_with(&gvfs))
 }
 
-/// One-line text-buffer editing shared by the connect dialog's two
-/// fields (URI field, credential answer). Returns false for keys it
-/// does not handle.
-fn edit_line(buf: &mut String, cursor: &mut usize, key: &str, keystroke: &gpui::Keystroke) -> bool {
-    match key {
-        "backspace" => {
-            if *cursor > 0 {
-                let head = &buf[..*cursor];
-                if let Some((prev, _)) = head.char_indices().next_back() {
-                    buf.remove(prev);
-                    *cursor = prev;
-                }
+/// Parse a gvfs-FUSE mount directory name back into the server URI a
+/// reconnect needs: `smb-share:server=X,share=Y` is `smb://X/Y`,
+/// `sftp:host=server,user=bob` is `sftp://bob@server`. The backend
+/// appends `;N` when the same URI mounts twice; digits after a `;`
+/// are stripped. None for names without a network host.
+fn uri_from_gvfs_name(raw: &str) -> Option<String> {
+    let (scheme, rest) = raw.split_once(':')?;
+    let scheme = if scheme == "smb-share" {
+        "smb"
+    } else {
+        scheme
+    };
+    let mut host = None;
+    let mut share = None;
+    let mut user = None;
+    for part in rest.split(',') {
+        if let Some((key, value)) = part.split_once('=') {
+            // the backend's `;N` repeat counter rides the last value
+            let value = match value.split_once(';') {
+                Some((head, tail)) if tail.bytes().all(|b| b.is_ascii_digit()) => head,
+                _ => value,
+            };
+            if value.is_empty() {
+                continue;
             }
-            true
-        }
-        "left" => {
-            if *cursor > 0 {
-                let head = &buf[..*cursor];
-                if let Some((prev, _)) = head.char_indices().next_back() {
-                    *cursor = prev;
-                }
+            match key {
+                "host" | "server" => host = Some(value),
+                "share" => share = Some(value),
+                "user" => user = Some(value),
+                _ => {}
             }
-            true
         }
-        "right" => {
-            if buf.is_char_boundary(*cursor) && *cursor < buf.len() {
-                let tail = &buf[*cursor..];
-                if let Some(ch) = tail.chars().next() {
-                    *cursor += ch.len_utf8();
-                }
-            }
-            true
-        }
-        _ if !keystroke.modifiers.control
-            && !keystroke.modifiers.alt
-            && !keystroke.modifiers.platform
-            && !keystroke.modifiers.function =>
-        {
-            if let Some(character) = keystroke.key_char.as_deref() {
-                insert_text(buf, cursor, character);
-            }
-            true
-        }
-        _ => false,
     }
+    let host = host?;
+    let mut uri = format!("{scheme}://");
+    if let Some(user) = user {
+        uri.push_str(user);
+        uri.push('@');
+    }
+    uri.push_str(host);
+    if let Some(share) = share {
+        uri.push('/');
+        uri.push_str(share);
+    }
+    Some(uri)
+}
+
+/// Which sidebar section a place renders in. Home shares the top
+/// block with Recent and Trash; the rest group under headers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaceSection {
+    Top,
+    Places,
+    Network,
+    Removable,
+}
+
+/// Network protocols mount under Network; local-device backends
+/// (MTP phones, cameras, iPods) ride with the removable drives.
+fn gvfs_mount_kind(raw: &str) -> MountKind {
+    let scheme = raw.split(':').next().unwrap_or_default();
+    match scheme {
+        "smb-share" | "smb" | "sftp" | "ftp" | "ftps" | "webdav" | "dav" | "davs" | "afp"
+        | "nfs" => MountKind::Network,
+        _ => MountKind::Removable,
+    }
+}
+
+fn place_section(place: &Place) -> PlaceSection {
+    match place.mount {
+        Some(MountKind::Network) => PlaceSection::Network,
+        Some(MountKind::Removable) => PlaceSection::Removable,
+        None if place.stale => PlaceSection::Network,
+        None => {
+            if is_home_dir(&place.path) {
+                PlaceSection::Top
+            } else {
+                PlaceSection::Places
+            }
+        }
+    }
+}
+
+fn is_home_dir(path: &std::path::Path) -> bool {
+    dirs::home_dir().is_some_and(|home| home == path)
 }
 
 /// Is this gio output chunk (text up to a colon) a credential prompt?
@@ -1013,8 +1234,8 @@ pub(crate) struct Browser {
     /// entries instead of clearing the whole cache.
     thumb_order: VecDeque<PathBuf>,
     path_editing: bool,
-    path_buffer: String,
-    path_cursor: usize,
+    /// the path bar's editor, live while `path_editing`
+    path_field: input::Field,
     /// Content zoom, 1.0 = normal; clamped to 0.75..=2.0.
     scale: f32,
     titled: Option<PathBuf>,
@@ -1093,8 +1314,7 @@ impl Browser {
             thumbs_inflight: HashSet::new(),
             thumb_order: VecDeque::new(),
             path_editing: false,
-            path_buffer: String::new(),
-            path_cursor: 0,
+            path_field: Default::default(),
             scale: 1.0,
             titled: None,
             watcher: None,
@@ -1182,7 +1402,8 @@ impl Browser {
                     name: name.into(),
                     path,
                     bookmark: false,
-                    mount: false,
+                    mount: None,
+                    stale: false,
                 });
             }
         };
@@ -1198,7 +1419,7 @@ impl Browser {
         // gvfs-FUSE bridges that back samba, MTP, phones, and friends.
         // Mounted volumes appear here without any protocol code on our
         // side (gio mount / the desktop session do that part).
-        let mount_root = |root: PathBuf, label: bool, places: &mut Vec<Place>| {
+        let mount_root = |root: PathBuf, classify: fn(&str) -> MountKind, places: &mut Vec<Place>| {
             let Ok(read) = fs::read_dir(&root) else {
                 return;
             };
@@ -1206,16 +1427,17 @@ impl Browser {
                 .flatten()
                 .map(|entry| {
                     let raw = entry.file_name().to_string_lossy().into_owned();
-                    let name = if label {
-                        mount_label(&raw)
-                    } else {
-                        raw
+                    let kind = classify(&raw);
+                    let name = match kind {
+                        MountKind::Network => mount_label(&raw),
+                        MountKind::Removable => raw,
                     };
                     Place {
                         name,
                         path: entry.path(),
                         bookmark: false,
-                        mount: true,
+                        mount: Some(kind),
+                        stale: false,
                     }
                 })
                 .collect();
@@ -1225,19 +1447,43 @@ impl Browser {
         if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
             let mut gvfs = PathBuf::from(&runtime);
             gvfs.push("gvfs");
-            mount_root(gvfs, true, &mut places);
+            mount_root(gvfs, gvfs_mount_kind, &mut places);
         }
         if let Some(user) = std::env::var_os("USER") {
             let mut media = PathBuf::from("/run/media");
             media.push(user);
-            mount_root(media, false, &mut places);
+            mount_root(media, |_| MountKind::Removable, &mut places);
         }
 
         // pinned folders ride the GTK bookmarks file, so Thunar and
         // Nautilus agree with us about what is pinned; entries the
         // XDG dirs or mounts already cover are not repeated
         for (path, name) in Self::read_bookmarks() {
-            if !path.is_dir() || places.iter().any(|place| place.path == path) {
+            let raw = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // a bookmark into the gvfs root whose mount is gone
+            // (reboot, disconnect): keep it, dimmed, as a reconnect
+            // affordance, instead of letting the saved connection
+            // vanish. Local dead bookmarks (moved folders) still drop.
+            if !path.is_dir() {
+                if !is_gvfs_path(&path)
+                    || uri_from_gvfs_name(&raw).is_none()
+                    || places.iter().any(|place| place.path == path)
+                {
+                    continue;
+                }
+                places.push(Place {
+                    name: name.unwrap_or_else(|| mount_label(&raw)),
+                    path,
+                    bookmark: true,
+                    mount: None,
+                    stale: true,
+                });
+                continue;
+            }
+            if places.iter().any(|place| place.path == path) {
                 continue;
             }
             let name = name.unwrap_or_else(|| {
@@ -1249,7 +1495,8 @@ impl Browser {
                 name,
                 path,
                 bookmark: true,
-                mount: false,
+                mount: None,
+                stale: false,
             });
         }
         places
@@ -1279,7 +1526,7 @@ impl Browser {
                 .zip(&self.places)
                 .any(|(a, b)| {
                     a.name != b.name || a.path != b.path || a.bookmark != b.bookmark
-                        || a.mount != b.mount
+                        || a.mount != b.mount || a.stale != b.stale
                 });
         if changed {
             self.places = next;
@@ -2063,8 +2310,7 @@ impl Browser {
             return;
         };
         self.path_editing = true;
-        self.path_buffer = dir.display().to_string();
-        self.path_cursor = self.path_buffer.len();
+        self.path_field = input::Field::new(dir.display().to_string());
         cx.notify();
     }
 
@@ -2076,7 +2322,7 @@ impl Browser {
     /// Enter in the path bar: ~ expands home, existing dirs navigate.
     fn commit_path_edit(&mut self, cx: &mut Context<Self>) {
         self.path_editing = false;
-        let mut target = self.path_buffer.trim().to_string();
+        let mut target = self.path_field.text().trim().to_string();
         if target == "~" {
             target = dirs::home_dir()
                 .map(|home| home.display().to_string())
@@ -2574,41 +2820,179 @@ impl Browser {
     }
 
     /// Open the compress dialog over the current selection.
-    /// The sidebar's Connect to Server entry: an empty dialog, the
-    /// pump starts on Enter.
+    /// The sidebar's Connect to Server entry: a blank dialog whose
+    /// host field carries the caret, the pump starts on Enter.
     fn open_connect_dialog(&mut self, cx: &mut Context<Self>) {
+        self.open_connect_dialog_with(String::new(), cx);
+    }
+
+    /// The same dialog, blank or prefilled: reconnecting a stale
+    /// network place hands over the URI parsed from the gvfs dir
+    /// name, which fills the protocol and its fields and parks the
+    /// caret on the last one, so Enter connects.
+    fn open_connect_dialog_with(&mut self, uri: String, cx: &mut Context<Self>) {
         self.menu = None;
-        self.connect = Some(ConnectDialog {
-            uri: "sftp://".into(),
-            uri_cursor: 7,
-            input: String::new(),
-            input_cursor: 0,
+        let mut dialog = ConnectDialog {
+            proto: ConnectProto::Sftp,
+            fields: Default::default(),
+            focus: FIELD_HOST,
+            uri: String::new(),
+            input: Default::default(),
             prompt: None,
             mask: false,
             status: String::new(),
             notes: Vec::new(),
             since: None,
             session: None,
-        });
+            password_tried: false,
+        };
+        if !uri.is_empty() {
+            match parse_server_uri(&uri) {
+                Some((proto, host, user, port, share)) => {
+                    dialog.proto = proto;
+                    dialog.fields[FIELD_HOST] = input::Field::new(host);
+                    dialog.fields[FIELD_USER] = input::Field::new(user);
+                    dialog.fields[FIELD_PORT] = input::Field::new(port);
+                    dialog.fields[FIELD_SHARE] = input::Field::new(share);
+                    dialog.focus = dialog.last_visible();
+                }
+                None => {
+                    dialog.status =
+                        "cannot parse that server; schemes I speak: smb, sftp, ftp".into()
+                }
+            }
+        }
+        self.connect = Some(dialog);
         cx.notify();
     }
 
-    /// Enter in the URI field: spawn `gio mount` and start relaying
-    /// its prompts. The pump runs on the background pool; a task
-    /// forwards its events into the view. The piped stdio handles
-    /// belong to the pump; the child itself stays in a mutex so
-    /// Cancel can kill it while the pump is blocked on its stdout.
+    /// Click a protocol button in the connect dialog: swap the field
+    /// layout, keep the buffers, caret back to Host.
+    fn set_connect_proto(&mut self, proto: ConnectProto, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.connect.as_mut() {
+            if dialog.session.is_none() {
+                dialog.proto = proto;
+                dialog.focus = FIELD_HOST;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Click a field box: the caret moves there (its selection
+    /// collapses; mouse-position placement needs text metrics Koguma
+    /// does not have).
+    fn set_connect_focus(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.connect.as_mut() {
+            if dialog.session.is_none() {
+                dialog.fields[dialog.focus].collapse();
+                dialog.focus = ix;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Click on a stale network place: the mount is gone (reboot,
+    /// disconnect), so there is nothing to navigate into. Open the
+    /// connect dialog prefilled with the URI parsed from the gvfs
+    /// dir name instead.
+    fn reconnect_place(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.menu = None;
+        let raw = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match uri_from_gvfs_name(&raw) {
+            Some(uri) => self.open_connect_dialog_with(uri, cx),
+            None => {
+                self.status = "cannot tell which server this was; use Connect to Server".into();
+                cx.notify();
+            }
+        }
+    }
+
+    /// If the active tab sits inside the mount, step out to Home
+    /// first: our own directory watch would hold the mount busy.
+    fn leave_mount(&mut self, mount: &std::path::Path, cx: &mut Context<Self>) {
+        if self
+            .tab()
+            .current_dir()
+            .is_some_and(|dir| dir.starts_with(mount))
+        {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            self.load_source(Source::Dir(home), cx);
+        }
+    }
+
+    /// Disconnect (gvfs network mount) or eject (udisks removable
+    /// mount) a place: `gio mount -u` in the background, then a
+    /// places refresh. Unmount asks no prompts; a failure surfaces
+    /// gio's own error text, busy mounts included.
+    fn unmount(&mut self, mount: PathBuf, kind: MountKind, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.leave_mount(&mount, cx);
+        let label = mount.display().to_string();
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_spawn(async move {
+                    std::process::Command::new("gio")
+                        .args(["mount", "-u"])
+                        .arg(&mount)
+                        .output()
+                })
+                .await;
+            let update = this.update(cx, |this, cx| {
+                match done {
+                    Ok(out) if out.status.success() => {
+                        this.status = match kind {
+                            MountKind::Network => format!("disconnected: {label}"),
+                            MountKind::Removable => format!("ejected: {label}"),
+                        };
+                        this.refresh_places_now();
+                    }
+                    Ok(out) => {
+                        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                        this.status = if err.is_empty() {
+                            format!("unmount failed: {label}")
+                        } else {
+                            format!("unmount: {err}")
+                        };
+                    }
+                    Err(err) => this.status = format!("unmount: gio: {err}"),
+                }
+                cx.notify();
+            });
+            if let Err(err) = update {
+                log::error!("unmount update failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// Enter on the last field: compose the URI from the protocol and
+    /// its fields, spawn `gio mount`, and start relaying its prompts.
+    /// The pump runs on the background pool; a task forwards its
+    /// events into the view. The piped stdio handles belong to the
+    /// pump; the child itself stays in a mutex so Cancel can kill it
+    /// while the pump is blocked on its stdout.
     fn connect_start(&mut self, cx: &mut Context<Self>) {
         let Some(mut dialog) = self.connect.take() else {
             return;
         };
-        let uri = dialog.uri.trim().to_string();
-        if !uri.contains("://") {
-            dialog.status = "enter a server URI, e.g. sftp://host".into();
+        let host = dialog.fields[FIELD_HOST].text().trim().to_string();
+        if host.is_empty() {
+            dialog.status = "enter a host, e.g. nas.local or 192.168.1.10".into();
+            dialog.focus = FIELD_HOST;
             self.connect = Some(dialog);
             cx.notify();
             return;
         }
+        let uri = compose_server_uri(
+            dialog.proto,
+            &host,
+            dialog.fields[FIELD_USER].text(),
+            dialog.fields[FIELD_PORT].text(),
+            dialog.fields[FIELD_SHARE].text(),
+        );
         let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
             dialog.status = "no session runtime dir".into();
             self.connect = Some(dialog);
@@ -2656,6 +3040,8 @@ impl Browser {
         dialog.prompt = None;
         dialog.mask = false;
         dialog.notes.clear();
+        dialog.password_tried = false;
+        dialog.uri = uri.clone();
         dialog.status = format!("connecting to {uri}…");
         dialog.since = Some(std::time::Instant::now());
         self.connect = Some(dialog);
@@ -2701,11 +3087,29 @@ impl Browser {
                 let Some(dialog) = self.connect.as_mut() else {
                     return false;
                 };
+                // a password typed into the form answers the first
+                // password prompt by itself (the URI never carries it:
+                // process lists are world-readable); a second one, it
+                // was wrong, surfaces for typing
+                let stored = dialog.fields[FIELD_PASSWORD].text().to_string();
+                if mask && !dialog.password_tried && !stored.is_empty() {
+                    dialog.password_tried = true;
+                    // the question just answered is gone, including
+                    // any stale prompt still on screen
+                    dialog.prompt = None;
+                    dialog.mask = false;
+                    dialog.input = input::Field::default();
+                    if let Some(session) = dialog.session.as_ref() {
+                        let _ = session.answers.send(stored);
+                    }
+                    log::info!("connect: password prompt answered from the form");
+                    cx.notify();
+                    return true;
+                }
                 log::info!("connect: prompt '{text}' (masked: {mask})");
                 dialog.prompt = Some(text);
                 dialog.mask = mask;
-                dialog.input.clear();
-                dialog.input_cursor = 0;
+                dialog.input = input::Field::default();
                 cx.notify();
                 true
             }
@@ -2753,19 +3157,22 @@ impl Browser {
                     }
                     self.refresh_places_now();
                 } else {
-                    // keep the dialog up: the URI is editable for a retry
+                    // keep the dialog up: the fields are editable for
+                    // a retry
                     log::info!("connect: failed ({message})");
                     self.connect = Some(ConnectDialog {
+                        proto: dialog.proto,
+                        fields: dialog.fields,
+                        focus: FIELD_HOST,
                         uri: dialog.uri,
-                        uri_cursor: dialog.uri_cursor,
-                        input: String::new(),
-                        input_cursor: 0,
+                        input: input::Field::default(),
                         prompt: None,
                         mask: false,
                         status: message,
                         notes: dialog.notes,
                         since: None,
                         session: None,
+                        password_tried: false,
                     });
                 }
                 cx.notify();
@@ -2782,13 +3189,12 @@ impl Browser {
         let (Some(session), Some(_)) = (dialog.session.as_ref(), dialog.prompt.as_ref()) else {
             return;
         };
-        let answer = dialog.input.clone();
-        if session.answers.send(answer).is_ok() {
-            log::info!("connect: answer sent ({} chars)", dialog.input.len());
+        let answer = dialog.input.text().to_string();
+        if session.answers.send(answer.clone()).is_ok() {
+            log::info!("connect: answer sent ({} chars)", answer.len());
             dialog.prompt = None;
             dialog.mask = false;
-            dialog.input.clear();
-            dialog.input_cursor = 0;
+            dialog.input = input::Field::default();
             dialog.status = "connecting…".into();
         }
         cx.notify();
@@ -2820,8 +3226,7 @@ impl Browser {
                 .and_then(|e| e.path.file_stem().map(|s| s.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| "archive".into());
             self.compress = Some(CompressDialog {
-                name: format!("{default_name}.tar.gz"),
-                cursor: 0,
+                name: input::Field::new(format!("{default_name}.tar.gz")),
                 zip: false,
                 zip_available: have_tool("file-roller"),
             });
@@ -2841,11 +3246,12 @@ impl Browser {
         } else {
             (".tar.gz", ".zip")
         };
-        if dialog.name.to_lowercase().ends_with(other) {
-            dialog.name =
-                format!("{}{want}", &dialog.name[..dialog.name.len() - other.len()]);
+        if dialog.name.buf.to_lowercase().ends_with(other) {
+            let stem_len = dialog.name.buf.len() - other.len();
+            dialog.name.buf = format!("{}{want}", &dialog.name.buf[..stem_len]);
+            dialog.name.cursor = dialog.name.cursor.min(dialog.name.buf.len());
+            dialog.name.sel = None;
         }
-        dialog.cursor = dialog.cursor.min(dialog.name.len());
         dialog.zip = zip;
     }
 
@@ -2854,7 +3260,7 @@ impl Browser {
         let Some(dialog) = self.compress.take() else {
             return;
         };
-        let name = dialog.name.trim().to_string();
+        let name = dialog.name.text().trim().to_string();
         if name.is_empty() {
             return;
         }
@@ -3571,8 +3977,7 @@ impl Tab {
             history: Vec::new(),
             forward: Vec::new(),
             renaming: None,
-            rename_buffer: String::new(),
-            rename_cursor: 0,
+            rename_field: Default::default(),
             view_mode: ViewMode::List,
             sort_key: SortKey::Name,
             sort_asc: true,
@@ -3760,17 +4165,42 @@ impl Browser {
                     return;
                 }
                 "enter" => {
-                    self.connect = Some(dialog);
                     if at_prompt {
+                        self.connect = Some(dialog);
                         self.connect_submit(cx);
-                    } else if !self.connect.as_ref().unwrap().session.is_some() {
+                    } else if dialog.session.is_some() {
+                        // between prompts: gio is thinking
+                        self.connect = Some(dialog);
+                        cx.notify();
+                    } else if dialog.focus == dialog.last_visible() {
+                        self.connect = Some(dialog);
                         self.connect_start(cx);
+                    } else {
+                        dialog.cycle(false);
+                        self.connect = Some(dialog);
+                        cx.notify();
                     }
                     return;
                 }
+                "tab" => {
+                    if dialog.session.is_none() {
+                        dialog.cycle(keystroke.modifiers.shift);
+                    }
+                    self.connect = Some(dialog);
+                    cx.notify();
+                    return;
+                }
+                "a" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                    if at_prompt {
+                        dialog.input.select_all();
+                    } else if dialog.session.is_none() {
+                        dialog.focused_mut().select_all();
+                    }
+                }
                 "v" if keystroke.modifiers.control || keystroke.modifiers.platform => {
-                    // paste into the active field: the URI before the
-                    // pump runs, the credential answer at a prompt
+                    // paste into the active field: the focused field
+                    // before the pump runs, the credential answer at a
+                    // prompt; a pasted URI fills the whole form
                     if let Some(item) = cx.read_from_clipboard() {
                         // a URI or a credential is one line; pasted
                         // newlines would corrupt the stdin protocol
@@ -3780,24 +4210,36 @@ impl Browser {
                             .trim_matches(|c: char| c == '\r' || c == '\n')
                             .to_string();
                         if at_prompt {
-                            insert_text(&mut dialog.input, &mut dialog.input_cursor, &text);
+                            dialog.input.paste(&text);
                         } else if dialog.session.is_none() {
-                            insert_text(&mut dialog.uri, &mut dialog.uri_cursor, &text);
+                            if text.contains("://") {
+                                match parse_server_uri(&text) {
+                                    Some((proto, host, user, port, share)) => {
+                                        dialog.proto = proto;
+                                        dialog.fields[FIELD_HOST] = input::Field::new(host);
+                                        dialog.fields[FIELD_USER] = input::Field::new(user);
+                                        dialog.fields[FIELD_PORT] = input::Field::new(port);
+                                        dialog.fields[FIELD_SHARE] = input::Field::new(share);
+                                        dialog.focus = dialog.last_visible();
+                                    }
+                                    None => {
+                                        dialog.status =
+                                            "schemes I can connect: smb, sftp, ftp".into()
+                                    }
+                                }
+                            } else {
+                                dialog.focused_mut().paste(&text);
+                            }
                         }
                     }
                 }
                 key => {
-                    // two buffers: the URI before the pump runs, the
-                    // credential answer while a prompt is up
+                    // two phases: the focused field before the pump
+                    // runs, the credential answer while a prompt is up
                     if at_prompt {
-                        edit_line(
-                            &mut dialog.input,
-                            &mut dialog.input_cursor,
-                            key,
-                            &keystroke,
-                        );
+                        dialog.input.key(key, &keystroke);
                     } else if dialog.session.is_none() {
-                        edit_line(&mut dialog.uri, &mut dialog.uri_cursor, key, &keystroke);
+                        dialog.focused_mut().key(key, &keystroke);
                     }
                 }
             }
@@ -3818,49 +4260,23 @@ impl Browser {
                     cx.notify();
                     return;
                 }
-                "backspace" => {
-                    if dialog.cursor > 0 {
-                        let head = &dialog.name[..dialog.cursor];
-                        if let Some((prev, _)) = head.char_indices().next_back() {
-                            dialog.name.remove(prev);
-                            dialog.cursor = prev;
-                        }
+                "a" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                    dialog.name.select_all();
+                }
+                "v" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                    if let Some(item) = cx.read_from_clipboard() {
+                        // an archive name is one line
+                        let text = item
+                            .text()
+                            .unwrap_or_default()
+                            .trim_matches(|c: char| c == '\r' || c == '\n')
+                            .to_string();
+                        dialog.name.paste(&text);
                     }
                 }
-                "left" => {
-                    if dialog.cursor > 0 {
-                        let head = &dialog.name[..dialog.cursor];
-                        if let Some((prev, _)) = head.char_indices().next_back() {
-                            dialog.cursor = prev;
-                        }
-                    }
+                key => {
+                    dialog.name.key(key, &keystroke);
                 }
-                "right" => {
-                    if dialog.name.is_char_boundary(dialog.cursor)
-                        && dialog.cursor < dialog.name.len()
-                    {
-                        let tail = &dialog.name[dialog.cursor..];
-                        if let Some(ch) = tail.chars().next() {
-                            dialog.cursor += ch.len_utf8();
-                        }
-                    }
-                }
-                _ if !keystroke.modifiers.control
-                    && !keystroke.modifiers.alt
-                    && !keystroke.modifiers.platform
-                    && !keystroke.modifiers.function =>
-                {
-                    if let Some(character) = keystroke.key_char.as_deref() {
-                        let cursor = if dialog.name.is_char_boundary(dialog.cursor) {
-                            dialog.cursor
-                        } else {
-                            dialog.name.len()
-                        };
-                        dialog.name.insert_str(cursor, character);
-                        dialog.cursor = cursor + character.len();
-                    }
-                }
-                _ => {}
             }
             self.compress = Some(dialog);
             cx.notify();
@@ -3887,61 +4303,26 @@ impl Browser {
             match keystroke.key.as_str() {
                 "enter" => self.commit_path_edit(cx),
                 "escape" => self.cancel_path_edit(cx),
-                "backspace" => {
-                    if self.path_cursor > 0 {
-                        let head = &self.path_buffer[..self.path_cursor];
-                        if let Some((prev, _)) = head.char_indices().next_back() {
-                            self.path_buffer.remove(prev);
-                            self.path_cursor = prev;
-                        }
-                    }
+                "a" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                    self.path_field.select_all();
                     cx.notify();
                 }
-                "left" => {
-                    if self.path_cursor > 0 {
-                        let head = &self.path_buffer[..self.path_cursor];
-                        if let Some((prev, _)) = head.char_indices().next_back() {
-                            self.path_cursor = prev;
-                        }
-                    }
-                    cx.notify();
-                }
-                "right" => {
-                    if self.path_buffer.is_char_boundary(self.path_cursor)
-                        && self.path_cursor < self.path_buffer.len()
-                    {
-                        let tail = &self.path_buffer[self.path_cursor..];
-                        if let Some(ch) = tail.chars().next() {
-                            self.path_cursor += ch.len_utf8();
-                        }
-                    }
-                    cx.notify();
-                }
-                "home" => {
-                    self.path_cursor = 0;
-                    cx.notify();
-                }
-                "end" => {
-                    self.path_cursor = self.path_buffer.len();
-                    cx.notify();
-                }
-                _ if !keystroke.modifiers.control
-                    && !keystroke.modifiers.alt
-                    && !keystroke.modifiers.platform
-                    && !keystroke.modifiers.function =>
-                {
-                    if let Some(character) = keystroke.key_char.as_deref() {
-                        let cursor = if self.path_buffer.is_char_boundary(self.path_cursor) {
-                            self.path_cursor
-                        } else {
-                            self.path_buffer.len()
-                        };
-                        self.path_buffer.insert_str(cursor, character);
-                        self.path_cursor = cursor + character.len();
+                "v" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                    if let Some(item) = cx.read_from_clipboard() {
+                        // a path is one line
+                        let text = item
+                            .text()
+                            .unwrap_or_default()
+                            .trim_matches(|c: char| c == '\r' || c == '\n')
+                            .to_string();
+                        self.path_field.paste(&text);
                         cx.notify();
                     }
                 }
-                _ => {}
+                key => {
+                    self.path_field.key(key, &keystroke);
+                    cx.notify();
+                }
             }
             return;
         }
@@ -3955,69 +4336,26 @@ impl Browser {
                     tab.renaming = None;
                     cx.notify();
                 }
-                "backspace" => {
-                    if tab.rename_cursor > 0 {
-                        let head = &tab.rename_buffer[..tab.rename_cursor];
-                        if let Some((prev, _)) = head.char_indices().next_back() {
-                            tab.rename_buffer.remove(prev);
-                            tab.rename_cursor = prev;
-                        }
-                    }
+                "a" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                    tab.rename_field.select_all();
                     cx.notify();
                 }
-                "delete" => {
-                    if tab.rename_buffer.is_char_boundary(tab.rename_cursor)
-                        && tab.rename_cursor < tab.rename_buffer.len()
-                    {
-                        tab.rename_buffer.remove(tab.rename_cursor);
-                    }
-                    cx.notify();
-                }
-                "left" => {
-                    if tab.rename_cursor > 0 {
-                        let head = &tab.rename_buffer[..tab.rename_cursor];
-                        if let Some((prev, _)) = head.char_indices().next_back() {
-                            tab.rename_cursor = prev;
-                        }
-                    }
-                    cx.notify();
-                }
-                "right" => {
-                    if tab.rename_buffer.is_char_boundary(tab.rename_cursor)
-                        && tab.rename_cursor < tab.rename_buffer.len()
-                    {
-                        let tail = &tab.rename_buffer[tab.rename_cursor..];
-                        if let Some(ch) = tail.chars().next() {
-                            tab.rename_cursor += ch.len_utf8();
-                        }
-                    }
-                    cx.notify();
-                }
-                "home" => {
-                    tab.rename_cursor = 0;
-                    cx.notify();
-                }
-                "end" => {
-                    tab.rename_cursor = tab.rename_buffer.len();
-                    cx.notify();
-                }
-                _ if !keystroke.modifiers.control
-                    && !keystroke.modifiers.alt
-                    && !keystroke.modifiers.platform
-                    && !keystroke.modifiers.function =>
-                {
-                    if let Some(character) = keystroke.key_char.as_deref() {
-                        let cursor = if tab.rename_buffer.is_char_boundary(tab.rename_cursor) {
-                            tab.rename_cursor
-                        } else {
-                            tab.rename_buffer.len()
-                        };
-                        tab.rename_buffer.insert_str(cursor, character);
-                        tab.rename_cursor = cursor + character.len();
+                "v" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                    if let Some(item) = cx.read_from_clipboard() {
+                        // a file name is one line
+                        let text = item
+                            .text()
+                            .unwrap_or_default()
+                            .trim_matches(|c: char| c == '\r' || c == '\n')
+                            .to_string();
+                        tab.rename_field.paste(&text);
                         cx.notify();
                     }
                 }
-                _ => {}
+                key => {
+                    tab.rename_field.key(key, &keystroke);
+                    cx.notify();
+                }
             }
             return;
         }
@@ -4305,8 +4643,7 @@ impl Browser {
             return;
         };
         tab.renaming = Some(entry.path.clone());
-        tab.rename_buffer = entry.name.clone();
-        tab.rename_cursor = tab.rename_buffer.len();
+        tab.rename_field = input::Field::new(entry.name.clone());
         cx.notify();
     }
 
@@ -4315,7 +4652,7 @@ impl Browser {
         let Some(renaming) = tab.renaming.take() else {
             return;
         };
-        let target_name = tab.rename_buffer.trim().to_owned();
+        let target_name = tab.rename_field.text().trim().to_owned();
         let current_name = renaming
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
@@ -4581,24 +4918,19 @@ impl Browser {
         };
 
         let name_child = if renaming {
-            // the caret sits at rename_cursor (a byte offset on a char
-            // boundary); render the buffer split around it
-            let cursor = if tab.rename_buffer.is_char_boundary(tab.rename_cursor) {
-                tab.rename_cursor
-            } else {
-                tab.rename_buffer.len()
-            };
-            let (before, after) = tab.rename_buffer.split_at(cursor);
+            // the focused rename editor: highlighted selection, an
+            // accent bar for a caret
             div()
                 .flex_1()
                 .min_w_0()
+                .flex()
                 .id("rename-box")
                 .debug_selector(|| "rename-box".into())
                 .border_1()
                 .border_color(theme::accent())
                 .rounded_sm()
                 .px_1()
-                .child(format!("{before}▏{after}"))
+                .children(input::field_children(&tab.rename_field, false, true, ""))
         } else if let Some(rel) = &entry.rel {
             // recursive-search hit: name plus where it lives
             div()
@@ -4689,17 +5021,8 @@ impl Browser {
             .is_some_and(|path| *path == entry.path);
         let rename_box = renaming.then(|| {
             let tab = self.tab();
-            let cursor = if tab.rename_buffer.is_char_boundary(tab.rename_cursor) {
-                tab.rename_cursor
-            } else {
-                tab.rename_buffer.len()
-            };
-            let (before, after) = tab.rename_buffer.split_at(cursor);
-            (
-                before.to_string(),
-                after.to_string(),
-                tab.rename_cursor,
-            )
+            let (before, selected, after) = input::spans(&tab.rename_field, false);
+            (before, selected, after)
         });
 
         // thumbnails only for local image files: trash entries point at
@@ -4847,12 +5170,13 @@ impl Browser {
                     .justify_center()
                     .child(preview),
             )
-            .child(if let Some((before, after, _)) = rename_box {
+            .child(if let Some((before, selected, after)) = rename_box {
                 // the rename edit box, same as the list row's
                 div()
                     .id("rename-box")
                     .debug_selector(|| "rename-box".into())
                     .w_full()
+                    .flex()
                     .h(px(16. * s))
                     .border_1()
                     .border_color(theme::accent())
@@ -4860,7 +5184,7 @@ impl Browser {
                     .px_1()
                     .text_size(px(12. * s))
                     .overflow_hidden()
-                    .child(format!("{before}▏{after}"))
+                    .children(input::span_children(&before, selected, &after, true, ""))
             } else if entry.rel.is_some() {
                 // deep search hit: a second dim line under the name
                 div()
@@ -4903,9 +5227,13 @@ impl Browser {
     }
 
     fn place_row(&self, ix: usize, place: &Place, cx: &mut Context<Self>) -> Stateful<Div> {
-        let here = self.tab().current_dir() == Some(place.path.as_path());
+        let here = !place.stale && self.tab().current_dir() == Some(place.path.as_path());
         let path = place.path.clone();
         let unbookmark_path = place.path.clone();
+        let unmount_path = place.path.clone();
+        let reconnect_path = place.path.clone();
+        let mount_kind = place.mount;
+        let stale = place.stale;
         let bookmarked = place.bookmark;
         let place_drag = PlaceDrag(path.clone());
         let reorder_drag = path.clone();
@@ -4956,13 +5284,47 @@ impl Browser {
             })
             .hover(|this| this.bg(theme::row_hover()))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.load_source(Source::Dir(path.clone()), cx);
+                if stale {
+                    // nothing to navigate into: offer the reconnect
+                    this.reconnect_place(path.clone(), cx);
+                } else {
+                    this.load_source(Source::Dir(path.clone()), cx);
+                }
             }))
-            // pinned places can be unpinned from their row menu
+            // pinned places can be unpinned from their row menu;
+            // mounts disconnect or eject; stale network bookmarks
+            // reconnect
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    if bookmarked {
+                    if stale {
+                        this.open_menu(
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                            vec![
+                                MenuItem::new(
+                                    "Connect...",
+                                    MenuAction::Reconnect(reconnect_path.clone()),
+                                ),
+                                MenuItem::new(
+                                    "Remove Bookmark",
+                                    MenuAction::Unbookmark(unbookmark_path.clone()),
+                                ),
+                            ],
+                        );
+                    } else if let Some(kind) = mount_kind {
+                        this.open_menu(
+                            f32::from(event.position.x),
+                            f32::from(event.position.y),
+                            vec![MenuItem::new(
+                                match kind {
+                                    MountKind::Network => "Disconnect",
+                                    MountKind::Removable => "Eject",
+                                },
+                                MenuAction::Unmount(unmount_path.clone(), kind),
+                            )],
+                        );
+                    } else if bookmarked {
                         this.open_menu(
                             f32::from(event.position.x),
                             f32::from(event.position.y),
@@ -4971,8 +5333,8 @@ impl Browser {
                                 MenuAction::Unbookmark(unbookmark_path.clone()),
                             )],
                         );
-                        cx.notify();
                     }
+                    cx.notify();
                 }),
             )            .flex()
             .items_center()
@@ -4997,7 +5359,12 @@ impl Browser {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .child(place.name.clone()),
+                    .child(if stale {
+                        // say why the click does not navigate
+                        format!("{} (not connected)", place.name)
+                    } else {
+                        place.name.clone()
+                    }),
             )
     }
 
@@ -5536,30 +5903,104 @@ impl Browser {
     /// The Connect to Server dialog. Before the pump runs: the URI
     /// field. At a prompt: the gio prompt text and a masked (or plain)
     /// answer field. Between prompts: the status line alone.
-    fn connect_overlay(&self, _cx: &mut Context<Self>) -> Option<Div> {
+    fn connect_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {
         let dialog = self.connect.as_ref()?;
-        // two layouts: the URI field before the pump runs, then the
-        // server line locked above whatever gio is asking for
         let at_prompt = dialog.session.is_some();
-        let (buffer, cursor, _field_label) = if dialog.prompt.is_some() {
-            (&dialog.input, dialog.input_cursor, dialog.prompt.clone().unwrap())
-        } else {
-            (&dialog.uri, dialog.uri_cursor, "server URI".to_string())
-        };
-        let cursor = if buffer.is_char_boundary(cursor) {
-            cursor
-        } else {
-            buffer.len()
-        };
-        let (before, after) = buffer.split_at(cursor);
-        let shown = if at_prompt && dialog.prompt.is_none() {
-            // no question up: nothing is editable, no caret
-            dialog.uri.clone()
-        } else if dialog.mask {
-            format!("{}{}", "\u{2022}".repeat(before.chars().count()), after)
-        } else {
-            format!("{before}\u{254f}{after}")
-        };
+        let asking = dialog.prompt.is_some();
+        // the protocol picker and its field rows, before the pump
+        // runs; then the locked server line and the one question at a
+        // time answer field
+        let picker = (!at_prompt).then(|| {
+            let buttons: Vec<AnyElement> = ConnectProto::ALL
+                .into_iter()
+                .map(|proto| {
+                    let active = proto == dialog.proto;
+                    div()
+                        .id(format!("proto-{}", proto.scheme()))
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .text_color(if active {
+                            theme::accent()
+                        } else {
+                            theme::text_dim()
+                        })
+                        .bg(if active {
+                            theme::row_selected()
+                        } else {
+                            theme::clear()
+                        })
+                        .hover(|this| this.bg(theme::row_hover()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_connect_proto(proto, cx);
+                        }))
+                        .child(proto.label())
+                        .into_any_element()
+                })
+                .collect();
+            div().flex().gap_1().children(buttons)
+        });
+        let field_rows = (!at_prompt).then(|| {
+            let labels: [(&str, &str); 5] = [
+                ("Host", "host or IP"),
+                ("User", "user, optional"),
+                ("Port", "port, optional"),
+                ("Share", "share name"),
+                ("Password", "optional, asked if empty"),
+            ];
+            let rows: Vec<AnyElement> = dialog
+                .layout()
+                .into_iter()
+                .map(|ix| {
+                    let (label, hint) = labels[ix];
+                    let focused = dialog.focus == ix;
+                    let masked = ix == FIELD_PASSWORD;
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(64.))
+                                .text_size(px(12.))
+                                .text_color(theme::text_dim())
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .id(format!("connect-box-{ix}"))
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .border_1()
+                                .border_color(if focused {
+                                    theme::accent()
+                                } else {
+                                    theme::border()
+                                })
+                                .rounded_sm()
+                                .px_1()
+                                .py_0p5()
+                                .text_color(theme::text())
+                                .cursor(gpui::CursorStyle::IBeam)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_connect_focus(ix, cx);
+                                }))
+                                .children(input::field_children(
+                                    &dialog.fields[ix],
+                                    masked,
+                                    focused,
+                                    hint,
+                                )),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            div().flex().flex_col().gap_1().children(rows)
+        });
         let label = div()
             .text_size(px(14.))
             .text_color(theme::text())
@@ -5626,8 +6067,10 @@ impl Browser {
                         .text_size(px(13.))
                         .child(label)
                         .children(server_row)
+                        .children(picker)
+                        .children(field_rows)
                         .children(notes)
-                        .child(
+                        .children(at_prompt.then(|| {
                             div()
                                 .flex()
                                 .items_center()
@@ -5637,8 +6080,13 @@ impl Browser {
                                 .px_1()
                                 .py_0p5()
                                 .text_color(theme::text())
-                                .child(shown),
-                        )
+                                .children(input::field_children(
+                                    &dialog.input,
+                                    dialog.mask,
+                                    asking,
+                                    "",
+                                ))
+                        }))
                         .children(status)
                         .child(
                             div()
@@ -5649,8 +6097,10 @@ impl Browser {
                                 .text_color(theme::text_dim())
                                 .child(if at_prompt {
                                     "Enter submits, Esc cancels"
+                                } else if dialog.session.is_some() {
+                                    "Connecting, Esc cancels"
                                 } else {
-                                    "Enter connects, Esc closes"
+                                    "Tab moves, Enter connects, Esc closes"
                                 }),
                         ),
                 ),
@@ -5659,12 +6109,6 @@ impl Browser {
 
     fn compress_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {        let dialog = self.compress.as_ref()?;
         let count = self.tab().selection.len();
-        let cursor = if dialog.name.is_char_boundary(dialog.cursor) {
-            dialog.cursor
-        } else {
-            dialog.name.len()
-        };
-        let (before, after) = dialog.name.split_at(cursor);
         Some(
             div()
                 .absolute()
@@ -5710,7 +6154,12 @@ impl Browser {
                                 .px_1()
                                 .py_0p5()
                                 .text_color(theme::text())
-                                .child(format!("{before}▏{after}")),
+                                .children(input::field_children(
+                                    &dialog.name,
+                                    false,
+                                    true,
+                                    "archive name",
+                                )),
                         )
                         .child(
                             div()
@@ -5850,6 +6299,8 @@ impl Browser {
             MenuAction::Bookmark(dir) => self.add_bookmark(dir, cx),
             MenuAction::Unbookmark(dir) => self.remove_bookmark(dir, cx),
             MenuAction::Forget => self.forget_recent(cx),
+            MenuAction::Unmount(path, kind) => self.unmount(path, kind, cx),
+            MenuAction::Reconnect(path) => self.reconnect_place(path, cx),
             MenuAction::AccentPicker => {
                 self.menu = None;
                 self.accent_picker = true;
@@ -6249,31 +6700,120 @@ impl Render for Browser {
             }
         }
 
-        // mounts split off into the Network section, which renders
-        // below Recent and Trash (everything after the first mount
-        // keeps its current grouping)
-        let mut places: Vec<AnyElement> = Vec::new();
-        let mut network: Vec<AnyElement> = Vec::new();
-        let mut network_started = false;
+        // the sidebar groups into sections: Home with Recent and
+        // Trash at the top, then Places (XDG dirs and bookmarks),
+        // Network (network mounts and stale network bookmarks), and
+        // Removable (USB drives and local devices). A header renders
+        // only when its section is non-empty.
+        let mut top_items: Vec<AnyElement> = Vec::new();
+        let mut place_items: Vec<AnyElement> = Vec::new();
+        let mut network_items: Vec<AnyElement> = Vec::new();
+        let mut removable_items: Vec<AnyElement> = Vec::new();
         for (ix, place) in self.places.iter().enumerate() {
-            if place.mount && !network_started {
-                network_started = true;
-                network.push(
-                    div()
-                        .px_3()
-                        .pt_2()
-                        .pb_1()
-                        .text_size(px(11.))
-                        .text_color(theme::text_dim())
-                        .child("Network")
-                        .into_any_element(),
-                );
+            let row = self.place_row(ix, place, cx).into_any_element();
+            match place_section(place) {
+                PlaceSection::Top => top_items.push(row),
+                PlaceSection::Places => place_items.push(row),
+                PlaceSection::Network => network_items.push(row),
+                PlaceSection::Removable => removable_items.push(row),
             }
-            if network_started {
-                network.push(self.place_row(ix, place, cx).into_any_element());
+        }
+
+        let in_trash = self.tab().source == Source::Trash;
+        let in_recent = self.tab().source == Source::Recent;
+        let recent_row = div()
+            .id("place-recent")
+            .px_3()
+            .py_1()
+            .rounded_sm()
+            .text_size(px(13.))
+            .cursor_pointer()
+            .text_color(if in_recent {
+                theme::accent()
             } else {
-                places.push(self.place_row(ix, place, cx).into_any_element());
-            }
+                theme::text_dim()
+            })
+            .bg(if in_recent {
+                theme::row_selected()
+            } else {
+                theme::clear()
+            })
+            .hover(|this| this.bg(theme::row_hover()))
+            .on_click(cx.listener(|this, _, _, cx| this.open_recent(cx)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                svg()
+                    .path("icons/clock.svg")
+                    .size(px(14.))
+                    .flex_none()
+                    .text_color(if in_recent {
+                        theme::accent()
+                    } else {
+                        theme::text_dim()
+                    }),
+            )
+            .child("Recent");
+        let trash_row = div()
+            .id("place-trash")
+            .px_3()
+            .py_1()
+            .rounded_sm()
+            .text_size(px(13.))
+            .cursor_pointer()
+            .text_color(if in_trash {
+                theme::accent()
+            } else {
+                theme::text_dim()
+            })
+            .bg(if in_trash {
+                theme::row_selected()
+            } else {
+                theme::clear()
+            })
+            .hover(|this| this.bg(theme::row_hover()))
+            .on_click(cx.listener(|this, _, _, cx| this.open_trash(cx)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                svg()
+                    .path("icons/trash.svg")
+                    .size(px(14.))
+                    .flex_none()
+                    .text_color(if in_trash {
+                        theme::accent()
+                    } else {
+                        theme::text_dim()
+                    }),
+            )
+            .child("Trash");
+
+        let section_header = |label: &'static str| {
+            div()
+                .px_3()
+                .pt_2()
+                .pb_1()
+                .text_size(px(11.))
+                .text_color(theme::text_dim())
+                .child(label)
+                .into_any_element()
+        };
+        let mut sidebar: Vec<AnyElement> = top_items;
+        sidebar.push(recent_row.into_any_element());
+        sidebar.push(trash_row.into_any_element());
+        if !place_items.is_empty() {
+            sidebar.push(section_header("Places"));
+            sidebar.extend(place_items);
+        }
+        if !network_items.is_empty() {
+            sidebar.push(section_header("Network"));
+            sidebar.extend(network_items);
+        }
+        if !removable_items.is_empty() {
+            sidebar.push(section_header("Removable"));
+            sidebar.extend(removable_items);
         }
 
         let mut tabs: Vec<Stateful<Div>> = Vec::new();
@@ -6281,8 +6821,6 @@ impl Render for Browser {
             tabs.push(self.tab_bar_row(ix, cx));
         }
 
-        let in_trash = self.tab().source == Source::Trash;
-        let in_recent = self.tab().source == Source::Recent;
         let error_status = self.status.contains("failed") || self.status.contains("cannot");
         let purge_armed = self
             .purge_armed
@@ -6400,80 +6938,7 @@ impl Render for Browser {
                     .border_r_1()
                     .border_color(theme::border())
                     .overflow_hidden()
-                    .children(places)
-                    .child(
-                        div()
-                            .id("place-recent")
-                            .px_3()
-                            .py_1()
-                            .rounded_sm()
-                            .text_size(px(13.))
-                            .cursor_pointer()
-                            .text_color(if in_recent {
-                                theme::accent()
-                            } else {
-                                theme::text_dim()
-                            })
-                            .bg(if in_recent {
-                                theme::row_selected()
-                            } else {
-                                theme::clear()
-                            })
-                            .hover(|this| this.bg(theme::row_hover()))
-                            .on_click(cx.listener(|this, _, _, cx| this.open_recent(cx)))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                svg()
-                                    .path("icons/clock.svg")
-                                    .size(px(14.))
-                                    .flex_none()
-                                    .text_color(if in_recent {
-                                        theme::accent()
-                                    } else {
-                                        theme::text_dim()
-                                    }),
-                            )
-                            .child("Recent"),
-                    )
-                    .child(
-                        div()
-                            .id("place-trash")
-                            .px_3()
-                            .py_1()
-                            .rounded_sm()
-                            .text_size(px(13.))
-                            .cursor_pointer()
-                            .text_color(if in_trash {
-                                theme::accent()
-                            } else {
-                                theme::text_dim()
-                            })
-                            .bg(if in_trash {
-                                theme::row_selected()
-                            } else {
-                                theme::clear()
-                            })
-                            .hover(|this| this.bg(theme::row_hover()))
-                            .on_click(cx.listener(|this, _, _, cx| this.open_trash(cx)))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                svg()
-                                    .path("icons/trash.svg")
-                                    .size(px(14.))
-                                    .flex_none()
-                                    .text_color(if in_trash {
-                                        theme::accent()
-                                    } else {
-                                        theme::text_dim()
-                                    }),
-                            )
-                            .child("Trash"),
-                    )
-                    .children(network)
+                    .children(sidebar)
                     .child(
                         // push the keys section to the bottom edge
                         div().flex_grow_1(),
@@ -6622,23 +7087,23 @@ impl Render for Browser {
                                     ),
                             )
                             .child(if self.path_editing {
-                                let cursor =
-                                    if self.path_buffer.is_char_boundary(self.path_cursor) {
-                                        self.path_cursor
-                                    } else {
-                                        self.path_buffer.len()
-                                    };
-                                let (before, after) = self.path_buffer.split_at(cursor);
                                 div()
                                     .id("path-edit")
                                     .flex_1()
                                     .min_w_0()
+                                    .flex()
+                                    .items_center()
                                     .border_1()
                                     .border_color(theme::accent())
                                     .rounded_sm()
                                     .px_1()
                                     .text_color(theme::text())
-                                    .child(format!("{before}▏{after}"))
+                                    .children(input::field_children(
+                                        &self.path_field,
+                                        false,
+                                        true,
+                                        "path",
+                                    ))
                             } else {
                                 self.path_crumbs(cx)
                             })
@@ -8609,26 +9074,24 @@ mod tests {
     #[test]
     fn zip_toggle_swaps_known_suffixes_only() {
         let mut dialog = CompressDialog {
-            name: "crew.tar.gz".into(),
-            cursor: 4,
+            name: input::Field::new("crew.tar.gz"),
             zip: false,
             zip_available: true,
         };
         Browser::set_zip_format(&mut dialog, true);
-        assert_eq!(dialog.name, "crew.zip");
+        assert_eq!(dialog.name.text(), "crew.zip");
         assert!(dialog.zip);
         Browser::set_zip_format(&mut dialog, false);
-        assert_eq!(dialog.name, "crew.tar.gz");
+        assert_eq!(dialog.name.text(), "crew.tar.gz");
 
         // custom names without a known suffix stay as typed; Create
         // appends the chosen suffix at build time
-        dialog.name = "backup 2026".into();
-        dialog.cursor = 11;
+        dialog.name = input::Field::new("backup 2026");
         Browser::set_zip_format(&mut dialog, true);
-        assert_eq!(dialog.name, "backup 2026");
+        assert_eq!(dialog.name.text(), "backup 2026");
         assert!(dialog.zip);
         Browser::set_zip_format(&mut dialog, false);
-        assert_eq!(dialog.name, "backup 2026");
+        assert_eq!(dialog.name.text(), "backup 2026");
     }
     #[test]
     fn bookmarks_parse_custom_names_and_uris() {
@@ -9368,7 +9831,7 @@ mod browser_rename {
             assert!(browser.tab().renaming.is_some(), "F2 path never entered rename");
             // append a 2, then commit
             browser.route_key(&key("2"), cx);
-            assert_eq!(browser.tab().rename_buffer, "notes.txt2");
+            assert_eq!(browser.tab().rename_field.text(), "notes.txt2");
             browser.route_key(&key("enter"), cx);
         });
         app.run_until_parked();
@@ -9429,13 +9892,257 @@ mod connect_tests {
     use super::browser_ux_keys::{key, open_browser, Lab};
     use super::*;
 
+    /// Paste into the connect dialog: a pasted URI fills the protocol
+    /// and its fields (a pasted password is dropped), plain text
+    /// inserts into the focused field.
+    #[test]
+    fn connect_dialog_paste_fills_the_form_from_a_uri() {
+        let lab = Lab::new("connect-dialog-paste");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.open_connect_dialog(cx);
+            let dialog = browser.connect.as_ref().unwrap();
+            assert_eq!(dialog.proto, ConnectProto::Sftp);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                "smb://bob:hidden@NAS/media".to_string(),
+            ));
+            let mut v = key("v");
+            v.keystroke.modifiers.control = true;
+            browser.route_key(&v, cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, cx| {
+            let dialog = browser.connect.as_ref().unwrap();
+            assert_eq!(dialog.proto, ConnectProto::Smb);
+            assert_eq!(dialog.fields[FIELD_HOST].text(), "NAS");
+            assert_eq!(dialog.fields[FIELD_USER].text(), "bob");
+            // a pasted password never lands in a field: gio re-asks
+            assert_eq!(dialog.fields[FIELD_PORT].text(), "");
+            assert_eq!(dialog.fields[FIELD_SHARE].text(), "media");
+            // the caret parks on the last visible field (Password),
+            // so Enter connects
+            assert_eq!(dialog.focus, dialog.last_visible());
+            // plain paste goes to the focused field: click through to
+            // Share first, the way the user would
+            browser.set_connect_focus(FIELD_SHARE, cx);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("/sub".to_string()));
+            let mut v2 = key("v");
+            v2.keystroke.modifiers.control = true;
+            browser.route_key(&v2, cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            let dialog = browser.connect.as_ref().unwrap();
+            assert_eq!(dialog.fields[FIELD_SHARE].text(), "media/sub");
+        });
+    }
+
+    /// Ctrl+A in a connect field selects the whole buffer; typing
+    /// replaces the selection.
+    #[test]
+    fn connect_dialog_ctrl_a_selects_all() {
+        let lab = Lab::new("connect-dialog-ctrl-a");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.open_connect_dialog(cx);
+            let dialog = browser.connect.as_mut().unwrap();
+            dialog.fields[FIELD_HOST] = input::Field::new("nas.local");
+            let mut a = key("a");
+            a.keystroke.modifiers.control = true;
+            browser.route_key(&a, cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, cx| {
+            let dialog = browser.connect.as_mut().unwrap();
+            assert_eq!(dialog.fields[FIELD_HOST].sel, Some((0, 9)));
+            // typing over the selection replaces it (printable keys
+            // ride key_char, as the real window delivers them)
+            let mut n = key("n");
+            n.keystroke.key_char = Some("n".into());
+            browser.route_key(&n, cx);
+            let dialog = browser.connect.as_ref().unwrap();
+            assert_eq!(dialog.fields[FIELD_HOST].text(), "n");
+        });
+    }
+
+    /// Clicking a field box moves the caret there: the next typed
+    /// characters land in that field, not the one the keyboard left.
+    #[test]
+    fn clicking_a_connect_field_moves_the_caret_there() {
+        let lab = Lab::new("connect-dialog-click-focus");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.open_connect_dialog(cx);
+            let dialog = browser.connect.as_mut().unwrap();
+            dialog.fields[FIELD_HOST] = input::Field::new("nas.local");
+            browser.set_connect_focus(FIELD_USER, cx);
+            let mut b = key("b");
+            b.keystroke.key_char = Some("b".into());
+            browser.route_key(&b, cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            let dialog = browser.connect.as_ref().unwrap();
+            assert_eq!(dialog.focus, FIELD_USER);
+            assert_eq!(dialog.fields[FIELD_USER].text(), "b");
+            assert_eq!(dialog.fields[FIELD_HOST].text(), "nas.local");
+        });
+    }
+
+    #[test]
+    fn server_uris_compose_and_parse_round_trip() {
+        let uri = compose_server_uri(ConnectProto::Smb, "NAS", "bob", "", "media");
+        assert_eq!(uri, "smb://bob@NAS/media");
+        let uri = compose_server_uri(ConnectProto::Sftp, "box", "ann", "2222", "");
+        assert_eq!(uri, "sftp://ann@box:2222");
+        // a non-digit port is not composed: it would break gio
+        let uri = compose_server_uri(ConnectProto::Ftp, "box", "", "abc", "");
+        assert_eq!(uri, "ftp://box");
+        // a share with slashes keeps its path
+        let uri = compose_server_uri(ConnectProto::Smb, "NAS", "", "", "/media/sub");
+        assert_eq!(uri, "smb://NAS/media/sub");
+
+        let (proto, host, user, port, share) =
+            parse_server_uri("sftp://ann@box:2222").unwrap();
+        assert_eq!(
+            (proto, host.as_str(), user.as_str(), port.as_str(), share.as_str()),
+            (ConnectProto::Sftp, "box", "ann", "2222", "")
+        );
+        let (proto, host, user, port, share) =
+            parse_server_uri("smb://bob:hidden@NAS/media/sub").unwrap();
+        assert_eq!(
+            (proto, host.as_str(), user.as_str(), port.as_str(), share.as_str()),
+            (ConnectProto::Smb, "NAS", "bob", "", "media/sub")
+        );
+        // bracketed IPv6
+        let (proto, host, _user, port, _share) =
+            parse_server_uri("sftp://[::1]:2222").unwrap();
+        assert_eq!(
+            (proto, host.as_str(), port.as_str()),
+            (ConnectProto::Sftp, "::1", "2222")
+        );
+        // a scheme the dialog does not speak
+        assert!(parse_server_uri("webdav://box").is_none());
+        assert!(parse_server_uri("no scheme at all").is_none());
+    }
+
     #[test]
     fn gvfs_names_become_place_labels() {
         assert_eq!(mount_label("sftp:host=localhost"), "localhost (sftp)");
         assert_eq!(mount_label("smb:host=NAS,share=media"), "NAS/media (smb)");
+        // the smb backend's real dir name shape
+        assert_eq!(
+            mount_label("smb-share:server=NAS,share=media"),
+            "NAS/media (smb)"
+        );
         // no parseable host: pass the raw name through
         assert_eq!(mount_label("mtp:[usb:003,004]"), "mtp:[usb:003,004]");
         assert_eq!(mount_label("External Drive"), "External Drive");
+    }
+
+    #[test]
+    fn gvfs_names_parse_back_to_reconnect_uris() {
+        assert_eq!(
+            uri_from_gvfs_name("smb-share:server=NAS,share=media").as_deref(),
+            Some("smb://NAS/media")
+        );
+        assert_eq!(
+            uri_from_gvfs_name("sftp:host=localhost").as_deref(),
+            Some("sftp://localhost")
+        );
+        // user rides the URI as user@host, so gio re-asks only for
+        // the password, not the name
+        assert_eq!(
+            uri_from_gvfs_name("sftp:host=localhost,user=bob").as_deref(),
+            Some("sftp://bob@localhost")
+        );
+        // the backend's `;N` repeat counter strips off
+        assert_eq!(
+            uri_from_gvfs_name("smb-share:server=NAS,share=media;2").as_deref(),
+            Some("smb://NAS/media")
+        );
+        // local and junk backends have nothing to reconnect to
+        assert_eq!(uri_from_gvfs_name("mtp:[usb:003,004]"), None);
+        assert_eq!(uri_from_gvfs_name("External Drive"), None);
+        assert_eq!(uri_from_gvfs_name("burn://"), None);
+    }
+
+    #[test]
+    fn gvfs_mounts_split_network_from_local_devices() {
+        assert_eq!(
+            gvfs_mount_kind("smb-share:server=NAS,share=media"),
+            MountKind::Network
+        );
+        assert_eq!(gvfs_mount_kind("sftp:host=localhost"), MountKind::Network);
+        assert_eq!(gvfs_mount_kind("webdav:host=box"), MountKind::Network);
+        // local-device backends ride with the removable drives
+        assert_eq!(gvfs_mount_kind("mtp:[usb:003,004]"), MountKind::Removable);
+        assert_eq!(gvfs_mount_kind("gphoto2:[usb:002]"), MountKind::Removable);
+        assert_eq!(gvfs_mount_kind("afc:host=iPod"), MountKind::Removable);
+    }
+
+    #[test]
+    fn places_group_into_sections() {
+        let place = |name: &str, path: PathBuf, bookmark: bool, mount: Option<MountKind>, stale: bool| {
+            Place {
+                name: name.into(),
+                path,
+                bookmark,
+                mount,
+                stale,
+            }
+        };
+        let home = dirs::home_dir().expect("tests run with a home dir");
+        assert_eq!(
+            place_section(&place("Home", home.clone(), false, None, false)),
+            PlaceSection::Top
+        );
+        assert_eq!(
+            place_section(&place(
+                "Documents",
+                home.join("Documents"),
+                false,
+                None,
+                false
+            )),
+            PlaceSection::Places
+        );
+        assert_eq!(
+            place_section(&place("Notes", home.join("notes"), true, None, false)),
+            PlaceSection::Places
+        );
+        let share = PathBuf::from("/run/user/1/gvfs/smb-share:server=NAS,share=media");
+        assert_eq!(
+            place_section(&place("NAS/media", share.clone(), false, Some(MountKind::Network), false)),
+            PlaceSection::Network
+        );
+        // a stale network bookmark keeps its network seat
+        assert_eq!(
+            place_section(&place("NAS/media", share, true, None, true)),
+            PlaceSection::Network
+        );
+        assert_eq!(
+            place_section(&place(
+                "Stick",
+                PathBuf::from("/run/media/user/Stick"),
+                false,
+                Some(MountKind::Removable),
+                false
+            )),
+            PlaceSection::Removable
+        );
     }
 
     #[test]
@@ -9504,12 +10211,75 @@ mod connect_tests {
         window.update(|browser, _, cx| {
             let dialog = browser.connect.as_ref().unwrap();
             assert!(dialog.prompt.is_none(), "prompt consumed");
-            assert!(dialog.input.is_empty(), "answer buffer cleared");
+            assert!(
+                dialog.input.text().is_empty(),
+                "answer buffer cleared"
+            );
             // Esc at this point (no prompt up) still tears the dialog down
             browser.route_key(&key("escape"), cx);
         });
         app.run_until_parked();
         window.update(|browser, _, _| assert!(browser.connect.is_none(), "Esc closes"));
+    }
+
+    /// A password typed into the form answers gio's first password
+    /// prompt by itself (user prompts and a wrong-password retry
+    /// still surface for typing).
+    #[test]
+    fn connect_dialog_password_field_answers_the_first_prompt() {
+        let lab = Lab::new("connect-dialog-password");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        let (ans_tx, ans_rx) = mpsc::channel::<String>();
+        window.update(|browser, _, cx| {
+            browser.open_connect_dialog(cx);
+            let dialog = browser.connect.as_mut().unwrap();
+            dialog.fields[FIELD_PASSWORD] = input::Field::new("secret");
+            dialog.session = Some(ConnectSession {
+                answers: ans_tx,
+                child: Arc::new(Mutex::new(None)),
+            });
+            // a user prompt is not a password prompt: it surfaces
+            browser.connect_event(ConnectEvent::Prompt {
+                text: "User".into(),
+                mask: false,
+            }, cx);
+            let dialog = browser.connect.as_ref().unwrap();
+            assert_eq!(dialog.prompt.as_deref(), Some("User"), "user prompt surfaces");
+            // the password prompt: answered from the form, no typing
+            browser.connect_event(ConnectEvent::Prompt {
+                text: "Password".into(),
+                mask: true,
+            }, cx);
+            let dialog = browser.connect.as_ref().unwrap();
+            assert!(
+                dialog.prompt.is_none(),
+                "password prompt auto-answered, never surfaced"
+            );
+            assert!(dialog.password_tried);
+        });
+        app.run_until_parked();
+        assert_eq!(
+            ans_rx.recv_timeout(std::time::Duration::from_secs(5)).as_deref(),
+            Ok("secret")
+        );
+        // the second password prompt (the stored one was wrong)
+        // surfaces for typing like any other
+        window.update(|browser, _, cx| {
+            browser.connect_event(ConnectEvent::Prompt {
+                text: "Password".into(),
+                mask: true,
+            }, cx);
+            let dialog = browser.connect.as_ref().unwrap();
+            assert_eq!(
+                dialog.prompt.as_deref(),
+                Some("Password"),
+                "retry prompt surfaces"
+            );
+        });
     }
 
     /// The full pump loop against a scripted child that mimics gio's
