@@ -1116,6 +1116,7 @@ impl Settings {
     pub fn refresh_theme(&self, cx: &mut Context<Self>) {
         if !self.theme.wallpaper_derived {
             crate::theme::set_current(crate::theme::Theme::default());
+            self.publish_palette();
             return;
         }
         let path = self.background.current_path();
@@ -1128,14 +1129,37 @@ impl Settings {
                 })
             })
             .await;
-            let _ = this.update(cx, |_, cx| {
+            let _ = this.update(cx, |this, cx| {
                 if let Some(theme) = derived {
                     crate::theme::set_current(theme);
                 }
+                this.publish_palette();
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Publish the live palette for session neighbors (kuma-files and
+    /// friends): a key=value file in the runtime dir, written
+    /// atomically so a reader never sees a half file. Absent or
+    /// unreadable on either side is fine; the built-ins backstop.
+    pub fn publish_palette(&self) {
+        let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(runtime).join("kuma-shell");
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            log::error!("palette dir: {err}");
+            return;
+        }
+        let theme = crate::theme::current();
+        let tmp = dir.join("palette.tmp");
+        if let Err(err) = std::fs::write(&tmp, crate::theme::palette_text(&theme))
+            .and_then(|()| std::fs::rename(&tmp, dir.join("palette")))
+        {
+            log::error!("palette write: {err}");
+        }
     }
 
     pub fn set_background_rotate(&mut self, minutes: u32, cx: &mut Context<Self>) {

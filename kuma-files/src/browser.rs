@@ -6178,6 +6178,7 @@ fn parse_palette(text: &str) -> theme::Palette {
         let Some(hex) = parse_hex_color(value) else {
             continue;
         };
+        let hex = hex & 0xFFFFFF; // the shell's panel colors may carry alpha we do not use
         match key.trim() {
             "panel_bg" => palette.panel_bg = hex,
             "surface" => palette.surface = hex,
@@ -6195,10 +6196,14 @@ fn parse_palette(text: &str) -> theme::Palette {
     palette
 }
 
-/// A color out of "#rrggbb", "rrggbb", or "0xrrggbb".
+/// A color out of "#rrggbb", "rrggbb", "0xrrggbb", or the 8-digit
+/// alpha-carrying form the shell publishes for panel colors.
 fn parse_hex_color(value: &str) -> Option<u32> {
     let text = value.trim().trim_start_matches('#').trim_start_matches("0x");
-    if text.len() != 6 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
+    if text.len() != 6 && text.len() != 8 {
+        return None;
+    }
+    if !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return None;
     }
     u32::from_str_radix(text, 16).ok()
@@ -7336,6 +7341,7 @@ sftp://remote/share skip-me
         assert_eq!(parse_hex_color("#89b4fa"), Some(0x89b4fa));
         assert_eq!(parse_hex_color("89b4fa"), Some(0x89b4fa));
         assert_eq!(parse_hex_color("0x89B4FA"), Some(0x89b4fa));
+        assert_eq!(parse_hex_color("181825f2"), Some(0x181825f2), "the shell's alpha-carrying panel colors");
         assert_eq!(parse_hex_color("auto"), None);
         assert_eq!(parse_hex_color("#89b4"), None);
         assert_eq!(parse_hex_color("#89b4faa"), None);

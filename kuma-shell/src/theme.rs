@@ -98,3 +98,45 @@ pub const TEXT_SIZE_LABEL: f32 = 10.;
 pub const ICON_SIZE: f32 = 14.;
 
 pub const SOFT_DIVIDER: u32 = 0x45475A66;
+
+/// The palette as a key=value file, the handshake for session
+/// neighbors (kuma-files and friends): published to the runtime dir
+/// whenever the live palette changes, read back with whatever subset
+/// a consumer understands. Values are bare hex; a consumer that
+/// wants alpha finds it on the panel colors it may carry.
+pub fn palette_text(theme: &Theme) -> String {
+    let mut out = String::new();
+    for (key, value) in [
+        ("panel_bg", theme.panel_bg),
+        ("surface", theme.surface),
+        ("surface_hover", theme.surface_hover),
+        ("inset", theme.inset),
+        ("divider", theme.divider),
+        ("divider_soft", theme.divider_soft),
+        ("text", theme.text),
+        ("text_dim", theme.text_dim),
+        ("accent", theme.accent),
+        ("accent_text", theme.accent_text),
+    ] {
+        out.push_str(&format!("{key}={value:08x}\n"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_text_lists_every_field() {
+        let theme = Theme::default();
+        let text = palette_text(&theme);
+        assert_eq!(text, format!(
+            "panel_bg={:08x}\nsurface={:08x}\nsurface_hover={:08x}\ninset={:08x}\ndivider={:08x}\ndivider_soft={:08x}\ntext={:08x}\ntext_dim={:08x}\naccent={:08x}\naccent_text={:08x}\n",
+            theme.panel_bg, theme.surface, theme.surface_hover, theme.inset,
+            theme.divider, theme.divider_soft, theme.text, theme.text_dim,
+            theme.accent, theme.accent_text,
+        ));
+    }
+}
+
