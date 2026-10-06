@@ -1,12 +1,14 @@
 use std::collections::HashSet;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{collections::HashMap, fs, io};
+use std::{collections::HashMap, env, fs, io};
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, ClickEvent, Context, Div, DragMoveEvent,
+    AnyElement, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent,
     ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, HighlightStyle,
     ImageSource, KeyDownEvent, MouseDownEvent, MouseButton, MouseUpEvent, ObjectFit, Pixels,
     Point, Render, RenderImage, Stateful, StyledText, UnderlineStyle, Window, div, img,
@@ -238,9 +240,13 @@ enum MenuAction {
     Rename,
     Copy,
     Cut,
+    CopyPath,
+    CopyUri,
     Paste,
+    Terminal,
     Trash,
     Delete,
+    EmptyTrash,
     Info,
     NewFolder,
     NewFile,
@@ -368,6 +374,12 @@ pub(crate) struct Browser {
     places: Vec<Place>,
     purge_armed: Option<Instant>,
     delete_armed: Option<Instant>,
+    /// Armed confirm for the trash tab's Empty Trash button.
+    empty_armed: Option<Instant>,
+    /// Available bytes on the active tab's volume, fetched in the
+    /// background on navigation; keyed by directory.
+    free_space: Option<(PathBuf, u64)>,
+    free_inflight: Option<PathBuf>,
     show_hidden: bool,
     /// Decoded thumbnails keyed by path; cleared wholesale when large.
     thumbs: HashMap<PathBuf, Arc<RenderImage>>,
@@ -426,6 +438,9 @@ impl Browser {
             places: Self::places(),
             purge_armed: None,
             delete_armed: None,
+            empty_armed: None,
+            free_space: None,
+            free_inflight: None,
             show_hidden: false,
             thumbs: HashMap::new(),
             thumbs_inflight: HashSet::new(),
@@ -1149,6 +1164,152 @@ impl Browser {
         self.clipboard = Some((false, paths));
         self.status = "cut; Ctrl+V to paste".into();
         cx.notify();
+    }
+
+    /// Copy the selected paths (or file:// URIs) to the system
+    /// clipboard, so other apps can use them too.
+    fn copy_paths_to_system(&mut self, as_uri: bool, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .tab()
+            .entries
+            .iter()
+            .filter(|entry| self.tab().selection.contains(&entry.key))
+            .map(|entry| entry.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let text = paths
+            .iter()
+            .map(|path| {
+                if as_uri {
+                    path_uri(path)
+                } else {
+                    path.display().to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.status = if as_uri {
+            "copied uri(s) to the clipboard"
+        } else {
+            "copied path(s) to the clipboard"
+        }
+        .into();
+        cx.notify();
+    }
+
+    /// Spawn the user's terminal in the current directory. $TERMINAL
+    /// wins, then the freedesktop launcher, then the usual suspects.
+    /// Each candidate is tried with the terminal's own cwd inheritance,
+    /// which every emulator honors.
+    fn open_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+            self.status = "no folder to open a terminal in".into();
+            cx.notify();
+            return;
+        };
+        let mut candidates: Vec<String> = Vec::new();
+        if let Ok(custom) = env::var("TERMINAL") {
+            candidates.push(custom);
+        }
+        candidates.extend([
+            "xdg-terminal-exec".into(),
+            "kgx".into(),
+            "gnome-terminal".into(),
+            "konsole".into(),
+            "alacritty".into(),
+            "foot".into(),
+            "kitty".into(),
+            "wezterm".into(),
+        ]);
+        for name in candidates {
+            match Command::new(&name).current_dir(&dir).spawn() {
+                Ok(mut child) => {
+                    // reap from a throwaway thread so the shell never
+                    // lingers as a zombie under our pid
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                    self.status = format!("opened {name}");
+                    cx.notify();
+                    return;
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    self.status = format!("terminal: {err}");
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        self.status = "no terminal found; set $TERMINAL".into();
+        cx.notify();
+    }
+
+    /// Empty the trash: purge every item. Armed like row purges:
+    /// first click asks, second click within the arm window does it.
+    fn empty_trash(&mut self, cx: &mut Context<Self>) {
+        if self.tab().source != Source::Trash {
+            return;
+        }
+        let armed = self
+            .empty_armed
+            .is_some_and(|armed| armed.elapsed() <= PURGE_ARM);
+        if !armed {
+            self.empty_armed = Some(Instant::now());
+            self.status = "click again to empty the trash (no undo)".into();
+            cx.notify();
+            return;
+        }
+        self.empty_armed = None;
+        match os_limited::list() {
+            Ok(items) if !items.is_empty() => self.enqueue(vec![Op::Purge { items }], cx),
+            Ok(_) => {
+                self.status = "trash is already empty".into();
+                cx.notify();
+            }
+            Err(err) => {
+                self.status = format!("trash list failed: {err}");
+                cx.notify();
+            }
+        }
+    }
+
+    /// Fetch free bytes for the tab's volume in the background. Safe
+    /// to call every render: deduped by directory, refreshed whenever
+    /// navigation lands somewhere new.
+    fn request_free_space(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+            return;
+        };
+        if self.free_inflight.is_some()
+            || self
+                .free_space
+                .as_ref()
+                .is_some_and(|(cached, _)| *cached == dir)
+        {
+            return;
+        }
+        self.free_inflight = Some(dir.clone());
+        let bg_dir = dir.clone();
+        cx.spawn(async move |this, cx| {
+            let bytes = cx
+                .background_spawn(async move { free_bytes(&bg_dir) })
+                .await;
+            let update = this.update(cx, |this, cx| {
+                this.free_inflight = None;
+                if let Some(bytes) = bytes {
+                    this.free_space = Some((dir, bytes));
+                    cx.notify();
+                }
+            });
+            if let Err(err) = update {
+                log::error!("free space update failed: {err:#}");
+            }
+        })
+        .detach();
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
@@ -2053,7 +2214,12 @@ impl Browser {
                 tab.selection = tab.entries.iter().map(|e| e.key.clone()).collect();
                 cx.notify();
             }
-            "c" if keystroke.modifiers.control => self.copy_selection(cx),
+            "c" if keystroke.modifiers.control && !keystroke.modifiers.shift => {
+                self.copy_selection(cx)
+            }
+            "c" if keystroke.modifiers.control && keystroke.modifiers.shift => {
+                self.copy_paths_to_system(false, cx)
+            }
             "x" if keystroke.modifiers.control => self.cut_selection(cx),
             "v" if keystroke.modifiers.control => self.paste(cx),
             "z" if keystroke.modifiers.control => self.undo_last(cx),
@@ -2958,7 +3124,7 @@ impl Browser {
             .gap_2()
             .min_w_0()
             .children(entry.map(|e| prop_row("name", e.name.clone())))
-            .children(entry.map(|_| prop_row("kind", if is_dir { "folder".into() } else { "file".into() })))
+            .children(entry.map(|e| prop_row("kind", friendly_kind(&e.name, e.is_dir))))
             .children(entry.map(|e| prop_row("path", e.path.display().to_string())))
             .children(entry.map(|_| {
                 prop_row(
@@ -3091,9 +3257,13 @@ impl Browser {
             MenuAction::Rename => self.start_rename(cx),
             MenuAction::Copy => self.copy_selection(cx),
             MenuAction::Cut => self.cut_selection(cx),
+            MenuAction::CopyPath => self.copy_paths_to_system(false, cx),
+            MenuAction::CopyUri => self.copy_paths_to_system(true, cx),
             MenuAction::Paste => self.paste(cx),
+            MenuAction::Terminal => self.open_terminal(cx),
             MenuAction::Trash => self.trash_selection(cx),
             MenuAction::Delete => self.delete_selection(cx),
+            MenuAction::EmptyTrash => self.empty_trash(cx),
             MenuAction::Info => self.toggle_inspector(cx),
             MenuAction::NewFolder => self.new_folder(cx),
             MenuAction::NewFile => self.new_file(cx),
@@ -3114,6 +3284,8 @@ impl Browser {
             MenuItem { label: "Rename", action: MenuAction::Rename },
             MenuItem { label: "Copy", action: MenuAction::Copy },
             MenuItem { label: "Cut", action: MenuAction::Cut },
+            MenuItem { label: "Copy Path", action: MenuAction::CopyPath },
+            MenuItem { label: "Copy URI", action: MenuAction::CopyUri },
             MenuItem { label: "Trash", action: MenuAction::Trash },
             MenuItem { label: "Delete permanently", action: MenuAction::Delete },
             MenuItem { label: "Properties", action: MenuAction::Info },
@@ -3128,16 +3300,23 @@ impl Browser {
         ]
     }
 
-    fn empty_menu_items() -> Vec<MenuItem> {
-        vec![
+    fn empty_menu_items(in_trash: bool) -> Vec<MenuItem> {
+        let mut items = vec![
             MenuItem { label: "New Folder", action: MenuAction::NewFolder },
             MenuItem { label: "New File", action: MenuAction::NewFile },
             MenuItem { label: "Paste", action: MenuAction::Paste },
+        ];
+        // a terminal has no meaning in the trash listing
+        if !in_trash {
+            items.push(MenuItem { label: "Open Terminal Here", action: MenuAction::Terminal });
+        }
+        items.extend([
             MenuItem { label: "Sort by Name", action: MenuAction::SortName },
             MenuItem { label: "Sort by Size", action: MenuAction::SortSize },
             MenuItem { label: "Sort by Date", action: MenuAction::SortModified },
             MenuItem { label: "Show Hidden", action: MenuAction::ToggleHidden },
-        ]
+        ]);
+        items
     }
 
     fn conflict_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {        let dialog = self.conflict_dialog.as_ref()?;
@@ -3411,6 +3590,17 @@ impl Render for Browser {
         } else {
             self.status.clone()
         };
+
+        // the volume this tab sits on: refresh free space in the
+        // background whenever navigation lands somewhere new
+        if matches!(self.tab().source, Source::Dir(_)) {
+            self.request_free_space(cx);
+        }
+        let free_text = self
+            .free_space
+            .as_ref()
+            .filter(|(dir, _)| Some(dir.as_path()) == self.tab().current_dir())
+            .map(|(_, bytes)| format!("{} free", human_size(*bytes)));
         let status_color = if error_status {
             theme::error()
         } else if self.busy || purge_armed || delete_armed {
@@ -3435,6 +3625,26 @@ impl Render for Browser {
                     .unwrap_or_default();
                 format!("{} · {} · {}", entry.name, size, age)
             });
+
+        // selection summary: when something is selected, its count and
+        // combined byte size ride along in the items cell
+        let selected_bytes: u64 = self
+            .tab()
+            .entries
+            .iter()
+            .filter(|entry| self.tab().selection.contains(&entry.key))
+            .filter_map(|entry| entry.size)
+            .sum();
+        let items_text = format!(
+            "{} items, {} selected{}",
+            self.tab().entries.len(),
+            self.tab().selection.len(),
+            if !self.tab().selection.is_empty() && selected_bytes > 0 {
+                format!(", {}", human_size(selected_bytes))
+            } else {
+                String::new()
+            }
+        );
 
         div()
             .size_full()
@@ -3706,6 +3916,37 @@ impl Render for Browser {
                                             }),
                                     ),
                             )
+                            .children(in_trash.then(|| {
+                                let armed = self
+                                    .empty_armed
+                                    .is_some_and(|armed| armed.elapsed() <= PURGE_ARM);
+                                div()
+                                    .id("empty-trash")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(12.))
+                                    .text_color(if armed {
+                                        theme::error()
+                                    } else {
+                                        theme::text_dim()
+                                    })
+                                    .bg(if armed {
+                                        theme::row()
+                                    } else {
+                                        theme::clear()
+                                    })
+                                    .hover(|this| this.text_color(theme::text()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.run_menu_action(MenuAction::EmptyTrash, cx)
+                                    }))
+                                    .child(if armed {
+                                        "confirm: empty trash"
+                                    } else {
+                                        "Empty Trash"
+                                    })
+                            }))
                             .child(
                                 div()
                                     .id("toggle-hidden")
@@ -3772,7 +4013,9 @@ impl Render for Browser {
                                             this.open_menu(
                                                 f32::from(event.position.x),
                                                 f32::from(event.position.y),
-                                                Self::empty_menu_items(),
+                                                Self::empty_menu_items(
+                                                    this.tab().source == Source::Trash,
+                                                ),
                                             );
                                             cx.notify();
                                         }),
@@ -3804,7 +4047,9 @@ impl Render for Browser {
                                             this.open_menu(
                                                 f32::from(event.position.x),
                                                 f32::from(event.position.y),
-                                                Self::empty_menu_items(),
+                                                Self::empty_menu_items(
+                                                    this.tab().source == Source::Trash,
+                                                ),
                                             );
                                             cx.notify();
                                         }),
@@ -3940,11 +4185,7 @@ impl Render for Browser {
                             .border_color(theme::border())
                             .text_size(px(12.))
                             .text_color(status_color)
-                            .child(format!(
-                                "{} items, {} selected",
-                                self.tab().entries.len(),
-                                self.tab().selection.len()
-                            ))
+                            .child(items_text)
                             .child(div().flex_1().truncate().child(status_text))
                             .child(if self.filter.is_empty() {
                                 div()
@@ -3954,6 +4195,13 @@ impl Render for Browser {
                                     .text_color(theme::accent())
                                     .truncate()
                                     .child(format!("filter: {} (Esc clears)", self.filter))
+                            })
+                            .child(match &free_text {
+                                Some(text) => div()
+                                    .flex_none()
+                                    .text_color(theme::text_dim())
+                                    .child(text.clone()),
+                                None => div(),
                             })
                             .child(match cursor_info {
                                 Some(info) => div()
@@ -3976,6 +4224,73 @@ impl Render for Browser {
             // does not lift an element above later siblings
             .children(self.conflict_overlay(cx))
             .children(self.menu_overlay(window, cx))
+    }
+}
+
+/// Free bytes on the volume holding dir, via libc statvfs (already in
+/// the binary through gpui; no new build artifact).
+fn free_bytes(dir: &Path) -> Option<u64> {
+    let cpath = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut vfs) };
+    if rc != 0 {
+        return None;
+    }
+    Some(vfs.f_bavail as u64 * vfs.f_frsize as u64)
+}
+
+/// A file:// URI with minimal percent-encoding for odd characters.
+fn path_uri(path: &Path) -> String {
+    let mut uri = String::from("file://");
+    for byte in path.as_os_str().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
+                uri.push(*byte as char)
+            }
+            other => uri.push_str(&format!("%{other:02X}")),
+        }
+    }
+    uri
+}
+
+/// A human kind for the info panel: folder, or an extension-mapped
+/// label like "PNG image" instead of a bare "file".
+fn friendly_kind(name: &str, is_dir: bool) -> String {
+    if is_dir {
+        return "folder".into();
+    }
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "avif" => {
+            format!("{} image", ext.to_uppercase())
+        }
+        "pdf" => "PDF document".into(),
+        "md" | "markdown" => "Markdown document".into(),
+        "txt" | "log" => "text document".into(),
+        "rs" => "Rust source".into(),
+        "py" => "Python source".into(),
+        "sh" | "bash" | "zsh" => "shell script".into(),
+        "js" => "JavaScript source".into(),
+        "ts" => "TypeScript source".into(),
+        "c" | "h" => "C source".into(),
+        "cpp" | "hpp" => "C++ source".into(),
+        "go" => "Go source".into(),
+        "json" => "JSON file".into(),
+        "toml" => "TOML file".into(),
+        "yaml" | "yml" => "YAML file".into(),
+        "html" | "xml" | "css" | "kdl" => format!("{} file", ext.to_uppercase()),
+        "zip" | "7z" | "rar" | "bz2" | "xz" | "zst" | "gz" | "tar" => {
+            format!("{} archive", ext.to_uppercase())
+        }
+        "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" => format!("{} audio", ext.to_uppercase()),
+        "mp4" | "mkv" | "webm" | "mov" | "avi" => format!("{} video", ext.to_uppercase()),
+        "iso" => "disk image".into(),
+        "" => "file".into(),
+        _ => format!("{ext} file"),
     }
 }
 
@@ -4395,6 +4710,7 @@ const KEY_HINTS: &[(&str, &str)] = &[
     ("Alt+Enter", "info"),
     ("Right-click", "menu"),
     ("Ctrl+C/X/V/Z", "clipboard"),
+    ("Ctrl+Shift+C", "copy path"),
     ("Ctrl+Left/Right", "back/fwd"),
     ("Ctrl+Up", "up folder"),
     ("Ctrl+L/F6", "edit path"),
@@ -4585,6 +4901,28 @@ mod tests {
         };
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("a "));
+    }
+
+    #[test]
+    fn free_bytes_reports_a_volume() {
+        assert!(free_bytes(Path::new("/tmp")).is_some_and(|n| n > 0));
+        assert!(free_bytes(Path::new("/no/such/dir/anywhere")).is_none());
+    }
+
+    #[test]
+    fn path_uri_escapes_spaces() {
+        assert_eq!(path_uri(Path::new("/tmp/a b/c.txt")), "file:///tmp/a%20b/c.txt");
+        assert_eq!(path_uri(Path::new("/tmp/plain")), "file:///tmp/plain");
+    }
+
+    #[test]
+    fn friendly_kinds_map_extensions() {
+        assert_eq!(friendly_kind("thing/", true), "folder");
+        assert_eq!(friendly_kind("photo.png", false), "PNG image");
+        assert_eq!(friendly_kind("readme.md", false), "Markdown document");
+        assert_eq!(friendly_kind("backup.zip", false), "ZIP archive");
+        assert_eq!(friendly_kind("clip.mov", false), "MOV video");
+        assert_eq!(friendly_kind("Makefile", false), "file");
     }
 
     #[test]

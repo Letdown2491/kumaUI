@@ -2967,6 +2967,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
+ "libc",
  "log",
  "notify",
  "nucleo",
