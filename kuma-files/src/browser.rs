@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use notify::Watcher as _;
 use std::os::unix::fs::PermissionsExt;
+
+/// Thumbnail cache bound. 256x256 RGBA each, so ~300 thumbs is the
+/// most memory the cache can hold (about 75 MiB worst case).
+const THUMB_CACHE_MAX: usize = 300;
+
+/// Undo memory bound: individual file operations, not steps, so a
+/// thousand-file paste is a thousand undo records.
+const UNDO_MAX_OPS: usize = 1000;
 
 use crate::{icons, theme};
 
@@ -631,6 +639,9 @@ pub(crate) struct Browser {
     /// Decoded thumbnails keyed by path; cleared wholesale when large.
     thumbs: HashMap<PathBuf, Arc<RenderImage>>,
     thumbs_inflight: HashSet<PathBuf>,
+    /// Insertion order into `thumbs`, so trimming drops the oldest
+    /// entries instead of clearing the whole cache.
+    thumb_order: VecDeque<PathBuf>,
     path_editing: bool,
     path_buffer: String,
     path_cursor: usize,
@@ -709,6 +720,7 @@ impl Browser {
             show_hidden: false,
             thumbs: HashMap::new(),
             thumbs_inflight: HashSet::new(),
+            thumb_order: VecDeque::new(),
             path_editing: false,
             path_buffer: String::new(),
             path_cursor: 0,
@@ -733,6 +745,28 @@ impl Browser {
         browser.apply_theme();
         browser.places = browser.ordered_places();
         browser.start_dir_watch(cx);
+        // the idle tick: palette republishes and mount changes land
+        // without any input, and render cannot tick (an idle window
+        // draws no frames). Check on a timer, wake the UI only when
+        // something actually changed.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(2))
+                    .await;
+                let update = this.update(cx, |this, cx| {
+                    let palette = this.refresh_palette(cx);
+                    let places = this.refresh_places();
+                    if palette || places {
+                        cx.notify();
+                    }
+                });
+                if update.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
         browser
     }
 
@@ -834,12 +868,24 @@ impl Browser {
     }
 
     /// Mounts come and go without us doing anything; re-scan the places
-    /// roots at most every couple of seconds.
-    fn refresh_places(&mut self) {
-        if self.places_refresh.elapsed() >= Duration::from_secs(2) {
-            self.places = self.ordered_places();
-            self.places_refresh = Instant::now();
+    /// roots at most every couple of seconds. Reports whether the
+    /// sidebar changed, so the idle tick only wakes the renderer on
+    /// real changes.
+    fn refresh_places(&mut self) -> bool {
+        if self.places_refresh.elapsed() < Duration::from_secs(2) {
+            return false;
         }
+        self.places_refresh = Instant::now();
+        let next = self.ordered_places();
+        let changed = next.len() != self.places.len()
+            || next
+                .iter()
+                .zip(&self.places)
+                .any(|(a, b)| a.name != b.name || a.path != b.path || a.bookmark != b.bookmark);
+        if changed {
+            self.places = next;
+        }
+        changed
     }
 
     fn zoom_in(&mut self, cx: &mut Context<Self>) {
@@ -932,9 +978,6 @@ impl Browser {
             return;
         }
         self.thumbs_inflight.insert(path.clone());
-        if self.thumbs.len() > 300 {
-            self.thumbs.clear();
-        }
         cx.spawn(async move |this, cx| {
             let bg_path = path.clone();
             let is_pdf = icons::is_pdf(&bg_path.file_name().unwrap_or_default().to_string_lossy());
@@ -953,6 +996,17 @@ impl Browser {
             let update = this.update(cx, |this, cx| {
                 this.thumbs_inflight.remove(&path);
                 if let Some(render) = render {
+                    // insertion-order trim: dropping the oldest keeps
+                    // the visible window's thumbs warm, where a
+                    // wholesale clear re-decoded everything at once
+                    while this.thumbs.len() >= THUMB_CACHE_MAX {
+                        let Some(oldest) = this.thumb_order.pop_front() else {
+                            this.thumbs.clear();
+                            break;
+                        };
+                        this.thumbs.remove(&oldest);
+                    }
+                    this.thumb_order.push_back(path.clone());
                     this.thumbs.insert(path, Arc::new(render));
                     cx.notify();
                 }
@@ -1156,10 +1210,12 @@ impl Browser {
     }
 
     /// Wallpaper changes republish the palette; noticed on the
-    /// regular two second tick.
-    fn refresh_palette(&mut self, cx: &mut Context<Self>) {
+    /// regular two second tick (the idle tick task, not render:
+    /// an idle window draws no frames). Reports whether the theme
+    /// changed.
+    fn refresh_palette(&mut self, cx: &mut Context<Self>) -> bool {
         if self.theme_refresh.elapsed() < Duration::from_secs(2) {
-            return;
+            return false;
         }
         self.theme_refresh = Instant::now();
         let mtime = Self::palette_mtime();
@@ -1179,7 +1235,9 @@ impl Browser {
                 },
             );
             cx.notify();
+            return true;
         }
+        false
     }
 
     /// The accent picker's choice, written to the state file.
@@ -1787,6 +1845,13 @@ impl Browser {
                     None if !undo.is_empty() => {
                         this.status = "done; Ctrl+Z to undo".into();
                         this.undo.extend(undo);
+                        // a session of big pastes would grow this
+                        // forever; past the cap the oldest steps
+                        // stop being undoable
+                        if this.undo.len() > UNDO_MAX_OPS {
+                            let drop = this.undo.len() - UNDO_MAX_OPS;
+                            this.undo.drain(..drop);
+                        }
                     }
                     None => {}
                 }
@@ -5285,9 +5350,7 @@ impl Browser {
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.refresh_places();
         self.arm_watcher();
-        self.refresh_palette(cx);
         self.auto_dock(window);
         let inspector_docked_bottom = self.inspector_bottom;
 

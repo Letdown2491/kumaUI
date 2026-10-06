@@ -135,9 +135,14 @@ fn pump_activations(
                     Ok(stream) => stream,
                     Err(_) => return,
                 };
-                let mut line = String::new();
                 use std::io::Read as _;
-                if stream.read_to_string(&mut line).is_err() {
+                // one small message per connection: a client that
+                // connects and never writes would otherwise stall
+                // every later activation, and an unbounded read would
+                // let it balloon the pump's memory
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut line = String::new();
+                if (&mut stream).take(4096).read_to_string(&mut line).is_err() {
                     continue;
                 }
                 let text = line.trim();
