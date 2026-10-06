@@ -1153,6 +1153,18 @@ impl Browser {
         if mtime != self.palette_mtime {
             self.palette_mtime = mtime;
             self.apply_theme();
+            log::info!(
+                "palette: {} (user accent {})",
+                if Self::read_palette().is_some() {
+                    "applied shell palette"
+                } else {
+                    "applied built-ins"
+                },
+                match self.accent {
+                    Some(hex) => format!("#{hex:06x}"),
+                    None => "unset".into(),
+                },
+            );
             cx.notify();
         }
     }
