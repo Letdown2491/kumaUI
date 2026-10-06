@@ -19,9 +19,10 @@ The binary is `kuma-shell`: a top bar, an app launcher, drawer panels, and a ses
 
 ## What's in the file manager
 
-Koguma (`kuma-files`) is the workspace's second app: kuma's own file manager, replacing Thunar ([issue #25](https://github.com/Letdown2491/kumaUI/issues/25)). Distro-agnostic by construction: every kumaOS integration is opportunistic and falls back to built-ins. Phase 1 (local browsing) is complete:
+Koguma (`kuma-files`) is the workspace's second app: kuma's own file manager, replacing Thunar ([issue #25](https://github.com/Letdown2491/kumaUI/issues/25)). Distro-agnostic by construction: every kumaOS integration is opportunistic and falls back to built-ins. Phases 1 (local browsing) and 2 (network places) are complete:
 
-- **Browsing**: tabs, places sidebar (XDG user dirs plus the GTK bookmarks file, drag-ordered), trash and recent-files sources, in-place rename, compress and extract riding file-roller/tar/unzip, open-with over desktop entries, terminal spawn, an info rail with text, PDF, and image previews.
+- **Browsing**: tabs, a places sidebar (XDG user dirs, GTK bookmarks, and mounted volumes, drag-ordered; mounts sit under a Network header below Recent and Trash), trash and recent-files sources, in-place rename, compress and extract riding file-roller/tar/unzip, open-with over desktop entries, terminal spawn, an info rail with text, PDF, and image previews.
+- **Network**: mounted volumes and remote shares list under the sidebar's Network section: gvfs-FUSE bridges get human labels like `host/share (smb)`, udisks2 mounts keep their volume labels, and mounts appear and disappear with the 2s places tick. Connect to Server spawns `gio mount` and relays its prompt protocol (passwords masked, host-key questions included) into a dialog.
 - **File operations**: one serialized op queue, undo, a keyboard-first conflict dialog, drags in both directions (outbound Copy-only, per the DnD spike finding).
 - **Search**: type-to-filter over the listing (nucleo-scored) plus a debounced background subtree walk appending deep hits.
 - **Theming**: reads the shell's palette opportunistically and recolors on wallpaper changes; built-ins everywhere else. Accent picker.

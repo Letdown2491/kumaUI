@@ -9,8 +9,8 @@ Thunar. Koguma must be deeply integrated with kumaOS (that is its
 reason to exist, versus a generic manager) and simultaneously portable
 by construction, because it doubles as the desktop's advertisement on
 every other distro. Integration usually means coupling; this ADR
-records the shape that resolves the tension, which phase 1 has now
-demonstrated in practice.
+records the shape that resolves the tension, which phases 1 and 2
+have now demonstrated in practice.
 
 ## Decision
 
@@ -42,8 +42,10 @@ kumaOS-specific, and never required:
   image-level swap away from Thunar stays gated by the release rule
   (kumaOS#29): Thunar leaves only after a release has ridden Koguma.
 - **Protocols ride system tools**: archives via file-roller/tar/unzip,
-  PDF previews via pdftocairo, network places (phase 2) via gvfs-FUSE
-  and `gio mount`. Koguma writes no protocol code.
+  PDF previews via pdftocairo, network places via gvfs-FUSE and
+  `gio mount`. Koguma writes no protocol code: phase 2 landed through
+  exactly this seam (the connect dialog spawns `gio mount` and relays
+  its prompt protocol; mounts surface as gvfs-FUSE places).
 
 ## Consequences
 
