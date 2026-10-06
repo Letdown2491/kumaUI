@@ -3663,7 +3663,16 @@ impl Render for Browser {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_view_mode(ViewMode::List, cx)
                                     }))
-                                    .child("List"),
+                                    .child(
+                                        svg()
+                                            .path("icons/list.svg")
+                                            .size(px(14.))
+                                            .text_color(if self.tab().view_mode == ViewMode::List {
+                                                theme::accent()
+                                            } else {
+                                                theme::text_dim()
+                                            }),
+                                    ),
                             )
                             .child(
                                 div()
@@ -3686,7 +3695,16 @@ impl Render for Browser {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.set_view_mode(ViewMode::Icons, cx)
                                     }))
-                                    .child("Icons"),
+                                    .child(
+                                        svg()
+                                            .path("icons/grid.svg")
+                                            .size(px(14.))
+                                            .text_color(if self.tab().view_mode == ViewMode::Icons {
+                                                theme::accent()
+                                            } else {
+                                                theme::text_dim()
+                                            }),
+                                    ),
                             )
                             .child(
                                 div()
