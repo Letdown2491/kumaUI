@@ -656,6 +656,8 @@ pub(crate) struct Browser {
     /// recursive-search walker that finishes under an older
     /// generation drops its results.
     search_gen: u64,
+    /// A search walker is in flight; drives the banner's indicator.
+    searching: bool,
 }
 
 impl Focusable for Browser {
@@ -722,6 +724,7 @@ impl Browser {
             place_order: Vec::new(),
             places_refresh: Instant::now(),
             search_gen: 0,
+            searching: false,
         };
         browser.load_state(cli_dir.as_deref());
         let show_hidden = browser.show_hidden;
@@ -1430,11 +1433,13 @@ impl Browser {
     fn filter_changed(&mut self, cx: &mut Context<Self>) {
         self.search_gen += 1;
         if self.filter.is_empty() {
+            self.searching = false;
             self.prune_deep();
             self.snap_cursor_visible();
             cx.notify();
             return;
         }
+        self.searching = true;
         let Source::Dir(root) = self.tab().source.clone() else {
             return;
         };
@@ -1459,6 +1464,7 @@ impl Browser {
                 if this.search_gen != generation {
                     return; // the listing moved on; results are stale
                 }
+                this.searching = false;
                 // replace the deep rows only when the walk brought
                 // something new, or the watcher's re-runs flicker
                 let fresh: Vec<PathBuf> = matches.iter().map(|e| e.key.clone()).collect();
@@ -5800,6 +5806,62 @@ impl Render for Browser {
                                     ),
                             ),
                     )
+                    .children((!self.filter.is_empty()).then(|| {
+                        // the search banner: only while a filter is
+                        // live, so the odd two-line rows below it
+                        // explain themselves
+                        let visible = self.visible_indices();
+                            let entries = &self.tab().entries;
+                            let here = visible
+                                .iter()
+                                .filter(|&&ix| entries[ix].rel.is_none())
+                                .count();
+                            let deep = entries.iter().filter(|e| e.rel.is_some()).count();
+                            let dir_label = self
+                                .tab()
+                                .current_dir()
+                                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+                                .unwrap_or_default();
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_1()
+                                .border_b_1()
+                                .border_color(theme::border())
+                                .bg(theme::row())
+                                .text_size(px(12.))
+                                .text_color(theme::text_dim())
+                                .child(div().child("Search"))
+                                .child(
+                                    div()
+                                        .text_color(theme::text())
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(self.filter.clone()),
+                                )
+                                .child(div().truncate().child(format!(
+                                    "· {here} here, {deep} in subfolders of {dir_label}"
+                                )))
+                                .children(self.searching.then(|| {
+                                    div().child("searching subfolders…")
+                                }))
+                                .child(div().flex_1())
+                                .child(div().child("Esc clears"))
+                                .child(
+                                    div()
+                                        .id("search-clear")
+                                        .px_1()
+                                        .cursor_pointer()
+                                        .hover(|this| this.text_color(theme::text()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.filter.clear();
+                                            this.filter_changed(cx);
+                                        }))
+                                        .child("×"),
+                                )
+                        }),
+                    )
                     .child({
                         // list flows as rows under sortable headers, icons
                         // as a wrapping grid. Empty space is a dedicated
@@ -6014,15 +6076,6 @@ impl Render for Browser {
                             .text_color(status_color)
                             .child(items_text)
                             .child(div().flex_1().truncate().child(status_text))
-                            .child(if self.filter.is_empty() {
-                                div()
-                            } else {
-                                div()
-                                    .flex_none()
-                                    .text_color(theme::accent())
-                                    .truncate()
-                                    .child(format!("filter: {} (Esc clears)", self.filter))
-                            })
                             .child(match &cursor_info {
                                 // the info panel shows name, size, and
                                 // age whenever it is open, so the footer
@@ -8303,6 +8356,7 @@ mod browser_search {
                 browser.tab().entries.iter().filter(|e| e.rel.is_some()).collect();
             assert_eq!(deep.len(), 2, "walker results never landed");
             assert!(browser.tab().entries.iter().any(|e| e.path == tree.root.join("sub").join("needle.txt")));
+            assert!(!browser.searching, "walk finished but the banner still says searching");
         });
         // esc clears the filter and prunes the deep rows
         window.update(|browser, _, cx| {
