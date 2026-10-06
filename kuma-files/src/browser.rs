@@ -5144,7 +5144,13 @@ impl Render for Browser {
             .relative()
             .flex()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // Ctrl+Q closes the window; everything else flows into
+                // the keymap
+                if event.keystroke.key == "q" && event.keystroke.modifiers.control {
+                    window.remove_window();
+                    return;
+                }
                 this.handle_key(event, cx);
             }))
             .bg(theme::bg())
@@ -5282,6 +5288,26 @@ impl Render for Browser {
                                             }
                                         },
                                     )),
+                            )
+                            .child(
+                                // the window control: tabs close, the
+                                // window itself closes here (or Ctrl+Q)
+                                div()
+                                    .id("window-close")
+                                    .px_2()
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .text_size(px(13.))
+                                    .text_color(theme::text_dim())
+                                    .hover(|this| {
+                                        this.text_color(theme::error()).bg(theme::row_hover())
+                                    })
+                                    .on_click(cx.listener(|_this, _, window, _| {
+                                        window.remove_window();
+                                    }))
+                                    .child("×"),
                             ),
                     )
                     .child(
@@ -6881,6 +6907,7 @@ const KEY_HINTS: &[(&str, &str)] = &[
     ("Ctrl+1/2", "views"),
     ("Ctrl+=/-/0", "zoom"),
     ("Ctrl+T/W", "tabs"),
+    ("Ctrl+Q", "close window"),
     ("Type", "filter"),
 ];
 
