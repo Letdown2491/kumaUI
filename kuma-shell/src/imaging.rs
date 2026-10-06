@@ -18,7 +18,15 @@ pub enum IconImage {
 /// Where themed icon files live: pixmaps + the icon theme dirs (system,
 /// flatpak, user), the same roots the launcher searches.
 pub fn icon_roots() -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from("/usr/share/pixmaps")];
+    let mut roots = Vec::new();
+    // user-installed icons first: the XDG spec gives the user data dir
+    // precedence, and first root seen wins same-rank ties in the index
+    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+        roots.push(PathBuf::from(data_home).join("icons"));
+    } else if let Ok(home) = std::env::var("HOME") {
+        roots.push(PathBuf::from(&home).join(".local/share/icons"));
+    }
+    roots.push(PathBuf::from("/usr/share/pixmaps"));
     if let Ok(home) = std::env::var("HOME") {
         roots.push(PathBuf::from(&home).join(".local/share/flatpak/exports/share/icons"));
     }
@@ -198,4 +206,23 @@ pub fn resolve_icon(spec: &str) -> Option<IconImage> {
         return decode_icon_file(Path::new(spec));
     }
     cached_icon(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_icon_root_precedes_system_roots() {
+        // the shell dock and launcher resolve an icon by first root
+        // seen: user-installed icons (e.g. Koguma's) must outrank the
+        // system theme trees, per XDG data-dir precedence
+        let roots = icon_roots();
+        let first = roots.first().unwrap().to_string_lossy().into_owned();
+        assert!(
+            first.ends_with("/icons"),
+            "user icons root should come first, got {first}"
+        );
+        assert!(!first.starts_with("/usr"));
+    }
 }
