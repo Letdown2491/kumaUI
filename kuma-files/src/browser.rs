@@ -465,6 +465,8 @@ enum MenuAction {
     Unbookmark(PathBuf),
     /// Drop a file from the recency list.
     Forget,
+    /// Open the accent (highlight color) picker.
+    AccentPicker,
 }
 
 /// A paste that may collide with an existing file, resolved by the
@@ -587,6 +589,14 @@ pub(crate) struct Browser {
     /// Pinned dock: None follows the window width (auto), Some pins
     /// bottom or right no matter how the window is resized.
     inspector_lock: Option<bool>,
+    /// Chosen accent: None follows the wallpaper (kuma-shell palette
+    /// when present), Some pins a user color over it.
+    accent: Option<u32>,
+    /// Last seen mtime of the shell's palette file, so wallpaper
+    /// changes are noticed on the regular refresh tick.
+    palette_mtime: Option<std::time::SystemTime>,
+    theme_refresh: Instant,
+    accent_picker: bool,
     /// Keybinding cheatsheet expanded in the places sidebar.
     keys_open: bool,
     /// Text snippet for the rail, when the focused entry is textual.
@@ -664,6 +674,10 @@ impl Browser {
             inspector: true,
             inspector_bottom: false,
             inspector_lock: None,
+            accent: None,
+            palette_mtime: None,
+            theme_refresh: Instant::now(),
+            accent_picker: false,
             keys_open: false,
             text_preview: None,
             preview_key: None,
@@ -701,6 +715,8 @@ impl Browser {
         browser.load_state(cli_dir.as_deref());
         let show_hidden = browser.show_hidden;
         browser.tab_mut().reload(show_hidden);
+        browser.palette_mtime = Browser::palette_mtime();
+        browser.apply_theme();
         browser.places = browser.ordered_places();
         browser.start_dir_watch(cx);
         browser
@@ -1090,6 +1106,74 @@ impl Browser {
             text.push('\n');
         }
         fs::write(path, text)
+    }
+
+    /// The kuma-shell palette file: the session's wallpaper-derived
+    /// colors, published for any app that wants them. Absent means we
+    /// are not running under kuma-shell (or adaptive is off) and the
+    /// built-ins stand.
+    fn palette_path() -> Option<PathBuf> {
+        Some(PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("kuma-shell/palette"))
+    }
+
+    fn palette_mtime() -> Option<std::time::SystemTime> {
+        fs::metadata(Self::palette_path()?)
+            .ok()?
+            .modified()
+            .ok()
+    }
+
+    fn read_palette() -> Option<theme::Palette> {
+        let text = fs::read_to_string(Self::palette_path()?).ok()?;
+        Some(parse_palette(&text))
+    }
+
+    /// Accent precedence: an explicit color wins over the wallpaper;
+    /// auto means the shell palette when the shell published one, the
+    /// built-ins otherwise.
+    fn apply_theme(&mut self) {
+        if let Some(palette) = Self::read_palette() {
+            theme::apply_palette(&palette);
+        } else {
+            theme::apply_palette(&theme::Palette::default());
+        }
+        if let Some(hex) = self.accent {
+            theme::set_accent(hex);
+        }
+    }
+
+    /// Wallpaper changes republish the palette; noticed on the
+    /// regular two second tick.
+    fn refresh_palette(&mut self, cx: &mut Context<Self>) {
+        if self.theme_refresh.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.theme_refresh = Instant::now();
+        let mtime = Self::palette_mtime();
+        if mtime != self.palette_mtime {
+            self.palette_mtime = mtime;
+            self.apply_theme();
+            cx.notify();
+        }
+    }
+
+    /// The accent picker's choice, written to the state file.
+    fn set_accent(&mut self, hex: Option<u32>, cx: &mut Context<Self>) {
+        self.accent = hex;
+        self.accent_picker = false;
+        self.apply_theme();
+        self.save_state();
+        self.status = match hex {
+            Some(_) => "accent set".into(),
+            None => {
+                if Self::read_palette().is_some() {
+                    "accent follows the wallpaper".into()
+                } else {
+                    "accent: auto (no kuma-shell palette found)".into()
+                }
+            }
+        };
+        cx.notify();
     }
 
     fn refresh_places_now(&mut self) {
@@ -2224,6 +2308,8 @@ impl Browser {
                 ("inspector-lock", "auto") => self.inspector_lock = None,
                 ("inspector-lock", "bottom") => self.inspector_lock = Some(true),
                 ("inspector-lock", "right") => self.inspector_lock = Some(false),
+                ("accent", "auto") => self.accent = None,
+                ("accent", _) => self.accent = parse_hex_color(value),
                 ("keys", "true") => self.keys_open = true,
                 ("keys", "false") => self.keys_open = false,
                 ("active", _) => saved_active = value.parse().ok(),
@@ -2294,7 +2380,7 @@ impl Browser {
             SortKey::Modified => "modified",
         };
         let text = format!(
-            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\ninspector-lock={}\nkeys={}\nscale={}\n",
+            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\ninspector-lock={}\naccent={}\nkeys={}\nscale={}\n",
             if tab.view_mode == ViewMode::Icons {
                 "icons"
             } else {
@@ -2309,6 +2395,10 @@ impl Browser {
                 Some(true) => "bottom",
                 Some(false) => "right",
                 None => "auto",
+            },
+            match self.accent {
+                Some(hex) => format!("#{hex:06x}"),
+                None => "auto".into(),
             },
             self.keys_open,
             self.scale,
@@ -2843,6 +2933,14 @@ impl Browser {
             }
             self.compress = Some(dialog);
             cx.notify();
+            return;
+        }
+
+        if self.accent_picker {
+            if keystroke.key == "escape" {
+                self.accent_picker = false;
+                cx.notify();
+            }
             return;
         }
 
@@ -4298,8 +4396,112 @@ impl Browser {
 
     /// The compress dialog: name field, format choice, create/cancel.
     /// Painted last so it sits above the listing.
-    fn compress_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let dialog = self.compress.as_ref()?;
+    /// The accent picker: preset swatches plus a follow-the-wallpaper
+    /// release. A small card, like the compress dialog.
+    fn accent_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.accent_picker {
+            return None;
+        }
+        let current = self.accent;
+        let palette_live = Self::read_palette().is_some();
+        let swatches = ACCENT_PRESETS
+            .iter()
+            .enumerate()
+            .map(|(ix, hex)| {
+                let hex = *hex;
+                let selected = current == Some(hex);
+                div()
+                    .id(format!("accent-swatch-{ix}"))
+                    .size(px(28.))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(rgb(hex))
+                    .border_1()
+                    .border_color(if selected {
+                        theme::text()
+                    } else {
+                        theme::border()
+                    })
+                    .hover(|this| this.border_color(theme::text()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_accent(Some(hex), cx);
+                    }))
+            })
+            .collect::<Vec<_>>();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                // a click outside the card closes it
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.accent_picker = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .w(px(300.))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .rounded_md()
+                        .bg(theme::sidebar())
+                        .border_1()
+                        .border_color(theme::border())
+                        // clicks inside the card must not fall through
+                        // to the catcher above
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .text_color(theme::text())
+                                .child("Accent"),
+                        )
+                        .child(
+                            div().flex().flex_wrap().gap_2().children(swatches),
+                        )
+                        .child(
+                            div()
+                                .id("accent-follow-wallpaper")
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .px_2()
+                                .py_1p5()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .text_color(if current.is_none() {
+                                    theme::accent()
+                                } else {
+                                    theme::text_dim()
+                                })
+                                .hover(|this| this.bg(theme::row_hover()))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_accent(None, cx);
+                                }))
+                                .child("Follow Wallpaper")
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme::text_dim())
+                                        .child(if palette_live {
+                                            "kuma-shell palette detected"
+                                        } else {
+                                            "no kuma-shell palette found"
+                                        }),
+                                ),
+                        ),
+                ),
+        )
+    }
+
+    fn compress_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {        let dialog = self.compress.as_ref()?;
         let count = self.tab().selection.len();
         let cursor = if dialog.name.is_char_boundary(dialog.cursor) {
             dialog.cursor
@@ -4491,6 +4693,11 @@ impl Browser {
             MenuAction::Bookmark(dir) => self.add_bookmark(dir, cx),
             MenuAction::Unbookmark(dir) => self.remove_bookmark(dir, cx),
             MenuAction::Forget => self.forget_recent(cx),
+            MenuAction::AccentPicker => {
+                self.menu = None;
+                self.accent_picker = true;
+                cx.notify();
+            }
         }
     }
 
@@ -4566,6 +4773,7 @@ impl Browser {
                     ));
                 }
                 items.push(MenuItem::new("Open Terminal Here", MenuAction::Terminal));
+                items.push(MenuItem::new("Accent…", MenuAction::AccentPicker));
             }
             // preserve the long-standing trash behavior: the file ops
             // target the selection, paste is inert without a clipboard
@@ -4771,6 +4979,7 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_places();
         self.arm_watcher();
+        self.refresh_palette(cx);
         self.auto_dock(window);
         let inspector_docked_bottom = self.inspector_bottom;
 
@@ -5534,6 +5743,7 @@ impl Render for Browser {
             // does not lift an element above later siblings
             .children(self.conflict_overlay(cx))
             .children(self.compress_overlay(cx))
+            .children(self.accent_overlay(cx))
             .children(self.menu_overlay(window, cx))
     }
 }
@@ -5956,6 +6166,49 @@ fn auto_dock_for(width: f32, current_bottom: bool) -> Option<bool> {
     }
     .filter(|bottom| *bottom != current_bottom)
 }
+
+/// Parse the shell's palette file: key=value hex lines, unknown or
+/// broken lines ignored, missing keys keep the built-ins.
+fn parse_palette(text: &str) -> theme::Palette {
+    let mut palette = theme::Palette::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(hex) = parse_hex_color(value) else {
+            continue;
+        };
+        match key.trim() {
+            "panel_bg" => palette.panel_bg = hex,
+            "surface" => palette.surface = hex,
+            "surface_hover" => palette.surface_hover = hex,
+            "inset" => palette.inset = hex,
+            "divider" => palette.divider = hex,
+            "divider_soft" => palette.divider_soft = hex,
+            "text" => palette.text = hex,
+            "text_dim" => palette.text_dim = hex,
+            "accent" => palette.accent = hex,
+            "accent_text" => palette.accent_text = hex,
+            _ => {}
+        }
+    }
+    palette
+}
+
+/// A color out of "#rrggbb", "rrggbb", or "0xrrggbb".
+fn parse_hex_color(value: &str) -> Option<u32> {
+    let text = value.trim().trim_start_matches('#').trim_start_matches("0x");
+    if text.len() != 6 || !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(text, 16).ok()
+}
+
+/// The accent presets in the picker: the built-in blue first, then
+/// hues that hold up on a dark surface.
+const ACCENT_PRESETS: [u32; 8] = [
+    0x4f8cc9, 0x89b4fa, 0xa6da95, 0x8bd5ca, 0xc6a0f6, 0xf5a97f, 0xee99a0, 0xeed49f,
+];
 
 /// One recently-used file: where it lives and when we last opened it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7065,6 +7318,39 @@ sftp://remote/share skip-me
         // already on the target dock: nothing to change
         assert_eq!(auto_dock_for(1200.0, false), None);
         assert_eq!(auto_dock_for(700.0, true), None);
+    }
+
+    #[test]
+    fn palette_parses_shell_key_values() {
+        let text = "panel_bg=0x101014\naccent=#89b4fa\ntext=e0e0e8\nbogus=zz\nfuture=0x123456\n";
+        let palette = parse_palette(text);
+        assert_eq!(palette.panel_bg, 0x101014);
+        assert_eq!(palette.accent, 0x89b4fa);
+        assert_eq!(palette.text, 0xe0e0e8);
+        // untouched keys keep the defaults
+        assert_eq!(palette.text_dim, theme::Palette::default().text_dim);
+    }
+
+    #[test]
+    fn hex_colors_accept_the_common_spellings() {
+        assert_eq!(parse_hex_color("#89b4fa"), Some(0x89b4fa));
+        assert_eq!(parse_hex_color("89b4fa"), Some(0x89b4fa));
+        assert_eq!(parse_hex_color("0x89B4FA"), Some(0x89b4fa));
+        assert_eq!(parse_hex_color("auto"), None);
+        assert_eq!(parse_hex_color("#89b4"), None);
+        assert_eq!(parse_hex_color("#89b4faa"), None);
+    }
+
+    #[test]
+    fn accent_change_drags_the_tints_along() {
+        // green accent: the selection tints keep the accent's hue
+        theme::set_accent(0xa6da95);
+        let tint = theme::rgb_to_hsl(theme::row_selected_hex() & 0xFFFFFF);
+        assert!((tint.0 - 100.0).abs() < 30.0, "green hue, got {}", tint.0);
+        // back to the default accent, the original blues return
+        theme::set_accent(0x4f8cc9);
+        let tint = theme::rgb_to_hsl(theme::row_selected_hex() & 0xFFFFFF);
+        assert!((tint.0 - 215.0).abs() < 8.0, "blue hue, got {}", tint.0);
     }
 
     #[test]
