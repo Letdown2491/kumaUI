@@ -1536,9 +1536,20 @@ impl Browser {
             while let Some(batch) = batch_rx.next().await {
                 let update = this.update(cx, |this, cx| {
                     let current = this.tab().current_dir().map(Path::to_path_buf);
-                    let relevant = batch.iter().flat_map(|event| event.paths.iter()).any(|p| {
-                        matches!(&p.parent(), Some(parent) if Some(*parent) == current.as_deref())
-                    });
+                    // notify's mask includes OPEN: every readdir of a
+                    // child (ours and the search walker's own) fires
+                    // an Access event that would feed the watcher
+                    // itself. Only content changes matter.
+                    let meaningful = |event: &&notify::Event| {
+                        !matches!(event.kind, notify::EventKind::Access(_))
+                    };
+                    let relevant = batch
+                        .iter()
+                        .filter(meaningful)
+                        .flat_map(|event| event.paths.iter())
+                        .any(|p| {
+                            matches!(&p.parent(), Some(parent) if Some(*parent) == current.as_deref())
+                        });
                     if relevant {
                         let show_hidden = this.show_hidden;
                         let filtering = !this.filter.is_empty();
