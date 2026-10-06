@@ -47,6 +47,10 @@ struct Entry {
     /// mtime as seconds since the epoch, for the details column.
     modified: Option<i64>,
     item: Option<TrashItem>,
+    /// Recursive search hit: the containing folder's path relative to
+    /// the tab's directory, shown as a dim second line. `None` for
+    /// rows the flat listing produced.
+    rel: Option<String>,
 }
 
 #[derive(Clone)]
@@ -648,6 +652,10 @@ pub(crate) struct Browser {
     /// list (and list entries not in the sidebar) fall back to the
     /// computed order, so churny mounts stay safe.
     place_order: Vec<PathBuf>,
+    /// Bumped on every filter edit, navigation, and tab switch; a
+    /// recursive-search walker that finishes under an older
+    /// generation drops its results.
+    search_gen: u64,
 }
 
 impl Focusable for Browser {
@@ -713,6 +721,7 @@ impl Browser {
             rubber_ctrl: false,
             place_order: Vec::new(),
             places_refresh: Instant::now(),
+            search_gen: 0,
         };
         browser.load_state(cli_dir.as_deref());
         let show_hidden = browser.show_hidden;
@@ -998,6 +1007,7 @@ impl Browser {
         } else {
             "hidden files hidden".into()
         };
+        self.filter_changed(cx);
         cx.notify();
     }
 
@@ -1386,6 +1396,21 @@ impl Browser {
         scored.into_iter().map(|(_, ix)| ix).collect()
     }
 
+    /// Drop recursive-search rows (they carry a relative path); the
+    /// flat listing keeps whatever it has. Reports whether any were
+    /// dropped.
+    fn prune_deep(&mut self) -> bool {
+        let tab = self.tab_mut();
+        let before = tab.entries.len();
+        tab.entries.retain(|entry| entry.rel.is_none());
+        before != tab.entries.len()
+    }
+
+    /// Append a walker's results to the listing.
+    fn extend_deep(&mut self, matches: Vec<Entry>) {
+        self.tab_mut().entries.extend(matches);
+    }
+
     /// After a filter edit the cursor must sit on a visible entry.
     fn snap_cursor_visible(&mut self) {
         let visible = self.visible_indices();
@@ -1394,6 +1419,50 @@ impl Browser {
             Some(ix) if visible.contains(&ix) => {}
             _ => tab.cursor = visible.first().copied(),
         }
+    }
+
+    /// The filter changed: prune stale deep rows, and while the
+    /// filter is non-empty kick a recursive search of the tab's
+    /// directory subtree. Flat matches are already in place; deep
+    /// results land in the background and only if nothing (filter
+    /// edit, navigation, tab switch) moved on first.
+    fn filter_changed(&mut self, cx: &mut Context<Self>) {
+        self.search_gen += 1;
+        let pruned = self.prune_deep();
+        if self.filter.is_empty() {
+            if pruned {
+                self.snap_cursor_visible();
+                cx.notify();
+            }
+            return;
+        }
+        let Source::Dir(root) = self.tab().source.clone() else {
+            return;
+        };
+        let generation = self.search_gen;
+        let filter = self.filter.clone();
+        let show_hidden = self.show_hidden;
+        cx.spawn(async move |this, cx| {
+            let matches =
+                cx.background_spawn(async move { search_subtree(&root, &filter, show_hidden) })
+                    .await;
+            let update = this.update(cx, |this, cx| {
+                if this.search_gen != generation {
+                    return; // the listing moved on; results are stale
+                }
+                let deep = matches.len();
+                this.extend_deep(matches);
+                if deep > 0 {
+                    this.snap_cursor_visible();
+                }
+                cx.notify();
+            });
+            if let Err(err) = update {
+                log::error!("search results update failed: {err:#}");
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Watch the active tab's directory so external changes (other apps,
@@ -1449,7 +1518,13 @@ impl Browser {
                     });
                     if relevant {
                         let show_hidden = this.show_hidden;
+                        let filtering = !this.filter.is_empty();
                         this.tab_mut().reload(show_hidden);
+                        // reload rebuilt the flat listing; deep rows
+                        // died with it, so re-run a live search
+                        if filtering {
+                            this.filter_changed(cx);
+                        }
                         log::info!("dir changed externally, reloaded");
                         cx.notify();
                     }
@@ -1548,6 +1623,8 @@ impl Browser {
         tab.reload(show_hidden);
         self.status.clear();
         self.disarm();
+        // the filter survives navigation; search the new tree too
+        self.filter_changed(cx);
         self.save_state();
         cx.notify();
     }
@@ -1560,6 +1637,8 @@ impl Browser {
         let count = self.tabs.len() as isize;
         let next = (self.active as isize + step).rem_euclid(count);
         self.active = next as usize;
+        // the incoming tab needs its own deep rows for a live filter
+        self.filter_changed(cx);
         self.save_state();
         cx.notify();
     }
@@ -2786,6 +2865,7 @@ impl Tab {
                             size,
                             modified,
                             item: None,
+                            rel: None,
                         });
                     }
                     sort_entries(&mut entries, self.sort_key, self.sort_asc);
@@ -2824,6 +2904,7 @@ impl Tab {
                         size: Some(meta.len()),
                         modified: Some(recent.modified),
                         item: None,
+                        rel: None,
                     });
                 }
                 self.entries = entries;
@@ -2857,6 +2938,7 @@ impl Tab {
                         // trashed
                         modified: Some(item.time_deleted),
                         item: Some(item),
+                        rel: None,
                     });
                 }
                 entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -3143,8 +3225,7 @@ impl Browser {
             "backspace" => {
                 if filtering {
                     self.filter.pop();
-                    self.snap_cursor_visible();
-                    cx.notify();
+                    self.filter_changed(cx);
                 } else {
                     self.go_up(cx);
                 }
@@ -3152,8 +3233,7 @@ impl Browser {
             "escape" => {
                 if filtering {
                     self.filter.clear();
-                    self.snap_cursor_visible();
-                    cx.notify();
+                    self.filter_changed(cx);
                 } else {
                     tab.selection.clear();
                     tab.cursor = None;
@@ -3180,6 +3260,7 @@ impl Browser {
             "f5" => {
                 let show_hidden = self.show_hidden;
                 self.tab_mut().reload(show_hidden);
+                self.filter_changed(cx);
                 self.status = "refreshed".into();
                 cx.notify();
             }
@@ -3272,8 +3353,7 @@ impl Browser {
                 && !keystroke.key.chars().all(|ch| ch.is_control()) =>
             {
                 self.filter.push_str(&keystroke.key);
-                self.snap_cursor_visible();
-                cx.notify();
+                self.filter_changed(cx);
             }
             _ => {}
         }
@@ -3714,6 +3794,27 @@ impl Browser {
                 .rounded_sm()
                 .px_1()
                 .child(format!("{before}▏{after}"))
+        } else if let Some(rel) = &entry.rel {
+            // recursive-search hit: name plus where it lives
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(13. * s))
+                        .child(entry.name.clone()),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(11. * s))
+                        .text_color(theme::text_dim())
+                        .child(rel.clone()),
+                )
         } else {
             div().flex_1().min_w_0().truncate().child(entry.name.clone())
         };
@@ -3923,7 +4024,33 @@ impl Browser {
                     .justify_center()
                     .child(preview),
             )
-            .child(
+            .child(if entry.rel.is_some() {
+                // deep search hit: a second dim line under the name
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .child(
+                        div()
+                            .h(px(16. * s))
+                            .text_size(px(12. * s))
+                            .line_height(relative(1.3))
+                            .overflow_hidden()
+                            .text_center()
+                            .truncate()
+                            .child(entry.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10. * s))
+                            .text_color(theme::text_dim())
+                            .overflow_hidden()
+                            .text_center()
+                            .truncate()
+                            .child(entry.rel.clone().unwrap_or_default()),
+                    )
+            } else {
                 div()
                     .h(px(16. * s))
                     .w_full()
@@ -3932,8 +4059,8 @@ impl Browser {
                     .overflow_hidden()
                     .text_center()
                     .truncate()
-                    .child(entry.name.clone()),
-            )
+                    .child(entry.name.clone())
+            })
     }
 
     fn place_row(&self, ix: usize, place: &Place, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -5225,9 +5352,16 @@ impl Render for Browser {
             .filter(|entry| self.tab().selection.contains(&entry.key))
             .filter_map(|entry| entry.size)
             .sum();
+        let deep = self.tab().entries.iter().filter(|e| e.rel.is_some()).count();
+        let deep_note = if deep > 0 {
+            format!(" (+{deep} in subfolders)")
+        } else {
+            String::new()
+        };
         let items_text = format!(
-            "{} items, {} selected{}",
-            self.tab().entries.len(),
+            "{} items{}, {} selected{}",
+            self.tab().entries.len() - deep,
+            deep_note,
             self.tab().selection.len(),
             if !self.tab().selection.is_empty() && selected_bytes > 0 {
                 format!(", {}", human_size(selected_bytes))
@@ -5982,6 +6116,111 @@ fn archive_kind(name: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// How far below the tab's directory the search walks.
+const SEARCH_MAX_DEPTH: usize = 6;
+/// Bounds so a search from a huge tree cannot wedge the app. Walked
+/// counts every fs entry visited; matches cap what the listing keeps.
+const SEARCH_MAX_WALKED: usize = 4000;
+const SEARCH_MAX_MATCHES: usize = 200;
+
+/// The recursive half of the type-in filter: walk `root`'s subtree
+/// looking for names the fuzzy filter scores, best first. Runs on the
+/// background executor; the caller drops results if the filter or the
+/// tab moved on. Skips dot-names unless `show_hidden`. Root-level
+/// entries are not produced: the flat listing already has them.
+fn search_subtree(root: &Path, filter: &str, show_hidden: bool) -> Vec<Entry> {
+    use nucleo::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+    use nucleo::{Config, Matcher, Utf32String};
+
+    let pattern = Pattern::new(
+        filter,
+        CaseMatching::Smart,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    );
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut out: Vec<(u32, Entry)> = Vec::new();
+    let mut walked = 0usize;
+    // (dir, depth below root, dir's path relative to root)
+    let mut stack = vec![(root.to_path_buf(), 0usize, String::new())];
+    while let Some((dir, depth, rel_prefix)) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in read.flatten() {
+            walked += 1;
+            if walked > SEARCH_MAX_WALKED || out.len() >= SEARCH_MAX_MATCHES {
+                return best_first(out);
+            }
+            let name = item.file_name().to_string_lossy().into_owned();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            let path = item.path();
+            let is_dir = item.file_type().is_ok_and(|t| t.is_dir());
+            let child_rel = is_dir.then(|| {
+                if rel_prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel_prefix}/{name}")
+                }
+            });
+            if is_dir && depth < SEARCH_MAX_DEPTH {
+                stack.push((path.clone(), depth + 1, child_rel.unwrap()));
+            }
+            // depth 0 is the flat listing's job; scoring here would
+            // duplicate its rows
+            if depth == 0 {
+                continue;
+            }
+            let Some(score) =
+                pattern.score(Utf32String::from(name.as_str()).slice(..), &mut matcher)
+            else {
+                continue;
+            };
+            let meta = fs::symlink_metadata(&path).ok();
+            let size = meta.as_ref().filter(|_| !is_dir).map(|meta| meta.len());
+            let modified = meta.and_then(|meta| {
+                meta.modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+            });
+            out.push((
+                score,
+                Entry {
+                    key: path.clone(),
+                    path,
+                    name,
+                    is_dir,
+                    size,
+                    modified,
+                    item: None,
+                    rel: Some(if rel_prefix.is_empty() {
+                        ".".into()
+                    } else {
+                        rel_prefix.clone()
+                    }),
+                },
+            ));
+        }
+    }
+    best_first(out)
+}
+
+/// Sort walker output the way the flat filter ranks: score first,
+/// then name. Plain files before folders within one score, mirroring
+/// the listing's own sort.
+fn best_first(mut scored: Vec<(u32, Entry)>) -> Vec<Entry> {
+    scored.sort_by(|a, b| {
+        b.0
+            .cmp(&a.0)
+            .then_with(|| a.1.is_dir.cmp(&b.1.is_dir))
+            .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+    });
+    scored.into_iter().map(|(_, entry)| entry).collect()
 }
 
 fn is_archive(name: &str) -> bool {
@@ -7015,7 +7254,7 @@ const KEY_HINTS: &[(&str, &str)] = &[
     ("Ctrl+=/-/0", "zoom"),
     ("Ctrl+T/W", "tabs"),
     ("Ctrl+Q", "close window"),
-    ("Type", "filter"),
+    ("Type", "filter; also searches subfolders"),
 ];
 
 fn sort_entries(entries: &mut [Entry], key: SortKey, asc: bool) {
@@ -7910,5 +8149,137 @@ mod browser_ux_keys {
             .find(|item| item.label == "Paste Into Folder")
             .expect("dir row menu must offer Paste Into Folder");
         assert!(paste.dim, "no clipboard: dim");
+    }
+}
+
+/// Recursive search: the walker's tree semantics as pure tests, plus
+/// a live-Browser run of filter_changed end to end.
+#[cfg(test)]
+mod browser_search {
+    use super::*;
+    use gpui::TestApp;
+
+    struct Tree {
+        root: PathBuf,
+    }
+
+    impl Tree {
+        /// needle.txt/needle.md at the root, one a folder down, one
+        /// exactly at the depth cap, one past it, and one under a
+        /// hidden dir. Six nested dirs deep at the cap.
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("koguma-search-{name}-{}", std::process::id()));
+            let deep = root
+                .join("d1")
+                .join("d2")
+                .join("d3")
+                .join("d4")
+                .join("d5")
+                .join("d6");
+            fs::create_dir_all(&deep).unwrap();
+            fs::create_dir_all(deep.join("d7")).unwrap();
+            fs::create_dir_all(root.join("sub")).unwrap();
+            fs::create_dir_all(root.join(".hidden")).unwrap();
+            fs::write(root.join("needle.txt"), "x").unwrap();
+            fs::write(root.join("needle.md"), "x").unwrap();
+            fs::write(root.join("sub").join("needle.txt"), "x").unwrap();
+            fs::write(deep.join("needle.txt"), "x").unwrap();
+            fs::write(deep.join("d7").join("needle.txt"), "x").unwrap();
+            fs::write(root.join(".hidden").join("needle.txt"), "x").unwrap();
+            Self { root }
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn walker_finds_matches_depth_capped_and_skips_hidden() {
+        let tree = Tree::new("walker");
+        let hits = search_subtree(&tree.root, "needle", false);
+        let found: Vec<(String, String)> = hits
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    entry.rel.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        // root-level rows are the flat listing's job: the walker must
+        // not duplicate them
+        assert_eq!(
+            found
+                .iter()
+                .filter(|(name, _)| name == "needle.txt" || name == "needle.md")
+                .count(),
+            2,
+            "root rows leaked into the walker: {found:?}"
+        );
+        // the sub-folder hit and the depth-cap hit are both in
+        assert!(
+            found.contains(&("needle.txt".into(), "sub".into())),
+            "sub hit missing: {found:?}"
+        );
+        assert!(
+            found.contains(&(
+                "needle.txt".into(),
+                "d1/d2/d3/d4/d5/d6".into()
+            )),
+            "depth-cap hit missing: {found:?}"
+        );
+        // one past the cap, and the hidden dir: excluded
+        assert_eq!(found.len(), 2, "unexpected extra hits: {found:?}");
+    }
+
+    #[test]
+    fn walker_respects_show_hidden() {
+        let tree = Tree::new("hidden");
+        let hits = search_subtree(&tree.root, "needle", true);
+        assert!(
+            hits.iter()
+                .any(|entry| entry.rel.as_deref() == Some(".hidden")),
+            "hidden dir skipped with show_hidden on"
+        );
+    }
+
+    #[test]
+    fn filter_change_lands_deep_rows_and_escape_clears() {
+        let tree = Tree::new("live");
+        let mut app = TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = app.open_window(|window, cx| {
+            Browser::new(Some(tree.root.clone()), window, cx)
+        });
+        app.run_until_parked();
+        window.update(|browser, _, cx| {
+            browser.filter = "needle".into();
+            browser.filter_changed(cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            let deep: Vec<&Entry> =
+                browser.tab().entries.iter().filter(|e| e.rel.is_some()).collect();
+            assert_eq!(deep.len(), 2, "walker results never landed");
+            assert!(browser.tab().entries.iter().any(|e| e.path == tree.root.join("sub").join("needle.txt")));
+        });
+        // esc clears the filter and prunes the deep rows
+        window.update(|browser, _, cx| {
+            browser.filter.clear();
+            browser.filter_changed(cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            assert!(
+                browser.tab().entries.iter().all(|e| e.rel.is_none()),
+                "deep rows survived esc"
+            );
+            assert!(browser.filter.is_empty());
+        });
     }
 }
