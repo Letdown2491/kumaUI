@@ -3366,7 +3366,7 @@ impl Render for Browser {
             .text_color(theme::text())
             .child(
                 div()
-                    .w(px(170.))
+                    .w(px(190.))
                     .h_full()
                     .flex()
                     .flex_col()
