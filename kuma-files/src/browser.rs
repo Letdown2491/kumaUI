@@ -4988,7 +4988,17 @@ impl Browser {
                         theme::text_dim()
                     }),
             )
-            .child(place.name.clone())
+            .child(
+                // mount labels run long (host/share strings): keep
+                // them inside the rail instead of painting over the
+                // file pane
+                div()
+                    .id("place-name")
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(place.name.clone()),
+            )
     }
 
     /// The details header for list view: click a column to sort, click
@@ -6239,12 +6249,16 @@ impl Render for Browser {
             }
         }
 
+        // mounts split off into the Network section, which renders
+        // below Recent and Trash (everything after the first mount
+        // keeps its current grouping)
         let mut places: Vec<AnyElement> = Vec::new();
+        let mut network: Vec<AnyElement> = Vec::new();
         let mut network_started = false;
         for (ix, place) in self.places.iter().enumerate() {
             if place.mount && !network_started {
                 network_started = true;
-                places.push(
+                network.push(
                     div()
                         .px_3()
                         .pt_2()
@@ -6255,7 +6269,11 @@ impl Render for Browser {
                         .into_any_element(),
                 );
             }
-            places.push(self.place_row(ix, place, cx).into_any_element());
+            if network_started {
+                network.push(self.place_row(ix, place, cx).into_any_element());
+            } else {
+                places.push(self.place_row(ix, place, cx).into_any_element());
+            }
         }
 
         let mut tabs: Vec<Stateful<Div>> = Vec::new();
@@ -6381,6 +6399,7 @@ impl Render for Browser {
                     .bg(theme::sidebar())
                     .border_r_1()
                     .border_color(theme::border())
+                    .overflow_hidden()
                     .children(places)
                     .child(
                         div()
@@ -6454,6 +6473,7 @@ impl Render for Browser {
                             )
                             .child("Trash"),
                     )
+                    .children(network)
                     .child(
                         // push the keys section to the bottom edge
                         div().flex_grow_1(),
