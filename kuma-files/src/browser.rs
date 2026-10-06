@@ -744,6 +744,65 @@ fn child_cell_lock_kill(cell: &Mutex<Option<std::process::Child>>) {
     }
 }
 
+/// The gvfsd-fuse binary, if this system ships it. Fedora keeps it in
+/// the separate gvfs-fuse package, which a minimal image can miss.
+fn gvfs_fuse_bin() -> Option<String> {
+    for candidate in ["/usr/libexec/gvfsd-fuse", "/usr/lib/gvfs/gvfsd-fuse"] {
+        if fs::metadata(candidate).is_ok() {
+            return Some(candidate.into());
+        }
+    }
+    // unusual packaging: plain PATH scan, no probing (the daemon does
+    // not have a help mode and must not be started here)
+    // unusual packaging: plain PATH scan, no probing (the daemon does
+    // not have a help mode and must not be started here)
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).find_map(|dir| {
+                let candidate = dir.join("gvfsd-fuse");
+                (fs::metadata(&candidate).is_ok())
+                    .then(|| candidate.display().to_string())
+            })
+        })
+        .unwrap_or(None)
+}
+
+/// Make sure the gvfs-FUSE bridge is running: it exposes mounted
+/// network shares as POSIX paths under XDG_RUNTIME_DIR/gvfs, and
+/// without it a mount succeeds at the DBus level while there is no
+/// folder anywhere to browse. A desktop session usually starts it;
+/// kumaOS (niri) has none, so Koguma starts it on demand. Safe to
+/// call repeatedly: a mounted bridge is detected by device id.
+fn ensure_gvfs_fuse() {
+    if gvfs_fuse_bin().is_none() {
+        return;
+    }
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return;
+    };
+    let runtime = PathBuf::from(runtime);
+    let gvfs = runtime.join("gvfs");
+    use std::os::unix::fs::MetadataExt;
+    if let (Ok(parent), Ok(mount)) = (fs::metadata(&runtime), fs::metadata(&gvfs)) {
+        if parent.dev() != mount.dev() {
+            return; // bridge already mounted
+        }
+    }
+    let _ = fs::create_dir_all(&gvfs);
+    let bin = gvfs_fuse_bin().unwrap_or_else(|| "gvfsd-fuse".into());
+    match std::process::Command::new(bin).arg(&gvfs).spawn() {
+        Ok(child) => {
+            log::info!("connect: started gvfsd-fuse at {}", gvfs.display());
+            // reaped on a thread: a dropped Child would zombie
+            std::thread::spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            });
+        }
+        Err(err) => log::error!("connect: gvfsd-fuse failed to start: {err}"),
+    }
+}
+
 /// Drive one `gio mount` child to completion: pipe its stdout through
 /// the prompt classifier, relay prompts to the dialog and feed the
 /// user's answers back down stdin, then diff the gvfs-FUSE directory
@@ -1057,6 +1116,9 @@ impl Browser {
         browser.apply_theme();
         browser.places = browser.ordered_places();
         browser.start_dir_watch(cx);
+        // the gvfs-FUSE bridge, so mounts made anywhere in the session
+        // (ours or gio's CLI) turn into browsable folders
+        ensure_gvfs_fuse();
         // the idle tick: palette republishes and mount changes land
         // without any input, and render cannot tick (an idle window
         // draws no frames). Check on a timer, wake the UI only when
@@ -2554,6 +2616,9 @@ impl Browser {
             return;
         };
         let gvfs_dir = PathBuf::from(runtime).join("gvfs");
+        // the FUSE bridge must be up before the mount lands, or the
+        // pump's directory diff cannot see the new entry
+        ensure_gvfs_fuse();
         let (ev_tx, ev_rx) = mpsc::channel::<ConnectEvent>();
         let (ans_tx, ans_rx) = mpsc::channel::<String>();
         let mut child = match std::process::Command::new("gio")
@@ -2668,8 +2733,23 @@ impl Browser {
                 );
                 if ok {
                     self.status = format!("{}: {}", message, dialog.uri.trim());
-                    if let Some(path) = mount {
-                        self.load_source(Source::Dir(path), cx);
+                    match mount {
+                        Some(path) => self.load_source(Source::Dir(path), cx),
+                        None if gvfs_fuse_bin().is_none() => {
+                            // connected, but nothing can browse it: the
+                            // image lacks the gvfs-fuse bridge
+                            if let Some(dialog) = self.connect.as_mut() {
+                                dialog.status = "connected. The gvfs-fuse package is missing \
+                                    on this system, so there is no folder to browse yet; \
+                                    the mount is live and will appear once the bridge is \
+                                    installed."
+                                    .into();
+                            }
+                        }
+                        None => {
+                            log::info!("connect: mount registered, fuse entry not found");
+                            self.refresh_places_now();
+                        }
                     }
                     self.refresh_places_now();
                 } else {
