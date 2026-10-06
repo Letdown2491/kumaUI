@@ -7,10 +7,10 @@ use std::{collections::HashMap, fs, io};
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClickEvent, Context, Div, DragMoveEvent,
-    ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, ImageSource,
-    KeyDownEvent, MouseDownEvent, MouseButton, MouseUpEvent, ObjectFit, Pixels, Point, Render,
-    RenderImage, Stateful, Window, div, img, prelude::*, px, relative, rgba, rgb, svg,
-    FontWeight,
+    ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, HighlightStyle,
+    ImageSource, KeyDownEvent, MouseDownEvent, MouseButton, MouseUpEvent, ObjectFit, Pixels,
+    Point, Render, RenderImage, Stateful, StyledText, UnderlineStyle, Window, div, img,
+    prelude::*, px, relative, rgba, rgb, svg, FontStyle, FontWeight, SharedString,
 };
 use trash::{os_limited, TrashItem};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1621,7 +1621,18 @@ impl Browser {
             let update = this.update(cx, |this, cx| {
                 this.preview_inflight.remove(&path);
                 if this.preview_key.as_ref() == Some(&path) {
-                    this.text_preview = lines.map(|lines| TextPreview { kind, lines });
+                    this.text_preview = lines.clone().map(|loaded| {
+                        let blocks = if kind == TextKind::Markdown {
+                            Some(parse_markdown(&loaded.join("\n")))
+                        } else {
+                            None
+                        };
+                        TextPreview {
+                            kind,
+                            lines: loaded,
+                            blocks,
+                        }
+                    });
                     cx.notify();
                 }
             });
@@ -2860,15 +2871,11 @@ impl Browser {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .gap_px()
+                    .gap_2()
                     .overflow_hidden()
                     .text_size(px(11.))
                     .text_color(theme::text())
-                    .children(
-                        text.lines
-                            .iter()
-                            .map(|line| markdown_line(line)),
-                    ),
+                    .children(md_blocks(text)),
                 TextKind::Plain => mono.children(
                     text.lines
                         .iter()
@@ -3962,6 +3969,9 @@ enum TextKind {
 struct TextPreview {
     kind: TextKind,
     lines: Vec<String>,
+    /// Parsed markdown, when kind is Markdown; None or empty falls
+    /// back to plain lines.
+    blocks: Option<Vec<MdBlock>>,
 }
 
 fn text_kind(path: &Path) -> TextKind {
@@ -4021,61 +4031,6 @@ fn code_line(line: &str) -> Div {
     }
 }
 
-/// A markdown line: headings sized, bullets indented, quotes dimmed.
-fn markdown_line(line: &str) -> AnyElement {
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() {
-        return div().h(px(6.)).into_any_element();
-    }
-    let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
-    if hashes >= 1
-        && hashes <= 6
-        && trimmed[hashes..].starts_with(' ')
-    {
-        let size = match hashes {
-            1 => 15.,
-            2 => 14.,
-            _ => 13.,
-        };
-        let heading = trimmed[hashes..].trim();
-        return preview_line(heading.to_string())
-            .text_size(px(size))
-            .font_weight(FontWeight::BOLD)
-            .text_color(if hashes <= 2 {
-                theme::accent()
-            } else {
-                theme::text()
-            })
-            .into_any_element();
-    }
-    if trimmed.starts_with("```") {
-        return preview_line("⋯".to_string())
-            .text_color(theme::text_dim())
-            .into_any_element();
-    }
-    if trimmed.starts_with('>') {
-        return preview_line(trimmed.trim_start_matches(['>', ' ']).to_string())
-            .italic()
-            .text_color(theme::text_dim())
-            .into_any_element();
-    }
-    if (trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ "))
-        && let Some(rest) = trimmed.get(2..)
-    {
-        return div()
-            .w_full()
-            .flex()
-            .pl_2()
-            .gap_1()
-            .child(div().text_color(theme::accent()).child("·"))
-            .child(preview_line(rest.to_string()).text_color(theme::text()))
-            .into_any_element();
-    }
-    preview_line(trimmed.to_string())
-        .text_color(theme::text())
-        .into_any_element()
-}
-
 /// A csv preview: cells padded into an aligned mono table, first row
 /// as the header. Quote handling is out of scope for a glance.
 fn csv_lines(lines: &[String]) -> Vec<String> {
@@ -4110,8 +4065,302 @@ fn csv_lines(lines: &[String]) -> Vec<String> {
                 })
                 .collect::<Vec<_>>()
                 .join("  ")
+                .trim_end()
+                .to_string()
         })
         .collect()
+}
+
+/// Inline markdown runs as a wrapping StyledText element.
+fn md_spans(spans: &[MdSpan]) -> StyledText {
+    let mut text = String::new();
+    let mut highlights = Vec::new();
+    for span in spans {
+        let start = text.len();
+        text.push_str(&span.text);
+        let mut style = HighlightStyle::default();
+        if span.bold {
+            style.font_weight = Some(FontWeight::BOLD);
+        }
+        if span.italic {
+            style.font_style = Some(FontStyle::Italic);
+        }
+        if span.code {
+            style.background_color = Some(theme::row().into());
+            style.color = Some(theme::accent().into());
+        }
+        if span.link {
+            style.color = Some(theme::accent().into());
+            style.underline = Some(UnderlineStyle::default());
+        }
+        highlights.push((start..text.len(), style));
+    }
+    StyledText::new(SharedString::from(text)).with_highlights(highlights)
+}
+
+/// Lay out parsed markdown blocks for the preview box. Falls back to
+/// the raw lines when a file parses to nothing.
+fn md_blocks(preview: &TextPreview) -> Vec<AnyElement> {
+    let blocks = match &preview.blocks {
+        Some(blocks) if !blocks.is_empty() => blocks,
+        _ => {
+            return preview
+                .lines
+                .iter()
+                .map(|line| {
+                    preview_line(line.clone())
+                        .text_color(theme::text())
+                        .into_any_element()
+                })
+                .collect();
+        }
+    };
+    blocks
+        .iter()
+        .map(|block| match block {
+            MdBlock::Heading { level, spans } => div()
+                .font_weight(FontWeight::BOLD)
+                .text_size(px(match level {
+                    1 => 16.,
+                    2 => 15.,
+                    _ => 13.,
+                }))
+                .text_color(if *level <= 2 {
+                    theme::accent()
+                } else {
+                    theme::text()
+                })
+                .child(md_spans(spans))
+                .into_any_element(),
+            MdBlock::Para(spans) => div()
+                .w_full()
+                .text_color(theme::text())
+                .child(md_spans(spans))
+                .into_any_element(),
+            MdBlock::Quote(spans) => div()
+                .border_l_1()
+                .border_color(theme::accent())
+                .pl_2()
+                .italic()
+                .text_color(theme::text_dim())
+                .child(md_spans(spans))
+                .into_any_element(),
+            MdBlock::Item(spans) => div()
+                .w_full()
+                .flex()
+                .gap_1()
+                .child(div().text_color(theme::accent()).child("·"))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme::text())
+                        .child(md_spans(spans)),
+                )
+                .into_any_element(),
+            MdBlock::Code(lines) => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_px()
+                .rounded_sm()
+                .border_1()
+                .border_color(theme::border())
+                .p_1()
+                .text_size(px(11.))
+                .font_family("monospace")
+                .text_color(theme::text())
+                .children(lines.iter().map(|l| preview_line(l.clone())))
+                .into_any_element(),
+            MdBlock::Table(lines) => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_px()
+                .text_size(px(11.))
+                .font_family("monospace")
+                .children(
+                    lines
+                        .iter()
+                        .map(|l| preview_line(l.clone()).text_color(theme::text_dim())),
+                )
+                .into_any_element(),
+            MdBlock::Rule => div()
+                .w_full()
+                .h(px(1.))
+                .flex_none()
+                .bg(theme::border())
+                .into_any_element(),
+        })
+        .collect()
+}
+
+/// One styled run of inline markdown text.
+#[derive(Clone, Default)]
+struct MdSpan {
+    text: String,
+    bold: bool,
+    italic: bool,
+    code: bool,
+    link: bool,
+}
+
+/// A parsed markdown block, ready to lay out in the preview.
+#[derive(Clone)]
+enum MdBlock {
+    Heading { level: u8, spans: Vec<MdSpan> },
+    Para(Vec<MdSpan>),
+    Quote(Vec<MdSpan>),
+    Item(Vec<MdSpan>),
+    Code(Vec<String>),
+    Table(Vec<String>),
+    Rule,
+}
+
+fn parse_markdown(text: &str) -> Vec<MdBlock> {
+    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let mut blocks = Vec::new();
+    let mut spans: Vec<MdSpan> = Vec::new();
+    let mut bold: i32 = 0;
+    let mut italic: i32 = 0;
+    let mut in_link = false;
+    let mut item_depth = 0;
+    let mut quote_depth = 0;
+    let mut in_code = false;
+    let mut code_lines: Vec<String> = Vec::new();
+    let mut in_table = false;
+    let mut table_rows: Vec<Vec<String>> = Vec::new();
+
+    let push_span = |spans: &mut Vec<MdSpan>, text: &str, style: (bool, bool, bool)| {
+        if text.is_empty() {
+            return;
+        }
+        let md_span = MdSpan {
+            text: text.to_string(),
+            bold: style.0,
+            italic: style.1,
+            code: false,
+            link: style.2,
+        };
+        // merge into the previous run when the style is unchanged
+        if let Some(last) = spans.last_mut()
+            && last.bold == md_span.bold
+            && last.italic == md_span.italic
+            && last.code == md_span.code
+            && last.link == md_span.link
+        {
+            last.text.push_str(text);
+        } else {
+            spans.push(md_span);
+        }
+    };
+
+    for event in Parser::new_ext(text, options) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code = true;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code = false;
+                blocks.push(MdBlock::Code(std::mem::take(&mut code_lines)));
+            }
+            Event::Start(Tag::Table(_)) => in_table = true,
+            Event::End(TagEnd::Table) => {
+                in_table = false;
+                let rows = std::mem::take(&mut table_rows);
+                blocks.push(MdBlock::Table(csv_lines(
+                    &rows.iter().map(|row| row.join(",")).collect::<Vec<_>>(),
+                )));
+            }
+            Event::Start(Tag::TableHead | Tag::TableRow) => table_rows.push(Vec::new()),
+            Event::Start(Tag::TableCell) => {
+                if let Some(row) = table_rows.last_mut() {
+                    row.push(String::new());
+                }
+            }
+            Event::Start(Tag::Paragraph) => {}
+            Event::End(TagEnd::Paragraph) => {
+                if item_depth == 0 && quote_depth == 0 && !in_table {
+                    blocks.push(MdBlock::Para(std::mem::take(&mut spans)));
+                }
+            }
+            Event::Start(Tag::Item) => item_depth += 1,
+            Event::End(TagEnd::Item) => {
+                item_depth -= 1;
+                if item_depth == 0 {
+                    blocks.push(MdBlock::Item(std::mem::take(&mut spans)));
+                }
+            }
+            Event::Start(Tag::BlockQuote(_)) => quote_depth += 1,
+            Event::End(TagEnd::BlockQuote(_)) => {
+                quote_depth -= 1;
+                blocks.push(MdBlock::Quote(std::mem::take(&mut spans)));
+            }
+            Event::Start(Tag::Heading { level, .. }) => {
+                spans.clear();
+                let _ = level;
+            }
+            Event::End(TagEnd::Heading(level)) => {
+                let level = match level {
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
+                };
+                blocks.push(MdBlock::Heading {
+                    level,
+                    spans: std::mem::take(&mut spans),
+                });
+            }
+            Event::Rule => blocks.push(MdBlock::Rule),
+            Event::Text(t) => {
+                if in_code {
+                    for line in t.lines() {
+                        code_lines.push(line.to_string());
+                    }
+                } else if in_table {
+                    if let Some(row) = table_rows.last_mut()
+                        && let Some(cell) = row.last_mut()
+                    {
+                        cell.push_str(&t);
+                    }
+                } else {
+                    push_span(&mut spans, &t, (bold > 0, italic > 0, in_link));
+                }
+            }
+            Event::Code(t) => spans.push(MdSpan {
+                text: t.to_string(),
+                bold: false,
+                italic: false,
+                code: true,
+                link: false,
+            }),
+            Event::SoftBreak | Event::HardBreak => {
+                push_span(&mut spans, " ", (bold > 0, italic > 0, in_link))
+            }
+            Event::TaskListMarker(checked) => push_span(
+                &mut spans,
+                if checked { "[x] " } else { "[ ] " },
+                (bold > 0, italic > 0, in_link),
+            ),
+            Event::Start(Tag::Strong) => bold += 1,
+            Event::End(TagEnd::Strong) => bold = bold.saturating_sub(1),
+            Event::Start(Tag::Emphasis) => italic += 1,
+            Event::End(TagEnd::Emphasis) => italic = italic.saturating_sub(1),
+            Event::Start(Tag::Link { .. }) => in_link = true,
+            Event::End(TagEnd::Link) => in_link = false,
+            _ => {}
+        }
+    }
+    blocks
 }
 
 /// The sidebar cheatsheet's lines: key, what it does.
@@ -4272,5 +4521,57 @@ impl Render for Ghost {
                     .shadow_md()
                     .child(self.name.clone()),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_parses_into_blocks() {
+        let blocks = parse_markdown(
+            "# Title\n\nIntro with **bold** and `code`.\n\n- one\n- two\n\n> quoted\n\n```rust\nlet x = 1;\n```\n",
+        );
+        assert!(matches!(blocks[0], MdBlock::Heading { level: 1, .. }));
+        assert!(matches!(blocks[1], MdBlock::Para(_)));
+        let bolded = &blocks[1];
+        let MdBlock::Para(spans) = bolded else {
+            panic!("expected para");
+        };
+        assert!(spans.iter().any(|s| s.bold));
+        assert!(spans.iter().any(|s| s.code));
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|b| matches!(b, MdBlock::Item(_)))
+                .count(),
+            2
+        );
+        assert!(blocks.iter().any(|b| matches!(b, MdBlock::Quote(_))));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, MdBlock::Code(lines) if lines.len() == 1)));
+    }
+
+    #[test]
+    fn markdown_table_becomes_aligned_lines() {
+        let blocks = parse_markdown("| a | bb |\n|---|----|\n| 1 | 2  |\n");
+        let MdBlock::Table(lines) = &blocks[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("a "));
+    }
+
+    #[test]
+    fn csv_alignment_caps_columns() {
+        let lines = csv_lines(&[
+            "name,role,city".to_string(),
+            "ada,pilot,berlin".to_string(),
+        ]);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "name  role   city");
+        assert_eq!(lines[1], "ada   pilot  berlin");
     }
 }
