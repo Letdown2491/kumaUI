@@ -7,8 +7,10 @@ kumaOS is atomic: **there is no host toolchain**. Always build with:
     ./scripts/build.sh build --release
 
 This runs cargo inside the `localhost/kuma-dev-rust` podman container
-(built on first use from `containers/`) and copies the binary to
-`~/.local/bin/kuma-shell`.
+(built on first use from `containers/`). It installs `kuma-shell` to
+`~/.local/bin/kuma-shell`; when `target/release/kuma-files` exists it
+also installs Koguma: the binary, the menu entry, the app icon, and
+the directory-handler binding (all user-local).
 
 Do not build on the host and do not try to shim a toolchain: there is no
 `cc`, and brew's gcc-16 fails at link time (`rust-lld` cannot find
@@ -39,6 +41,34 @@ volumes, so builds are incremental.
 - Tests run inside the build container (no host toolchain):
 
       ./scripts/build.sh test --release -p kuma-shell
+
+- Koguma (`kuma-files`) runs as a plain user process, no service:
+
+      pkill -x kuma-files; sleep 1; setsid env RUST_LOG=info \
+        ~/.local/bin/kuma-files > /tmp/opencode/koguma.log 2>&1 < /dev/null &
+
+  A bare launch restores tabs from the state file; a directory argument
+  defeats restore. Two instances never fight: the second hands its dir
+  over the activation socket and exits. Menu-launch equivalent: the
+  desktop entry in `~/.local/share/applications/`.
+- Koguma test notes (same container):
+
+      ./scripts/build.sh test --release -p kuma-files
+
+  - TestApp::with_text_system_and_assets(CosmicTextSystem, icons::Assets);
+    `app.run_until_parked()` after open_window; `app.advance_clock(Duration)`
+    passes the 150ms search debounce timer.
+  - `debug_element_bounds(selector)` keys off `.debug_selector(|| ...)`,
+    not `.id()`.
+  - if/else render branches must share one element type: give every branch
+    `.id(...)` (ids nest under the row's `.id(ix)`, staying unique).
+  - `Keystroke::parse(k)` leaves `key_char` None; the rename and compress
+    buffers insert from `key_char`, so printable-key tests must set
+    `keystroke.key_char = Some(...)`.
+  - The notify 8.x watch mask includes OPEN: any readdir of a watched
+    dir's children fires events; the watcher pump drops
+    `EventKind::Access` wholesale (else the walker's own readdir
+    re-triggers the reload, a self-sustaining loop).
 
 - The displayless smoke runs the whole surface lifecycle plus the session
   mirror under a headless sway, in a second container image (niri cannot

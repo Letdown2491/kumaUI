@@ -1,4 +1,4 @@
-# kuma-shell domain glossary
+# kumaUI domain glossary
 
 One line per term. These names are the seams in the code; use them in code, docs, and ADRs.
 
@@ -25,6 +25,17 @@ One line per term. These names are the seams in the code; use them in code, docs
 - **Memory return**: the two seams that keep the Shell's footprint at its working set over weeks: notification icons' atlas tiles drop when their entries leave the history (`notifications.rs::drop_icon`; the `img` element never drops the tile it paints), and a 30 s background `malloc_trim(0)` madvises glibc's freed arena pages back to the OS (`main.rs`, ADR-0011). The memory probe (`scripts/memory-probe.sh`) runs the Shell under scripted load in the test container and reads the per-phase deltas.
 - **Vendored gpui**: the gpui framework, vendored from zed main at a pinned commit (`VENDORED.md`); the crates.io release predates layer-shell.
 - **Greeter**: the login screen (`kuma-greeter` binary, `greeter.rs` protocol, `docs/greeter-deploy.md`): a gpui layer-shell surface launched by greetd through a minimal hosting niri, speaking greetd's framed-JSON IPC; success exits the process so greetd starts the session. Loads the settings fallbacks for wallpaper and theme (the greeter user has no user settings); answers any PAM auth message generically, which is the seam fingerprint auth will ride.
+
+## Koguma (`kuma-files`)
+
+- **Koguma**: the file manager (`kuma-files` binary, issue #25): tabs over Sources, one op queue, and kumaOS integrations that degrade to built-ins when absent (ADR-0013).
+- **Source**: what a Tab browses: a directory (Dir), the freedesktop Trash, or the recently-used list. Same browsing surface, different backing store.
+- **Op queue**: the serialized runner for file operations (copy, move, trash, delete, compress, mkdir); undo rides the inverse operations it records. Boring and auditable on purpose: `std::fs` and the trash crate, no custom fs code.
+- **Activation socket**: the single-instance seam (`$XDG_RUNTIME_DIR/kuma-files.sock`): the first instance listens; later launches write their dir over and exit, so every launch lands in one window.
+- **State file**: `~/.config/kuma-files/state` (key=value), saved on navigation, tab, and theme changes; a bare launch restores tabs, place order, accent, and inspector dock from it.
+- **Places**: the sidebar entries: XDG user dirs, mounted volume roots, and the user's GTK bookmarks (`~/.config/gtk-3.0/bookmarks`), drag-ordered; refreshes on a 2s tick that wakes the renderer only on change.
+- **Filter/search**: type-to-filter over the visible listing (nucleo-scored) plus a debounced background subtree walker whose deep hits append to the listing; caps (depth 6, 4000 walked, 200 kept) and a generation counter drop stale results.
+- **Palette**: the shell's published theme (`$XDG_RUNTIME_DIR/kuma-shell/palette`, plain 6-digit RGB per field), re-read opportunistically on a 2s tick; absent or stale means built-in colors. User accent pins over it.
 
 ## Ethos
 

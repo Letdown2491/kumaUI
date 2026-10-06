@@ -75,3 +75,25 @@ local patches, which should be recorded here.
   answers by killing the client. Found by the greeter rehearsal
   (docs/greeter-deploy.md); the lock screen never met it because the
   session niri is configured with scale 1.
+
+## Behaviors to know (no patch, but they shape app code)
+
+- `WindowOptions.app_id` sets the Wayland app_id on the xdg_toplevel.
+  kumaOS's dock matches windows to desktop entries by app_id, so a
+  gpui app that omits it floats in the dock as an anonymous window
+  (kuma-files sets `kuma-files`).
+- The `svg()` element tints with the surrounding text color and
+  discards the SVG's own colors (that is what makes theme-aware icons
+  cheap). A multicolor icon must ship as a raster image: `img()` with
+  a `RenderImage` renders true colors. Found by the Koguma app icon
+  coming out white-on-green in the launcher and near-black in the
+  dock.
+- The Wayland CSD hook (`window_control_area` / the
+  `on_hit_test_window_control` path) is a stub in this backend: a
+  titlebar's close/maximize buttons must be self-drawn (kuma-files
+  draws its own tab-strip close button and binds Ctrl+Q).
+- `window.open_window` + `TitlebarOptions.title` is all a plain
+  toplevel app needs; drag-out and drop-in ride the same
+  `start_external_drag` / `FileDragPaths` plumbing the shell never
+  touches.
+
