@@ -1951,6 +1951,10 @@ impl Browser {
 
             "left" if keystroke.modifiers.alt => self.go_back(cx),
             "right" if keystroke.modifiers.alt => self.go_forward(cx),
+            "up" if keystroke.modifiers.alt => self.go_up(cx),
+            "left" if keystroke.modifiers.control => self.go_back(cx),
+            "right" if keystroke.modifiers.control => self.go_forward(cx),
+            "up" if keystroke.modifiers.control => self.go_up(cx),
             "down" => {
                 let per_line = self.grid_per_line();
                 if per_line > 1 {
@@ -3888,6 +3892,8 @@ const KEY_HINTS: &[(&str, &str)] = &[
     ("Alt+Enter", "info"),
     ("Right-click", "menu"),
     ("Ctrl+C/X/V/Z", "clipboard"),
+    ("Ctrl+Left/Right", "back/fwd"),
+    ("Ctrl+Up", "up folder"),
     ("Ctrl+H", "hidden"),
     ("Ctrl+1/2", "views"),
     ("Ctrl+=/-/0", "zoom"),
