@@ -88,6 +88,9 @@ fn main() {
             let handle = match cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    // the Wayland app_id: the dock matches it against
+                    // the desktop-file stem for icon and grouping
+                    app_id: Some("kuma-files".into()),
                     titlebar: Some(TitlebarOptions {
                         title: Some(SharedString::from("Koguma")),
                         ..Default::default()

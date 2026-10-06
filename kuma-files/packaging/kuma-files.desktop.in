@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Koguma
+GenericName=File Manager
+Comment=Browse files and folders
+Keywords=files;folders;file manager;kuma;koguma;
+Exec=@HOME@/.local/bin/kuma-files
+Icon=kuma-files
+Terminal=false
+Categories=System;FileTools;
+MimeType=inode/directory;x-scheme-handler/file;
+StartupNotify=true

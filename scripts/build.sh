@@ -28,10 +28,25 @@ podman run --rm \
     cargo "$@"
   ' _ "$@"
 
-# keep the binary niri's `spawn` finds fresh
+# keep the binary niri's `spawn` finds fresh, and install kuma-files
+# for the session: binary, menu entry, icon, directory-handler binding
 if [ "${1:-}" = "build" ]; then
   mkdir -p ~/.local/bin
   # rename(2) over a running binary works where cp fails with Text file busy
   cp target/release/kuma-shell ~/.local/bin/kuma-shell.new
   mv -f ~/.local/bin/kuma-shell.new ~/.local/bin/kuma-shell
+  if [ -f target/release/kuma-files ]; then
+    cp target/release/kuma-files ~/.local/bin/kuma-files.new
+    mv -f ~/.local/bin/kuma-files.new ~/.local/bin/kuma-files
+    mkdir -p ~/.local/share/applications \
+      ~/.local/share/icons/hicolor/scalable/apps
+    sed "s|@HOME@|$HOME|" kuma-files/packaging/kuma-files.desktop.in \
+      > ~/.local/share/applications/kuma-files.desktop
+    cp kuma-files/packaging/kuma-files.svg \
+      ~/.local/share/icons/hicolor/scalable/apps/kuma-files.svg
+    # "Open folder" from other apps lands in Koguma
+    if command -v xdg-mime >/dev/null 2>&1; then
+      xdg-mime default kuma-files.desktop inode/directory
+    fi
+  fi
 fi
