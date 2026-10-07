@@ -10,8 +10,8 @@ use log::error;
 
 use crate::session::SessionState;
 use crate::settings::{
-    BarAlign, BarRadius, CornerRounding, Section, Settings, WidgetConfig, WidgetIconSpec,
-    WidgetKind, WidgetMode,
+    BarAlign, BarPosition, BarRadius, CornerRounding, Section, Settings, WidgetConfig,
+    WidgetIconSpec, WidgetKind, WidgetMode,
 };
 use crate::sysmon::{Playback, RecordingState, SysMon};
 use crate::weather::WeatherState;
@@ -35,7 +35,7 @@ pub struct ShellBar {
     tray: Entity<crate::tray::TrayState>,
     nostr: Entity<crate::nostr::NostrState>,
     weather: Entity<WeatherState>,
-    applied_geometry: Option<(f32, f32, f32, f32, f32)>,
+    applied_geometry: Option<(f32, f32, f32, f32, f32, BarPosition)>,
     clock: String,
     /// Set by the panel host on every panel transition; consumed at the next
     /// render, which snapshots the mouse position into `tooltips_suppressed_at`.
@@ -140,16 +140,27 @@ impl Render for ShellBar {
             BarAlign::Center => ((viewport.width - content_width) / 2.).max(px(0.)),
             BarAlign::Right => (viewport.width - content_width).max(px(0.)),
         };
+        // the surface stacks [offset][strip][tooltip room] for a top
+        // bar and [tooltip room][strip][offset] for a bottom one: the
+        // strip's offset inside the surface flips with the bar (a
+        // bottom bar's tooltips flip above the cursor via gpui's own
+        // bottom-overflow handling)
+        let strip_top = match bar.position {
+            BarPosition::Top => f32::from(bar.offset_top),
+            BarPosition::Bottom => TOOLTIP_ROOM,
+        };
         // content_x rides in the tuple: an align change moves the
         // content without touching height, width, or viewport, and
         // panels must hear about it or they keep centering on the old
-        // alignment forever
+        // alignment forever; position rides too, since it flips the
+        // edge panels hang from
         let geometry = (
             f32::from(bar.height),
             f32::from(bar.offset_top),
             f32::from(content_width),
             f32::from(viewport.width),
             f32::from(content_x),
+            bar.position,
         );
         let changed = match self.applied_geometry {
             None => true,
@@ -159,6 +170,7 @@ impl Render for ShellBar {
                     || (last.2 - geometry.2).abs() > 0.5
                     || (last.3 - geometry.3).abs() > 0.5
                     || (last.4 - geometry.4).abs() > 0.5
+                    || last.5 != geometry.5
             }
         };
         if changed {
@@ -169,13 +181,15 @@ impl Render for ShellBar {
                     viewport.width,
                     px(bar.height + bar.offset_top + TOOLTIP_ROOM),
                 ));
-                // panels center on the bar content's center line and hang
-                // flush under its bottom edge
+                // panels center on the bar content's center line and sit
+                // flush against the bar's inner face, measured from the
+                // edge the bar hangs from
                 cx.global_mut::<crate::panel::PanelHost>()
                     .report_bar_geometry(crate::panel::BarGeometry {
                         content_x: content_x.into(),
                         content_width: content_width.into(),
-                        panel_top: (f32::from(bar.offset_top) + f32::from(bar.height)).into(),
+                        bar_edge: (f32::from(bar.offset_top) + f32::from(bar.height)).into(),
+                        position: bar.position,
                     });
                 // re-anchor any open panel to the fresh geometry: its
                 // drawer positions at render from this value
@@ -184,7 +198,7 @@ impl Render for ShellBar {
             window.set_exclusive_zone(px(bar.height + bar.offset_top));
             if content_width > px(0.) {
                 window.set_input_region(Some(&[Bounds {
-                    origin: point(content_x, px(bar.offset_top)),
+                    origin: point(content_x, px(strip_top)),
                     size: size(content_width, px(bar.height)),
                 }]));
             } else {
@@ -198,7 +212,7 @@ impl Render for ShellBar {
         let content = apply_corner_radii(
             div()
                 .absolute()
-                .top(px(bar.offset_top))
+                .top(px(strip_top))
                 .left(content_x)
                 .w(content_width)
                 .h(px(bar.height))

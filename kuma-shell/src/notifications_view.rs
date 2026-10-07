@@ -243,7 +243,19 @@ impl Render for ToastView {
 /// Toasts hang under the bar's right edge, not centered on the bar content:
 /// they're transient, not drawers. `top` is just under the bar's bottom edge,
 /// read from the panel host at open time.
-pub fn toast_window_options(top: f32) -> WindowOptions {
+pub fn toast_window_options(edge: f32, position: crate::settings::BarPosition) -> WindowOptions {
+    // toasts pin off the bar's inner face at the screen's right; a
+    // bottom bar flips them above the bar
+    let (anchor, margin) = match position {
+        crate::settings::BarPosition::Top => (
+            Anchor::TOP | Anchor::RIGHT,
+            (px(edge), px(8.), px(0.), px(0.)),
+        ),
+        crate::settings::BarPosition::Bottom => (
+            Anchor::BOTTOM | Anchor::RIGHT,
+            (px(0.), px(8.), px(edge), px(0.)),
+        ),
+    };
     WindowOptions {
         titlebar: None,
         window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -256,9 +268,9 @@ pub fn toast_window_options(top: f32) -> WindowOptions {
             namespace: "kuma-shell-toast".into(),
             layer: Layer::Overlay,
             exclusive_zone: Some(px(-1.)),
-            anchor: Anchor::TOP | Anchor::RIGHT,
+            anchor,
             keyboard_interactivity: KeyboardInteractivity::None,
-            margin: Some((px(top), px(8.), px(0.), px(0.))),
+            margin: Some(margin),
             ..Default::default()
         }),
         ..Default::default()

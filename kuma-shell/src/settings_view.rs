@@ -8,7 +8,7 @@ use gpui::{
 use crate::panel::PanelGeometry;
 use crate::panel_kit::{self as kit, ButtonVariant};
 use crate::settings::{
-    BarAlign, BarRadius, BarWidth, Corner, SECTIONS, Section, Settings, WidgetMode,
+    BarAlign, BarPosition, BarRadius, BarWidth, Corner, SECTIONS, Section, Settings, WidgetMode,
 };
 
 const HEIGHTS: [f32; 6] = [24., 28., 32., 36., 40., 48.];
@@ -20,6 +20,7 @@ const WIDTHS: [BarWidth; 4] = [
     BarWidth::Half,
 ];
 const ALIGNS: [BarAlign; 3] = [BarAlign::Left, BarAlign::Center, BarAlign::Right];
+const POSITIONS: [BarPosition; 2] = [BarPosition::Top, BarPosition::Bottom];
 const RADII: [BarRadius; 5] = [
     BarRadius::None,
     BarRadius::Sm,
@@ -876,7 +877,18 @@ impl SettingsView {
                 ),
             ))
             .child(kit::setting_row(
-                "Top offset",
+                "Position",
+                self.segmented(
+                    "position",
+                    &POSITIONS,
+                    bar.position,
+                    |v| v.label().to_string(),
+                    move |settings, value, cx| settings.set_position(value, cx),
+                    cx,
+                ),
+            ))
+            .child(kit::setting_row(
+                "Offset",
                 self.segmented(
                     "offset",
                     &OFFSETS,

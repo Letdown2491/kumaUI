@@ -32,7 +32,7 @@ use crate::lock;
 use crate::session::SessionState;
 use crate::nostr::NostrState;
 use crate::notifications::NotificationState;
-use crate::settings::{BarConfig, Settings};
+use crate::settings::{BarConfig, BarPosition, Settings};
 use crate::sysmon::SysMon;
 use crate::tray::TrayState;
 
@@ -58,6 +58,10 @@ struct SurfaceHost {
     deps: SurfaceDeps,
     wallpaper: Option<AnyWindowHandle>,
     bar: Option<AnyWindowHandle>,
+    /// The position the live bar surface was created for: layer-shell
+    /// anchors are fixed at creation, so a position change is not a
+    /// live change; the observer closes the bar and ensure reopens it.
+    bar_position: Option<BarPosition>,
     /// The last surface-creation failure, kept as its message: a
     /// permanent failure (a compositor without layer-shell support,
     /// say) must log once per distinct error, not once per watch tick.
@@ -70,12 +74,35 @@ impl Global for SurfaceHost {}
 /// shell's first `ensure` does, so startup and every recovery run the
 /// same code.
 pub fn init(deps: SurfaceDeps, cx: &mut App) {
+    let settings = deps.settings.clone();
     cx.set_global(SurfaceHost {
         deps,
         wallpaper: None,
         bar: None,
+        bar_position: None,
         last_error: None,
     });
+    // A bar position change cannot apply by re-render: the surface's
+    // anchors are fixed at creation. Drop the bar so the ensure pass
+    // reopens it at the new edge; every other bar setting applies live.
+    cx.observe(&settings, |settings, cx| {
+        let position = settings.read(cx).bar.position;
+        let bar = {
+            let host = cx.global_mut::<SurfaceHost>();
+            if host.bar_position == Some(position) {
+                return;
+            }
+            host.bar_position = None;
+            host.bar.take()
+        };
+        if let Some(bar) = bar {
+            if let Err(err) = bar.update(cx, |_, window, _| window.remove_window()) {
+                log::error!("closing the bar for its position change failed: {err:#}");
+            }
+        }
+        ensure(cx);
+    })
+    .detach();
 }
 
 /// Recreate whatever persistent surface is missing. A no-op while there
@@ -129,6 +156,7 @@ pub fn ensure(cx: &mut App) {
             Ok(handle) => {
                 let host = cx.global_mut::<SurfaceHost>();
                 host.bar = Some(*handle);
+                host.bar_position = Some(config.position);
                 host.last_error = None;
                 log::info!("surfaces: bar opened");
             }
@@ -200,6 +228,13 @@ fn wallpaper_options() -> WindowOptions {
 }
 
 fn bar_window_options(config: &BarConfig) -> WindowOptions {
+    // the anchors pick the edge the bar hangs from; the offset, the
+    // tooltip room, and the strip's placement inside the surface are
+    // the view's business, so every other geometry setting changes live
+    let anchor = match config.position {
+        BarPosition::Top => Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+        BarPosition::Bottom => Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+    };
     WindowOptions {
         titlebar: None,
         window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -213,7 +248,7 @@ fn bar_window_options(config: &BarConfig) -> WindowOptions {
             layer: Layer::Top,
             // always stretched full-width; width/align/offset are applied by the
             // view's content div so every geometry setting can change live
-            anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+            anchor,
             exclusive_zone: Some(px(config.height + config.offset_top)),
             keyboard_interactivity: KeyboardInteractivity::None,
             ..Default::default()

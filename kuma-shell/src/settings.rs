@@ -259,6 +259,25 @@ impl BarAlign {
     }
 }
 
+/// The screen edge the bar hangs from. Panels, toasts, and the OSD open
+/// off the bar's inner face, so a bottom bar flips them all upward.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BarPosition {
+    #[default]
+    Top,
+    Bottom,
+}
+
+impl BarPosition {
+    pub fn label(self) -> &'static str {
+        match self {
+            BarPosition::Top => "top",
+            BarPosition::Bottom => "bottom",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BarRadius {
@@ -317,6 +336,7 @@ pub struct BarConfig {
     pub offset_top: f32,
     pub width: BarWidth,
     pub align: BarAlign,
+    pub position: BarPosition,
     pub radius: BarRadius,
     pub corners: CornerRounding,
     pub left: Vec<WidgetConfig>,
@@ -331,6 +351,7 @@ impl Default for BarConfig {
             offset_top: 0.0,
             width: BarWidth::default(),
             align: BarAlign::default(),
+            position: BarPosition::default(),
             radius: BarRadius::default(),
             corners: CornerRounding::default(),
             left: Vec::new(),
@@ -1052,6 +1073,11 @@ impl Settings {
 
     pub fn set_align(&mut self, align: BarAlign, cx: &mut Context<Self>) {
         self.bar.align = align;
+        self.commit(cx);
+    }
+
+    pub fn set_position(&mut self, position: BarPosition, cx: &mut Context<Self>) {
+        self.bar.position = position;
         self.commit(cx);
     }
 

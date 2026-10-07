@@ -21,9 +21,11 @@ applied by the content div at render.
 ## Decision
 
 - Panel surfaces stretch along their placement axis. Bar and Widget
-  panels anchor TOP|LEFT|RIGHT; a dock menu stretches along its dock's
-  edge. Only the cross-axis offset (the bar's bottom edge, or the gap to
-  the dock) stays a fixed margin.
+  panels anchor to the edge the bar hangs from (`BarPosition`: a top bar
+  anchors TOP|LEFT|RIGHT, a bottom bar BOTTOM|LEFT|RIGHT, and the drawer
+  opens away from the bar, so a bottom bar's panels open upward); a dock
+  menu stretches along its dock's edge. Only the cross-axis offset (the
+  bar's inner face, or the gap to the dock) stays a fixed margin.
 - The drawer's offset along the stretched axis is computed at render by
   `drawer_axis` (panel.rs) from the live bar geometry and viewport,
   clamped to both screen edges. `chrome` positions the silhouette, the

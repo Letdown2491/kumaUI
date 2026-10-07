@@ -11,26 +11,53 @@ use gpui::{
 };
 
 pub const COVE: f32 = 16.;
-pub const BOTTOM_RADIUS: f32 = 12.;
+pub const CORNER_RADIUS: f32 = 12.;
 
-/// One continuous drawer silhouette: concave coves flaring out to the bar at
-/// the top, straight sides, convex rounded bottom corners.
-pub fn drawer_silhouette(width: f32, height: f32, cove: f32, bottom: f32) -> Arc<[u8]> {
+/// One continuous drawer silhouette: concave coves flaring out toward
+/// the bar on one side, straight sides, convex rounded corners on the
+/// other. `bar_at_top` faces the coves up (a top bar's panels open
+/// downward); a bottom bar faces them down so the drawer opens upward.
+pub fn drawer_silhouette(
+    width: f32,
+    height: f32,
+    cove: f32,
+    radius: f32,
+    bar_at_top: bool,
+) -> Arc<[u8]> {
     let body_left = cove;
     let body_right = width - cove;
-    let body_bottom = height - bottom;
-    let path = format!(
-        "M 0 0 A {c} {c} 0 0 1 {c} {c} L {bl} {bb} A {r} {r} 0 0 0 {bl2} {h} L {br2} {h} A {r} {r} 0 0 0 {br} {bb} L {br} {c} A {c} {c} 0 0 1 {w} 0 Z",
-        c = cove,
-        bl = body_left,
-        bl2 = body_left + bottom,
-        bb = body_bottom,
-        br2 = body_right - bottom,
-        br = body_right,
-        r = bottom,
-        h = height,
-        w = width,
-    );
+    let path = if bar_at_top {
+        let body_bottom = height - radius;
+        format!(
+            "M 0 0 A {c} {c} 0 0 1 {c} {c} L {bl} {bb} A {r} {r} 0 0 0 {bl2} {h} L {br2} {h} A {r} {r} 0 0 0 {br} {bb} L {br} {c} A {c} {c} 0 0 1 {w} 0 Z",
+            c = cove,
+            bl = body_left,
+            bl2 = body_left + radius,
+            bb = body_bottom,
+            br2 = body_right - radius,
+            br = body_right,
+            r = radius,
+            h = height,
+            w = width,
+        )
+    } else {
+        let body_top = radius;
+        // the mirror of the top-hung path: y runs the other way, so
+        // every arc's sweep flag flips too
+        format!(
+            "M 0 {h} A {c} {c} 0 0 0 {c} {c2} L {bl} {r2} A {r} {r} 0 0 1 {bl2} 0 L {br2} 0 A {r} {r} 0 0 1 {br} {r2} L {br} {c2} A {c} {c} 0 0 0 {w} {h} Z",
+            c = cove,
+            c2 = height - cove,
+            bl = body_left,
+            bl2 = body_left + radius,
+            br2 = body_right - radius,
+            br = body_right,
+            r = radius,
+            r2 = body_top,
+            h = height,
+            w = width,
+        )
+    };
     format!(
         r#"<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg"><path d="{path}" fill="currentColor"/></svg>"#,
         w = width,
@@ -154,14 +181,17 @@ impl Element for MeasureHeight {
     }
 }
 
-/// The Bar's live content rect, reported by the bar view into the host.
-/// Panels center on the content's center line and sit flush under its bottom
-/// edge (`panel_top`).
+/// The Bar's live content rect and edge, reported by the bar view into
+/// the host. Panels center on the content's center line and sit flush
+/// against the bar's inner face (`bar_edge`), measured from the edge
+/// the bar hangs from; `position` says which edge that is and which
+/// way the drawer faces.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct BarGeometry {
     pub content_x: f32,
     pub content_width: f32,
-    pub panel_top: f32,
+    pub bar_edge: f32,
+    pub position: crate::settings::BarPosition,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -802,9 +832,13 @@ pub fn chrome(
         height,
         cove,
     } = geometry;
-    let axis = {
+    let (axis, bar_at_top) = {
         let host = cx.global::<PanelHost>();
-        drawer_axis(host.placement, host.bar(), window.viewport_size(), width, height)
+        let bar = host.bar();
+        (
+            drawer_axis(host.placement, bar, window.viewport_size(), width, height),
+            bar.position == crate::settings::BarPosition::Top,
+        )
     };
     let (drawer_left, drawer_top) = match axis {
         DrawerAxis::Horizontal(left) => (left, 0.),
@@ -825,7 +859,7 @@ pub fn chrome(
         })
         .child(
             svg()
-                .data(&drawer_silhouette(width, height, cove, BOTTOM_RADIUS))
+                .data(&drawer_silhouette(width, height, cove, CORNER_RADIUS, bar_at_top))
                 .absolute()
                 .top(px(drawer_top))
                 .left(px(drawer_left))
@@ -858,13 +892,20 @@ pub fn panel_window_options(
     // changes, and the drawer is positioned in-view at render time (see
     // drawer_axis), so resolution, align, and bar width changes
     // re-anchor an open panel instead of stranding it at stale margins.
-    // Only the cross-axis offset (the bar's bottom edge, or the gap to
-    // the dock) is a fixed margin.
+    // Only the cross-axis offset (the bar's inner edge, or the gap to
+    // the dock) is a fixed margin; a bottom bar hangs its panels above
+    // it, opening upward.
     let (anchor, margin) = match placement {
-        PanelPlacement::Bar | PanelPlacement::Widget { .. } => (
-            Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
-            (px(bar.panel_top), px(0.), px(0.), px(0.)),
-        ),
+        PanelPlacement::Bar | PanelPlacement::Widget { .. } => match bar.position {
+            crate::settings::BarPosition::Top => (
+                Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
+                (px(bar.bar_edge), px(0.), px(0.), px(0.)),
+            ),
+            crate::settings::BarPosition::Bottom => (
+                Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+                (px(0.), px(0.), px(bar.bar_edge), px(0.)),
+            ),
+        },
         PanelPlacement::At { dock, offset, .. } => match dock {
             crate::settings::DockPosition::Bottom => (
                 Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
@@ -985,7 +1026,8 @@ mod tests {
             BarGeometry {
                 content_x: 200.,
                 content_width: 600.,
-                panel_top: 40.,
+                bar_edge: 40.,
+                ..Default::default()
             },
             PanelPlacement::Bar,
             KeyboardInteractivity::OnDemand,
@@ -1001,13 +1043,62 @@ mod tests {
     }
 
     #[test]
+    fn bottom_bar_panels_hang_above_the_bar_and_open_upward() {
+        let options = panel_window_options(
+            "test",
+            400.,
+            300.,
+            BarGeometry {
+                content_x: 200.,
+                content_width: 600.,
+                bar_edge: 40.,
+                position: crate::settings::BarPosition::Bottom,
+            },
+            PanelPlacement::Bar,
+            KeyboardInteractivity::OnDemand,
+        );
+        let layer = layer_of(&options);
+        // the surface pins to the bottom edge, margin holds the bar's
+        // inner face away, and the drawer positions at render like any
+        // top-bar panel
+        assert_eq!(
+            layer.anchor,
+            Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT
+        );
+        assert_eq!(margins(layer), (0., 0., 40., 0.));
+    }
+
+    #[test]
+    fn the_silhouette_faces_its_coves_toward_the_bar() {
+        let top = String::from_utf8(
+            drawer_silhouette(200., 100., 16., 12., true)
+                .to_vec(),
+        )
+        .unwrap();
+        let bottom = String::from_utf8(
+            drawer_silhouette(200., 100., 16., 12., false)
+                .to_vec(),
+        )
+        .unwrap();
+        // top bar: concave coves at the top (toward the bar), convex
+        // rounded corners at the bottom
+        assert!(top.contains("M 0 0 A 16 16 0 0 1 16 16"), "{top}");
+        assert!(top.contains("A 12 12 0 0 0 28 100"), "{top}");
+        // bottom bar: mirrored, coves at the bottom, convex corners at
+        // the top
+        assert!(bottom.contains("M 0 100 A 16 16 0 0 0 16 84"), "{bottom}");
+        assert!(bottom.contains("A 12 12 0 0 1 28 0"), "{bottom}");
+    }
+
+    #[test]
     fn panel_centers_on_the_bar_content_center_line() {
         // viewport 1000, content 600 centered → content_x 200; a panel
         // centered on the content's center line is screen-centered.
         let bar = BarGeometry {
             content_x: 200.,
             content_width: 600.,
-            panel_top: 40.,
+            bar_edge: 40.,
+            ..Default::default()
         };
         assert_eq!(
             axis(PanelPlacement::Bar, bar, (1000., 800.), 400., 300.),
@@ -1023,7 +1114,8 @@ mod tests {
         let bar = BarGeometry {
             content_x: 800.,
             content_width: 200.,
-            panel_top: 40.,
+            bar_edge: 40.,
+            ..Default::default()
         };
         assert_eq!(
             axis(PanelPlacement::Bar, bar, (1200., 800.), 400., 300.),
@@ -1036,7 +1128,8 @@ mod tests {
         let bar = BarGeometry {
             content_x: 0.,
             content_width: 200.,
-            panel_top: 0.,
+            bar_edge: 0.,
+            ..Default::default()
         };
         assert_eq!(
             axis(PanelPlacement::Bar, bar, (1000., 800.), 560., 300.),
@@ -1052,7 +1145,8 @@ mod tests {
         let bar = BarGeometry {
             content_x: 800.,
             content_width: 200.,
-            panel_top: 40.,
+            bar_edge: 40.,
+            ..Default::default()
         };
         assert_eq!(
             axis(PanelPlacement::Bar, bar, (1000., 800.), 560., 300.),
@@ -1079,7 +1173,8 @@ mod tests {
         let bar = BarGeometry {
             content_x: 200.,
             content_width: 600.,
-            panel_top: 40.,
+            bar_edge: 40.,
+            ..Default::default()
         };
         // widget at x=500; panel 360 wide centers under it
         assert_eq!(
@@ -1099,7 +1194,8 @@ mod tests {
         let bar = BarGeometry {
             content_x: 0.,
             content_width: 600.,
-            panel_top: 40.,
+            bar_edge: 40.,
+            ..Default::default()
         };
         // anchor near the left edge: clamps to 0
         assert_eq!(

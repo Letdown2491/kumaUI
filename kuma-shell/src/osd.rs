@@ -230,11 +230,16 @@ impl Osd {
                 }
             }
             None => {
-                let top = cx
+                // the card hangs off the bar's inner face, whichever
+                // edge the bar hangs from
+                let (position, edge) = cx
                     .try_global::<PanelHost>()
-                    .map(|host| host.bar().panel_top + 8.)
-                    .unwrap_or(8.);
-                match cx.open_window(osd_window_options(top), |_, cx| {
+                    .map(|host| {
+                        let bar = host.bar();
+                        (bar.position, bar.bar_edge)
+                    })
+                    .unwrap_or((crate::settings::BarPosition::default(), 0.));
+                match cx.open_window(osd_window_options(edge + 8., position), |_, cx| {
                     cx.new(|_| OsdView {
                         content: Some(content.clone()),
                         height: OSD_HEIGHT,
@@ -386,7 +391,14 @@ impl Render for OsdView {
 
 /// Centered under the bar's bottom edge: anchored to the top edge
 /// only, since an unanchored axis centers the surface.
-fn osd_window_options(top: f32) -> WindowOptions {
+fn osd_window_options(edge: f32, position: crate::settings::BarPosition) -> WindowOptions {
+    // the card hangs off the bar's inner face, horizontally centered
+    let (anchor, margin) = match position {
+        crate::settings::BarPosition::Top => (Anchor::TOP, (px(edge), px(0.), px(0.), px(0.))),
+        crate::settings::BarPosition::Bottom => {
+            (Anchor::BOTTOM, (px(0.), px(0.), px(edge), px(0.)))
+        }
+    };
     WindowOptions {
         titlebar: None,
         window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -399,9 +411,9 @@ fn osd_window_options(top: f32) -> WindowOptions {
             namespace: "kuma-shell-osd".into(),
             layer: Layer::Overlay,
             exclusive_zone: Some(px(-1.)),
-            anchor: Anchor::TOP,
+            anchor,
             keyboard_interactivity: KeyboardInteractivity::None,
-            margin: Some((px(top), px(0.), px(0.), px(0.))),
+            margin: Some(margin),
             ..Default::default()
         }),
         ..Default::default()

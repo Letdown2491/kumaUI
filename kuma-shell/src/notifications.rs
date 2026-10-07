@@ -442,13 +442,17 @@ impl NotificationState {
         };
         let duration = toast_duration(notification.expire_timeout);
         let state = cx.entity();
-        // toasts hang just under the bar's bottom edge
-        let top = cx
+        // toasts hang just off the bar's inner face, whichever edge
+        // the bar hangs from
+        let (position, edge) = cx
             .try_global::<crate::panel::PanelHost>()
-            .map(|host| host.bar().panel_top + 8.)
-            .unwrap_or(8.);
+            .map(|host| {
+                let bar = host.bar();
+                (bar.position, bar.bar_edge)
+            })
+            .unwrap_or((crate::settings::BarPosition::default(), 0.));
         match cx.open_window(
-            crate::notifications_view::toast_window_options(top),
+            crate::notifications_view::toast_window_options(edge + 8., position),
             |_, cx| {
                 cx.new(|cx| {
                     let view = crate::notifications_view::ToastView {
