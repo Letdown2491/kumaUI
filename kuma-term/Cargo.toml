@@ -1,0 +1,15 @@
+[package]
+name = "kuma-term"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal emulator spike: alacritty_terminal behind an engine seam, gpui renderer"
+license = "MIT"
+repository = "https://github.com/Letdown2491/kumaUI"
+
+[dependencies]
+gpui = { workspace = true }
+gpui_platform = { workspace = true }
+alacritty_terminal = "0.26"
+log = "0.4"
+env_logger = "0.11"
+futures = "0.3"
