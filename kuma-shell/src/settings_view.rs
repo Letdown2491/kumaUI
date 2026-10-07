@@ -2797,6 +2797,7 @@ impl Render for SettingsView {
         crate::panel::chrome(
             self.geometry,
             window,
+            cx,
             div()
                 .id("settings-panel")
                 .size_full()

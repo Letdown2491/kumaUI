@@ -377,7 +377,6 @@ impl Render for SliderPanelView {
 
         // measured-panel flow: the content height refines the panel height
         let view = cx.weak_entity();
-        let width = self.geometry.width;
         let measured = crate::panel::MeasureHeight::new(content, move |height, window, cx| {
             let Some(view) = view.upgrade() else {
                 return;
@@ -391,10 +390,10 @@ impl Render for SliderPanelView {
                 }
             });
             if let Some(height) = resized {
-                window.resize(size(px(width), px(height)));
+                window.resize(size(window.viewport_size().width, px(height)));
             }
         });
 
-        crate::panel::chrome(self.geometry, window, measured)
+        crate::panel::chrome(self.geometry, window, cx, measured)
     }
 }

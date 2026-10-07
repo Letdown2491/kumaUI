@@ -104,7 +104,6 @@ impl Render for CalendarView {
         // report the laid-out content height back into this view's geometry
         // and resize the surface; converges when the delta is sub-pixel
         let view = cx.weak_entity();
-        let width = self.geometry.width;
         let measured = crate::panel::MeasureHeight::new(content, move |height, window, cx| {
             let Some(view) = view.upgrade() else {
                 return;
@@ -118,11 +117,11 @@ impl Render for CalendarView {
                 }
             });
             if let Some(height) = resized {
-                window.resize(size(px(width), px(height)));
+                window.resize(size(window.viewport_size().width, px(height)));
             }
         });
 
-        crate::panel::chrome(self.geometry, window, measured)
+        crate::panel::chrome(self.geometry, window, cx, measured)
     }
 }
 

@@ -229,7 +229,7 @@ impl Render for ToastView {
                     }
                 });
                 if let Some(height) = resized {
-                    window.resize(size(px(width), px(height)));
+                    window.resize(size(window.viewport_size().width, px(height)));
                 }
             });
 
@@ -352,7 +352,7 @@ impl Render for NotificationsView {
             ))
             .child(list);
 
-        crate::panel::chrome(self.geometry, window, content)
+        crate::panel::chrome(self.geometry, window, cx, content)
     }
 }
 

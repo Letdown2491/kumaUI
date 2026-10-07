@@ -414,16 +414,18 @@ impl Render for LauncherView {
         let filtered = self.filtered();
         let query = self.query.clone();
         let selected = self.selected;
+        let key_handler = cx.listener(Self::handle_key);
         crate::panel::chrome(
             self.geometry,
             window,
+            cx,
             div()
                 .id("launcher")
                 .size_full()
                 .flex()
                 .flex_col()
                 .track_focus(&self.focus_handle)
-                .on_key_down(cx.listener(Self::handle_key))
+                .on_key_down(key_handler)
                 .px(px(12.))
                 .pb(px(12.))
                 .pt(px(10.))

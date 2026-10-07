@@ -80,6 +80,6 @@ impl Render for PowerProfileView {
             .child(kit::pane_header("Power profile"))
             .child(rows);
 
-        crate::panel::chrome(self.geometry, window, content)
+        crate::panel::chrome(self.geometry, window, cx, content)
     }
 }

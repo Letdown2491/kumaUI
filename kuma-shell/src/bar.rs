@@ -35,7 +35,7 @@ pub struct ShellBar {
     tray: Entity<crate::tray::TrayState>,
     nostr: Entity<crate::nostr::NostrState>,
     weather: Entity<WeatherState>,
-    applied_geometry: Option<(f32, f32, f32, f32)>,
+    applied_geometry: Option<(f32, f32, f32, f32, f32)>,
     clock: String,
     /// Set by the panel host on every panel transition; consumed at the next
     /// render, which snapshots the mouse position into `tooltips_suppressed_at`.
@@ -140,11 +140,16 @@ impl Render for ShellBar {
             BarAlign::Center => ((viewport.width - content_width) / 2.).max(px(0.)),
             BarAlign::Right => (viewport.width - content_width).max(px(0.)),
         };
+        // content_x rides in the tuple: an align change moves the
+        // content without touching height, width, or viewport, and
+        // panels must hear about it or they keep centering on the old
+        // alignment forever
         let geometry = (
             f32::from(bar.height),
             f32::from(bar.offset_top),
             f32::from(content_width),
             f32::from(viewport.width),
+            f32::from(content_x),
         );
         let changed = match self.applied_geometry {
             None => true,
@@ -153,6 +158,7 @@ impl Render for ShellBar {
                     || (last.1 - geometry.1).abs() > 0.5
                     || (last.2 - geometry.2).abs() > 0.5
                     || (last.3 - geometry.3).abs() > 0.5
+                    || (last.4 - geometry.4).abs() > 0.5
             }
         };
         if changed {
@@ -171,6 +177,9 @@ impl Render for ShellBar {
                         content_width: content_width.into(),
                         panel_top: (f32::from(bar.offset_top) + f32::from(bar.height)).into(),
                     });
+                // re-anchor any open panel to the fresh geometry: its
+                // drawer positions at render from this value
+                crate::panel::refresh_open_panels(cx);
             }
             window.set_exclusive_zone(px(bar.height + bar.offset_top));
             if content_width > px(0.) {

@@ -447,7 +447,7 @@ impl Render for NostrSignerView {
             .child(rail)
             .child(pane);
 
-        crate::panel::chrome(self.geometry, window, content)
+        crate::panel::chrome(self.geometry, window, cx, content)
     }
 }
 
