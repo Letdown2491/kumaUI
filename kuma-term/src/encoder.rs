@@ -164,7 +164,6 @@ fn ctrl_byte(key: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::Modifiers;
 
     fn ks(s: &str) -> Keystroke {
         Keystroke::parse(s).unwrap()

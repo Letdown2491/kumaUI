@@ -16,10 +16,12 @@ use gpui::{
 use log::warn;
 
 use crate::encoder;
-use crate::palette::{self, Rgb8};
+use crate::font;
+use crate::glyphs;
+use crate::palette::Rgb8;
 use crate::term::{Engine, Row, UiEvent};
+use crate::theme::Theme;
 
-const FONT_SIZE: f32 = 14.0;
 const PADDING: f32 = 8.0;
 
 fn hsla_of(c: Rgb8) -> gpui::Hsla {
@@ -29,6 +31,7 @@ fn hsla_of(c: Rgb8) -> gpui::Hsla {
 
 pub struct TerminalView {
     engine: Engine,
+    theme: Theme,
     focus: FocusHandle,
     font: gpui::Font,
     cell_w: f32,
@@ -42,8 +45,15 @@ pub struct TerminalView {
 
 impl TerminalView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let font = gpui::Font { family: "monospace".into(), ..Default::default() };
-        let (cell_w, cell_h) = cell_metrics(&font, window.text_system());
+        let theme = Theme::load();
+        let family = font::pick_family(theme.font_family.as_deref(), window.text_system());
+        let font = gpui::Font {
+            family: family.into(),
+            fallbacks: Some(theme.font_fallbacks()),
+            ..Default::default()
+        };
+        let font_size = px(theme.font_size_px());
+        let (cell_w, cell_h) = cell_metrics(&font, font_size, window.text_system());
 
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -56,7 +66,7 @@ impl TerminalView {
             cell_height: cell_h as u16,
         };
         let (tx, rx) = futures::channel::mpsc::unbounded::<UiEvent>();
-        let engine = match Engine::new(window_size, tx) {
+        let engine = match Engine::new(window_size, theme.clone(), tx) {
             Ok(engine) => engine,
             Err(err) => {
                 // without a shell there is no terminal
@@ -78,6 +88,7 @@ impl TerminalView {
 
         Self {
             engine,
+            theme,
             focus,
             font,
             cell_w,
@@ -219,18 +230,35 @@ impl Render for TerminalView {
         }
 
         let snapshot = self.engine.snapshot();
-        let default_bg = palette::default_bg();
-        let font_size = px(FONT_SIZE);
+        let default_bg = self.theme.background;
+        let font_size = px(self.theme.font_size_px());
 
         let mut row_elements = Vec::with_capacity(snapshot.rows.len());
+        let (cw, chh) = (self.cell_w, self.cell_h);
         for (ix, row) in snapshot.rows.iter().enumerate() {
             let on_cursor_row = matches!(snapshot.cursor, Some(c) if c.row == ix);
-            let (text, runs) = build_line(row, &self.font, font_size, on_cursor_row);
+            let (text, runs, glyphs) = build_line(row, &self.font, font_size, on_cursor_row, &self.theme);
+            // vector glyphs paint as absolutely positioned quads over the
+            // row text, one div per rect; ordering is children order, so
+            // they land above the runs' backgrounds
+            let overlays = glyphs.into_iter().flat_map(move |g| {
+                glyphs::cell_rects(g.ch, cw, chh).into_iter().map(move |(x, y, w, h)| {
+                    div()
+                        .absolute()
+                        .left(px(g.col as f32 * cw + x))
+                        .top(px(y))
+                        .w(px(w))
+                        .h(px(h))
+                        .bg(hsla_of(g.fg))
+                })
+            });
             row_elements.push(
                 div()
+                    .relative()
                     .h(px(self.cell_h))
                     .overflow_hidden()
-                    .child(StyledText::new(text).with_runs(runs)),
+                    .child(StyledText::new(text).with_runs(runs))
+                    .children(overlays),
             );
         }
 
@@ -240,6 +268,10 @@ impl Render for TerminalView {
             .size_full()
             .p(px(PADDING))
             .bg(hsla_of(default_bg))
+            // the grid is measured in theme cells; every StyledText row
+            // inherits this, so it must match cell_metrics
+            .text_size(font_size)
+            .font_family(self.font.family.clone())
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
@@ -257,7 +289,7 @@ impl Render for TerminalView {
                         .right_0()
                         .w(px(3.0))
                         .h_full()
-                        .bg(hsla_of(palette::default_fg().scale(0.4))),
+                        .bg(hsla_of(self.theme.foreground.scale(0.4))),
                 )
             })
     }
@@ -265,11 +297,14 @@ impl Render for TerminalView {
 
 /// Measure the monospace cell from the real font: the shaped advance of `M`
 /// for the width, its ascent plus descent for the height.
-fn cell_metrics(font: &gpui::Font, text_system: &WindowTextSystem) -> (f32, f32) {
-    let size = px(FONT_SIZE);
+fn cell_metrics(
+    font: &gpui::Font,
+    font_size: Pixels,
+    text_system: &WindowTextSystem,
+) -> (f32, f32) {
     let layout = text_system.layout_line(
         "M",
-        size,
+        font_size,
         &[TextRun {
             len: 1,
             font: font.clone(),
@@ -283,10 +318,11 @@ fn cell_metrics(font: &gpui::Font, text_system: &WindowTextSystem) -> (f32, f32)
     let advance = layout.width.as_f32();
     let height = layout.ascent.as_f32() + layout.descent.as_f32();
     if advance > 0.0 && height > 0.0 {
+        log::info!("cell metrics: {advance:.2} x {height:.2}px at {}px", font_size.as_f32());
         (advance, height)
     } else {
         warn!("font metrics came back empty; using a generic cell size");
-        (8.0, FONT_SIZE * 1.35)
+        (8.0, font_size.as_f32() * 1.35)
     }
 }
 
@@ -296,13 +332,22 @@ fn cell_metrics(font: &gpui::Font, text_system: &WindowTextSystem) -> (f32, f32)
 /// dropped, spacer cells are skipped, and adjacent same-style cells merge
 /// into one run. The cursor row is marked by the caller so its restyled cell
 /// keeps its painted background.
+/// A cell the vector layer draws: grid column, the glyph, its color.
+#[derive(Clone, Copy)]
+struct CellGlyph {
+    col: usize,
+    ch: char,
+    fg: Rgb8,
+}
+
 fn build_line(
     row: &Row,
     font: &gpui::Font,
     font_size: Pixels,
     on_cursor_row: bool,
-) -> (String, Vec<TextRun>) {
-    let default_bg = palette::default_bg();
+    theme: &Theme,
+) -> (String, Vec<TextRun>, Vec<CellGlyph>) {
+    let default_bg = theme.background;
     let _ = (font_size, on_cursor_row);
 
     // last cell worth drawing
@@ -321,21 +366,50 @@ fn build_line(
         }
     }
 
+    // grid column of every cell: a wide char leader counts two, its spacer
+    // counts zero; everything else counts one
+    let mut col_of = Vec::with_capacity(row.cells.len());
+    let mut col = 0usize;
+    for i in 0..row.cells.len() {
+        col_of.push(col);
+        let width = if row.cells[i].spacer {
+            0
+        } else if i + 1 < row.cells.len() && row.cells[i + 1].spacer {
+            2
+        } else {
+            1
+        };
+        col += width;
+    }
+
     let mut text = String::new();
     let mut runs: Vec<TextRun> = Vec::new();
+    let mut glyphs: Vec<CellGlyph> = Vec::new();
     // (bold, italic, underline, strikeout, fg, bg) of the run being built
     let mut current: Option<(bool, bool, bool, bool, Rgb8, Rgb8)> = None;
 
-    for cell in &row.cells[..end] {
+    for i in 0..end {
+        let cell = &row.cells[i];
         if cell.spacer {
             continue;
         }
-        text.push(cell.c);
+
+        // box drawing, block elements, braille: drawn as vector quads on
+        // top of the row; the text slot becomes a blank that still wears
+        // the cell's background
+        let drawn = if glyphs::is_vector_glyph(cell.c) && cell.fg != cell.bg {
+            glyphs.push(CellGlyph { col: col_of[i], ch: cell.c, fg: cell.fg });
+            ' '
+        } else {
+            cell.c
+        };
+        text.push(drawn);
 
         let key = (cell.bold, cell.italic, cell.underline, cell.strikeout, cell.fg, cell.bg);
+        let len_in_text = drawn.len_utf8();
         match &mut current {
             Some(prev) if *prev == key => {
-                runs.last_mut().unwrap().len += cell.c.len_utf8();
+                runs.last_mut().unwrap().len += len_in_text;
             }
             _ => {
                 current = Some(key);
@@ -353,7 +427,7 @@ fn build_line(
                     ..font.clone()
                 };
                 runs.push(TextRun {
-                    len: cell.c.len_utf8(),
+                    len: len_in_text,
                     font: cell_font,
                     color: fg,
                     background_color,
@@ -370,26 +444,32 @@ fn build_line(
         runs.push(TextRun {
             len: 1,
             font: font.clone(),
-            color: hsla_of(palette::default_fg()),
+            color: hsla_of(theme.foreground),
             background_color: None,
             underline: None,
             strikethrough: None,
         });
     }
 
-    (text, runs)
+    (text, runs, glyphs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::term::RenderCell;
+    use crate::theme::Theme;
+
+    fn theme() -> Theme {
+        Theme::builtin()
+    }
 
     fn cell(c: char) -> RenderCell {
+        let t = theme();
         RenderCell {
             c,
-            fg: palette::default_fg(),
-            bg: palette::default_bg(),
+            fg: t.foreground,
+            bg: t.background,
             bold: false,
             italic: false,
             underline: false,
@@ -408,7 +488,8 @@ mod tests {
         row.cells.push(cell(' '));
         row.cells.push(cell(' '));
         let font = font();
-        let (text, runs) = build_line(&row, &font, px(14.0), false);
+        let t = theme();
+        let (text, runs, _) = build_line(&row, &font, px(14.0), false, &t);
         assert_eq!(text, "hi");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].len, 2);
@@ -421,7 +502,8 @@ mod tests {
         let green = cell('g');
         let row = Row { cells: vec![red, green] };
         let font = font();
-        let (text, runs) = build_line(&row, &font, px(14.0), false);
+        let t = theme();
+        let (text, runs, _) = build_line(&row, &font, px(14.0), false, &t);
         assert_eq!(text, "rg");
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].len, 1);
@@ -434,7 +516,8 @@ mod tests {
         marked.bg = Rgb8(40, 40, 40);
         let row = Row { cells: vec![cell('a'), cell(' '), marked] };
         let font = font();
-        let (text, runs) = build_line(&row, &font, px(14.0), false);
+        let t = theme();
+        let (text, runs, _) = build_line(&row, &font, px(14.0), false, &t);
         // the marked background cell is not trailing-default, so it stays
         assert_eq!(text, "a  ");
         assert_eq!(runs.len(), 2);
@@ -445,8 +528,51 @@ mod tests {
     fn empty_rows_collapse_to_a_placeholder_space() {
         let row = Row { cells: vec![] };
         let font = font();
-        let (text, runs) = build_line(&row, &font, px(14.0), false);
+        let t = theme();
+        let (text, runs, _) = build_line(&row, &font, px(14.0), false, &t);
         assert_eq!(text, " ");
         assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn box_drawing_becomes_a_blank_plus_an_overlay() {
+        let row = Row { cells: vec![cell('\u{2500}'), cell('x')] };
+        let font = font();
+        let t = theme();
+        let (text, runs, glyphs) = build_line(&row, &font, px(14.0), false, &t);
+        // the box cell is a space in the text (background intact), the
+        // glyph rides in the overlay list at grid column 0
+        assert_eq!(text, " x");
+        assert_eq!(glyphs.len(), 1);
+        assert_eq!(glyphs[0].col, 0);
+        assert_eq!(glyphs[0].ch, '\u{2500}');
+        assert_eq!(runs[0].len, 2);
+    }
+
+    #[test]
+    fn overlay_columns_survive_wide_chars() {
+        let mut spacer = cell(' ');
+        spacer.spacer = true;
+        let row = Row { cells: vec![cell('a'), cell('漢'), spacer, cell('\u{2588}')] };
+        let font = font();
+        let t = theme();
+        let (_, _, glyphs) = build_line(&row, &font, px(14.0), false, &t);
+        // the wide pair eats columns 1 and 2, so the block lands at 3
+        assert_eq!(glyphs.len(), 1);
+        assert_eq!(glyphs[0].col, 3);
+    }
+
+    #[test]
+    fn invisible_vector_glyphs_stay_on_text() {
+        // fg == bg: the overlay would paint nothing visible, leave the
+        // char to the shaper
+        let mut hidden = cell('\u{2500}');
+        hidden.fg = hidden.bg;
+        let row = Row { cells: vec![hidden] };
+        let font = font();
+        let t = theme();
+        let (text, _, glyphs) = build_line(&row, &font, px(14.0), false, &t);
+        assert_eq!(text, "\u{2500}");
+        assert!(glyphs.is_empty());
     }
 }

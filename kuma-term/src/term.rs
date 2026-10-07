@@ -18,9 +18,10 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::{CursorShape, NamedColor, Rgb};
+use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 
 use crate::palette::{self, Rgb8};
+use crate::theme::Theme;
 use futures::channel::mpsc::UnboundedSender;
 
 /// Events the engine forwards to the UI thread. Alacritty's own event type
@@ -160,17 +161,26 @@ pub struct Engine {
     notifier: Notifier,
     loop_tx: alacritty_terminal::event_loop::EventLoopSender,
     window_size: WindowSize,
+    theme: Theme,
 }
 
 impl Engine {
     /// Spawn the shell, wire the PTY reader thread. `window_size` carries
     /// the initial cell geometry (measured from the real font by the view).
-    pub fn new(window_size: WindowSize, tx: UnboundedSender<UiEvent>) -> io::Result<Self> {
+    pub fn new(window_size: WindowSize, theme: Theme, tx: UnboundedSender<UiEvent>) -> io::Result<Self> {
         // TERM and COLORTERM for the child; alacritty's own helper picks
         // alacritty terminfo when installed, xterm-256color otherwise
         tty::setup_env();
 
-        let options = tty::Options::default();
+        // spike hook: KUMA_TERM_COMMAND replaces the login shell, so the
+        // headless smoke and visual tests can drive exact content
+        let options = match std::env::var("KUMA_TERM_COMMAND") {
+            Ok(command) => tty::Options {
+                shell: Some(tty::Shell::new("/bin/sh".to_string(), vec!["-c".to_string(), command])),
+                ..Default::default()
+            },
+            Err(_) => tty::Options::default(),
+        };
         let pty = tty::new(&options, window_size, 0)?;
 
         let proxy = UiProxy { tx };
@@ -187,7 +197,7 @@ impl Engine {
         let loop_tx = event_loop.channel();
         event_loop.spawn();
 
-        Ok(Self { term, notifier: Notifier(loop_tx.clone()), loop_tx, window_size })
+        Ok(Self { term, notifier: Notifier(loop_tx.clone()), loop_tx, window_size, theme })
     }
 
     /// Write bytes to the PTY (user input, query replies).
@@ -231,7 +241,7 @@ impl Engine {
     /// Resolve a raw palette index (0..269) for OSC 4 replies.
     pub fn resolve_index(&self, index: usize) -> Rgb8 {
         let term = self.term.lock();
-        palette::resolve_index(index, term.colors())
+        palette::resolve_index(index, term.colors(), &self.theme)
     }
 
     /// The shell's current input mode flags the encoder needs.
@@ -265,8 +275,8 @@ impl Engine {
             if flags.contains(Flags::WIDE_CHAR_SPACER) {
                 row.cells.push(RenderCell {
                     c: ' ',
-                    fg: palette::default_fg(),
-                    bg: palette::default_bg(),
+                    fg: self.theme.foreground,
+                    bg: self.theme.background,
                     bold: false,
                     italic: false,
                     underline: false,
@@ -276,8 +286,8 @@ impl Engine {
                 continue;
             }
 
-            let mut fg = palette::resolve(cell.fg, content.colors);
-            let mut bg = palette::resolve(cell.bg, content.colors);
+            let mut fg = palette::resolve(cell.fg, content.colors, &self.theme);
+            let mut bg = palette::resolve(cell.bg, content.colors, &self.theme);
             if flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
@@ -308,13 +318,10 @@ impl Engine {
             let col = point.column.0;
             if line < screen_lines && col < columns {
                 let cell = &mut rows[line].cells[col];
-                // foreground becomes the cursor color, background keeps
-                // what the cell's foreground was: the classic inverted block
-                let cursor_color = term.colors()[NamedColor::Cursor]
-                    .map(|c| palette::Rgb8(c.r, c.g, c.b))
-                    .unwrap_or_else(palette::default_fg);
-                cell.bg = cursor_color;
-                std::mem::swap(&mut cell.fg, &mut cell.bg);
+                // the block: cursor color behind, the theme's cursor text
+                // color for the glyph, regardless of what the cell wore
+                cell.bg = self.theme.cursor;
+                cell.fg = self.theme.cursor_text;
                 cursor = Some(CursorSpot { row: line, col });
             }
         }
@@ -400,7 +407,8 @@ mod tests {
         let content = term.renderable_content();
         for indexed in content.display_iter {
             if indexed.cell.c == 'X' {
-                let fg = palette::resolve(indexed.cell.fg, content.colors);
+                let theme = crate::theme::Theme::builtin();
+                let fg = palette::resolve(indexed.cell.fg, content.colors, &theme);
                 assert_eq!(fg, palette::Rgb8(255, 0, 0));
                 return;
             }

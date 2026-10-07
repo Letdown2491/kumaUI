@@ -5,4 +5,7 @@
 # a TTY seat), so sway stands in for the compositor; where the two differ
 # the script says so inline.
 FROM localhost/kuma-dev-rust
-RUN dnf -y install sway dbus-daemon jq wayland-utils mesa-libEGL mesa-vulkan-drivers vulkan-loader foot dejavu-sans-fonts && dnf clean all
+RUN dnf -y install sway dbus-daemon jq wayland-utils mesa-libEGL mesa-vulkan-drivers vulkan-loader foot dejavu-sans-fonts \
+    grim \
+    google-noto-sans-mono-vf-fonts adwaita-mono-fonts liberation-mono-fonts dejavu-sans-mono-fonts \
+  && dnf clean all

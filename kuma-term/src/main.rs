@@ -2,8 +2,11 @@
 //! rendered by gpui. One window, one shell, no tabs, no config yet.
 
 mod encoder;
+mod font;
+mod glyphs;
 mod palette;
 mod term;
+mod theme;
 mod view;
 
 use std::io::Write as _;
