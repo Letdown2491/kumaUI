@@ -36,6 +36,8 @@ the page is its only client):
   pinned: changing scale writes `scale 1.25` and nothing else. Unset fields
   follow niri's defaults, which is what keeps image defaults flowing. Picking
   Auto removes the field's line; a block that shrinks to nothing disappears.
+  A hard apply error persists nothing: the store records only pins niri
+  accepted or reported missing.
 - **The store is rewritten whole, never appended or patched in place.** Read,
   update the one output's block, write to a temp file, rename. A second block
   for one output is a parse error in niri, so append-style writing would

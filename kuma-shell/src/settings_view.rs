@@ -1235,7 +1235,9 @@ impl SettingsView {
     /// Apply one display setting live, then persist the delta. The
     /// live apply is what the eyes see; the store write is what a
     /// reboot reads. Parse failures pause persistence only: the file
-    /// is never rewritten over content the shell cannot parse.
+    /// is never rewritten over content the shell cannot parse. A
+    /// failed apply persists nothing: the store records only pins
+    /// niri accepted or reported missing.
     fn apply_display_pin(
         &mut self,
         output: String,
@@ -1244,17 +1246,27 @@ impl SettingsView {
     ) {
         self.displays_note = None;
         match crate::displays::apply(&output, &pin) {
-            Ok(crate::displays::Applied::OutputMissing) => {
-                self.displays_note = Some(format!(
-                    "{output} is not connected right now; the setting will apply when it is plugged in"
-                ));
+            // the live apply failed: nothing changed, so the store
+            // keeps its old pins; persisting here would queue a
+            // change the user never saw
+            Err(err) => {
+                self.displays_error =
+                    Some(format!("the change did not apply: {err:#}"));
             }
-            Ok(crate::displays::Applied::Yes) => {}
-            Err(err) => self.displays_error = Some(format!("{err:#}")),
-        }
-        match crate::displays::persist(&output, &pin) {
-            Ok(()) => self.store_error = None,
-            Err(err) => self.store_error = Some(format!("{err:#}")),
+            Ok(applied) => {
+                match applied {
+                    crate::displays::Applied::OutputMissing => {
+                        self.displays_note = Some(format!(
+                            "{output} is not connected right now; the setting will apply when it is plugged in"
+                        ));
+                    }
+                    crate::displays::Applied::Yes => {}
+                }
+                match crate::displays::persist(&output, &pin) {
+                    Ok(()) => self.store_error = None,
+                    Err(err) => self.store_error = Some(format!("{err:#}")),
+                }
+            }
         }
         self.probe_soon(cx);
         cx.notify();
