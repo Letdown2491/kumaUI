@@ -410,6 +410,18 @@ impl LauncherView {
         let rows = self.rows();
         let key = event.keystroke.key.as_str();
         match key {
+            "escape" => {
+                // a live filter clears first (kuma-files' convention);
+                // only an idle query lets Esc bubble to chrome, which
+                // closes the panel
+                if !self.query.is_empty() {
+                    self.query.clear();
+                    self.selected = 0;
+                    self.results_scroll.set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }
             "enter" => {
                 if let Some(&(app_index, _)) = rows.get(self.selected) {
                     self.launch_at(app_index, cx);
@@ -501,6 +513,12 @@ impl Render for LauncherView {
             .collect();
         let query = self.query.clone();
         let key_handler = cx.listener(Self::handle_key);
+        let clear = cx.listener(move |this, _, _, cx| {
+            this.query.clear();
+            this.selected = 0;
+            this.results_scroll.set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        });
         crate::panel::chrome(
             self.geometry,
             window,
@@ -521,43 +539,56 @@ impl Render for LauncherView {
                         header.child(kit::count_badge(rows_count))
                     }),
                 )
-                .child(
-                    div()
-                        .id("search")
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(crate::theme::current().inset))
-                        .border_1()
-                        .border_color(rgb(crate::theme::current().divider))
-                        .child(
-                            gpui::svg()
-                                .path("icons/search.svg")
-                                .size(px(13.))
-                                .text_color(rgb(crate::theme::current().text_dim)),
-                        )
-                        .child(if query.is_empty() {
-                            div()
-                                .text_size(px(14.))
-                                .text_color(rgb(crate::theme::current().text_dim))
-                                .child("Search apps…")
-                        } else {
-                            div()
-                                .text_size(px(14.))
-                                .text_color(rgb(crate::theme::current().text))
-                                .child(query.clone())
-                        }),
-                )
+                // the kuma-files filter banner: no field at rest, typing
+                // filters straight away (this panel holds the keyboard),
+                // and the banner only explains a live filter
+                .when(!query.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(crate::theme::current().text_dim))
+                                    .child("Search"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(crate::theme::current().text))
+                                    .child(query.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(crate::theme::current().text_dim))
+                                    .child(format!("· {rows_count} apps")),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(crate::theme::current().text_dim))
+                                    .child("Esc clears"),
+                            )
+                            .child(kit::icon_button(
+                                "launcher-clear",
+                                "icons/x.svg",
+                                kit::ButtonVariant::Ghost,
+                                clear,
+                            )),
+                    )
+                })
                 .child(
                     div()
                         .id("results")
                         .flex_1()
                         .flex()
                         .flex_col()
-                        .gap_0p5()
+                        .gap_1()
                         .overflow_y_scroll()
                         .track_scroll(&self.results_scroll)
                         .when(rows_count == 0, |el| {
@@ -608,14 +639,15 @@ fn app_row(
         .flex()
         .items_center()
         .gap_2()
-        .px_2()
-        .py_1p5()
-        .rounded_md()
-        .cursor_pointer()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        // the wifi row's fills: inset at rest, surface when selected,
+        // hover brightens; no naked rows on the drawer
         .bg(rgb(if is_selected {
             crate::theme::current().surface
         } else {
-            0x00000000
+            crate::theme::current().inset
         }))
         .on_mouse_move(on_hover)
         .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
@@ -624,29 +656,38 @@ fn app_row(
         })
         .hover(|style| style.bg(rgb(crate::theme::current().surface_hover)))
         .child(
-            // the tile never fills the accent: the family's selection
-            // is a surface + weight shift, not a color flood
+            // the glyph sits directly on the row (no tile), like wifi's
+            // signal glyph, tinting accent when the row is selected
             div()
-                .size(px(26.))
-                .rounded_md()
-                .bg(rgb(crate::theme::current().inset))
+                .w(px(24.))
                 .flex()
-                .items_center()
                 .justify_center()
                 .overflow_hidden()
                 .when_some(icon.clone(), |el, icon| match icon {
                     IconImage::Raster(raster) => el.child(
                         img(gpui::ImageSource::Render(raster))
                             .object_fit(ObjectFit::Cover)
-                            .size_full(),
+                            .w(px(22.))
+                            .h(px(22.)),
                     ),
-                    IconImage::Svg(bytes) => {
-                        el.child(gpui::svg().data(&bytes).size(px(18.)).text_color(rgb(crate::theme::current().text)))
-                    }
+                    IconImage::Svg(bytes) => el.child(
+                        gpui::svg()
+                            .data(&bytes)
+                            .size(px(18.))
+                            .text_color(rgb(if is_selected {
+                                crate::theme::current().accent
+                            } else {
+                                crate::theme::current().text
+                            })),
+                    ),
                 })
                 .when_none(&icon, |el| {
-                    el.text_size(px(12.))
-                        .text_color(rgb(crate::theme::current().text))
+                    el.text_size(px(12.5))
+                        .text_color(rgb(if is_selected {
+                            crate::theme::current().accent
+                        } else {
+                            crate::theme::current().text
+                        }))
                         .child(app.name.chars().next().unwrap_or('?').to_string())
                 }),
         )
@@ -688,7 +729,7 @@ fn app_row(
                 gpui::svg()
                     .path("icons/enter.svg")
                     .size(px(11.))
-                    .text_color(rgb(crate::theme::current().text_dim)),
+                    .text_color(rgb(crate::theme::current().accent)),
             )
         })
         .when(!is_selected && app.terminal, |el| {

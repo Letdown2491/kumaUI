@@ -221,7 +221,7 @@ impl PanelKind {
     fn geometry(self) -> (f32, f32, KeyboardInteractivity) {
         match self {
             PanelKind::Settings => (560., 640., KeyboardInteractivity::OnDemand),
-            PanelKind::Launcher => (560., 460., KeyboardInteractivity::Exclusive),
+            PanelKind::Launcher => (560., 640., KeyboardInteractivity::Exclusive),
             PanelKind::Calendar => (400., 330., KeyboardInteractivity::OnDemand),
             PanelKind::Notifications => (560., 520., KeyboardInteractivity::OnDemand),
             PanelKind::Volume => (360., 150., KeyboardInteractivity::OnDemand),
