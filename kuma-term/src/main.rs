@@ -4,6 +4,7 @@
 mod encoder;
 mod font;
 mod glyphs;
+mod osc;
 mod palette;
 mod term;
 mod theme;

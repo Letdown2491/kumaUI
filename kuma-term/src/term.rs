@@ -2,17 +2,15 @@
 //! module. The rest of kuma-term sees only `Engine`, `Snapshot`, `UiEvent`
 //! and raw bytes, so the emulator behind the seam stays swappable.
 //!
-//! Ownership model: the PTY reader thread (alacritty's EventLoop) and the UI
-//! thread share the term behind a fair mutex. The reader parses bytes into
-//! the grid and wakes the UI through the event proxy; the UI never touches
-//! the PTY, it only pushes encoded bytes and resize requests back through
-//! the event loop's channel.
+//! Ownership model: the pump thread reads the PTY and shares the term
+//! behind a fair mutex; the UI never touches the PTY read side, it pushes
+//! encoded bytes back through the master's write half.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::sync::Arc;
+use std::thread;
 
-use alacritty_terminal::event::{Event, EventListener, Notify, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -20,8 +18,9 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
+use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
 
+use crate::osc::Marker;
 use crate::palette::{self, Rgb8};
 use crate::theme::Theme;
 use futures::channel::mpsc::UnboundedSender;
@@ -49,6 +48,9 @@ pub enum UiEvent {
     /// The shell asked to write bytes to the PTY (DA replies, DSR, and the
     /// replies to the queries above).
     PtyWrite(Vec<u8>),
+    /// A shell-integration marker tapped from the raw PTY stream (OSC 133
+    /// prompt lifecycle, OSC 7 cwd).
+    Marker(Marker),
 }
 
 /// The event proxy: lives on the PTY reader thread, forwards into the UI
@@ -244,10 +246,79 @@ fn selection_spans(
     spans
 }
 
+/// The PTY master out of alacritty's Pty: the pump owns reading, input
+/// writes own the same fd through a clone. The child handle stays inside
+/// the Pty (its Drop sends SIGHUP and reaps), which the Engine keeps.
+fn pty_take_master(pty: &mut tty::Pty) -> std::fs::File {
+    pty.file().try_clone().expect("clone the PTY master")
+}
+
+/// The byte pump: the terminal's own read loop, replacing alacritty's
+/// EventLoop. Reads the PTY master in blocking mode, taps shell-integration
+/// markers from the raw bytes, then hands the same bytes to the vte parser
+/// (which updates the grid and fires UiProxy events for queries/titles).
+/// On Linux a PTY master read after child exit returns EIO once the
+/// kernel buffer drains, which is the drain-on-exit behavior alacritty's
+/// loop implemented: final output lands, then the Exit event closes the
+/// window.
+fn pump_thread(
+    mut master: std::fs::File,
+    term: Arc<FairMutex<Term<UiProxy>>>,
+    proxy: UiProxy,
+) {
+    // alacritty leaves the master nonblocking for its poller; the pump
+    // wants blocking reads: zero idle CPU, the child's exit surfaces as
+    // EIO once the buffer drains, and input writes never lose bytes to
+    // EAGAIN
+    use std::os::fd::AsRawFd;
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    }
+
+    let mut parser = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+    let mut scanner = crate::osc::Scanner::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match master.read(&mut buf) {
+            Ok(0) => {
+                // EOF: child gone, buffer drained
+                proxy.forward(UiEvent::Exit);
+                return;
+            },
+            Ok(n) => {
+                for marker in scanner.feed(&buf[..n]) {
+                    proxy.forward(UiEvent::Marker(marker));
+                }
+                let mut locked = term.lock();
+                parser.advance(&mut *locked, &buf[..n]);
+                // like alacritty's loop: wake the UI once per chunk, after
+                // the grid took the bytes
+                drop(locked);
+                proxy.forward(UiEvent::Wakeup);
+            },
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                // EIO is the normal end: the child exited and the kernel
+                // buffer drained. Anything else is a real error, but the
+                // terminal is done either way.
+                if err.raw_os_error() != Some(libc::EIO) {
+                    log::warn!("pty read failed: {err}");
+                }
+                proxy.forward(UiEvent::Exit);
+                return;
+            },
+        }
+    }
+}
+
 pub struct Engine {
     term: Arc<FairMutex<Term<UiProxy>>>,
-    notifier: Notifier,
-    loop_tx: alacritty_terminal::event_loop::EventLoopSender,
+    /// alacritty's Pty handle, kept for its Drop: it sends SIGHUP to the
+    /// child and reaps it when the view (and with it the Engine) goes away
+    _pty: tty::Pty,
+    /// the PTY master: input writes here, the pump thread reads a clone
+    master: std::fs::File,
     window_size: WindowSize,
     theme: Theme,
     /// how the current selection started, so the snapshot projects its
@@ -258,7 +329,8 @@ pub struct Engine {
 impl Engine {
     /// Spawn the shell, wire the PTY reader thread. `window_size` carries
     /// the initial cell geometry (measured from the real font by the view).
-    pub fn new(window_size: WindowSize, theme: Theme, tx: UnboundedSender<UiEvent>) -> io::Result<Self> {        // TERM and COLORTERM for the child; alacritty's own helper picks
+    pub fn new(window_size: WindowSize, theme: Theme, tx: UnboundedSender<UiEvent>) -> io::Result<Self> {
+        // TERM and COLORTERM for the child; alacritty's own helper picks
         // alacritty terminfo when installed, xterm-256color otherwise
         tty::setup_env();
 
@@ -271,7 +343,7 @@ impl Engine {
             },
             Err(_) => tty::Options::default(),
         };
-        let pty = tty::new(&options, window_size, 0)?;
+        let mut pty = tty::new(&options, window_size, 0)?;
 
         let proxy = UiProxy { tx };
         let term = Term::new(
@@ -281,13 +353,23 @@ impl Engine {
         );
         let term = Arc::new(FairMutex::new(term));
 
-        // drain_on_exit: flush the child's final output before the window
-        // closes, so `exit` leaves clean scrollback behind
-        let event_loop = EventLoop::new(term.clone(), proxy, pty, true, false)?;
-        let loop_tx = event_loop.channel();
-        event_loop.spawn();
+        // The byte pump: read the PTY master, tap shell-integration
+        // markers, feed the vte parser, wake the UI. alacritty's own
+        // EventLoop is not used: its vte version has no hook for arbitrary
+        // OSC sequences, so OSC 133/7 must be tapped from the raw stream
+        // anyway, and once the tap exists the rest of the loop is a small
+        // read-parse-wake cycle this module can own. The parser lives on
+        // the pump thread only, so no lock is held while bytes decode.
+        let pump_proxy = proxy.clone();
+        let pump_term = term.clone();
+        let master = pty_take_master(&mut pty);
+        let pump_master = master.try_clone().expect("clone the PTY master for the pump");
+        thread::Builder::new()
+            .name("kuma-term-pty".into())
+            .spawn(move || pump_thread(pump_master, pump_term, pump_proxy))
+            .expect("spawn the PTY pump");
 
-        Ok(Self { term, notifier: Notifier(loop_tx.clone()), loop_tx, window_size, theme, selection_mode: None })
+        Ok(Self { term, _pty: pty, master, window_size, theme, selection_mode: None })
     }
 
     /// Swap the chrome colors for a republished shell palette; the next
@@ -298,7 +380,9 @@ impl Engine {
 
     /// Write bytes to the PTY (user input, query replies).
     pub fn input(&self, bytes: Vec<u8>) {
-        self.notifier.notify(bytes);
+        if let Err(err) = (&self.master).write_all(&bytes) {
+            log::warn!("pty write failed: {err}");
+        }
     }
 
     /// Resize the grid and PTY. Cell pixel size is unchanged (font fixed for
@@ -315,7 +399,17 @@ impl Engine {
         }
         self.window_size = ws;
         // the PTY first so SIGWINCH lands with the new size already set
-        let _ = self.loop_tx.send(Msg::Resize(ws));
+        use std::os::fd::AsRawFd;
+        let winsize = libc::winsize {
+            ws_row: lines,
+            ws_col: cols,
+            ws_xpixel: self.window_size.cell_width as u16 * cols,
+            ws_ypixel: self.window_size.cell_height as u16 * lines,
+        };
+        let ok = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
+        if ok != 0 {
+            log::warn!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error());
+        }
         self.term.lock().resize(GridDims::from_window_size(ws));
     }
 

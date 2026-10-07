@@ -20,6 +20,7 @@ use log::warn;
 use crate::encoder;
 use crate::font;
 use crate::glyphs;
+use crate::osc::BarState;
 use crate::palette::Rgb8;
 use crate::term::{CellEdge, Engine, GridPoint, Row, SelectMode, SelectSpan, UiEvent};
 use crate::theme::Theme;
@@ -43,6 +44,12 @@ pub struct TerminalView {
     title: Option<String>,
     /// a left-drag is actively stretching the selection
     selecting: bool,
+    /// prompt-bar data, maintained from shell-integration markers
+    bar: BarState,
+    /// the bar's duration ticks once a second while a command runs; this
+    /// guard keeps one tick task alive at a time
+    bar_tick_active: bool,
+    _bar_tick: Task<()>,
     // the pump task aborts if dropped, so it stays owned by the view
     _pump: Task<()>,
     _palette_tick: Task<()>,
@@ -127,6 +134,9 @@ impl TerminalView {
             lines: 24,
             title: None,
             selecting: false,
+            bar: BarState::default(),
+            bar_tick_active: false,
+            _bar_tick: Task::ready(()),
             _pump: pump,
             _palette_tick: palette_tick,
         }
@@ -157,6 +167,11 @@ impl TerminalView {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             UiEvent::PtyWrite(bytes) => self.engine.input(bytes),
+            UiEvent::Marker(marker) => {
+                self.bar.apply(&marker, std::time::Instant::now());
+                self.spawn_bar_tick(cx);
+                cx.notify();
+            }
         }
     }
 
@@ -168,6 +183,37 @@ impl TerminalView {
             self.engine.set_theme(self.theme.clone());
             cx.notify();
         }
+    }
+
+    /// While a command runs, the bar's duration ticks; one re-render a
+    /// second is plenty and the tick only lives while `running`.
+    fn spawn_bar_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.bar.running || self.bar_tick_active {
+            return;
+        }
+        self.bar_tick_active = true;
+        self._bar_tick = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let still = this
+                    .update(cx, |this, cx| {
+                        if this.bar.running {
+                            cx.notify();
+                            true
+                        } else {
+                            // the command finished under us: retire the tick
+                            this.bar_tick_active = false;
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !still {
+                    return;
+                }
+            }
+        });
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {        let Some(item) = cx.read_from_clipboard() else { return };
@@ -329,10 +375,11 @@ impl Focusable for TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // fit the grid to the viewport: rounded-down cell counts, so the
-        // last row and column never clip
+        // last row and column never clip. The prompt bar reserves one cell
+        // row at the top, in both normal and alt screen (no layout jump).
         let viewport = window.viewport_size();
         let usable_w = (viewport.width - px(PADDING * 2.0)).as_f32().max(1.0);
-        let usable_h = (viewport.height - px(PADDING * 2.0)).as_f32().max(1.0);
+        let usable_h = (viewport.height - px(PADDING * 2.0) - px(self.cell_h)).as_f32().max(1.0);
         let want_cols = ((usable_w / self.cell_w).floor() as u16).max(2);
         let want_lines = ((usable_h / self.cell_h).floor() as u16).max(2);
         if want_cols != self.cols || want_lines != self.lines {
@@ -350,8 +397,15 @@ impl Render for TerminalView {
             .map(|row| build_row(row, &self.font, &self.theme))
             .collect();
 
-        // one div for interactivity, one canvas for the grid: painting
-        // never goes through flex layout
+        // one div for interactivity, one canvas per painted strip: the
+        // prompt bar, then the grid. Painting never goes through flex layout
+        let bar = BarPaint {
+            text: self.bar_line(snapshot.alt_screen),
+            font: self.font.clone(),
+            font_size,
+            cell_w: self.cell_w,
+            cell_h: self.cell_h,
+        };
         let grid = GridPaint {
             rows,
             font_size,
@@ -382,6 +436,8 @@ impl Render for TerminalView {
         div()
             .id("terminal")
             .size_full()
+            .flex()
+            .flex_col()
             .p(px(PADDING))
             .bg(bg)
             .track_focus(&self.focus)
@@ -394,10 +450,139 @@ impl Render for TerminalView {
                 window.focus(&this.focus, cx);
             }))
             .child(
+                canvas(|_, _, _| (), move |bounds, _, window, cx| bar.paint(bounds, window, cx))
+                    .w(px(grid_w))
+                    .h(px(self.cell_h)),
+            )
+            .child(
                 canvas(|_, _, _| (), move |bounds, _, window, cx| grid.paint(bounds, window, cx))
                     .w(px(grid_w))
                     .h(px(grid_h)),
             )
+    }
+}
+
+impl TerminalView {
+    /// The bar's segments left to right: cwd, last command status +
+    /// duration, running state. Each carries its color. On the alt screen
+    /// the bar goes quiet (cwd and the running indicator only): commands
+    /// like vim redraw constantly and a frozen status line would lie about
+    /// the shell underneath.
+    fn bar_line(&self, alt_screen: bool) -> Vec<(String, gpui::Hsla)> {
+        let theme = &self.theme;
+        let dim = hsla_of(theme.foreground.scale(0.6));
+        let mut segments: Vec<(String, gpui::Hsla)> = Vec::new();
+
+        if let Some(cwd) = &self.bar.cwd_short {
+            segments.push((cwd.clone(), hsla_of(theme.foreground)));
+        }
+
+        // quiet mode: cwd + running indicator stay, the rest is held back
+        if alt_screen {
+            if self.bar.running {
+                let elapsed = self
+                    .bar
+                    .started_at
+                    .map(|s| std::time::Instant::now() - s)
+                    .unwrap_or_default();
+                segments.push((
+                    format!("▶ {:.1}s", elapsed.as_secs_f32()),
+                    hsla_of(theme.cursor),
+                ));
+            }
+            return segments;
+        }
+
+        if let Some(exit) = self.bar.last_exit {
+            let duration = self
+                .bar
+                .last_duration
+                .filter(|d| d.as_secs_f32() >= 1.0)
+                .map(|d| format!(" {:.1}s", d.as_secs_f32()))
+                .unwrap_or_default();
+            if exit == 0 {
+                segments.push((format!("✓{duration}"), dim));
+            } else {
+                segments.push((
+                    format!("✗ {exit}{duration}"),
+                    hsla_of(Rgb8(255, 102, 102)),
+                ));
+            }
+        }
+
+        if self.bar.running {
+            let elapsed = self
+                .bar
+                .started_at
+                .map(|s| std::time::Instant::now() - s)
+                .unwrap_or_default();
+            segments.push((
+                format!("▶ {:.1}s", elapsed.as_secs_f32()),
+                hsla_of(theme.cursor),
+            ));
+        }
+
+        segments
+    }
+}
+
+/// The prompt bar: one shaped line of context segments, painted as part of
+/// the same canvas pass as the grid.
+struct BarPaint {
+    text: Vec<(String, gpui::Hsla)>,
+    font: gpui::Font,
+    font_size: Pixels,
+    cell_w: f32,
+    cell_h: f32,
+}
+
+impl BarPaint {
+    fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        if self.text.is_empty() {
+            return;
+        }
+        // join the segments into one string with two-space separators,
+        // runs carrying each segment's color
+        let mut joined = String::new();
+        let mut runs: Vec<gpui::TextRun> = Vec::new();
+        for (i, (segment, color)) in self.text.iter().enumerate() {
+            if i > 0 {
+                joined.push_str("  ");
+                runs.push(gpui::TextRun {
+                    len: 2,
+                    font: self.font.clone(),
+                    color: hsla_of(Rgb8(0, 0, 0)),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
+            }
+            joined.push_str(segment);
+            runs.push(gpui::TextRun {
+                len: segment.len(),
+                font: self.font.clone(),
+                color: *color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+        let shaped = window.text_system().shape_line(
+            SharedString::from(joined),
+            self.font_size,
+            &runs,
+            None,
+        );
+        if let Err(err) = shaped.paint(
+            bounds.origin,
+            px(self.cell_h),
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        ) {
+            warn!("bar paint failed: {err}");
+        }
     }
 }
 
