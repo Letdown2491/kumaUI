@@ -366,6 +366,59 @@ powerline glyphs and starship's icons never render as tofu. Parsing OSC 133 is
 cheap and should land with the MVP parser even though the block UI above is
 later work; the marks are load-bearing scrollback structure once they exist.
 
+## Amendment (2026-10-07): portable scope and the built-in prompt bar
+
+Two scope decisions landed after the survey was written, and they amend the
+conclusions above.
+
+### Portability: any distro, kuma-shell optional
+
+kuma-term is not a kumaOS exclusive. It runs on any Linux distro. What changes:
+
+- The "Never: a config file" decision above is rescinded. Portability needs a
+  fallback for the palette and fonts, so: a minimal TOML config
+  (`~/.config/kuma-term/config.toml`, the kuma-shell house pattern) carrying
+  theme, font, and a few toggles, with sane built-in defaults underneath. OSC
+  4/10/11 queries and mode 2031 dark/light remain runtime surfaces on top of it.
+  On kumaOS the shell's palette is the theme's source, so the config file
+  becomes the portable fallback rather than the primary system.
+- The "Never: X11" decision softens: gpui ships both Wayland and X11 backends,
+  and a portable terminal cannot refuse half the distros out there. Wayland
+  stays the preferred path; X11 comes nearly free from the framework.
+- Notifications: OSC 9/777 renders as a desktop notification over
+  org.freedesktop.Notifications (every distro has a daemon). On kumaOS that
+  daemon is kuma-shell, and integration extras (cwd-aware launcher, dock
+  inheritance) are progressive enhancements detected at runtime, never runtime
+  dependencies.
+- Tabs/splits, multiplexer/daemon, sixel: stay Never (any WM or tmux covers
+  them, and they are portability-neutral).
+
+### The starship features, built in
+
+The owner wants starship's value built into the terminal, not layered on top as
+a prompt config. The prompt line itself stays the shell's (fish draws it); what
+a terminal can own is the ambient context around it, and it can compute all of
+it itself:
+
+- cwd, from OSC 7 (fish sends it by default).
+- Command boundaries, duration, and exit status, from OSC 133 (fish marks
+  prompts unconditionally and its D mark carries the exit status by default
+  (<https://sw.kovidgoyal.net/kitty/shell-integration/>,
+  <https://fishshell.com/docs/current/terminal-compatibility.html>)).
+- Git branch and dirty state, read from the cwd (git2).
+- Detected toolchains, from project files in the cwd (Cargo.toml, package.json,
+  pyproject.toml, go.mod, .tool-versions, mise.toml).
+- System load, from /proc (the sysmon recipe).
+
+Rendered two ways: a slim status bar along the window's edge (the iTerm2 status
+bar model) and the scrollback gutter (per-command marks, green or red by exit
+status). On fish this is zero-config: fish already reports everything the bar
+needs. On bash and zsh, an optional shell-integration script (the kitty model)
+supplies the same marks, so the feature degrades rather than dies on other
+shells. This is the headline differentiator: no terminal in the survey computes
+starship-class context itself, and it needs no prompt framework, no Nerd Font
+config on the user's side, and works on any distro.
+
 ## The three most surprising findings
 
 1. Alacritty has supported the kitty keyboard protocol since 0.13.0 (and CSI 2026
