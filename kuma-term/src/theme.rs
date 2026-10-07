@@ -22,6 +22,9 @@ pub struct Theme {
     pub font_family: Option<String>,
     /// Font size in points (kitty's unit); rendered as pt * 96/72.
     pub font_size_pt: f32,
+    /// Terminal background alpha, kitty's background_opacity. 1.0 stays
+    /// fully opaque; below that the desktop shows through behind the text.
+    pub background_opacity: f32,
 }
 
 impl Theme {
@@ -51,6 +54,7 @@ impl Theme {
             cursor_text: Rgb8(24, 26, 31),
             font_family: None,
             font_size_pt: 11.0,
+            background_opacity: 1.0,
         }
     }
 
@@ -64,6 +68,14 @@ impl Theme {
             if let Ok(pt) = pt.parse::<f32>() {
                 if pt > 0.0 {
                     theme.font_size_pt = pt;
+                }
+            }
+        }
+        // spike knob: demo translucency without touching kitty.conf
+        if let Ok(alpha) = std::env::var("KUMA_TERM_OPACITY") {
+            if let Ok(alpha) = alpha.parse::<f32>() {
+                if (0.0..=1.0).contains(&alpha) {
+                    theme.background_opacity = alpha;
                 }
             }
         }
@@ -164,6 +176,13 @@ fn apply_kitty_config(theme: &mut Theme, path: &Path, depth: u8) {
                     }
                 }
             }
+            "background_opacity" => {
+                if let Ok(alpha) = value.parse::<f32>() {
+                    if (0.0..=1.0).contains(&alpha) {
+                        theme.background_opacity = alpha;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -203,7 +222,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kuma-term-test2-{}.conf", std::process::id()));
         std::fs::write(
             &path,
-            "# comment\nbackground #131317\nforeground  #e4e2e6 \ncolor1 #ffb4ab\nfont_size 12.5\nfont_family \"JetBrains Mono\"\n",
+            "# comment\nbackground #131317\nforeground  #e4e2e6 \ncolor1 #ffb4ab\nfont_size 12.5\nfont_family \"JetBrains Mono\"\nbackground_opacity 0.85\n",
         )
         .unwrap();
         apply_kitty_config(&mut theme, &path, 0);
@@ -213,6 +232,7 @@ mod tests {
         assert_eq!(theme.named[1], Rgb8(0xff, 0xb4, 0xab));
         assert_eq!(theme.font_size_pt, 12.5);
         assert_eq!(theme.font_family.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(theme.background_opacity, 0.85);
     }
 
     #[test]

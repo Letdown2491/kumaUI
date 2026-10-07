@@ -15,6 +15,11 @@ use gpui::{App, AppContext, TitlebarOptions, WindowBounds, WindowOptions, px, si
 use gpui_platform::application;
 
 fn main() {
+    // the PTY child inherits this process's environment, so anything set
+    // here is how the shell recognizes kuma-term (prompt snippets key on
+    // it). Sound: no other thread exists yet.
+    unsafe { std::env::set_var("KUMA_TERM", "1") };
+
     env_logger::Builder::from_env(env_logger::Env::default())
         .format(|buf, record| {
             writeln!(

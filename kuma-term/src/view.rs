@@ -1,17 +1,17 @@
-//! The gpui view: renders engine snapshots as styled text lines, feeds
+//! The gpui view: renders engine snapshots as one painted grid, feeds
 //! keystrokes and scroll events back into the engine.
 //!
-//! Rendering strategy for the spike: each visible grid line becomes one
-//! `StyledText` element whose runs merge adjacent cells sharing a style.
-//! Backgrounds ride inside the runs (gpui paints them behind the glyphs), so
-//! one pass over a row produces both the string and its paint list. Damage
-//! tracking and a purpose-built element come after the spike.
+//! The grid is a single custom element: run backgrounds and vector glyphs
+//! paint as quads, text rows shape and paint directly. No per-row or
+//! per-cell layout nodes, so a full-screen TUI costs the same handful of
+//! quads a frame regardless of how many cells it touches.
 
 use futures::StreamExt;
 use gpui::{
-    ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight, IntoElement, Keystroke,
-    ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent, Styled, StyledText, Task,
-    TextRun, UnderlineStyle, Window, WindowTextSystem, div, px, prelude::*,
+    App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight,
+    Keystroke, ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, Task,
+    TextAlign, TextRun, UnderlineStyle, Window, WindowTextSystem, canvas, div, fill, point, px,
+    prelude::*, size,
 };
 use log::warn;
 
@@ -46,6 +46,11 @@ pub struct TerminalView {
 impl TerminalView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let theme = Theme::load();
+        // the window surface must opt into alpha before anything paints,
+        // and subpixel AA is wrong over a translucent background
+        if theme.background_opacity < 1.0 {
+            window.set_background_appearance(gpui::WindowBackgroundAppearance::Transparent);
+        }
         let family = font::pick_family(theme.font_family.as_deref(), window.text_system());
         let font = gpui::Font {
             family: family.into(),
@@ -230,68 +235,47 @@ impl Render for TerminalView {
         }
 
         let snapshot = self.engine.snapshot();
-        let default_bg = self.theme.background;
         let font_size = px(self.theme.font_size_px());
+        let rows = snapshot
+            .rows
+            .iter()
+            .map(|row| build_row(row, &self.font, &self.theme))
+            .collect();
 
-        let mut row_elements = Vec::with_capacity(snapshot.rows.len());
-        let (cw, chh) = (self.cell_w, self.cell_h);
-        for (ix, row) in snapshot.rows.iter().enumerate() {
-            let on_cursor_row = matches!(snapshot.cursor, Some(c) if c.row == ix);
-            let (text, runs, glyphs) = build_line(row, &self.font, font_size, on_cursor_row, &self.theme);
-            // vector glyphs paint as absolutely positioned quads over the
-            // row text, one div per rect; ordering is children order, so
-            // they land above the runs' backgrounds
-            let overlays = glyphs.into_iter().flat_map(move |g| {
-                glyphs::cell_rects(g.ch, cw, chh).into_iter().map(move |(x, y, w, h)| {
-                    div()
-                        .absolute()
-                        .left(px(g.col as f32 * cw + x))
-                        .top(px(y))
-                        .w(px(w))
-                        .h(px(h))
-                        .bg(hsla_of(g.fg))
-                })
-            });
-            row_elements.push(
-                div()
-                    .relative()
-                    .h(px(self.cell_h))
-                    .overflow_hidden()
-                    .child(StyledText::new(text).with_runs(runs))
-                    .children(overlays),
-            );
-        }
+        // one div for interactivity, one canvas for the grid: painting
+        // never goes through flex layout
+        let grid = GridPaint {
+            rows,
+            font_size,
+            cell_w: self.cell_w,
+            cell_h: self.cell_h,
+            fg: self.theme.foreground,
+            display_offset: snapshot.display_offset,
+        };
+        let grid_w = self.cols as f32 * self.cell_w;
+        let grid_h = snapshot.rows.len() as f32 * self.cell_h;
+
+        // background alpha: kitty's background_opacity, subpixel AA is
+        // switched off for the window when translucent
+        let mut bg = hsla_of(self.theme.background);
+        bg.a *= self.theme.background_opacity;
 
         div()
             .id("terminal")
-            .relative()
             .size_full()
             .p(px(PADDING))
-            .bg(hsla_of(default_bg))
-            // the grid is measured in theme cells; every StyledText row
-            // inherits this, so it must match cell_metrics
-            .text_size(font_size)
-            .font_family(self.font.family.clone())
+            .bg(bg)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
             .on_click(cx.listener(|this, _event: &gpui::ClickEvent, window, cx| {
                 window.focus(&this.focus, cx);
             }))
-            .child(div().flex().flex_col().children(row_elements))
-            // scrolled back into history: a thin edge mark, since the
-            // viewport no longer shows the live grid
-            .when(snapshot.display_offset > 0, |edge| {
-                edge.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .w(px(3.0))
-                        .h_full()
-                        .bg(hsla_of(self.theme.foreground.scale(0.4))),
-                )
-            })
+            .child(
+                canvas(|_, _, _| (), move |bounds, _, window, cx| grid.paint(bounds, window, cx))
+                    .w(px(grid_w))
+                    .h(px(grid_h)),
+            )
     }
 }
 
@@ -326,12 +310,17 @@ fn cell_metrics(
     }
 }
 
-/// Merge a row of cells into one display string plus styled runs.
-///
-/// Trailing default cells (plain spaces on the default background) are
-/// dropped, spacer cells are skipped, and adjacent same-style cells merge
-/// into one run. The cursor row is marked by the caller so its restyled cell
-/// keeps its painted background.
+/// One painted row: the shaped text plus everything painted behind or
+/// instead of it.
+struct RowRender {
+    text: String,
+    runs: Vec<TextRun>,
+    /// background rects, cell aligned: (column, length, color)
+    bg_quads: Vec<(usize, usize, Rgb8)>,
+    /// cells the vector layer draws
+    glyphs: Vec<CellGlyph>,
+}
+
 /// A cell the vector layer draws: grid column, the glyph, its color.
 #[derive(Clone, Copy)]
 struct CellGlyph {
@@ -340,15 +329,15 @@ struct CellGlyph {
     fg: Rgb8,
 }
 
-fn build_line(
-    row: &Row,
-    font: &gpui::Font,
-    font_size: Pixels,
-    on_cursor_row: bool,
-    theme: &Theme,
-) -> (String, Vec<TextRun>, Vec<CellGlyph>) {
+/// Merge a row of cells into one display string plus its paint lists.
+///
+/// Trailing default cells (plain spaces on the default background) are
+/// dropped, spacer cells are skipped, and adjacent same-style cells merge
+/// into one run. Runs split only on shaping style (font, fg, underline,
+/// strikeout); backgrounds collect separately as cell-aligned quads, which
+/// also keeps the quads exact across wide characters.
+fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
     let default_bg = theme.background;
-    let _ = (font_size, on_cursor_row);
 
     // last cell worth drawing
     let mut end = row.cells.len();
@@ -385,13 +374,44 @@ fn build_line(
     let mut text = String::new();
     let mut runs: Vec<TextRun> = Vec::new();
     let mut glyphs: Vec<CellGlyph> = Vec::new();
-    // (bold, italic, underline, strikeout, fg, bg) of the run being built
-    let mut current: Option<(bool, bool, bool, bool, Rgb8, Rgb8)> = None;
+    let mut bg_quads: Vec<(usize, usize, Rgb8)> = Vec::new();
+    // (bold, italic, underline, strikeout, fg) of the run being built
+    let mut current: Option<(bool, bool, bool, bool, Rgb8)> = None;
+    // (start column, length, color) of the open background run
+    let mut bg_open: Option<(usize, usize, Rgb8)> = None;
 
     for i in 0..end {
         let cell = &row.cells[i];
         if cell.spacer {
             continue;
+        }
+
+        // extend or close the open background quad at this cell's start
+        let bg_color = if cell.bg == default_bg { None } else { Some(cell.bg) };
+        match (bg_open.as_ref().map(|&(_, _, c)| c), bg_color) {
+            (Some(c), Some(color)) if c == color => {
+                let open = bg_open.as_mut().unwrap();
+                open.1 = col_of[i] + cell_width(row, i) - open.0;
+            }
+            (Some(_), Some(color)) => {
+                if let Some((col, len, c)) = bg_open.take() {
+                    if len > 0 {
+                        bg_quads.push((col, len, c));
+                    }
+                }
+                bg_open = Some((col_of[i], cell_width(row, i), color));
+            }
+            (Some(_), None) => {
+                if let Some((col, len, c)) = bg_open.take() {
+                    if len > 0 {
+                        bg_quads.push((col, len, c));
+                    }
+                }
+            }
+            (None, Some(color)) => {
+                bg_open = Some((col_of[i], cell_width(row, i), color));
+            }
+            (None, None) => {}
         }
 
         // box drawing, block elements, braille: drawn as vector quads on
@@ -405,7 +425,7 @@ fn build_line(
         };
         text.push(drawn);
 
-        let key = (cell.bold, cell.italic, cell.underline, cell.strikeout, cell.fg, cell.bg);
+        let key = (cell.bold, cell.italic, cell.underline, cell.strikeout, cell.fg);
         let len_in_text = drawn.len_utf8();
         match &mut current {
             Some(prev) if *prev == key => {
@@ -414,8 +434,6 @@ fn build_line(
             _ => {
                 current = Some(key);
                 let fg = hsla_of(cell.fg);
-                let background_color =
-                    if cell.bg == default_bg { None } else { Some(hsla_of(cell.bg)) };
                 let underline =
                     cell.underline.then(|| UnderlineStyle { thickness: px(1.0), color: Some(fg), wavy: false });
                 let strikethrough = cell
@@ -430,28 +448,107 @@ fn build_line(
                     len: len_in_text,
                     font: cell_font,
                     color: fg,
-                    background_color,
+                    background_color: None,
                     underline,
                     strikethrough,
                 });
             }
         }
     }
+    flush_bg_at_end(&mut bg_quads, bg_open.take());
 
-    if text.is_empty() {
-        // keep the row height stable for untouched lines
-        text.push(' ');
-        runs.push(TextRun {
-            len: 1,
-            font: font.clone(),
-            color: hsla_of(theme.foreground),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        });
+    RowRender { text, runs, bg_quads, glyphs }
+}
+
+/// Push a finished background quad if it covers anything.
+fn flush_bg_at_end(quads: &mut Vec<(usize, usize, Rgb8)>, open: Option<(usize, usize, Rgb8)>) {
+    if let Some((col, len, color)) = open {
+        if len > 0 {
+            quads.push((col, len, color));
+        }
     }
+}
 
-    (text, runs, glyphs)
+/// The grid width this cell contributes, mirroring the col_of pass.
+fn cell_width(row: &Row, i: usize) -> usize {
+    if row.cells[i].spacer {
+        0
+    } else if i + 1 < row.cells.len() && row.cells[i + 1].spacer {
+        2
+    } else {
+        1
+    }
+}
+
+/// The whole visible grid, painted directly: run backgrounds and vector
+/// glyphs as quads, each row's text shaped and painted. No flex layout in
+/// the hot path, and the data is rebuilt from the engine snapshot every
+/// frame.
+struct GridPaint {
+    rows: Vec<RowRender>,
+    font_size: Pixels,
+    cell_w: f32,
+    cell_h: f32,
+    fg: Rgb8,
+    display_offset: usize,
+}
+impl GridPaint {
+    fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let origin = bounds.origin;
+        for (iy, row) in self.rows.iter().enumerate() {
+            let row_y = origin.y + px(iy as f32 * self.cell_h);
+
+            // run backgrounds, cell aligned
+            for &(col, len, color) in &row.bg_quads {
+                let quad_bounds = Bounds::new(
+                    point(origin.x + px(col as f32 * self.cell_w), row_y),
+                    size(px(len as f32 * self.cell_w), px(self.cell_h)),
+                );
+                window.paint_quad(fill(quad_bounds, hsla_of(color)));
+            }
+
+            // vector glyphs: box drawing, block elements, braille
+            for g in &row.glyphs {
+                for (x, y, w, h) in glyphs::cell_rects(g.ch, self.cell_w, self.cell_h) {
+                    let quad_bounds = Bounds::new(
+                        point(origin.x + px(g.col as f32 * self.cell_w + x), row_y + px(y)),
+                        size(px(w), px(h)),
+                    );
+                    window.paint_quad(fill(quad_bounds, hsla_of(g.fg)));
+                }
+            }
+
+            // the text itself
+            if !row.text.is_empty() {
+                let shaped = window.text_system().shape_line(
+                    SharedString::from(row.text.clone()),
+                    self.font_size,
+                    &row.runs,
+                    None,
+                );
+                if let Err(err) = shaped.paint(
+                    point(origin.x, row_y),
+                    px(self.cell_h),
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                ) {
+                    warn!("row paint failed: {err}");
+                }
+            }
+        }
+
+        // scrolled back into history: a thin edge mark, since the
+        // viewport no longer shows the live grid
+        if self.display_offset > 0 {
+            let quad_bounds = Bounds::new(
+                point(origin.x + bounds.size.width - px(3.0), origin.y),
+                size(px(3.0), bounds.size.height),
+            );
+            window.paint_quad(fill(quad_bounds, hsla_of(self.fg.scale(0.4))));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -489,10 +586,11 @@ mod tests {
         row.cells.push(cell(' '));
         let font = font();
         let t = theme();
-        let (text, runs, _) = build_line(&row, &font, px(14.0), false, &t);
-        assert_eq!(text, "hi");
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].len, 2);
+        let rendered = build_row(&row, &font, &t);
+        assert_eq!(rendered.text, "hi");
+        assert_eq!(rendered.runs.len(), 1);
+        assert_eq!(rendered.runs[0].len, 2);
+        assert!(rendered.bg_quads.is_empty());
     }
 
     #[test]
@@ -503,35 +601,52 @@ mod tests {
         let row = Row { cells: vec![red, green] };
         let font = font();
         let t = theme();
-        let (text, runs, _) = build_line(&row, &font, px(14.0), false, &t);
-        assert_eq!(text, "rg");
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].len, 1);
-        assert_eq!(runs[1].len, 1);
+        let rendered = build_row(&row, &font, &t);
+        assert_eq!(rendered.text, "rg");
+        assert_eq!(rendered.runs.len(), 2);
+        assert_eq!(rendered.runs[0].len, 1);
+        assert_eq!(rendered.runs[1].len, 1);
     }
 
     #[test]
-    fn colored_background_survives_trimming() {
+    fn colored_background_becomes_a_cell_aligned_quad() {
         let mut marked = cell(' ');
         marked.bg = Rgb8(40, 40, 40);
         let row = Row { cells: vec![cell('a'), cell(' '), marked] };
         let font = font();
         let t = theme();
-        let (text, runs, _) = build_line(&row, &font, px(14.0), false, &t);
-        // the marked background cell is not trailing-default, so it stays
-        assert_eq!(text, "a  ");
-        assert_eq!(runs.len(), 2);
-        assert!(runs[1].background_color.is_some());
+        let rendered = build_row(&row, &font, &t);
+        // the marked background cell is not trailing-default, so it stays;
+        // the background rides as a quad, not inside the run
+        assert_eq!(rendered.text, "a  ");
+        // fg is equal across the row, so the shaping run merges fully
+        assert_eq!(rendered.runs.len(), 1);
+        assert_eq!(rendered.runs[0].len, 3);
+        assert_eq!(rendered.bg_quads, vec![(2, 1, Rgb8(40, 40, 40))]);
     }
 
     #[test]
-    fn empty_rows_collapse_to_a_placeholder_space() {
+    fn background_quads_span_wide_characters() {
+        let mut wide = cell('漢');
+        wide.bg = Rgb8(40, 40, 40);
+        let mut spacer = cell(' ');
+        spacer.spacer = true;
+        let row = Row { cells: vec![wide, spacer] };
+        let font = font();
+        let t = theme();
+        let rendered = build_row(&row, &font, &t);
+        assert_eq!(rendered.bg_quads, vec![(0, 2, Rgb8(40, 40, 40))]);
+    }
+
+    #[test]
+    fn empty_rows_paint_nothing() {
         let row = Row { cells: vec![] };
         let font = font();
         let t = theme();
-        let (text, runs, _) = build_line(&row, &font, px(14.0), false, &t);
-        assert_eq!(text, " ");
-        assert_eq!(runs.len(), 1);
+        let rendered = build_row(&row, &font, &t);
+        assert_eq!(rendered.text, "");
+        assert!(rendered.runs.is_empty());
+        assert!(rendered.bg_quads.is_empty());
     }
 
     #[test]
@@ -539,14 +654,14 @@ mod tests {
         let row = Row { cells: vec![cell('\u{2500}'), cell('x')] };
         let font = font();
         let t = theme();
-        let (text, runs, glyphs) = build_line(&row, &font, px(14.0), false, &t);
+        let rendered = build_row(&row, &font, &t);
         // the box cell is a space in the text (background intact), the
         // glyph rides in the overlay list at grid column 0
-        assert_eq!(text, " x");
-        assert_eq!(glyphs.len(), 1);
-        assert_eq!(glyphs[0].col, 0);
-        assert_eq!(glyphs[0].ch, '\u{2500}');
-        assert_eq!(runs[0].len, 2);
+        assert_eq!(rendered.text, " x");
+        assert_eq!(rendered.glyphs.len(), 1);
+        assert_eq!(rendered.glyphs[0].col, 0);
+        assert_eq!(rendered.glyphs[0].ch, '\u{2500}');
+        assert_eq!(rendered.runs[0].len, 2);
     }
 
     #[test]
@@ -556,10 +671,10 @@ mod tests {
         let row = Row { cells: vec![cell('a'), cell('漢'), spacer, cell('\u{2588}')] };
         let font = font();
         let t = theme();
-        let (_, _, glyphs) = build_line(&row, &font, px(14.0), false, &t);
+        let rendered = build_row(&row, &font, &t);
         // the wide pair eats columns 1 and 2, so the block lands at 3
-        assert_eq!(glyphs.len(), 1);
-        assert_eq!(glyphs[0].col, 3);
+        assert_eq!(rendered.glyphs.len(), 1);
+        assert_eq!(rendered.glyphs[0].col, 3);
     }
 
     #[test]
@@ -571,8 +686,8 @@ mod tests {
         let row = Row { cells: vec![hidden] };
         let font = font();
         let t = theme();
-        let (text, _, glyphs) = build_line(&row, &font, px(14.0), false, &t);
-        assert_eq!(text, "\u{2500}");
-        assert!(glyphs.is_empty());
+        let rendered = build_row(&row, &font, &t);
+        assert_eq!(rendered.text, "\u{2500}");
+        assert!(rendered.glyphs.is_empty());
     }
 }
