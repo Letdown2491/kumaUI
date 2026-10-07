@@ -167,8 +167,7 @@ pub struct Engine {
 impl Engine {
     /// Spawn the shell, wire the PTY reader thread. `window_size` carries
     /// the initial cell geometry (measured from the real font by the view).
-    pub fn new(window_size: WindowSize, theme: Theme, tx: UnboundedSender<UiEvent>) -> io::Result<Self> {
-        // TERM and COLORTERM for the child; alacritty's own helper picks
+    pub fn new(window_size: WindowSize, theme: Theme, tx: UnboundedSender<UiEvent>) -> io::Result<Self> {        // TERM and COLORTERM for the child; alacritty's own helper picks
         // alacritty terminfo when installed, xterm-256color otherwise
         tty::setup_env();
 
@@ -198,6 +197,12 @@ impl Engine {
         event_loop.spawn();
 
         Ok(Self { term, notifier: Notifier(loop_tx.clone()), loop_tx, window_size, theme })
+    }
+
+    /// Swap the chrome colors for a republished shell palette; the next
+    /// snapshot picks it up.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     /// Write bytes to the PTY (user input, query replies).

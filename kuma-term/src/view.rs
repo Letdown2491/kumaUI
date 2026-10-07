@@ -6,6 +6,8 @@
 //! per-cell layout nodes, so a full-screen TUI costs the same handful of
 //! quads a frame regardless of how many cells it touches.
 
+use std::time::Duration;
+
 use futures::StreamExt;
 use gpui::{
     App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight,
@@ -41,6 +43,7 @@ pub struct TerminalView {
     title: Option<String>,
     // the pump task aborts if dropped, so it stays owned by the view
     _pump: Task<()>,
+    _palette_tick: Task<()>,
 }
 
 impl TerminalView {
@@ -48,7 +51,7 @@ impl TerminalView {
         let theme = Theme::load();
         // the window surface must opt into alpha before anything paints,
         // and subpixel AA is wrong over a translucent background
-        if theme.background_opacity < 1.0 {
+        if theme.background_opacity < 1.0 || theme.background_opacity_unfocused < 1.0 {
             window.set_background_appearance(gpui::WindowBackgroundAppearance::Transparent);
         }
         let family = font::pick_family(theme.font_family.as_deref(), window.text_system());
@@ -91,6 +94,26 @@ impl TerminalView {
             }
         });
 
+        // the wallpaper republishes the shell palette; swap the chrome
+        // live so the terminal follows the session like kuma-files does
+        let palette_tick = cx.spawn(async move |this, cx| {
+            let mut mtime = crate::theme::Theme::palette_mtime();
+            loop {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                let now = crate::theme::Theme::palette_mtime();
+                if now == mtime {
+                    continue;
+                }
+                mtime = now;
+                if this
+                    .update_in(cx, |this, _window, cx| this.apply_shell_palette(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         Self {
             engine,
             theme,
@@ -102,6 +125,7 @@ impl TerminalView {
             lines: 24,
             title: None,
             _pump: pump,
+            _palette_tick: palette_tick,
         }
     }
 
@@ -133,8 +157,17 @@ impl TerminalView {
         }
     }
 
-    fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = cx.read_from_clipboard() else { return };
+    /// A republished shell palette: swap the chrome colors in place, no
+    /// restart. The tick only calls this when the file changed.
+    fn apply_shell_palette(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = Theme::shell_palette_text() {
+            crate::theme::apply_shell_palette(&mut self.theme, &text);
+            self.engine.set_theme(self.theme.clone());
+            cx.notify();
+        }
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {        let Some(item) = cx.read_from_clipboard() else { return };
         let Some(text) = item.text() else { return };
         // newlines become carriage returns: that is what the shell's line
         // discipline expects from a paste
@@ -255,10 +288,15 @@ impl Render for TerminalView {
         let grid_w = self.cols as f32 * self.cell_w;
         let grid_h = snapshot.rows.len() as f32 * self.cell_h;
 
-        // background alpha: kitty's background_opacity, subpixel AA is
-        // switched off for the window when translucent
+        // background alpha: more opaque when the window has focus (the
+        // terminal you read sits on less wallpaper)
+        let opacity = if window.is_window_active() {
+            self.theme.background_opacity
+        } else {
+            self.theme.background_opacity_unfocused
+        };
         let mut bg = hsla_of(self.theme.background);
-        bg.a *= self.theme.background_opacity;
+        bg.a *= opacity;
 
         div()
             .id("terminal")

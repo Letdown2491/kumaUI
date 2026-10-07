@@ -22,9 +22,12 @@ pub struct Theme {
     pub font_family: Option<String>,
     /// Font size in points (kitty's unit); rendered as pt * 96/72.
     pub font_size_pt: f32,
-    /// Terminal background alpha, kitty's background_opacity. 1.0 stays
-    /// fully opaque; below that the desktop shows through behind the text.
+    /// Terminal background alpha when the window has focus (kitty's
+    /// background_opacity).
     pub background_opacity: f32,
+    /// Terminal background alpha when it does not; defaults to
+    /// background_opacity so unconfigured means no dim.
+    pub background_opacity_unfocused: f32,
 }
 
 impl Theme {
@@ -54,7 +57,8 @@ impl Theme {
             cursor_text: Rgb8(24, 26, 31),
             font_family: None,
             font_size_pt: 11.0,
-            background_opacity: 1.0,
+            background_opacity: 0.95,
+            background_opacity_unfocused: 0.85,
         }
     }
 
@@ -62,6 +66,12 @@ impl Theme {
         let mut theme = Self::builtin();
         if let Some(path) = kitty_config() {
             apply_kitty_config(&mut theme, &path, 0);
+        }
+        // the session's look: kuma-shell publishes the wallpaper palette
+        // for its neighbors and it wins for the chrome colors (the ANSI 16
+        // stay the terminal's own; the palette carries none of them)
+        if let Some(text) = Self::shell_palette_text() {
+            apply_shell_palette(&mut theme, &text);
         }
         // spike knob: blow the font up for shape debugging
         if let Ok(pt) = std::env::var("KUMA_TERM_FONT_PT") {
@@ -71,7 +81,7 @@ impl Theme {
                 }
             }
         }
-        // spike knob: demo translucency without touching kitty.conf
+        // spike knobs: demo translucency without touching configs
         if let Ok(alpha) = std::env::var("KUMA_TERM_OPACITY") {
             if let Ok(alpha) = alpha.parse::<f32>() {
                 if (0.0..=1.0).contains(&alpha) {
@@ -79,7 +89,28 @@ impl Theme {
                 }
             }
         }
+        if let Ok(alpha) = std::env::var("KUMA_TERM_OPACITY_UNFOCUSED") {
+            if let Ok(alpha) = alpha.parse::<f32>() {
+                if (0.0..=1.0).contains(&alpha) {
+                    theme.background_opacity_unfocused = alpha;
+                }
+            }
+        }
         theme
+    }
+
+    /// The wallpaper palette kuma-shell publishes for session neighbors,
+    /// with its file's mtime so a two second tick can spot republishes.
+    pub fn shell_palette_text() -> Option<String> {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+        let path = std::path::PathBuf::from(dir).join("kuma-shell/palette");
+        std::fs::read_to_string(path).ok()
+    }
+
+    pub fn palette_mtime() -> Option<std::time::SystemTime> {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+        let path = std::path::PathBuf::from(dir).join("kuma-shell/palette");
+        std::fs::metadata(path).ok()?.modified().ok()
     }
 
     /// Fallback families for the glyphs a mono terminal leans on (box
@@ -183,6 +214,14 @@ fn apply_kitty_config(theme: &mut Theme, path: &Path, depth: u8) {
                     }
                 }
             }
+            // kuma-term's own key: unfocused alpha, kitty has no equivalent
+            "background_opacity_unfocused" => {
+                if let Ok(alpha) = value.parse::<f32>() {
+                    if (0.0..=1.0).contains(&alpha) {
+                        theme.background_opacity_unfocused = alpha;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -198,6 +237,38 @@ fn hex_color(value: &str) -> Option<Rgb8> {
     let g = u8::from_str_radix(&v[2..4], 16).ok()?;
     let b = u8::from_str_radix(&v[4..6], 16).ok()?;
     Some(Rgb8(r, g, b))
+}
+
+/// Swap the chrome for the wallpaper palette kuma-shell publishes
+/// (key=value, RRGGBB or RRGGBBAA). Same mapping kuma-files uses: the
+/// window backing is the shell's darkest inset, text follows the shell's
+/// text, and the cursor takes the accent. The ANSI 16 are untouched.
+pub fn apply_shell_palette(theme: &mut Theme, text: &str) {
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(hex) = palette_hex(value) else {
+            continue;
+        };
+        match key.trim() {
+            "inset" => theme.background = hex,
+            "text" => theme.foreground = hex,
+            "accent" => theme.cursor = hex,
+            "accent_text" => theme.cursor_text = hex,
+            _ => {}
+        }
+    }
+}
+
+/// The shell's panel colors arrive as RRGGBBAA (alpha in the low byte);
+/// the terminal's chrome is opaque, so keep the top 24 bits. Pure RGB
+/// values pass through untouched.
+fn palette_hex(value: &str) -> Option<Rgb8> {
+    let v = value.trim();
+    let n = u32::from_str_radix(v, 16).ok()?;
+    let n = if n > 0xFFFFFF { n >> 8 } else { n };
+    Some(Rgb8((n >> 16) as u8, (n >> 8) as u8, n as u8))
 }
 
 #[cfg(test)]
@@ -245,5 +316,29 @@ mod tests {
         apply_kitty_config(&mut theme, &dir.join("main.conf"), 0);
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(theme.named[3], Rgb8(0x11, 0x22, 0x33));
+    }
+
+    #[test]
+    fn shell_palette_swaps_the_chrome() {
+        let mut theme = Theme::builtin();
+        apply_shell_palette(
+            &mut theme,
+            "panel_bg=161c1d\ninset=0d1111\ntext=dbe0e1\naccent=90cfdf\naccent_text=0d1111\n",
+        );
+        // the window backing is the shell's darkest inset, text follows the
+        // shell, the cursor takes the accent; ANSI 16 stay untouched
+        assert_eq!(theme.background, Rgb8(0x0d, 0x11, 0x11));
+        assert_eq!(theme.foreground, Rgb8(0xdb, 0xe0, 0xe1));
+        assert_eq!(theme.cursor, Rgb8(0x90, 0xcf, 0xdf));
+        assert_eq!(theme.cursor_text, Rgb8(0x0d, 0x11, 0x11));
+        assert_eq!(theme.named[1], Theme::builtin().named[1]);
+    }
+
+    #[test]
+    fn shell_palette_accepts_alpha_bytes() {
+        let mut theme = Theme::builtin();
+        apply_shell_palette(&mut theme, "inset=0d1111ff\n");
+        // RRGGBBAA: the alpha byte drops, the top 24 bits stay
+        assert_eq!(theme.background, Rgb8(0x0d, 0x11, 0x11));
     }
 }
