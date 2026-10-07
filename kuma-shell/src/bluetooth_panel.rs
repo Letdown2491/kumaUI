@@ -1,6 +1,4 @@
-use gpui::{
-    Context, Div, Entity, Render, Window, div, prelude::*, px, rgb, rgba, size,
-};
+use gpui::{Context, Div, Entity, Render, Window, div, prelude::*, px, rgb, rgba};
 
 use crate::controls;
 use crate::panel_kit as kit;
@@ -138,21 +136,16 @@ impl BluetoothPanelView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let view = cx.weak_entity();
-        let measured = crate::panel::MeasureHeight::new(content, move |height, window, cx| {
+        let measured = crate::panel::MeasureHeight::new(content, move |height, _window, cx| {
             let Some(view) = view.upgrade() else {
                 return;
             };
-            let mut resized = None;
             view.update(cx, |this, cx| {
                 if (this.geometry.height - height).abs() > 0.5 {
                     this.geometry.height = height;
                     cx.notify();
-                    resized = Some(height);
                 }
             });
-            if let Some(height) = resized {
-                window.resize(size(window.viewport_size().width, px(height)));
-            }
         });
         crate::panel::chrome(self.geometry, window, cx, measured)
     }

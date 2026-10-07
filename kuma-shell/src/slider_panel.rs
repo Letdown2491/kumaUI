@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use gpui::{
     Context, Entity, ObjectFit, Pixels, Render, TextAlign, Window, div, img, prelude::*, px, rgb,
-    rgba, size,
+    rgba,
 };
 
 use crate::controls::{self, TrackStash};
@@ -375,23 +375,20 @@ impl Render for SliderPanelView {
                 })
         });
 
-        // measured-panel flow: the content height refines the panel height
+        // measured-panel flow: the content height refines the panel
+        // height; the surface itself is never resized (it spans the
+        // output, and the drawer reads this height at render)
         let view = cx.weak_entity();
-        let measured = crate::panel::MeasureHeight::new(content, move |height, window, cx| {
+        let measured = crate::panel::MeasureHeight::new(content, move |height, _window, cx| {
             let Some(view) = view.upgrade() else {
                 return;
             };
-            let mut resized = None;
             view.update(cx, |this, cx| {
                 if (this.geometry.height - height).abs() > 0.5 {
                     this.geometry.height = height;
                     cx.notify();
-                    resized = Some(height);
                 }
             });
-            if let Some(height) = resized {
-                window.resize(size(window.viewport_size().width, px(height)));
-            }
         });
 
         crate::panel::chrome(self.geometry, window, cx, measured)

@@ -209,28 +209,24 @@ impl Render for ToastView {
             );
 
         // the measured-height flow: the content's laid-out height refines
-        // the window (the calendar's pattern). The +2 covers the border
-        // and drain bar that paint inside the card but outside the
-        // measured child.
+        // this view's geometry (the calendar's pattern). The +2 covers the
+        // border and drain bar that paint inside the card but outside the
+        // measured child. The surface is never resized: it spans the
+        // output, and the drawer reads the height at render.
         let view = cx.weak_entity();
         let width = 360.;
         let measured =
-            crate::panel::MeasureHeight::new(content, move |content_height, window, cx| {
+            crate::panel::MeasureHeight::new(content, move |content_height, _window, cx| {
                 let Some(view) = view.upgrade() else {
                     return;
                 };
-                let mut resized = None;
                 view.update(cx, |this, cx| {
                     let new_height = (content_height + 2.).clamp(64., 140.);
                     if (this.height - new_height).abs() > 0.5 {
                         this.height = new_height;
                         cx.notify();
-                        resized = Some(new_height);
                     }
                 });
-                if let Some(height) = resized {
-                    window.resize(size(window.viewport_size().width, px(height)));
-                }
             });
 
         div()

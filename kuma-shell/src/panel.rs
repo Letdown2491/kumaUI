@@ -610,7 +610,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
         }
     }
 
-    let (settings, sysmon, notifications, nostr, weather, bar, placement) = {
+    let (settings, sysmon, notifications, nostr, weather) = {
         let host = cx.global_mut::<PanelHost>();
         (
             host.settings.clone(),
@@ -618,11 +618,11 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
             host.notifications.clone(),
             host.nostr.clone(),
             host.weather.clone(),
-            host.bar,
-            host.placement,
         )
     };
-    let (width, height, keyboard) = kind.geometry();
+    // the drawer's width and height are the view's business now (the
+    // surface spans the output); only the keyboard mode shapes it
+    let (_, _, keyboard) = kind.geometry();
     let namespace = kind.namespace();
 
     let mut close_steps: Vec<Box<dyn Fn(&mut App)>> = Vec::new();
@@ -641,7 +641,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
     }
 
     let panel_close: Box<dyn Fn(&mut App)> = match cx.open_window(
-        panel_window_options(namespace, width, height, bar, placement, keyboard),
+        panel_window_options(namespace, keyboard),
         |window, cx| {
             let view = kind.open_view(
                 settings.clone(),
@@ -762,54 +762,63 @@ fn notify_bar(cx: &mut App) {
     }
 }
 
-/// The drawer's offset along the surface's stretched axis.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub(crate) enum DrawerAxis {
-    /// Offset from the surface's left edge (horizontal stretch).
-    Horizontal(f32),
-    /// Offset from the surface's top edge (vertical stretch: a left or
-    /// right dock's menu).
-    Vertical(f32),
-}
-
-/// Where the drawer hangs along the stretched axis: centered on the bar
-/// content's center line (Bar), on the anchor x (Widget), or on the
-/// pointer along the dock's long axis (At). Computed at render from
-/// live geometry: the surface merely spans the output, so mode, align,
-/// and bar width changes reposition an open panel instead of stranding
-/// it where creation-time margins put it.
-fn drawer_axis(
+/// Where the drawer sits in the panel surface. The surface spans the
+/// whole output (surface coordinates are screen coordinates) and
+/// carries no placement at all: this is computed at render from live
+/// geometry, so mode, align, width, offset, and bar position changes
+/// re-anchor an open panel without recreating anything. The client
+/// never resizes the surface: a size on an all-edge-anchored surface
+/// is the compositor's to assign, and niri kills surfaces that
+/// set_size before their first configure.
+fn drawer_origin(
     placement: PanelPlacement,
     bar: BarGeometry,
     viewport: Size<Pixels>,
     width: f32,
     height: f32,
-) -> DrawerAxis {
-    let on_screen_right = (f32::from(viewport.width) - width).max(0.);
+) -> (f32, f32) {
+    let viewport_w = f32::from(viewport.width);
+    let viewport_h = f32::from(viewport.height);
+    let on_screen_right = (viewport_w - width).max(0.);
+    let on_screen_bottom = (viewport_h - height).max(0.);
+    // a drawer hangs just off an inner face: `edge` away from the
+    // screen edge its owner hugs, opening away from that owner
+    let hang_below = |edge: f32| edge.min(on_screen_bottom);
+    let hang_above = |edge: f32| (viewport_h - edge - height).max(0.).min(on_screen_bottom);
+    let bar_y = match bar.position {
+        crate::settings::BarPosition::Top => hang_below(bar.bar_edge),
+        crate::settings::BarPosition::Bottom => hang_above(bar.bar_edge),
+    };
     match placement {
-        PanelPlacement::Bar => DrawerAxis::Horizontal(
-            (bar.content_x + (bar.content_width - width) / 2.)
+        PanelPlacement::Bar => {
+            let x = (bar.content_x + (bar.content_width - width) / 2.)
                 .max(0.)
-                .min(on_screen_right),
-        ),
+                .min(on_screen_right);
+            (x, bar_y)
+        }
         PanelPlacement::Widget { x } => {
             let content_right = bar.content_x + bar.content_width;
-            DrawerAxis::Horizontal(
-                (x - width / 2.)
-                    .max(0.)
-                    .min((content_right - width).max(0.)),
-            )
+            let x = (x - width / 2.)
+                .max(0.)
+                .min((content_right - width).max(0.));
+            (x, bar_y)
         }
-        PanelPlacement::At { x, y, dock, .. } => match dock {
+        PanelPlacement::At { x, y, dock, offset } => match dock {
             // horizontal dock: menu above/below it, centered on the cell
-            crate::settings::DockPosition::Bottom | crate::settings::DockPosition::Top => {
-                DrawerAxis::Horizontal((x - width / 2.).max(0.).min(on_screen_right))
+            crate::settings::DockPosition::Bottom => {
+                ((x - width / 2.).max(0.).min(on_screen_right), hang_above(offset))
+            }
+            crate::settings::DockPosition::Top => {
+                ((x - width / 2.).max(0.).min(on_screen_right), hang_below(offset))
             }
             // vertical dock: menu beside it, centered on the cell
-            crate::settings::DockPosition::Left | crate::settings::DockPosition::Right => {
-                let on_screen_bottom = (f32::from(viewport.height) - height).max(0.);
-                DrawerAxis::Vertical((y - height / 2.).max(0.).min(on_screen_bottom))
+            crate::settings::DockPosition::Left => {
+                (offset, (y - height / 2.).max(0.).min(on_screen_bottom))
             }
+            crate::settings::DockPosition::Right => (
+                (viewport_w - offset - width).max(0.),
+                (y - height / 2.).max(0.).min(on_screen_bottom),
+            ),
         },
     }
 }
@@ -819,8 +828,8 @@ fn drawer_axis(
 /// click-through), insets the content by the cove, and dismisses on Esc.
 /// Panel views render content only.
 ///
-/// The drawer's offset along the stretched axis comes from `drawer_axis`
-/// at render time, so the input region tracks it too.
+/// The drawer's full rect comes from `drawer_origin` at render time, so
+/// the input region tracks it too.
 pub fn chrome(
     geometry: PanelGeometry,
     window: &mut Window,
@@ -832,17 +841,16 @@ pub fn chrome(
         height,
         cove,
     } = geometry;
-    let (axis, bar_at_top) = {
+    let (drawer_left, drawer_top, bar_at_top) = {
         let host = cx.global::<PanelHost>();
         let bar = host.bar();
+        let (left, top) =
+            drawer_origin(host.placement, bar, window.viewport_size(), width, height);
         (
-            drawer_axis(host.placement, bar, window.viewport_size(), width, height),
+            left,
+            top,
             bar.position == crate::settings::BarPosition::Top,
         )
-    };
-    let (drawer_left, drawer_top) = match axis {
-        DrawerAxis::Horizontal(left) => (left, 0.),
-        DrawerAxis::Vertical(top) => (0., top),
     };
     window.set_input_region(Some(&[Bounds {
         origin: point(px(drawer_left + cove), px(drawer_top)),
@@ -879,57 +887,20 @@ pub fn chrome(
         )
 }
 
-pub fn panel_window_options(
-    namespace: &str,
-    width: f32,
-    height: f32,
-    bar: BarGeometry,
-    placement: PanelPlacement,
-    keyboard: KeyboardInteractivity,
-) -> WindowOptions {
-    // The surface stretches along the placement axis, the bar's own
-    // trick: the compositor keeps it spanning the output through mode
-    // changes, and the drawer is positioned in-view at render time (see
-    // drawer_axis), so resolution, align, and bar width changes
-    // re-anchor an open panel instead of stranding it at stale margins.
-    // Only the cross-axis offset (the bar's inner edge, or the gap to
-    // the dock) is a fixed margin; a bottom bar hangs its panels above
-    // it, opening upward.
-    let (anchor, margin) = match placement {
-        PanelPlacement::Bar | PanelPlacement::Widget { .. } => match bar.position {
-            crate::settings::BarPosition::Top => (
-                Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
-                (px(bar.bar_edge), px(0.), px(0.), px(0.)),
-            ),
-            crate::settings::BarPosition::Bottom => (
-                Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-                (px(0.), px(0.), px(bar.bar_edge), px(0.)),
-            ),
-        },
-        PanelPlacement::At { dock, offset, .. } => match dock {
-            crate::settings::DockPosition::Bottom => (
-                Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-                (px(0.), px(0.), px(offset), px(0.)),
-            ),
-            crate::settings::DockPosition::Top => (
-                Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
-                (px(offset), px(0.), px(0.), px(0.)),
-            ),
-            crate::settings::DockPosition::Left => (
-                Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM,
-                (px(0.), px(0.), px(0.), px(offset)),
-            ),
-            crate::settings::DockPosition::Right => (
-                Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM,
-                (px(0.), px(offset), px(0.), px(0.)),
-            ),
-        },
-    };
+pub fn panel_window_options(namespace: &str, keyboard: KeyboardInteractivity) -> WindowOptions {
+    // The surface spans the whole output, the scrim's shape, and
+    // carries no placement at all: drawer_origin computes the drawer's
+    // rect at render from live geometry, so any bar change re-anchors
+    // an open panel without recreating anything. The client never
+    // resizes the surface (a size on an all-edge-anchored surface is
+    // the compositor's to assign, and niri kills set_size before the
+    // first configure); the input region keeps clicks outside the
+    // drawer passing through to the scrim.
     WindowOptions {
         titlebar: None,
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(0.), px(0.)),
-            size: size(px(width), px(height)),
+            size: size(px(0.), px(0.)),
         })),
         app_id: Some(format!("kuma-shell-{namespace}")),
         window_background: WindowBackgroundAppearance::Transparent,
@@ -937,9 +908,8 @@ pub fn panel_window_options(
             namespace: namespace.to_string(),
             layer: Layer::Overlay,
             exclusive_zone: Some(px(-1.)),
-            anchor,
+            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
             keyboard_interactivity: keyboard,
-            margin: Some(margin),
             ..Default::default()
         }),
         ..Default::default()
@@ -991,24 +961,14 @@ mod tests {
         }
     }
 
-    fn margins(layer: &LayerShellOptions) -> (f32, f32, f32, f32) {
-        let (top, right, bottom, left) = layer.margin.unwrap();
-        (
-            f32::from(top),
-            f32::from(right),
-            f32::from(bottom),
-            f32::from(left),
-        )
-    }
-
-    fn axis(
+    fn origin(
         placement: PanelPlacement,
         bar: BarGeometry,
         viewport: (f32, f32),
         width: f32,
         height: f32,
-    ) -> DrawerAxis {
-        drawer_axis(
+    ) -> (f32, f32) {
+        drawer_origin(
             placement,
             bar,
             size(px(viewport.0), px(viewport.1)),
@@ -1018,54 +978,49 @@ mod tests {
     }
 
     #[test]
-    fn panel_surface_stretches_across_the_output_under_the_bar() {
-        let options = panel_window_options(
-            "test",
-            400.,
-            300.,
-            BarGeometry {
-                content_x: 200.,
-                content_width: 600.,
-                bar_edge: 40.,
-                ..Default::default()
-            },
+    fn panel_surfaces_are_full_output_overlays() {
+        // the surface carries no placement at all: all four edges, no
+        // margins, and the client never resizes it (a size on an
+        // all-edge-anchored surface is the compositor's to assign, and
+        // niri kills set_size before the first configure)
+        for placement in [
             PanelPlacement::Bar,
-            KeyboardInteractivity::OnDemand,
-        );
-        let layer = layer_of(&options);
-        assert_eq!(
-            layer.anchor,
-            Anchor::TOP | Anchor::LEFT | Anchor::RIGHT
-        );
-        // the only margin is the bar's bottom edge; the horizontal
-        // position is decided at render, from live geometry
-        assert_eq!(margins(layer), (40., 0., 0., 0.));
+            PanelPlacement::Widget { x: 500. },
+            PanelPlacement::At {
+                x: 500.,
+                y: 20.,
+                dock: crate::settings::DockPosition::Bottom,
+                offset: 72.,
+            },
+        ] {
+            let _ = &placement;
+            let options = panel_window_options("test", KeyboardInteractivity::OnDemand);
+            let layer = layer_of(&options);
+            assert_eq!(
+                layer.anchor,
+                Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT
+            );
+            assert_eq!(layer.margin, None);
+            assert_eq!(layer.layer, Layer::Overlay);
+            assert_eq!(layer.exclusive_zone, Some(px(-1.)));
+        }
     }
 
     #[test]
-    fn bottom_bar_panels_hang_above_the_bar_and_open_upward() {
-        let options = panel_window_options(
-            "test",
-            400.,
-            300.,
-            BarGeometry {
-                content_x: 200.,
-                content_width: 600.,
-                bar_edge: 40.,
-                position: crate::settings::BarPosition::Bottom,
-            },
-            PanelPlacement::Bar,
-            KeyboardInteractivity::OnDemand,
-        );
-        let layer = layer_of(&options);
-        // the surface pins to the bottom edge, margin holds the bar's
-        // inner face away, and the drawer positions at render like any
-        // top-bar panel
+    fn panel_hangs_flush_under_the_bar_centered_on_its_content() {
+        // viewport 1000×800, content 600 centered → content_x 200; a
+        // 400-wide panel centered on the content's center line is
+        // screen-centered, hanging just under the bar's inner face.
+        let bar = BarGeometry {
+            content_x: 200.,
+            content_width: 600.,
+            bar_edge: 40.,
+            ..Default::default()
+        };
         assert_eq!(
-            layer.anchor,
-            Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT
+            origin(PanelPlacement::Bar, bar, (1000., 800.), 400., 300.),
+            (300., 40.)
         );
-        assert_eq!(margins(layer), (0., 0., 40., 0.));
     }
 
     #[test]
@@ -1101,8 +1056,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            axis(PanelPlacement::Bar, bar, (1000., 800.), 400., 300.),
-            DrawerAxis::Horizontal(300.)
+            origin(PanelPlacement::Bar, bar, (1000., 800.), 400., 300.),
+            (300., 40.)
         );
     }
 
@@ -1118,8 +1073,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            axis(PanelPlacement::Bar, bar, (1200., 800.), 400., 300.),
-            DrawerAxis::Horizontal(700.)
+            origin(PanelPlacement::Bar, bar, (1200., 800.), 400., 300.),
+            (700., 40.)
         );
     }
 
@@ -1132,8 +1087,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            axis(PanelPlacement::Bar, bar, (1000., 800.), 560., 300.),
-            DrawerAxis::Horizontal(0.)
+            origin(PanelPlacement::Bar, bar, (1000., 800.), 560., 300.),
+            (0., 0.)
         );
     }
 
@@ -1149,22 +1104,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            axis(PanelPlacement::Bar, bar, (1000., 800.), 560., 300.),
-            DrawerAxis::Horizontal(440.)
+            origin(PanelPlacement::Bar, bar, (1000., 800.), 560., 300.),
+            (440., 40.)
         );
     }
 
     #[test]
     fn unreported_bar_geometry_defaults_to_no_offset() {
         assert_eq!(
-            axis(
+            origin(
                 PanelPlacement::Bar,
                 BarGeometry::default(),
                 (0., 0.),
                 560.,
                 300.
             ),
-            DrawerAxis::Horizontal(0.)
+            (0., 0.)
         );
     }
 
@@ -1178,14 +1133,14 @@ mod tests {
         };
         // widget at x=500; panel 360 wide centers under it
         assert_eq!(
-            axis(
+            origin(
                 PanelPlacement::Widget { x: 500. },
                 bar,
                 (1000., 800.),
                 360.,
                 150.
             ),
-            DrawerAxis::Horizontal(320.)
+            (320., 40.)
         );
     }
 
@@ -1199,76 +1154,47 @@ mod tests {
         };
         // anchor near the left edge: clamps to 0
         assert_eq!(
-            axis(
+            origin(
                 PanelPlacement::Widget { x: 50. },
                 bar,
                 (1000., 800.),
                 360.,
                 150.
             ),
-            DrawerAxis::Horizontal(0.)
+            (0., 40.)
         );
 
         // anchor near the content's right edge: right edge clamps to 600
         assert_eq!(
-            axis(
+            origin(
                 PanelPlacement::Widget { x: 590. },
                 bar,
                 (1000., 800.),
                 360.,
                 150.
             ),
-            DrawerAxis::Horizontal(240.)
+            (240., 40.)
         );
     }
 
     #[test]
-    fn dock_menu_surface_stretches_along_the_dock_edge() {
-        let bar = BarGeometry::default();
-        let cases = [
-            (
-                crate::settings::DockPosition::Bottom,
-                Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-                (0., 0., 72., 0.),
-            ),
-            (
-                crate::settings::DockPosition::Top,
-                Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
-                (72., 0., 0., 0.),
-            ),
-            (
-                crate::settings::DockPosition::Left,
-                Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM,
-                (0., 0., 0., 72.),
-            ),
-            (
-                crate::settings::DockPosition::Right,
-                Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM,
-                (0., 72., 0., 0.),
-            ),
-        ];
-        for (dock, anchor, expected) in cases {
-            let options = panel_window_options(
-                "test",
-                180.,
-                96.,
-                bar,
-                PanelPlacement::At {
-                    x: 500.,
-                    y: 20.,
-                    dock,
-                    offset: 72.,
-                },
-                KeyboardInteractivity::OnDemand,
-            );
-            let layer = layer_of(&options);
-            assert_eq!(layer.anchor, anchor, "{dock:?} anchor");
-            assert_eq!(margins(layer), expected, "{dock:?} margins");
-        }
+    fn bottom_bar_panels_open_upward() {
+        let bar = BarGeometry {
+            content_x: 200.,
+            content_width: 600.,
+            bar_edge: 40.,
+            position: crate::settings::BarPosition::Bottom,
+        };
+        // the drawer's bottom edge sits at the bar's inner face:
+        // 460 + 300 + 40 = 800, the viewport's bottom
+        assert_eq!(
+            origin(PanelPlacement::Bar, bar, (1000., 800.), 400., 300.),
+            (300., 460.)
+        );
     }
 
     #[test]
-    fn dock_menu_hangs_at_the_pointer_along_the_dock_axis() {
+    fn dock_menu_hangs_off_its_dock_edge() {
         // bottom dock: menu above it, centered on the clicked cell's x
         let placement = PanelPlacement::At {
             x: 500.,
@@ -1277,8 +1203,20 @@ mod tests {
             offset: 72.,
         };
         assert_eq!(
-            axis(placement, BarGeometry::default(), (1000., 800.), 180., 96.),
-            DrawerAxis::Horizontal(410.)
+            origin(placement, BarGeometry::default(), (1000., 800.), 180., 96.),
+            (410., 632.)
+        );
+
+        // top dock: menu below it
+        let placement = PanelPlacement::At {
+            x: 500.,
+            y: 20.,
+            dock: crate::settings::DockPosition::Top,
+            offset: 72.,
+        };
+        assert_eq!(
+            origin(placement, BarGeometry::default(), (1000., 800.), 180., 96.),
+            (410., 72.)
         );
 
         // left dock: menu to the right of it, centered on the cell's y
@@ -1289,8 +1227,20 @@ mod tests {
             offset: 72.,
         };
         assert_eq!(
-            axis(placement, BarGeometry::default(), (1000., 1080.), 180., 96.),
-            DrawerAxis::Vertical(552.)
+            origin(placement, BarGeometry::default(), (1000., 1080.), 180., 96.),
+            (72., 552.)
+        );
+
+        // right dock: mirrored, menu's right edge at the dock's face
+        let placement = PanelPlacement::At {
+            x: 20.,
+            y: 600.,
+            dock: crate::settings::DockPosition::Right,
+            offset: 72.,
+        };
+        assert_eq!(
+            origin(placement, BarGeometry::default(), (1000., 1080.), 180., 96.),
+            (748., 552.)
         );
     }
 
@@ -1305,8 +1255,8 @@ mod tests {
             offset: 72.,
         };
         assert_eq!(
-            axis(placement, BarGeometry::default(), (1000., 800.), 180., 96.),
-            DrawerAxis::Horizontal(820.)
+            origin(placement, BarGeometry::default(), (1000., 800.), 180., 96.),
+            (820., 632.)
         );
 
         // left dock cell near the screen's bottom: the menu's bottom
@@ -1318,8 +1268,8 @@ mod tests {
             offset: 72.,
         };
         assert_eq!(
-            axis(placement, BarGeometry::default(), (1000., 1080.), 180., 96.),
-            DrawerAxis::Vertical(984.)
+            origin(placement, BarGeometry::default(), (1000., 1080.), 180., 96.),
+            (72., 984.)
         );
     }
 

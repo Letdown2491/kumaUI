@@ -1,5 +1,5 @@
 use chrono::{Datelike, Local, NaiveDate};
-use gpui::{App, Context, Div, Render, SharedString, Window, div, prelude::*, px, rgb, size};
+use gpui::{App, Context, Div, Render, SharedString, Window, div, prelude::*, px, rgb};
 
 use crate::panel_kit as kit;
 
@@ -101,24 +101,21 @@ impl Render for CalendarView {
                     })),
             );
 
-        // report the laid-out content height back into this view's geometry
-        // and resize the surface; converges when the delta is sub-pixel
+        // report the laid-out content height back into this view's
+        // geometry; converges when the delta is sub-pixel. The surface
+        // is never resized: it spans the output, and the drawer reads
+        // this height at render.
         let view = cx.weak_entity();
-        let measured = crate::panel::MeasureHeight::new(content, move |height, window, cx| {
+        let measured = crate::panel::MeasureHeight::new(content, move |height, _window, cx| {
             let Some(view) = view.upgrade() else {
                 return;
             };
-            let mut resized = None;
             view.update(cx, |this, cx| {
                 if (this.geometry.height - height).abs() > 0.5 {
                     this.geometry.height = height;
                     cx.notify();
-                    resized = Some(height);
                 }
             });
-            if let Some(height) = resized {
-                window.resize(size(window.viewport_size().width, px(height)));
-            }
         });
 
         crate::panel::chrome(self.geometry, window, cx, measured)

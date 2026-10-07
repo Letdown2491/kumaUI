@@ -1,4 +1,4 @@
-use gpui::{Context, Entity, Render, Window, div, prelude::*, px, rgb, size};
+use gpui::{Context, Entity, Render, Window, div, prelude::*, px, rgb};
 
 use crate::panel_kit as kit;
 use crate::sysmon::SysMon;
@@ -321,23 +321,20 @@ impl Render for SysPanelView {
         // height (no size_full) and its laid-out height refines the
         // geometry each frame (the calendar's convergence), so a
         // one-row stats block makes a shorter panel than a two-row
-        // one, with the same bottom padding under both
+        // one, with the same bottom padding under both. The surface
+        // is never resized: it spans the output, and the drawer reads
+        // this height at render.
         let view = cx.weak_entity();
-        let measured = crate::panel::MeasureHeight::new(content, move |height, window, cx| {
+        let measured = crate::panel::MeasureHeight::new(content, move |height, _window, cx| {
             let Some(view) = view.upgrade() else {
                 return;
             };
-            let mut resized = None;
             view.update(cx, |this, cx| {
                 if (this.geometry.height - height).abs() > 0.5 {
                     this.geometry.height = height;
                     cx.notify();
-                    resized = Some(height);
                 }
             });
-            if let Some(height) = resized {
-                window.resize(size(window.viewport_size().width, px(height)));
-            }
         });
 
         crate::panel::chrome(self.geometry, window, cx, measured)
