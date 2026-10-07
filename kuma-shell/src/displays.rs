@@ -483,12 +483,44 @@ fn parse_store(text: &str) -> Result<Vec<OutputBlock>> {
     let mut blocks: Vec<OutputBlock> = Vec::new();
     let mut open: Option<OutputBlock> = None;
     let mut seen: Vec<String> = Vec::new();
+    // lines of a window-rule block being collected for comparison against
+    // the one rule the shell writes
+    let mut rule: Option<Vec<String>> = None;
     for (no, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with("//") {
             continue;
         }
         let fail = |what: &str| anyhow::anyhow!("local.kdl line {}: {what}", no + 1);
+        if let Some(lines) = &mut rule {
+            if line == "}" {
+                let lines = rule.take().expect("checked above");
+                // the interior of the rule: the opening line is consumed
+                // by the match below, comments never reach collection
+                let expected: Vec<String> = KUMA_TERM_RULE
+                    .lines()
+                    .map(|line| line.trim().to_string())
+                    .filter(|line| {
+                        !line.is_empty()
+                            && !line.starts_with("//")
+                            && line != "window-rule {"
+                            && line != "}"
+                    })
+                    .collect();
+                if lines != expected {
+                    return Err(fail(
+                        "unknown window-rule (only the rule kuma-shell writes is understood)",
+                    ));
+                }
+            } else {
+                lines.push(line.to_string());
+            }
+            continue;
+        }
+        if line == "window-rule {" {
+            rule = Some(Vec::new());
+            continue;
+        }
         if line == "}" {
             match open.take() {
                 Some(block) => blocks.push(block),
@@ -575,6 +607,9 @@ fn parse_store(text: &str) -> Result<Vec<OutputBlock>> {
     }
     if open.is_some() {
         bail!("local.kdl ended inside an output block");
+    }
+    if rule.is_some() {
+        bail!("local.kdl ended inside a window-rule block");
     }
     Ok(blocks)
 }
@@ -684,10 +719,27 @@ fn block_text(block: &OutputBlock) -> String {
     out
 }
 
+/// The kuma-term window rule the shell writes into the store. kuma-term
+/// composites translucently, and niri's focus ring paints a filled rect
+/// behind the focused window: a translucent terminal blends over that rect
+/// and the ring color bleeds through its background. This rule draws the
+/// ring as an outline around the window instead. The shell rewrites the
+/// store whole on every pin, so the rule rides along in every write; the
+/// parser accepts exactly this block and rejects any other window-rule,
+/// so a hand edit can never be destroyed silently.
+const KUMA_TERM_RULE: &str = "\
+// kuma-term: the ring as an outline, not a filled rect behind the window
+window-rule {
+    match app-id=\"kuma-term\"
+    draw-border-with-background false
+}";
+
 fn serialize_store(blocks: &[OutputBlock]) -> String {
     let mut out = String::from(
         "// display settings persisted by kuma-shell; one block per monitor, only the changed fields\n",
     );
+    out.push_str(KUMA_TERM_RULE);
+    out.push('\n');
     for block in blocks {
         out.push_str(&block_text(block));
     }
@@ -755,11 +807,36 @@ mod tests {
         assert_eq!(
             serialize_store(&[pinned]),
             "// display settings persisted by kuma-shell; one block per monitor, only the changed fields\n\
+             // kuma-term: the ring as an outline, not a filled rect behind the window\n\
+             window-rule {\n    \
+             match app-id=\"kuma-term\"\n    \
+             draw-border-with-background false\n\
+             }\n\
              output \"DP-1\" {\n    \
              scale 1.25\n    \
              mode \"3440x1440@165.004\"\n    \
              variable-refresh-rate\n}\n"
         );
+    }
+
+    #[test]
+    fn the_kuma_term_rule_survives_a_display_pin() {
+        // the store the shell writes carries the kuma-term rule; a later
+        // pin reads the file back and must keep the rule
+        let text = serialize_store(&[block("eDP-1")]);
+        let parsed = parse_store(&text).unwrap();
+        assert!(parsed.is_empty() || parsed.len() == 1);
+        let repinned = serialize_store(&parsed);
+        assert_eq!(repinned, text);
+    }
+
+    #[test]
+    fn an_unknown_window_rule_is_a_parse_error_not_silence() {
+        let text = "window-rule {\n    match app-id=\"other\"\n}\n";
+        assert!(parse_store(text).is_err());
+        // and a mangled version of the shell's own rule too
+        let mangled = serialize_store(&[]).replace("draw-border-with-background false", "");
+        assert!(parse_store(&mangled).is_err());
     }
 
     #[test]
