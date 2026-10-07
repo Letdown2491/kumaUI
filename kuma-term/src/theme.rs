@@ -57,8 +57,8 @@ impl Theme {
             cursor_text: Rgb8(24, 26, 31),
             font_family: None,
             font_size_pt: 11.0,
-            background_opacity: 0.95,
-            background_opacity_unfocused: 0.85,
+            background_opacity: 0.90,
+            background_opacity_unfocused: 0.80,
         }
     }
 
