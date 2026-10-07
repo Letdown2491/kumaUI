@@ -23,10 +23,10 @@ pub struct Theme {
     /// Font size in points (kitty's unit); rendered as pt * 96/72.
     pub font_size_pt: f32,
     /// Terminal background alpha when the window has focus (kitty's
-    /// background_opacity).
+    /// background_opacity). The focused window shows the most wallpaper;
+    /// inactive windows dim toward solid.
     pub background_opacity: f32,
-    /// Terminal background alpha when it does not; defaults to
-    /// background_opacity so unconfigured means no dim.
+    /// Terminal background alpha when it does not.
     pub background_opacity_unfocused: f32,
 }
 
@@ -57,8 +57,8 @@ impl Theme {
             cursor_text: Rgb8(24, 26, 31),
             font_family: None,
             font_size_pt: 11.0,
-            background_opacity: 0.90,
-            background_opacity_unfocused: 0.80,
+            background_opacity: 0.80,
+            background_opacity_unfocused: 0.90,
         }
     }
 

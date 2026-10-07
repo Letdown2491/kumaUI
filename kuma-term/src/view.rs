@@ -11,9 +11,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use gpui::{
     App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight,
-    Keystroke, ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent, SharedString, Task,
-    TextAlign, TextRun, UnderlineStyle, Window, WindowTextSystem, canvas, div, fill, point, px,
-    prelude::*, size,
+    Keystroke, MouseButton, ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent,
+    SharedString, Task, TextAlign, TextRun, UnderlineStyle, Window, WindowTextSystem, canvas, div,
+    fill, point, px, prelude::*, size,
 };
 use log::warn;
 
@@ -21,7 +21,7 @@ use crate::encoder;
 use crate::font;
 use crate::glyphs;
 use crate::palette::Rgb8;
-use crate::term::{Engine, Row, UiEvent};
+use crate::term::{CellEdge, Engine, GridPoint, Row, SelectMode, SelectSpan, UiEvent};
 use crate::theme::Theme;
 
 const PADDING: f32 = 8.0;
@@ -41,6 +41,8 @@ pub struct TerminalView {
     cols: u16,
     lines: u16,
     title: Option<String>,
+    /// a left-drag is actively stretching the selection
+    selecting: bool,
     // the pump task aborts if dropped, so it stays owned by the view
     _pump: Task<()>,
     _palette_tick: Task<()>,
@@ -124,6 +126,7 @@ impl TerminalView {
             cols: 80,
             lines: 24,
             title: None,
+            selecting: false,
             _pump: pump,
             _palette_tick: palette_tick,
         }
@@ -190,7 +193,9 @@ impl TerminalView {
         if k.modifiers.control && k.modifiers.shift {
             match k.key.as_str() {
                 "c" => {
-                    // selection copy arrives with selection support
+                    if let Some(text) = self.engine.selection_text() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
                     cx.stop_propagation();
                     return;
                 }
@@ -205,9 +210,79 @@ impl TerminalView {
 
         let app_cursor = self.engine.app_cursor();
         if let Some(bytes) = encoder::encode(k, app_cursor) {
+            // landing input collapses any active selection, like every
+            // terminal; bare modifier presses do not
+            self.engine.clear_selection();
             cx.stop_propagation();
             self.engine.input(bytes);
         }
+    }
+
+    /// The grid cell a window-coordinate pointer sits over, plus which half
+    /// of the cell: both anchor the selection ends.
+    fn cell_at(&self, x: f32, y: f32) -> (usize, usize, CellEdge) {
+        let col = (((x - PADDING) / self.cell_w).floor().max(0.0) as usize)
+            .min(self.cols.max(1) as usize - 1);
+        let row = (((y - PADDING) / self.cell_h).floor().max(0.0) as usize)
+            .min(self.lines.max(1) as usize - 1);
+        let into_cell = (x - PADDING) - col as f32 * self.cell_w;
+        let edge = if into_cell < self.cell_w / 2.0 { CellEdge::Left } else { CellEdge::Right };
+        (row, col, edge)
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        let (row, col, edge) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
+        let mode = match event.click_count {
+            2 => SelectMode::Word,
+            3.. => SelectMode::Line,
+            _ => SelectMode::Char,
+        };
+        let offset = self.engine.display_offset();
+        self.engine.begin_selection(
+            GridPoint { line: row as i32 - offset as i32, column: col },
+            edge,
+            mode,
+        );
+        self.selecting = true;
+        cx.notify();
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selecting {
+            return;
+        }
+        let (row, col, edge) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
+        let offset = self.engine.display_offset();
+        self.engine
+            .update_selection(GridPoint { line: row as i32 - offset as i32, column: col }, edge);
+        cx.notify();
+    }
+
+    fn on_mouse_up(
+        &mut self,
+        event: &gpui::MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left || !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        self.engine.finish_selection();
+        cx.notify();
     }
 
     fn on_wheel(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -284,12 +359,18 @@ impl Render for TerminalView {
             cell_h: self.cell_h,
             fg: self.theme.foreground,
             display_offset: snapshot.display_offset,
+            selection: snapshot.selection,
+            selection_color: {
+                let mut color = hsla_of(self.theme.cursor);
+                color.a *= 0.35;
+                color
+            },
         };
         let grid_w = self.cols as f32 * self.cell_w;
         let grid_h = snapshot.rows.len() as f32 * self.cell_h;
 
-        // background alpha: more opaque when the window has focus (the
-        // terminal you read sits on less wallpaper)
+        // background alpha: the focused window shows the most wallpaper,
+        // inactive windows dim toward solid for contrast
         let opacity = if window.is_window_active() {
             self.theme.background_opacity
         } else {
@@ -306,6 +387,9 @@ impl Render for TerminalView {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_click(cx.listener(|this, _event: &gpui::ClickEvent, window, cx| {
                 window.focus(&this.focus, cx);
             }))
@@ -529,6 +613,9 @@ struct GridPaint {
     cell_h: f32,
     fg: Rgb8,
     display_offset: usize,
+    /// selection highlight, viewport row spans
+    selection: Vec<SelectSpan>,
+    selection_color: gpui::Hsla,
 }
 impl GridPaint {
     fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
@@ -543,6 +630,18 @@ impl GridPaint {
                     size(px(len as f32 * self.cell_w), px(self.cell_h)),
                 );
                 window.paint_quad(fill(quad_bounds, hsla_of(color)));
+            }
+
+            // the selection wash sits over cell backgrounds, under text
+            for span in &self.selection {
+                let quad_bounds = Bounds::new(
+                    point(
+                        origin.x + px(span.start as f32 * self.cell_w),
+                        origin.y + px(span.row as f32 * self.cell_h),
+                    ),
+                    size(px(span.len as f32 * self.cell_w), px(self.cell_h)),
+                );
+                window.paint_quad(fill(quad_bounds, self.selection_color));
             }
 
             // vector glyphs: box drawing, block elements, braille

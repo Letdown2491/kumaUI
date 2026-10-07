@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=kuma-term
+GenericName=Terminal
+Comment=The kumaOS terminal
+Keywords=terminal;shell;console;kuma;
+Exec=@HOME@/.local/bin/kuma-term
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupNotify=true

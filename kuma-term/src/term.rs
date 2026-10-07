@@ -14,6 +14,8 @@ use std::sync::Arc;
 use alacritty_terminal::event::{Event, EventListener, Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Term, TermMode};
@@ -146,6 +148,41 @@ pub struct CursorSpot {
     pub col: usize,
 }
 
+/// A grid position for selection, in buffer coordinates: line 0 is the top
+/// of the live screen, negative lines are scrollback history. The view
+/// converts pointer pixels into this, the engine converts it into the
+/// emulator's own point type behind the seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridPoint {
+    pub line: i32,
+    pub column: usize,
+}
+
+/// Which half of a cell a pointer position lands in: terminals anchor a
+/// selection's ends to cell edges, not cell centers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellEdge {
+    Left,
+    Right,
+}
+
+/// What a pointer gesture selects: plain drag, double-click word, or
+/// triple-click line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectMode {
+    Char,
+    Word,
+    Line,
+}
+
+/// One highlighted run of cells, in viewport coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectSpan {
+    pub row: usize,
+    pub start: usize,
+    pub len: usize,
+}
+
 /// A frame's worth of terminal state, plain data for the renderer.
 pub struct Snapshot {
     pub rows: Vec<Row>,
@@ -154,6 +191,57 @@ pub struct Snapshot {
     pub bracketed_paste: bool,
     /// how far the viewport is scrolled back into history (0 = live)
     pub display_offset: usize,
+    /// the active selection, projected into viewport row spans
+    pub selection: Vec<SelectSpan>,
+}
+
+fn cell_edge(edge: CellEdge) -> Side {
+    match edge {
+        CellEdge::Left => Side::Left,
+        CellEdge::Right => Side::Right,
+    }
+}
+
+fn select_type(mode: SelectMode) -> SelectionType {
+    match mode {
+        SelectMode::Char => SelectionType::Simple,
+        SelectMode::Word => SelectionType::Semantic,
+        SelectMode::Line => SelectionType::Lines,
+    }
+}
+
+/// Project a selection range (buffer coordinates) into viewport row spans:
+/// middle rows run the full width, the anchor rows clamp to the range's
+/// columns. A line selection fills every row it touches.
+fn selection_spans(
+    range: &SelectionRange,
+    mode: SelectMode,
+    display_offset: usize,
+    screen_lines: usize,
+    columns: usize,
+) -> Vec<SelectSpan> {
+    let last_col = columns.saturating_sub(1);
+    let mut spans = Vec::new();
+    for row in 0..screen_lines {
+        let line = row as i32 - display_offset as i32;
+        if line < range.start.line.0 || line > range.end.line.0 {
+            continue;
+        }
+        let (start_col, end_col) = match mode {
+            SelectMode::Line => (0, last_col),
+            _ => {
+                let start_col = if line == range.start.line.0 { range.start.column.0 } else { 0 };
+                let end_col = if line == range.end.line.0 { range.end.column.0 } else { last_col };
+                (start_col, end_col)
+            }
+        };
+        let start_col = start_col.min(last_col);
+        let end_col = end_col.min(last_col);
+        if end_col >= start_col {
+            spans.push(SelectSpan { row, start: start_col, len: end_col - start_col + 1 });
+        }
+    }
+    spans
 }
 
 pub struct Engine {
@@ -162,6 +250,9 @@ pub struct Engine {
     loop_tx: alacritty_terminal::event_loop::EventLoopSender,
     window_size: WindowSize,
     theme: Theme,
+    /// how the current selection started, so the snapshot projects its
+    /// spans the way the gesture expects (a line select fills whole rows)
+    selection_mode: Option<SelectMode>,
 }
 
 impl Engine {
@@ -196,7 +287,7 @@ impl Engine {
         let loop_tx = event_loop.channel();
         event_loop.spawn();
 
-        Ok(Self { term, notifier: Notifier(loop_tx.clone()), loop_tx, window_size, theme })
+        Ok(Self { term, notifier: Notifier(loop_tx.clone()), loop_tx, window_size, theme, selection_mode: None })
     }
 
     /// Swap the chrome colors for a republished shell palette; the next
@@ -241,6 +332,57 @@ impl Engine {
 
     pub fn window_size(&self) -> WindowSize {
         self.window_size
+    }
+
+    /// How far the viewport is scrolled back into history (0 = live).
+    pub fn display_offset(&self) -> usize {
+        self.term.lock().grid().display_offset()
+    }
+
+    /// Start a selection: a pointer press at `point` anchors one end.
+    pub fn begin_selection(&mut self, point: GridPoint, edge: CellEdge, mode: SelectMode) {
+        let mut term = self.term.lock();
+        term.selection = Some(Selection::new(
+            select_type(mode),
+            Point::new(Line(point.line), Column(point.column)),
+            cell_edge(edge),
+        ));
+        self.selection_mode = Some(mode);
+    }
+
+    /// Drag the selection's moving end.
+    pub fn update_selection(&mut self, point: GridPoint, edge: CellEdge) {
+        let mut term = self.term.lock();
+        let point = Point::new(Line(point.line), Column(point.column));
+        match &mut term.selection {
+            Some(selection) => selection.update(point, cell_edge(edge)),
+            None => {
+                // the emulator cleared under us (scroll or input); start over
+                term.selection =
+                    Some(Selection::new(SelectionType::Simple, point, cell_edge(edge)));
+            }
+        }
+    }
+
+    /// A pointer release: drop selections that never left the anchor.
+    pub fn finish_selection(&mut self) {
+        let mut term = self.term.lock();
+        if term.selection.as_ref().is_some_and(|s| s.is_empty()) {
+            term.selection = None;
+            self.selection_mode = None;
+        }
+    }
+
+    /// Collapse any active selection (a keystroke lands).
+    pub fn clear_selection(&mut self) {
+        let mut term = self.term.lock();
+        term.selection = None;
+        self.selection_mode = None;
+    }
+
+    /// The selected text, if any, in reading order with line breaks.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.lock().selection_to_string()
     }
 
     /// Resolve a raw palette index (0..269) for OSC 4 replies.
@@ -331,12 +473,28 @@ impl Engine {
             }
         }
 
+        // the active selection, as viewport row spans for the renderer
+        let selection = match (&term.selection, self.selection_mode) {
+            (Some(sel), Some(mode)) => sel
+                .to_range(&*term)
+                .map(|range| selection_spans(&range, mode, offset, screen_lines, columns))
+                .unwrap_or_default(),
+            (Some(sel), None) => sel
+                .to_range(&*term)
+                .map(|range| {
+                    selection_spans(&range, SelectMode::Char, offset, screen_lines, columns)
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+
         Snapshot {
             rows,
             cursor,
             alt_screen: mode.contains(TermMode::ALT_SCREEN),
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
             display_offset: offset,
+            selection,
         }
     }
 }
@@ -440,5 +598,107 @@ mod tests {
         assert_eq!(row0[0].1, false);
         assert_eq!(row0[1].1, true);
         assert_eq!(row0[2].1, false);
+    }
+
+    /// Mirror of the engine's gesture: anchor, drag, park on the term.
+    fn drag_select(
+        term: &mut Term<UiProxy>,
+        from: (i32, usize),
+        to: (i32, usize),
+    ) {
+        let mut selection = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(from.0), Column(from.1)),
+            Side::Left,
+        );
+        selection.update(Point::new(Line(to.0), Column(to.1)), Side::Right);
+        term.selection = Some(selection);
+    }
+
+    #[test]
+    fn selection_text_crosses_lines() {
+        let mut term = test_term(10, 3);
+        feed(&mut term, b"alpha\r\nbeta\r\ngamma");
+        // right edge of column 2 includes that column: "bet"
+        drag_select(&mut term, (0, 0), (1, 2));
+        assert_eq!(term.selection_to_string().as_deref(), Some("alpha\nbet"));
+    }
+
+    #[test]
+    fn selection_text_reaches_into_history() {
+        let mut term = test_term(10, 3);
+        for _ in 0..10 {
+            feed(&mut term, b"line\r\n");
+        }
+        term.scroll_display(Scroll::Delta(10));
+        // buffer line -2 is two lines above the live screen top
+        drag_select(&mut term, (-2, 0), (-1, 4));
+        assert_eq!(term.selection_to_string().as_deref(), Some("line\nline"));
+    }
+
+    #[test]
+    fn selection_spans_fill_middle_rows() {
+        let range = SelectionRange::new(
+            Point::new(Line(0), Column(2)),
+            Point::new(Line(2), Column(5)),
+            false,
+        );
+        let spans = selection_spans(&range, SelectMode::Char, 0, 3, 10);
+        assert_eq!(
+            spans,
+            vec![
+                SelectSpan { row: 0, start: 2, len: 8 },
+                SelectSpan { row: 1, start: 0, len: 10 },
+                SelectSpan { row: 2, start: 0, len: 6 },
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_spans_track_display_offset() {
+        let range = SelectionRange::new(
+            Point::new(Line(0), Column(2)),
+            Point::new(Line(2), Column(5)),
+            false,
+        );
+        // scrolled back one line: buffer line 0 sits at viewport row 1, and
+        // the range's last line (buffer line 2) is off the viewport, so its
+        // row renders as a middle row at full width
+        let spans = selection_spans(&range, SelectMode::Char, 1, 3, 10);
+        assert_eq!(
+            spans,
+            vec![
+                SelectSpan { row: 1, start: 2, len: 8 },
+                SelectSpan { row: 2, start: 0, len: 10 },
+            ]
+        );
+    }
+
+    #[test]
+    fn line_selection_fills_whole_rows() {
+        let range = SelectionRange::new(
+            Point::new(Line(0), Column(4)),
+            Point::new(Line(1), Column(7)),
+            false,
+        );
+        let spans = selection_spans(&range, SelectMode::Line, 0, 3, 10);
+        assert_eq!(
+            spans,
+            vec![
+                SelectSpan { row: 0, start: 0, len: 10 },
+                SelectSpan { row: 1, start: 0, len: 10 },
+            ]
+        );
+    }
+
+    #[test]
+    fn single_cell_selection_is_one_span() {
+        let range = SelectionRange::new(
+            Point::new(Line(0), Column(2)),
+            Point::new(Line(0), Column(2)),
+            false,
+        );
+        let spans = selection_spans(&range, SelectMode::Char, 0, 2, 10);
+        assert_eq!(spans, vec![SelectSpan { row: 0, start: 2, len: 1 }]);
     }
 }
