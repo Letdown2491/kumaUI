@@ -70,6 +70,13 @@ impl AssetSource for KumaAssets {
             }
             "icons/wifi-mid.svg" => Some(include_bytes!("../icons/wifi-mid.svg").as_slice()),
             "icons/wifi-low.svg" => Some(include_bytes!("../icons/wifi-low.svg").as_slice()),
+            "icons/search.svg" => Some(include_bytes!("../icons/search.svg").as_slice()),
+            "icons/arrow-down.svg" => Some(include_bytes!("../icons/arrow-down.svg").as_slice()),
+            "icons/chevron-left.svg" => {
+                Some(include_bytes!("../icons/chevron-left.svg").as_slice())
+            }
+            "icons/enter.svg" => Some(include_bytes!("../icons/enter.svg").as_slice()),
+            "icons/terminal.svg" => Some(include_bytes!("../icons/terminal.svg").as_slice()),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))

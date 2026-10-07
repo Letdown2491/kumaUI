@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui::{
-    App, Context, Div, FocusHandle, Focusable, KeyDownEvent, ObjectFit, Render, SharedString,
-    Window, div, img, point, prelude::*, px, rgb,
+    App, Context, Div, FocusHandle, Focusable, FontWeight, KeyDownEvent, ObjectFit, Render,
+    SharedString, Window, div, img, point, prelude::*, px, rgb, rgba,
 };
 
 use crate::imaging::{IconImage, decode_icon_file, icon_roots};
@@ -265,6 +265,75 @@ pub struct LauncherView {
     selected: usize,
 }
 
+/// The apps matching the query, best first: fuzzy score with the
+/// generic-name and keyword fallbacks penalized, then name order.
+fn filtered_indices(apps: &[AppEntry], query: &str) -> Vec<usize> {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return (0..apps.len()).collect();
+    }
+    let mut scored: Vec<(i32, usize)> = apps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, app)| {
+            // name hits rank first; generic name and keywords also
+            // match, with a penalty so "Koguma" beats "File Manager"
+            fuzzy_score(&query, &app.name.to_lowercase())
+                .or_else(|| {
+                    fuzzy_score(&query, &app.generic.to_lowercase()).map(|score| score - 20)
+                })
+                .or_else(|| {
+                    fuzzy_score(&query, &app.keywords.to_lowercase()).map(|score| score - 30)
+                })
+                .map(|score| (score, index))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| apps[a.1].name.to_lowercase().cmp(&apps[b.1].name.to_lowercase()))
+    });
+    scored.into_iter().map(|(_, index)| index).collect()
+}
+
+/// How many most-used apps the idle list pins under Frequent.
+const FREQUENT_LIMIT: usize = 4;
+
+/// One entry of the visible list: a section marker or an app row.
+#[derive(Clone, Debug, PartialEq)]
+enum LauncherItem {
+    Section(&'static str),
+    /// The app's index in the loaded list.
+    Row(usize),
+}
+
+/// The visible list: while idle, the most-used apps pinned under
+/// Frequent ahead of the catalog; while a query is active, one ranked
+/// list with the sections flattened away.
+fn sectioned_items(apps: &[AppEntry], query: &str) -> Vec<LauncherItem> {
+    if !query.is_empty() {
+        return filtered_indices(apps, query)
+            .into_iter()
+            .map(LauncherItem::Row)
+            .collect();
+    }
+    let frequent: Vec<usize> = (0..apps.len())
+        .filter(|&index| apps[index].usage > 0)
+        .take(FREQUENT_LIMIT)
+        .collect();
+    let mut items = Vec::new();
+    if !frequent.is_empty() {
+        items.push(LauncherItem::Section("Frequent"));
+        items.extend(frequent.iter().copied().map(LauncherItem::Row));
+    }
+    items.push(LauncherItem::Section("All applications"));
+    items.extend(
+        (0..apps.len())
+            .filter(|index| !frequent.contains(index))
+            .map(LauncherItem::Row),
+    );
+    items
+}
+
 impl LauncherView {
     pub fn new(
         apps: Vec<AppEntry>,
@@ -302,39 +371,6 @@ impl LauncherView {
         }
     }
 
-    fn filtered(&self) -> Vec<usize> {
-        let query = self.query.to_lowercase();
-        if query.is_empty() {
-            return (0..self.apps.len()).collect();
-        }
-        let mut scored: Vec<(i32, usize)> = self
-            .apps
-            .iter()
-            .enumerate()
-            .filter_map(|(index, app)| {
-                // name hits rank first; generic name and keywords also
-                // match, with a penalty so "Koguma" beats "File Manager"
-                fuzzy_score(&query, &app.name.to_lowercase())
-                    .or_else(|| {
-                        fuzzy_score(&query, &app.generic.to_lowercase()).map(|score| score - 20)
-                    })
-                    .or_else(|| {
-                        fuzzy_score(&query, &app.keywords.to_lowercase()).map(|score| score - 30)
-                    })
-                    .map(|score| (score, index))
-            })
-            .collect();
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0).then_with(|| {
-                self.apps[a.1]
-                    .name
-                    .to_lowercase()
-                    .cmp(&self.apps[b.1].name.to_lowercase())
-            })
-        });
-        scored.into_iter().map(|(_, index)| index).collect()
-    }
-
     fn launch_at(&mut self, app_index: usize, cx: &mut Context<Self>) {
         if let Some(app) = self.apps.get(app_index) {
             record_usage(&app.desktop_path);
@@ -346,37 +382,57 @@ impl LauncherView {
         crate::panel::close_panels(cx);
     }
 
-    fn scroll_selected_into_view(&self) {
-        self.results_scroll.scroll_to_item(self.selected);
+    /// The visible rows in selection order, each with its child index
+    /// in the scrolled list: section markers sit between the rows, so
+    /// scrolling targets the child, not the row number.
+    fn rows(&self) -> Vec<(usize, usize)> {
+        self.items()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(child, item)| match item {
+                LauncherItem::Row(app_index) => Some((app_index, child)),
+                LauncherItem::Section(_) => None,
+            })
+            .collect()
+    }
+
+    fn items(&self) -> Vec<LauncherItem> {
+        sectioned_items(&self.apps, &self.query)
+    }
+
+    fn scroll_selected_into_view(&self, rows: &[(usize, usize)]) {
+        if let Some((_, child)) = rows.get(self.selected) {
+            self.results_scroll.scroll_to_item(*child);
+        }
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let filtered = self.filtered();
+        let rows = self.rows();
         let key = event.keystroke.key.as_str();
         match key {
             "enter" => {
-                if let Some(&app_index) = filtered.get(self.selected) {
+                if let Some(&(app_index, _)) = rows.get(self.selected) {
                     self.launch_at(app_index, cx);
                 }
             }
             "up" => {
-                if filtered.is_empty() {
+                if rows.is_empty() {
                     return;
                 }
                 self.selected = if self.selected == 0 {
-                    filtered.len() - 1
+                    rows.len() - 1
                 } else {
                     self.selected - 1
                 };
-                self.scroll_selected_into_view();
+                self.scroll_selected_into_view(&rows);
                 cx.notify();
             }
             "down" => {
-                if filtered.is_empty() {
+                if rows.is_empty() {
                     return;
                 }
-                self.selected = (self.selected + 1) % filtered.len();
-                self.scroll_selected_into_view();
+                self.selected = (self.selected + 1) % rows.len();
+                self.scroll_selected_into_view(&rows);
                 cx.notify();
             }
             "backspace" => {
@@ -411,9 +467,39 @@ impl Focusable for LauncherView {
 
 impl Render for LauncherView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let filtered = self.filtered();
-        let query = self.query.clone();
+        let items = self.items();
+        let rows_count = items
+            .iter()
+            .filter(|item| matches!(item, LauncherItem::Row(_)))
+            .count();
         let selected = self.selected;
+        // the rows are built up front: the hover listeners mint here,
+        // before chrome borrows cx
+        let mut position = 0;
+        let list: Vec<gpui::AnyElement> = items
+            .into_iter()
+            .map(|item| match item {
+                LauncherItem::Section(label) => section_header(label).into_any_element(),
+                LauncherItem::Row(app_index) => {
+                    let at = position;
+                    position += 1;
+                    let app = self.apps[app_index].clone();
+                    let icon = self.icons.get(&app.icon).cloned().flatten();
+                    // the pointer and the keyboard share one selection:
+                    // hovering a row moves the selection to it
+                    let hover = cx.listener(
+                        move |this: &mut Self, _: &gpui::MouseMoveEvent, _, cx| {
+                            if this.selected != at {
+                                this.selected = at;
+                                cx.notify();
+                            }
+                        },
+                    );
+                    app_row(app, app_index, at == selected, icon, hover).into_any_element()
+                }
+            })
+            .collect();
+        let query = self.query.clone();
         let key_handler = cx.listener(Self::handle_key);
         crate::panel::chrome(
             self.geometry,
@@ -426,10 +512,15 @@ impl Render for LauncherView {
                 .flex_col()
                 .track_focus(&self.focus_handle)
                 .on_key_down(key_handler)
-                .px(px(12.))
+                .px(px(16.))
                 .pb(px(12.))
                 .pt(px(10.))
                 .gap_2()
+                .child(
+                    kit::pane_header("Applications").when(rows_count > 0, |header| {
+                        header.child(kit::count_badge(rows_count))
+                    }),
+                )
                 .child(
                     div()
                         .id("search")
@@ -469,27 +560,40 @@ impl Render for LauncherView {
                         .gap_0p5()
                         .overflow_y_scroll()
                         .track_scroll(&self.results_scroll)
-                        .when(filtered.is_empty(), |el| {
+                        .when(rows_count == 0, |el| {
                             el.child(kit::empty_state(
                                 "icons/search.svg",
                                 "No apps match",
                                 "Try a shorter or looser name",
                             ))
                         })
-                        .children(
-                            filtered
-                                .into_iter()
-                                .enumerate()
-                                .map(|(position, app_index)| {
-                                    let app = self.apps[app_index].clone();
-                                    let is_selected = position == selected;
-                                    let icon = self.icons.get(&app.icon).cloned().flatten();
-                                    app_row(app, app_index, is_selected, icon)
-                                }),
-                        ),
+                        .children(list),
                 ),
         )
     }
+}
+
+/// A section marker inside the list: the label and a hairline running
+/// to the pane's right edge (the wifi panel's section row, quieter).
+fn section_header(label: &'static str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .pt_1()
+        .child(
+            div()
+                .text_size(px(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(crate::theme::current().text_dim))
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .h(px(1.))
+                .flex_1()
+                .bg(rgba(crate::theme::current().divider_soft)),
+        )
 }
 
 fn app_row(
@@ -497,6 +601,7 @@ fn app_row(
     app_index: usize,
     is_selected: bool,
     icon: Option<IconImage>,
+    on_hover: impl Fn(&gpui::MouseMoveEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> gpui::Stateful<Div> {
     div()
         .id(SharedString::from(format!("app-{app_index}")))
@@ -507,17 +612,24 @@ fn app_row(
         .py_1p5()
         .rounded_md()
         .cursor_pointer()
-        .bg(rgb(if is_selected { crate::theme::current().surface } else { 0x00000000 }))
+        .bg(rgb(if is_selected {
+            crate::theme::current().surface
+        } else {
+            0x00000000
+        }))
+        .on_mouse_move(on_hover)
         .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
             let _ = launch(&app.exec, app.terminal);
             crate::panel::close_panels(cx);
         })
         .hover(|style| style.bg(rgb(crate::theme::current().surface_hover)))
         .child(
+            // the tile never fills the accent: the family's selection
+            // is a surface + weight shift, not a color flood
             div()
                 .size(px(26.))
                 .rounded_md()
-                .bg(rgb(if is_selected { crate::theme::current().accent } else { crate::theme::current().inset }))
+                .bg(rgb(crate::theme::current().inset))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -534,24 +646,59 @@ fn app_row(
                 })
                 .when_none(&icon, |el| {
                     el.text_size(px(12.))
-                        .text_color(rgb(if is_selected { crate::theme::current().accent_text } else { crate::theme::current().text }))
+                        .text_color(rgb(crate::theme::current().text))
                         .child(app.name.chars().next().unwrap_or('?').to_string())
                 }),
         )
         .child(
+            // the kit's row shape: the name over its dim note (the
+            // desktop entry's GenericName, when it has one)
             div()
                 .flex_1()
                 .min_w_0()
-                .text_size(px(12.5))
-                .font_weight(if is_selected {
-                    gpui::FontWeight::SEMIBOLD
-                } else {
-                    gpui::FontWeight::NORMAL
-                })
-                .text_color(rgb(if is_selected { crate::theme::current().text } else { crate::theme::current().text_dim }))
-                .truncate()
-                .child(app.name.clone()),
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .font_weight(if is_selected {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::NORMAL
+                        })
+                        .text_color(rgb(crate::theme::current().text))
+                        .truncate()
+                        .child(app.name.clone()),
+                )
+                .when(!app.generic.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(crate::theme::current().text_dim))
+                            .truncate()
+                            .child(app.generic.clone()),
+                    )
+                }),
         )
+        // trailing slot: the selected row shows the Enter affordance,
+        // unselected terminal apps show where a label would crowd
+        .when(is_selected, |el| {
+            el.child(
+                gpui::svg()
+                    .path("icons/enter.svg")
+                    .size(px(11.))
+                    .text_color(rgb(crate::theme::current().text_dim)),
+            )
+        })
+        .when(!is_selected && app.terminal, |el| {
+            el.child(
+                gpui::svg()
+                    .path("icons/terminal.svg")
+                    .size(px(11.))
+                    .text_color(rgb(crate::theme::current().text_dim)),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -641,5 +788,61 @@ mod tests {
         // no s); the keywords field is what catches the plural
         assert!(fuzzy_score("files", &koguma.generic.to_lowercase()).is_none());
         assert!(fuzzy_score("files", &koguma.keywords.to_lowercase()).is_some());
+    }
+
+    fn entry(name: &str, usage: u64) -> AppEntry {
+        AppEntry {
+            usage,
+            ..parse_desktop_entry(&format!("[Desktop Entry]\nName={name}\nExec={name}\n"))
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn idle_list_pins_frequent_apps_ahead_of_the_catalog() {
+        let apps = vec![
+            entry("Zed", 9),
+            entry("Amboss", 4),
+            entry("Files", 0),
+            entry("Terminal", 0),
+        ];
+        let items = sectioned_items(&apps, "");
+        // Frequent first: the two used apps, then the catalog section
+        assert_eq!(
+            items[..4],
+            [
+                LauncherItem::Section("Frequent"),
+                LauncherItem::Row(0),
+                LauncherItem::Row(1),
+                LauncherItem::Section("All applications"),
+            ]
+        );
+        // the catalog skips the pinned apps, so nothing repeats
+        assert_eq!(
+            items[4..],
+            [LauncherItem::Row(2), LauncherItem::Row(3)]
+        );
+    }
+
+    #[test]
+    fn idle_list_without_usage_is_one_catalog() {
+        let apps = vec![entry("Files", 0), entry("Terminal", 0)];
+        assert_eq!(
+            sectioned_items(&apps, ""),
+            [
+                LauncherItem::Section("All applications"),
+                LauncherItem::Row(0),
+                LauncherItem::Row(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_query_flattens_the_sections_away() {
+        let apps = vec![entry("Files", 5), entry("Terminal", 0)];
+        assert_eq!(
+            sectioned_items(&apps, "fil"),
+            [LauncherItem::Row(0)]
+        );
     }
 }
