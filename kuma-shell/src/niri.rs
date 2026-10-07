@@ -120,12 +120,13 @@ fn parse_event(line: &str) -> Result<Option<SessionEvent>> {
     Ok(Some(event))
 }
 
-/// Send one action request and check niri's reply envelope.
-fn send_action(action: Value) -> Result<()> {
+/// Send one request line and return niri's Ok payload. The error path
+/// keeps niri's own answer text, which is what makes IPC failures
+/// diagnosable in the journal.
+pub(crate) fn request(request: Value) -> Result<Value> {
     let path = socket_path()?;
     let stream = UnixStream::connect(&path).context("failed to connect to niri IPC socket")?;
 
-    let request = json!({"Action": action});
     let mut writer = &stream;
     writer.write_all(request.to_string().as_bytes())?;
     writer.write_all(b"\n")?;
@@ -134,8 +135,16 @@ fn send_action(action: Value) -> Result<()> {
     let mut reply = String::new();
     reader.read_line(&mut reply)?;
     if !reply.starts_with("{\"Ok\"") {
-        bail!("niri action request failed: {reply}");
+        bail!("niri request failed: {reply}");
     }
+    let envelope: Value = serde_json::from_str(reply.trim())
+        .with_context(|| format!("niri reply not JSON: {reply}"))?;
+    Ok(envelope["Ok"].clone())
+}
+
+/// Send one action request and check niri's reply envelope.
+fn send_action(action: Value) -> Result<()> {
+    request(json!({"Action": action}))?;
     Ok(())
 }
 

@@ -20,6 +20,7 @@ impl AssetSource for KumaAssets {
                 Some(include_bytes!("../icons/power-profile.svg").as_slice())
             }
             "icons/dock.svg" => Some(include_bytes!("../icons/dock.svg").as_slice()),
+            "icons/monitor.svg" => Some(include_bytes!("../icons/monitor.svg").as_slice()),
             "icons/bluetooth.svg" => Some(include_bytes!("../icons/bluetooth.svg").as_slice()),
             "icons/wifi.svg" => Some(include_bytes!("../icons/wifi.svg").as_slice()),
             "icons/bar.svg" => Some(include_bytes!("../icons/bar.svg").as_slice()),

@@ -2,6 +2,7 @@ pub mod bar;
 pub mod bluetooth_panel;
 pub mod calendar;
 pub mod controls;
+pub mod displays;
 pub mod dock;
 pub mod icons;
 pub mod idle;

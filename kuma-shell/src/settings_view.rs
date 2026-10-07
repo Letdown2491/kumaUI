@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use gpui::{
     Context, Div, DragMoveEvent, Entity, FocusHandle, ObjectFit, Render, RenderImage, SharedString,
@@ -100,6 +100,34 @@ fn power_action(
     }
 }
 
+/// The honest failure line at the top of a page: what broke, in the
+/// alarm color, no pretense that nothing happened.
+fn error_line(text: &str) -> Div {
+    div()
+        .px_3p5()
+        .py_2()
+        .rounded_lg()
+        .bg(rgb(crate::theme::current().surface))
+        .text_size(px(11.))
+        .text_color(rgb(crate::theme::URGENT))
+        .child(text.to_string())
+}
+
+/// The rotation dropdown's words for a transform.
+fn transform_label(transform: crate::displays::Transform) -> &'static str {
+    use crate::displays::Transform;
+    match transform {
+        Transform::Normal => "Normal",
+        Transform::Rotate90 => "90 degrees",
+        Transform::Rotate180 => "180 degrees",
+        Transform::Rotate270 => "270 degrees",
+        Transform::Flipped => "Flipped",
+        Transform::Flipped90 => "Flipped 90 degrees",
+        Transform::Flipped180 => "Flipped 180 degrees",
+        Transform::Flipped270 => "Flipped 270 degrees",
+    }
+}
+
 /// One continuous drawer silhouette: concave coves flaring out to the bar at
 /// the top, straight sides, convex rounded bottom corners.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +137,7 @@ enum Page {
     Widgets,
     Ordering,
     Dock,
+    Displays,
     Idle,
     Backgrounds,
     Weather,
@@ -123,6 +152,7 @@ impl Page {
             Page::Widgets => "Widgets",
             Page::Ordering => "Ordering",
             Page::Dock => "Dock",
+            Page::Displays => "Displays",
             Page::Idle => "Idle",
             Page::Backgrounds => "Backgrounds",
             Page::Weather => "Weather",
@@ -137,6 +167,7 @@ impl Page {
             Page::Widgets => "icons/widgets.svg",
             Page::Ordering => "icons/order.svg",
             Page::Dock => "icons/dock.svg",
+            Page::Displays => "icons/monitor.svg",
             Page::Idle => "icons/clock.svg",
             Page::Backgrounds => "icons/image.svg",
             Page::Weather => "icons/cloud.svg",
@@ -144,12 +175,13 @@ impl Page {
         }
     }
 
-    const ALL: [Page; 9] = [
+    const ALL: [Page; 10] = [
         Page::Quick,
         Page::Bar,
         Page::Widgets,
         Page::Ordering,
         Page::Dock,
+        Page::Displays,
         Page::Idle,
         Page::Backgrounds,
         Page::Weather,
@@ -269,6 +301,22 @@ pub struct SettingsView {
     weather_resolve: Option<WeatherResolve>,
     /// the open night light dropdown, if any
     night_menu: Option<(NightField, NightPart)>,
+    /// the Displays page's probe: the outputs as last read, why the
+    /// last read failed, and why the last store write failed. The
+    /// probe is the page's truth; nothing here lives in kuma.toml.
+    displays: Vec<crate::displays::Output>,
+    displays_error: Option<String>,
+    store_error: Option<String>,
+    /// a status niri volunteered for the last apply (an output that
+    /// was not connected takes its change when it appears)
+    displays_note: Option<String>,
+    /// which displays dropdown is open, by control id
+    displays_menu: Option<String>,
+    /// which output's reset is armed
+    displays_arm: Option<String>,
+    /// whether a probe has landed once; gates the "no displays" state
+    /// so a fresh panel never lies before its first read
+    displays_probed: bool,
 }
 
 impl SettingsView {
@@ -309,7 +357,7 @@ impl SettingsView {
             ],
             cx,
         );
-        Self {
+        let view = Self {
             settings,
             sysmon,
             focus_handle,
@@ -324,7 +372,37 @@ impl SettingsView {
             weather_edit: None,
             weather_resolve: None,
             night_menu: None,
-        }
+            displays: Vec::new(),
+            displays_error: None,
+            store_error: None,
+            displays_note: None,
+            displays_menu: None,
+            displays_arm: None,
+            displays_probed: false,
+        };
+        // the displays probe: a 2s tick for the panel's lifetime that
+        // reads only while the Displays page is open (niri's event
+        // stream has no output events, so the page polls instead), and
+        // dies with the view when the panel closes
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(2))
+                    .await;
+                let wanted = this
+                    .update(cx, |this, _| {
+                        this.page == Page::Displays && crate::displays::available()
+                    })
+                    .unwrap_or(false);
+                if !wanted {
+                    continue;
+                }
+                let result = cx.background_spawn(async move { crate::displays::probe() }).await;
+                let _ = this.update(cx, |this, cx| this.take_probe(result, cx));
+            }
+        })
+        .detach();
+        view
     }
 
     fn segmented<T: Copy + PartialEq + std::fmt::Debug + 'static>(
@@ -1124,6 +1202,519 @@ impl SettingsView {
                     .child(end_row),
             )
     }
+
+    /// The result of a displays probe, from the 2s tick or a one-shot
+    /// kick: the outputs are the page's truth, the error is why there
+    /// was no truth this time.
+    fn take_probe(
+        &mut self,
+        result: anyhow::Result<Vec<crate::displays::Output>>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(outputs) => {
+                self.displays = outputs;
+                self.displays_error = None;
+            }
+            Err(err) => self.displays_error = Some(format!("{err:#}")),
+        }
+        self.displays_probed = true;
+        cx.notify();
+    }
+
+    /// One displays probe right now, off the UI thread. The page
+    /// switch and every apply kick this; the 2s tick is the net.
+    fn probe_soon(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { crate::displays::probe() }).await;
+            let _ = this.update(cx, |this, cx| this.take_probe(result, cx));
+        })
+        .detach();
+    }
+
+    /// Apply one display setting live, then persist the delta. The
+    /// live apply is what the eyes see; the store write is what a
+    /// reboot reads. Parse failures pause persistence only: the file
+    /// is never rewritten over content the shell cannot parse.
+    fn apply_display_pin(
+        &mut self,
+        output: String,
+        pin: crate::displays::Pin,
+        cx: &mut Context<Self>,
+    ) {
+        self.displays_note = None;
+        match crate::displays::apply(&output, &pin) {
+            Ok(crate::displays::Applied::OutputMissing) => {
+                self.displays_note = Some(format!(
+                    "{output} is not connected right now; the setting will apply when it is plugged in"
+                ));
+            }
+            Ok(crate::displays::Applied::Yes) => {}
+            Err(err) => self.displays_error = Some(format!("{err:#}")),
+        }
+        match crate::displays::persist(&output, &pin) {
+            Ok(()) => self.store_error = None,
+            Err(err) => self.store_error = Some(format!("{err:#}")),
+        }
+        self.probe_soon(cx);
+        cx.notify();
+    }
+
+    /// Forget one output's stored delta: niri's include watch reloads,
+    /// the reload drops the temporary overrides, defaults flow again.
+    fn reset_display(&mut self, output: String, cx: &mut Context<Self>) {
+        match crate::displays::reset(&output) {
+            Ok(()) => self.store_error = None,
+            Err(err) => self.store_error = Some(format!("{err:#}")),
+        }
+        self.displays_arm = None;
+        self.probe_soon(cx);
+        cx.notify();
+    }
+
+    /// The displays page: one card per output with enable, mode,
+    /// scale, rotation, arrangement, and VRR, plus a reset per card.
+    /// Niri's IPC is the whole mechanism (ADR-0014); under another
+    /// compositor the page says so and does nothing.
+    fn displays_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        if !crate::displays::available() {
+            return div()
+                .id("page-displays")
+                .flex_1()
+                .child(kit::empty_state(
+                    "icons/monitor.svg",
+                    "Displays",
+                    "Output settings ride the niri IPC socket, which this session does not have.",
+                ));
+        }
+        let outputs = self.displays.clone();
+        let mut page = div()
+            .id("page-displays")
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .overflow_y_scroll();
+        if let Some(err) = &self.displays_error {
+            page = page.child(error_line(err));
+        }
+        if let Some(err) = &self.store_error {
+            page = page.child(error_line(&format!(
+                "Changes still apply live, but the saved copy failed: {err}"
+            )));
+        }
+        if let Some(note) = &self.displays_note {
+            page = page.child(error_line(note));
+        }
+        if outputs.is_empty() && self.displays_error.is_none() {
+            if self.displays_probed {
+                page = page.child(kit::empty_state(
+                    "icons/monitor.svg",
+                    "No displays",
+                    "Nothing is connected right now.",
+                ));
+            } else {
+                page = page.child(kit::card_note("Reading outputs..."));
+            }
+        }
+        page.children(outputs.iter().map(|output| {
+            self.display_card(output, cx)
+        }))
+    }
+
+    /// One output's card: title and state line, then a row per
+    /// setting. A switched-off output shows only enable and reset,
+    /// because niri reports no geometry for it.
+    fn display_card(
+        &mut self,
+        output: &crate::displays::Output,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let mut title = output.name.clone();
+        for part in [output.make.as_str(), output.model.as_str()] {
+            if !part.is_empty() && part != "Unknown" {
+                title.push(' ');
+                title.push_str(part);
+            }
+        }
+        let card = kit::card(format!("display-{}", output.name))
+            .child(kit::card_title(&title))
+            .child(kit::card_note(&output.state_line()));
+        if !output.enabled {
+            return card
+                .child(self.display_enable_row(output, cx))
+                .child(self.display_reset_row(&output.name, cx));
+        }
+        // The last enabled display gets no enable row: turning it off
+        // blanks the session, and the page that would undo it lives on
+        // the display just switched off. A display that is off always
+        // keeps its row, since turning it on is always safe.
+        let card = if crate::displays::would_leave_no_display(&self.displays, &output.name) {
+            card
+        } else {
+            card.child(self.display_enable_row(output, cx))
+        };
+        card.child(self.display_mode_row(output, cx))
+            .child(self.display_scale_row(output, cx))
+            .child(self.display_transform_row(output, cx))
+            .child(self.display_position_row(output, cx))
+            .child(self.display_vrr_section(output, cx))
+            .child(self.display_reset_row(&output.name, cx))
+    }
+
+    /// The one dropdown helper for the page: open state in
+    /// `displays_menu` keyed by control id, pick closes and applies.
+    fn display_dropdown(
+        &mut self,
+        id: String,
+        label: String,
+        options: Vec<String>,
+        current: usize,
+        on_pick: impl Fn(usize, &mut SettingsView, &mut Window, &mut Context<SettingsView>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let open = self.displays_menu.as_deref() == Some(id.as_str());
+        let id_for_toggle = id.clone();
+        kit::dropdown(
+            cx,
+            &id,
+            label,
+            options,
+            current,
+            open,
+            move |this: &mut SettingsView, _, cx| {
+                this.displays_menu =
+                    if this.displays_menu.as_deref() == Some(id_for_toggle.as_str()) {
+                        None
+                    } else {
+                        Some(id_for_toggle.clone())
+                    };
+                cx.notify();
+            },
+            move |index: usize, this: &mut SettingsView, window, cx| {
+                this.displays_menu = None;
+                on_pick(index, this, window, cx);
+            },
+            move |this: &mut SettingsView, _, cx| {
+                this.displays_menu = None;
+                cx.notify();
+            },
+        )
+    }
+
+    fn display_enable_row(
+        &self,
+        output: &crate::displays::Output,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let name = output.name.clone();
+        let enabled = output.enabled;
+        kit::setting_row("Enabled", crate::controls::toggle_switch(enabled))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // backstop for a stale render: the card hides this row
+                // when switching the output off would blank the session,
+                // but the probe can move between render and click; the
+                // note clears on the next apply
+                if enabled
+                    && crate::displays::would_leave_no_display(&this.displays, &name)
+                {
+                    this.displays_note = Some(format!(
+                        "cannot turn off {name}: it is the only display that is on"
+                    ));
+                    cx.notify();
+                    return;
+                }
+                this.apply_display_pin(name.clone(), crate::displays::Pin::Off(enabled), cx);
+            }))
+    }
+
+    fn display_mode_row(
+        &mut self,
+        output: &crate::displays::Output,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let name = output.name.clone();
+        let modes = output.modes.clone();
+        let mut options = vec!["Auto".to_string()];
+        for mode in &modes {
+            options.push(format!(
+                "{}x{} @ {} Hz",
+                mode.width,
+                mode.height,
+                crate::displays::fmt_f64(mode.refresh_mhz as f64 / 1000.)
+            ));
+        }
+        // the observed mode is the truth; Auto reads as current only
+        // when niri has no mode to name, which an enabled output
+        // always does
+        let current = output
+            .current_mode
+            .map(|index| index + 1)
+            .unwrap_or(0)
+            .min(options.len() - 1);
+        kit::setting_row(
+            "Mode",
+            self.display_dropdown(
+                format!("display-{}-mode", name),
+                options[current].clone(),
+                options,
+                current,
+                move |index, this, _, cx| {
+                    let pin = match index.checked_sub(1).and_then(|index| modes.get(index)) {
+                        Some(mode) => crate::displays::Pin::Mode(Some(
+                            crate::displays::ModeSpec {
+                                width: mode.width,
+                                height: mode.height,
+                                refresh_mhz: Some(mode.refresh_mhz),
+                            },
+                        )),
+                        None => crate::displays::Pin::Mode(None),
+                    };
+                    this.apply_display_pin(name.clone(), pin, cx);
+                },
+                cx,
+            ),
+        )
+    }
+
+    fn display_scale_row(
+        &mut self,
+        output: &crate::displays::Output,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        const SCALES: [f64; 7] = [1., 1.25, 1.5, 1.75, 2., 2.5, 3.];
+        let name = output.name.clone();
+        let mut values = vec![None];
+        for scale in SCALES {
+            values.push(Some(scale));
+        }
+        // a monitor running an odd scale shows its truth in the list
+        let known = values
+            .iter()
+            .any(|value| value.map_or(false, |value| (value - output.scale).abs() < 0.001));
+        if !known {
+            values.push(Some(output.scale));
+            values[1..].sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        let options: Vec<String> = values
+            .iter()
+            .map(|value| match value {
+                None => "Auto".to_string(),
+                Some(scale) => format!("{}%", crate::displays::fmt_f64(scale * 100.)),
+            })
+            .collect();
+        let current = values
+            .iter()
+            .position(|value| value.map_or(false, |value| (value - output.scale).abs() < 0.001))
+            .unwrap_or(0);
+        kit::setting_row(
+            "Scale",
+            self.display_dropdown(
+                format!("display-{}-scale", name),
+                options[current].clone(),
+                options,
+                current,
+                move |index, this, _, cx| {
+                    this.apply_display_pin(
+                        name.clone(),
+                        crate::displays::Pin::Scale(values[index]),
+                        cx,
+                    );
+                },
+                cx,
+            ),
+        )
+    }
+
+    fn display_transform_row(
+        &mut self,
+        output: &crate::displays::Output,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let name = output.name.clone();
+        let transforms = crate::displays::Transform::ALL;
+        let options: Vec<String> = transforms
+            .iter()
+            .map(|t| transform_label(*t).to_string())
+            .collect();
+        let current = transforms
+            .iter()
+            .position(|t| *t == output.transform)
+            .unwrap_or(0);
+        kit::setting_row(
+            "Rotation",
+            self.display_dropdown(
+                format!("display-{}-transform", name),
+                options[current].clone(),
+                options,
+                current,
+                move |index, this, _, cx| {
+                    this.apply_display_pin(
+                        name.clone(),
+                        crate::displays::Pin::Transform(transforms[index]),
+                        cx,
+                    );
+                },
+                cx,
+            ),
+        )
+    }
+
+    /// The arrangement dropdown: auto, or flush against one edge of
+    /// another enabled output. The current reading derives from the
+    /// observed layout, so nudged positions read as Auto.
+    fn display_position_row(
+        &mut self,
+        output: &crate::displays::Output,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        use crate::displays::Side;
+        let name = output.name.clone();
+        let mine = (output.logical_width, output.logical_height);
+        let mut options = vec!["Auto".to_string()];
+        let mut placements: Vec<(String, Side)> = Vec::new();
+        for other in self.displays.iter().filter(|other| other.enabled) {
+            if other.name == name {
+                continue;
+            }
+            for (side, words) in [
+                (Side::Left, "Left of"),
+                (Side::Right, "Right of"),
+                (Side::Above, "Above"),
+                (Side::Below, "Below"),
+            ] {
+                options.push(format!("{} {}", words, other.name));
+                placements.push((other.name.clone(), side));
+            }
+        }
+        let current = placements
+            .iter()
+            .position(|(anchor_name, side)| {
+                let Some(other) = self
+                    .displays
+                    .iter()
+                    .find(|candidate| candidate.name == *anchor_name)
+                else {
+                    return false;
+                };
+                match side {
+                    Side::Left => {
+                        other.x + other.logical_width as i32 == output.x && other.y == output.y
+                    }
+                    Side::Right => {
+                        output.x + output.logical_width as i32 == other.x && other.y == output.y
+                    }
+                    Side::Above => {
+                        other.y + other.logical_height as i32 == output.y && other.x == output.x
+                    }
+                    Side::Below => {
+                        output.y + output.logical_height as i32 == other.y && other.x == output.x
+                    }
+                }
+            })
+            .map(|index| index + 1)
+            .unwrap_or(0)
+            .min(options.len() - 1);
+        kit::setting_row(
+            "Arrange",
+            self.display_dropdown(
+                format!("display-{}-position", name),
+                options[current].clone(),
+                options,
+                current,
+                move |index, this, _, cx| {
+                    let pin = match index.checked_sub(1).and_then(|index| placements.get(index)) {
+                        Some((anchor_name, side)) => {
+                            let Some(anchor) = this
+                                .displays
+                                .iter()
+                                .find(|candidate| candidate.name == *anchor_name)
+                            else {
+                                return;
+                            };
+                            crate::displays::Pin::Position(Some(crate::displays::arrange(
+                                anchor, *side, mine,
+                            )))
+                        }
+                        None => crate::displays::Pin::Position(None),
+                    };
+                    this.apply_display_pin(name.clone(), pin, cx);
+                },
+                cx,
+            ),
+        )
+    }
+
+    fn display_vrr_section(
+        &self,
+        output: &crate::displays::Output,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if !output.vrr_supported {
+            return div()
+                .child(kit::card_note(
+                    "Variable refresh rate is not supported on this monitor.",
+                ))
+                .into_any_element();
+        }
+        let name = output.name.clone();
+        let pin_now = if output.vrr_enabled {
+            crate::displays::Pin::Vrr(None)
+        } else {
+            crate::displays::Pin::Vrr(Some(false))
+        };
+        kit::setting_row(
+            "Variable refresh rate",
+            crate::controls::toggle_switch(output.vrr_enabled),
+        )
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.apply_display_pin(name.clone(), pin_now.clone(), cx);
+        }))
+        .into_any_element()
+    }
+
+    /// Reset: delete the output's stored block and let niri's reload
+    /// forget the temporary overrides. Two clicks, then gone.
+    fn display_reset_row(&self, name: &str, cx: &mut Context<Self>) -> Div {
+        let armed = self.displays_arm.as_deref() == Some(name);
+        let name_owned = name.to_string();
+        let row = div().flex().justify_end().gap_2();
+        if armed {
+            row.child(kit::button(
+                format!("reset-keep-{name}"),
+                "Keep",
+                None,
+                kit::ButtonVariant::Ghost,
+                cx.listener(|this, _, _, cx| {
+                    this.displays_arm = None;
+                    cx.notify();
+                }),
+            ))
+            .child(kit::button(
+                format!("reset-confirm-{name}"),
+                "Really reset?",
+                None,
+                kit::ButtonVariant::Destructive,
+                cx.listener(move |this, _, _, cx| {
+                    this.reset_display(name_owned.clone(), cx);
+                }),
+            ))
+        } else {
+            row.child(kit::button(
+                format!("reset-arm-{name}"),
+                "Reset",
+                None,
+                kit::ButtonVariant::Ghost,
+                cx.listener(move |this, _, _, cx| {
+                    this.displays_arm = Some(name_owned.clone());
+                    cx.notify();
+                }),
+            ))
+        }
+    }
+
     fn idle_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let idle = self.settings.read(cx).idle;
         let lock_row = self.idle_number_row(
@@ -2150,6 +2741,11 @@ impl Render for SettingsView {
                     None,
                     cx.listener(move |this, _, _, cx| {
                         this.page = page;
+                        if page == Page::Displays {
+                            // the page's first truth arrives right now,
+                            // not on the next tick
+                            this.probe_soon(cx);
+                        }
                         cx.notify();
                     }),
                 )
@@ -2172,6 +2768,9 @@ impl Render for SettingsView {
                 el.child(self.ordering_page(cx))
             })
             .when(self.page == Page::Dock, |el| el.child(self.dock_page(cx)))
+            .when(self.page == Page::Displays, |el| {
+                el.child(self.displays_page(cx))
+            })
             .when(self.page == Page::Idle, |el| el.child(self.idle_page(cx)))
             .when(self.page == Page::Backgrounds, |el| {
                 el.child(self.backgrounds_page(cx))
