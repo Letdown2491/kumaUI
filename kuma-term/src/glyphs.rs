@@ -7,8 +7,8 @@
 //!
 //! Everything here is pure rect math in cell-local pixels; the view paints
 //! each rect as a quad behind the row text. Shades and diagonals stay on
-//! shaped text (their texture is the point), as do powerline arrows until
-//! a path-fill pass lands.
+//! shaped text (their texture is the point), as do half-circle powerline
+//! caps (E0B4..E0B7): stair-steps render triangles well but not curves.
 
 /// One painted rect in cell-local pixels: (x, y, w, h).
 pub type Rect = (f32, f32, f32, f32);
@@ -18,9 +18,9 @@ pub fn is_vector_glyph(c: char) -> bool {
     let u = c as u32;
     (0x2500..=0x257F).contains(&u) && box_arms(c).is_some()
         || (0x2580..=0x2590).contains(&u)
-        || (0x2594..=0x2595).contains(&u)
-        || (0x2596..=0x259F).contains(&u)
+        || (0x2594..=0x259F).contains(&u)
         || (0x2800..=0x28FF).contains(&u)
+        || (0xE0B0..=0xE0B3).contains(&u)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -167,14 +167,6 @@ fn box_arms(c: char) -> Option<Arms> {
     Some(a)
 }
 
-fn h_rect(x0: f32, x1: f32, y: f32, t: f32) -> Rect {
-    (x0, y - t / 2.0, x1 - x0, t)
-}
-
-fn v_rect(y0: f32, y1: f32, x: f32, t: f32) -> Rect {
-    (x - t / 2.0, y0, t, y1 - y0)
-}
-
 /// Same full-length style on both sides: the two stubs are one line.
 fn combine(a: Arm, b: Arm) -> Option<Arm> {
     match (a, b) {
@@ -275,7 +267,6 @@ fn block_rects(c: char, w: f32, h: f32) -> Vec<Rect> {
             let k = (u - 0x2588) as f32;
             vec![(0.0, 0.0, w * k / 8.0, h)]
         }
-        0x258C => vec![(0.0, 0.0, w / 2.0, h)],
         0x2590 => vec![(w / 2.0, 0.0, w / 2.0, h)],
         0x2594 => vec![full(0.0, h / 8.0)],
         0x2595 => vec![(w - w / 8.0, 0.0, w / 8.0, h)],
@@ -301,6 +292,48 @@ fn block_rects(c: char, w: f32, h: f32) -> Vec<Rect> {
         }
         _ => vec![],
     }
+}
+
+/// All rects for one powerline arrow cell (U+E0B0..U+E0B3): a stair-step
+/// triangle, one strip per step along the pointing axis. The flat edge
+/// sits flush with its cell edge (that is the edge segment joins care
+/// about); the apex falls short by at most one strip, which real powerline
+/// usage hides because the arrow cell's own background is the next
+/// segment's color.
+fn powerline_rects(c: char, w: f32, h: f32) -> Vec<Rect> {
+    // step count tracks cell width so the hypotenuse stays smooth at any
+    // font size: roughly one strip per pixel, sane bounds
+    let horizontal = matches!(c as u32, 0xE0B0 | 0xE0B1);
+    let (long, short) = if horizontal { (w, h) } else { (h, w) };
+    let n = ((long / 1.2).round() as usize).clamp(4, 16);
+
+    // canonical: flat edge at 0 on the pointing axis, apex at `long`;
+    // strip k spans the triangle's full width at its own leading edge
+    let step = long / n as f32;
+    let mut strips = Vec::with_capacity(n);
+    for k in 0..n {
+        let along = k as f32 * step;
+        let d_along = if k == n - 1 { long - along } else { step };
+        let across = (short / 2.0) * (along / long);
+        let d_across = short - 2.0 * across;
+        strips.push((along, across, d_along, d_across));
+    }
+
+    let mut rects = Vec::with_capacity(n);
+    for (along, across, d_along, d_across) in strips {
+        let r = match c as u32 {
+            // right: flat edge left, apex right
+            0xE0B0 => (along, across, d_along, d_across),
+            // left: mirror on x
+            0xE0B1 => (w - along - d_along, across, d_along, d_across),
+            // up: rotate; flat edge at the bottom (y = h), apex at y = 0
+            0xE0B2 => (across, h - along - d_along, d_across, d_along),
+            // down: flat edge at the top, apex at y = h
+            _ => (across, along, d_across, d_along),
+        };
+        rects.push(snap(r));
+    }
+    rects
 }
 
 /// All rects for one braille cell: a 2x4 dot grid, standard dot numbering
@@ -350,6 +383,8 @@ pub fn cell_rects(c: char, w: f32, h: f32) -> Vec<Rect> {
         block_rects(c, w, h).into_iter().map(snap).collect()
     } else if (0x2800..=0x28FF).contains(&u) {
         braille_rects(c, w, h).into_iter().map(snap).collect()
+    } else if (0xE0B0..=0xE0B3).contains(&u) {
+        powerline_rects(c, w, h).into_iter().map(snap).collect()
     } else {
         vec![]
     }
@@ -462,5 +497,50 @@ mod tests {
         assert!(is_vector_glyph('\u{2574}'));
         assert!(is_vector_glyph('\u{2588}'));
         assert!(is_vector_glyph('\u{28FF}'));
+    }
+
+    #[test]
+    fn powerline_arrows_cover_their_cells() {
+        // E0B0 right-pointing: the first strip is the flat edge, full
+        // height, flush with the cell's left edge; later strips taper
+        // toward the apex
+        let r = rects('\u{E0B0}', 8.8, 20.0);
+        assert!(r.len() >= 4, "stair-step needs several strips: {r:?}");
+        assert_eq!(r[0].0, 0.0, "flat edge hugs the leading edge");
+        assert_eq!(r[0].1, 0.0);
+        assert_eq!(r[0].3, 20.0, "flat strip is full height");
+        assert!(
+            r.last().unwrap().3 < r[0].3,
+            "strips taper toward the apex"
+        );
+        // E0B1 mirrors it: flat edge flush right
+        let r = rects('\u{E0B1}', 8.8, 20.0);
+        let flat = r.iter().max_by(|a, b| (a.0 + a.2).total_cmp(&(b.0 + b.2))).unwrap();
+        assert_eq!(flat.0 + flat.2, 9.0, "flat edge hugs the trailing edge");
+        assert_eq!(flat.3, 20.0);
+        // E0B2 up-pointing: flat edge along the bottom, full width
+        let r = rects('\u{E0B2}', 8.8, 20.0);
+        let flat = r.iter().max_by(|a, b| (a.1 + a.3).total_cmp(&(b.1 + b.3))).unwrap();
+        assert_eq!(flat.1 + flat.3, 20.0, "flat edge hugs the bottom");
+        assert_eq!(flat.2, 9.0, "flat strip is full width");
+        // E0B3 down-pointing: flat edge along the top
+        let r = rects('\u{E0B3}', 8.8, 20.0);
+        let flat = r.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        assert_eq!(flat.1, 0.0, "flat edge hugs the top");
+        assert_eq!(flat.2, 9.0);
+        // all snap to whole pixels and stay inside the cell
+        for c in ['\u{E0B0}', '\u{E0B1}', '\u{E0B2}', '\u{E0B3}'] {
+            for (x, y, w, h) in rects(c, 8.8, 20.0) {
+                assert!(x >= 0.0 && y >= 0.0 && x + w <= 9.0 && y + h <= 20.0, "{c}: {x},{y},{w},{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn left_half_block_matches_the_eighths_series() {
+        // U+258C was folded into the 2589..258F arm in the audit: same
+        // geometry must come out (half width)
+        let r = rects('\u{258C}', 8.8, 20.0);
+        assert_eq!(r, vec![(0.0, 0.0, 4.0, 20.0)]);
     }
 }
