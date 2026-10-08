@@ -46,6 +46,13 @@ pub struct TerminalView {
     selecting: bool,
     /// prompt-bar data, maintained from shell-integration markers
     bar: BarState,
+    /// the bar's git facts for the bar's cwd, refreshed off the render
+    /// path whenever the cwd changes or a command finishes
+    git: Option<crate::git::GitSummary>,
+    /// bumped on every git request; a result whose generation no longer
+    /// matches is stale (the cwd moved on) and gets dropped
+    git_generation: u64,
+    _git_task: Task<()>,
     /// the bar's duration ticks once a second while a command runs; this
     /// guard keeps one tick task alive at a time
     bar_tick_active: bool,
@@ -135,6 +142,9 @@ impl TerminalView {
             title: None,
             selecting: false,
             bar: BarState::default(),
+            git: None,
+            git_generation: 0,
+            _git_task: Task::ready(()),
             bar_tick_active: false,
             _bar_tick: Task::ready(()),
             _pump: pump,
@@ -169,6 +179,15 @@ impl TerminalView {
             UiEvent::PtyWrite(bytes) => self.engine.input(bytes),
             UiEvent::Marker(marker) => {
                 self.bar.apply(&marker, std::time::Instant::now());
+                // the git segment refreshes when the cwd changes or a
+                // command finishes: those are the moments the tree can
+                // have changed under it
+                if matches!(
+                    marker,
+                    crate::osc::Marker::Cwd { .. } | crate::osc::Marker::CommandDone(_)
+                ) {
+                    self.refresh_git(cx);
+                }
                 self.spawn_bar_tick(cx);
                 cx.notify();
             }
@@ -183,6 +202,32 @@ impl TerminalView {
             self.engine.set_theme(self.theme.clone());
             cx.notify();
         }
+    }
+
+    /// Refresh the bar's git segment for the bar's cwd. Runs on the
+    /// background executor after a short delay (collapses bursts of cwd
+    /// changes), and a generation guard drops results that went stale
+    /// while the query ran. Never called from the render path.
+    fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        self.git_generation += 1;
+        let generation = self.git_generation;
+        let cwd = self.bar.cwd.clone();
+        self._git_task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+            let summary = cx
+                .background_executor()
+                .spawn(async move { cwd.and_then(|cwd| crate::git::summary(&cwd)) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.git_generation == generation {
+                    this.git = summary;
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
     }
 
     /// While a command runs, the bar's duration ticks; one re-render a
@@ -475,6 +520,25 @@ impl TerminalView {
 
         if let Some(cwd) = &self.bar.cwd_short {
             segments.push((cwd.clone(), hsla_of(theme.foreground)));
+        }
+
+        // git: branch in the accent color, dirty count and ahead/behind in
+        // the ANSI yellow; absent outside a repo
+        if let Some(git) = &self.git {
+            segments.push((git.branch.clone(), hsla_of(theme.cursor)));
+            let mut details = String::new();
+            if git.dirty > 0 {
+                details.push_str(&format!("✚{} ", git.dirty));
+            }
+            if git.ahead > 0 {
+                details.push_str(&format!("↑{} ", git.ahead));
+            }
+            if git.behind > 0 {
+                details.push_str(&format!("↓{} ", git.behind));
+            }
+            if !details.is_empty() {
+                segments.push((details.trim_end().to_string(), hsla_of(theme.named[3])));
+            }
         }
 
         // quiet mode: cwd + running indicator stay, the rest is held back

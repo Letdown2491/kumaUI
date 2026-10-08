@@ -132,22 +132,21 @@ fn parse_osc(payload: &[u8]) -> Option<Marker> {
     let text = String::from_utf8_lossy(payload);
     let (code, rest) = text.split_once(';').unwrap_or((text.as_ref(), ""));
     match code {
-        "133" => match rest {
-            "A" => Some(Marker::PromptStart),
-            "B" => Some(Marker::CommandStart),
-            _ => {
-                if let Some(cmd) = rest.strip_prefix("C") {
-                    let cmd = cmd.strip_prefix(';').unwrap_or("");
-                    let cmd = (!cmd.is_empty()).then(|| cmd.to_string());
+        "133" => {
+            // fish 4.6 emits `133;A;click_events=1`, kitty's integration
+            // sends plain `133;A`: split the kind from its parameters and
+            // ignore anything extra
+            let (kind, params) = rest.split_once(';').unwrap_or((rest, ""));
+            match kind {
+                "A" => Some(Marker::PromptStart),
+                "B" => Some(Marker::CommandStart),
+                "C" => {
+                    let cmd = (!params.is_empty()).then(|| params.to_string());
                     Some(Marker::OutputStart(cmd))
-                } else if let Some(code) = rest.strip_prefix("D") {
-                    let code = code.strip_prefix(';').unwrap_or("");
-                    let code = code.parse::<i32>().ok();
-                    Some(Marker::CommandDone(code))
-                } else {
-                    None
-                }
-            },
+                },
+                "D" => Some(Marker::CommandDone(params.parse::<i32>().ok())),
+                _ => None,
+            }
         },
         "7" => {
             let uri = rest.strip_prefix("file://")?;
@@ -278,6 +277,13 @@ mod tests {
         assert_eq!(feed_all("\x1b]133;D;130\x07"), vec![Marker::CommandDone(Some(130))]);
         // shell may omit the code
         assert_eq!(feed_all("\x1b]133;D\x07"), vec![Marker::CommandDone(None)]);
+    }
+
+    #[test]
+    fn fishs_native_prompt_marker_with_params_parses() {
+        // fish 4.6 emits `133;A;click_events=1`; the kind splits from its
+        // parameters
+        assert_eq!(feed_all("\x1b]133;A;click_events=1\x1b\\"), vec![Marker::PromptStart]);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 mod encoder;
 mod font;
+mod git;
 mod glyphs;
 mod osc;
 mod palette;
@@ -20,6 +21,11 @@ fn main() {
     // here is how the shell recognizes kuma-term (prompt snippets key on
     // it). Sound: no other thread exists yet.
     unsafe { std::env::set_var("KUMA_TERM", "1") };
+    // the prompt bar is on: the conf.d snippet slims the in-grid prompt to
+    // a bare marker only when it sees this, so a user can opt the prompt
+    // out (KUMA_TERM_BAR=0 through the desktop environment) and keep
+    // everything else
+    unsafe { std::env::set_var("KUMA_TERM_BAR", "1") };
 
     env_logger::Builder::from_env(env_logger::Env::default())
         .format(|buf, record| {
