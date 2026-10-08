@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Generates kuma-term.png, the Higuma app icon.
 
-A bear-cub terminal: solid rounded screen in the kumaOS accent green,
-two round ears peeking over the top edge (Koguma's sibling), dot eyes
-and a prompt chevron for a mouth in accent_text. The chevron reads as
-both the `>` prompt and a grin. Filled shapes, not outlines: an app
-icon needs visual mass to read at 24px in the dock.
+Koguma's sibling, by the same recipe and palette but with the color
+balance inverted so the two never read as the same icon: Koguma is a
+green folder with dark features, Higuma is a green bear looking into
+a dark terminal screen. The screen is an inset panel on the body, and
+the face lives on the screen: dot eyes and a prompt, `>_`, drawn in
+the accent green. Filled shapes, not outlines: an app icon needs
+visual mass to read at 24px in the dock.
 
 Like Koguma's icon, this ships as a 256x256 PNG: raster icons decode
 through the true-color path, while the shell tints SVG icons with the
@@ -18,7 +20,7 @@ from this directory:
 from PIL import Image, ImageDraw, ImageColor
 
 ACCENT = ImageColor.getcolor("#8be4d2", "RGBA")  # kumaOS accent
-ACCENT_TEXT = ImageColor.getcolor("#0d1211", "RGBA")  # text on accent
+PANEL_BG = ImageColor.getcolor("#151e1c", "RGBA")  # the dark screen
 
 SIZE = 1024  # design grid is 48 units; drawn at 4x+ then downscaled
 
@@ -39,21 +41,32 @@ d.rounded_rectangle(
     radius=s(4.5),
     fill=ACCENT,
 )
-# eyes: the cub's dots
-d.ellipse([s(17.5 - 1.9), s(25.5 - 1.9), s(17.5 + 1.9), s(25.5 + 1.9)], fill=ACCENT_TEXT)
-d.ellipse([s(30.5 - 1.9), s(25.5 - 1.9), s(30.5 + 1.9), s(25.5 + 1.9)], fill=ACCENT_TEXT)
-# the prompt chevron as the mouth: `>` centered under the eyes
+# the dark inset screen: the identity. Koguma's features are dark dots
+# on green; Higuma's face is green marks on a dark display.
+d.rounded_rectangle(
+    [s(11.5), s(19), s(36.5), s(37)],
+    radius=s(3.0),
+    fill=PANEL_BG,
+)
+# eyes: accent dots on the dark screen
+d.ellipse([s(17 - 1.7), s(23 - 1.7), s(17 + 1.7), s(23 + 1.7)], fill=ACCENT)
+d.ellipse([s(31 - 1.7), s(23 - 1.7), s(31 + 1.7), s(23 + 1.7)], fill=ACCENT)
+# the prompt as the mouth: `>_` centered, chevron then cursor
 d.line(
-    [s(20.5), s(30.5), s(24.5), s(34.0), s(20.5), s(37.5)],
-    fill=ACCENT_TEXT,
-    width=round(s(2.6)),
+    [s(18.5), s(27), s(22), s(30.25), s(18.5), s(33.5)],
+    fill=ACCENT,
+    width=round(s(2.4)),
     joint="curve",
 )
-# round the chevron's caps so it matches the dot eyes at small sizes
-r = s(2.6) / 2
-d.ellipse([s(20.5) - r, s(30.5) - r, s(20.5) + r, s(30.5) + r], fill=ACCENT_TEXT)
-d.ellipse([s(20.5) - r, s(37.5) - r, s(20.5) + r, s(37.5) + r], fill=ACCENT_TEXT)
-d.ellipse([s(24.5) - r, s(34.0) - r, s(24.5) + r, s(34.0) + r], fill=ACCENT_TEXT)
+r = s(2.4) / 2
+for x, y in [(18.5, 27), (18.5, 33.5), (22, 30.25)]:
+    d.ellipse([s(x) - r, s(y) - r, s(x) + r, s(y) + r], fill=ACCENT)
+# the cursor underscore
+d.rounded_rectangle(
+    [s(25.5), s(31.9), s(30.5), s(34.3)],
+    radius=s(1.0),
+    fill=ACCENT,
+)
 
 img = img.resize((256, 256), Image.LANCZOS)
 img.save("kuma-term.png")
