@@ -209,6 +209,8 @@ fn surface_error(message: &str, cx: &mut App) {
 fn wallpaper_options() -> WindowOptions {
     WindowOptions {
         titlebar: None,
+        // client decorations: layer surfaces have no server side
+        window_decorations: Some(gpui::WindowDecorations::Client),
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(0.), px(0.)),
             size: size(px(0.), px(0.)),
@@ -237,6 +239,8 @@ fn bar_window_options(config: &BarConfig) -> WindowOptions {
     };
     WindowOptions {
         titlebar: None,
+        // client decorations: layer surfaces have no server side
+        window_decorations: Some(gpui::WindowDecorations::Client),
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(0.), px(0.)),
             size: size(px(0.), px(config.height + config.offset_top)),

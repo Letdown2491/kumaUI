@@ -254,6 +254,8 @@ pub fn toast_window_options(edge: f32, position: crate::settings::BarPosition) -
     };
     WindowOptions {
         titlebar: None,
+        // client decorations: layer surfaces have no server side
+        window_decorations: Some(gpui::WindowDecorations::Client),
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(0.), px(0.)),
             size: size(px(360.), px(TOAST_HEIGHT)),

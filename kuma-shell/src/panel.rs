@@ -13,50 +13,115 @@ use gpui::{
 pub const COVE: f32 = 16.;
 pub const CORNER_RADIUS: f32 = 12.;
 
+/// Which edge the drawer hangs from: the coves flare out toward the
+/// owner surface (bar or dock) on that edge, and the convex rounded
+/// corners sit on the far edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoveSide {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// A dock menu opens away from the dock's edge, so its coves face the
+/// dock, not the bar; bar panels face the bar.
+pub fn cove_side_for(placement: PanelPlacement, bar: crate::settings::BarPosition) -> CoveSide {
+    match placement {
+        PanelPlacement::At { dock, .. } => match dock {
+            crate::settings::DockPosition::Bottom => CoveSide::Bottom,
+            crate::settings::DockPosition::Top => CoveSide::Top,
+            crate::settings::DockPosition::Left => CoveSide::Left,
+            crate::settings::DockPosition::Right => CoveSide::Right,
+        },
+        PanelPlacement::Bar | PanelPlacement::Widget { .. } => match bar {
+            crate::settings::BarPosition::Top => CoveSide::Top,
+            crate::settings::BarPosition::Bottom => CoveSide::Bottom,
+        },
+    }
+}
+
 /// One continuous drawer silhouette: concave coves flaring out toward
-/// the bar on one side, straight sides, convex rounded corners on the
-/// other. `bar_at_top` faces the coves up (a top bar's panels open
-/// downward); a bottom bar faces them down so the drawer opens upward.
+/// the owning surface on one side, straight sides, convex rounded
+/// corners on the other. `CoveSide::Top` faces the coves up (a top
+/// bar's panels open downward); a bottom owner faces them down so the
+/// drawer opens upward, and vertical owners face them sideways.
 pub fn drawer_silhouette(
     width: f32,
     height: f32,
     cove: f32,
     radius: f32,
-    bar_at_top: bool,
+    side: CoveSide,
 ) -> Arc<[u8]> {
     let body_left = cove;
     let body_right = width - cove;
-    let path = if bar_at_top {
-        let body_bottom = height - radius;
-        format!(
-            "M 0 0 A {c} {c} 0 0 1 {c} {c} L {bl} {bb} A {r} {r} 0 0 0 {bl2} {h} L {br2} {h} A {r} {r} 0 0 0 {br} {bb} L {br} {c} A {c} {c} 0 0 1 {w} 0 Z",
-            c = cove,
-            bl = body_left,
-            bl2 = body_left + radius,
-            bb = body_bottom,
-            br2 = body_right - radius,
-            br = body_right,
-            r = radius,
-            h = height,
-            w = width,
-        )
-    } else {
-        let body_top = radius;
-        // the mirror of the top-hung path: y runs the other way, so
-        // every arc's sweep flag flips too
-        format!(
-            "M 0 {h} A {c} {c} 0 0 0 {c} {c2} L {bl} {r2} A {r} {r} 0 0 1 {bl2} 0 L {br2} 0 A {r} {r} 0 0 1 {br} {r2} L {br} {c2} A {c} {c} 0 0 0 {w} {h} Z",
-            c = cove,
-            c2 = height - cove,
-            bl = body_left,
-            bl2 = body_left + radius,
-            br2 = body_right - radius,
-            br = body_right,
-            r = radius,
-            r2 = body_top,
-            h = height,
-            w = width,
-        )
+    let path = match side {
+        CoveSide::Top => {
+            let body_bottom = height - radius;
+            format!(
+                "M 0 0 A {c} {c} 0 0 1 {c} {c} L {bl} {bb} A {r} {r} 0 0 0 {bl2} {h} L {br2} {h} A {r} {r} 0 0 0 {br} {bb} L {br} {c} A {c} {c} 0 0 1 {w} 0 Z",
+                c = cove,
+                bl = body_left,
+                bl2 = body_left + radius,
+                bb = body_bottom,
+                br2 = body_right - radius,
+                br = body_right,
+                r = radius,
+                h = height,
+                w = width,
+            )
+        }
+        CoveSide::Bottom => {
+            // the mirror of the top-hung path: y runs the other way, so
+            // every arc's sweep flag flips too
+            let body_top = radius;
+            format!(
+                "M 0 {h} A {c} {c} 0 0 0 {c} {c2} L {bl} {r2} A {r} {r} 0 0 1 {bl2} 0 L {br2} 0 A {r} {r} 0 0 1 {br} {r2} L {br} {c2} A {c} {c} 0 0 0 {w} {h} Z",
+                c = cove,
+                c2 = height - cove,
+                bl = body_left,
+                bl2 = body_left + radius,
+                br2 = body_right - radius,
+                br = body_right,
+                r = radius,
+                r2 = body_top,
+                h = height,
+                w = width,
+            )
+        }
+        CoveSide::Left => {
+            // a vertical attachment: the left edge hangs flat, the
+            // body's height is inset by the cove, rounded corners on
+            // the right end. The traversal runs clockwise, so the
+            // coves take sweep 0 and the convex corners sweep 1.
+            format!(
+                "M 0 0 A {c} {c} 0 0 0 {c} {c} L {tr} {c} A {r} {r} 0 0 1 {w} {c2} L {w} {br} A {r} {r} 0 0 1 {tr} {c3} L {c} {c3} A {c} {c} 0 0 0 0 {h} Z",
+                c = cove,
+                c2 = cove + radius,
+                c3 = height - cove,
+                br = height - cove - radius,
+                tr = width - radius,
+                r = radius,
+                w = width,
+                h = height,
+            )
+        }
+        CoveSide::Right => {
+            // the mirror of the left-hung path: x runs the other way,
+            // so every arc's sweep flag flips too
+            format!(
+                "M {w} 0 A {c} {c} 0 0 1 {c2} {c} L {r2} {c} A {r} {r} 0 0 0 0 {c3} L 0 {br} A {r} {r} 0 0 0 {r2} {c4} L {c2} {c4} A {c} {c} 0 0 1 {w} {h} Z",
+                c = cove,
+                c2 = width - cove,
+                c3 = cove + radius,
+                c4 = height - cove,
+                br = height - cove - radius,
+                r = radius,
+                r2 = radius,
+                w = width,
+                h = height,
+            )
+        }
     };
     format!(
         r#"<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg"><path d="{path}" fill="currentColor"/></svg>"#,
@@ -841,21 +906,27 @@ pub fn chrome(
         height,
         cove,
     } = geometry;
-    let (drawer_left, drawer_top, bar_at_top) = {
+    let (drawer_left, drawer_top, cove_side) = {
         let host = cx.global::<PanelHost>();
         let bar = host.bar();
         let (left, top) =
             drawer_origin(host.placement, bar, window.viewport_size(), width, height);
-        (
-            left,
-            top,
-            bar.position == crate::settings::BarPosition::Top,
-        )
+        (left, top, cove_side_for(host.placement, bar.position))
     };
-    window.set_input_region(Some(&[Bounds {
-        origin: point(px(drawer_left + cove), px(drawer_top)),
-        size: size(px(width - 2. * cove), px(height)),
-    }]));
+    // map the input region to the body rect: the cove slivers at the
+    // attachment edge stay click-through, so the exclusion runs along
+    // the attachment edge's axis
+    let input_region = match cove_side {
+        CoveSide::Top | CoveSide::Bottom => Bounds {
+            origin: point(px(drawer_left + cove), px(drawer_top)),
+            size: size(px(width - 2. * cove), px(height)),
+        },
+        CoveSide::Left | CoveSide::Right => Bounds {
+            origin: point(px(drawer_left), px(drawer_top + cove)),
+            size: size(px(width), px(height - 2. * cove)),
+        },
+    };
+    window.set_input_region(Some(&[input_region]));
     div()
         .id("panel-chrome")
         .size_full()
@@ -867,7 +938,7 @@ pub fn chrome(
         })
         .child(
             svg()
-                .data(&drawer_silhouette(width, height, cove, CORNER_RADIUS, bar_at_top))
+                .data(&drawer_silhouette(width, height, cove, CORNER_RADIUS, cove_side))
                 .absolute()
                 .top(px(drawer_top))
                 .left(px(drawer_left))
@@ -896,8 +967,14 @@ pub fn panel_window_options(namespace: &str, keyboard: KeyboardInteractivity) ->
     // the compositor's to assign, and niri kills set_size before the
     // first configure); the input region keeps clicks outside the
     // drawer passing through to the scrim.
+    //
+    // Client decorations, explicitly: the default is Server, and
+    // requesting server decorations on a layer surface makes the
+    // Wayland backend log its fallback warning (harmless but noisy on
+    // every panel open).
     WindowOptions {
         titlebar: None,
+        window_decorations: Some(gpui::WindowDecorations::Client),
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(0.), px(0.)),
             size: size(px(0.), px(0.)),
@@ -919,6 +996,8 @@ pub fn panel_window_options(namespace: &str, keyboard: KeyboardInteractivity) ->
 pub fn scrim_options() -> WindowOptions {
     WindowOptions {
         titlebar: None,
+        // client decorations: same reason as panel_window_options
+        window_decorations: Some(gpui::WindowDecorations::Client),
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(0.), px(0.)),
             size: size(px(0.), px(0.)),
@@ -1026,12 +1105,12 @@ mod tests {
     #[test]
     fn the_silhouette_faces_its_coves_toward_the_bar() {
         let top = String::from_utf8(
-            drawer_silhouette(200., 100., 16., 12., true)
+            drawer_silhouette(200., 100., 16., 12., CoveSide::Top)
                 .to_vec(),
         )
         .unwrap();
         let bottom = String::from_utf8(
-            drawer_silhouette(200., 100., 16., 12., false)
+            drawer_silhouette(200., 100., 16., 12., CoveSide::Bottom)
                 .to_vec(),
         )
         .unwrap();
@@ -1043,6 +1122,83 @@ mod tests {
         // the top
         assert!(bottom.contains("M 0 100 A 16 16 0 0 0 16 84"), "{bottom}");
         assert!(bottom.contains("A 12 12 0 0 1 28 0"), "{bottom}");
+    }
+
+    #[test]
+    fn the_silhouette_faces_its_coves_toward_a_vertical_dock() {
+        let left = String::from_utf8(
+            drawer_silhouette(200., 100., 16., 12., CoveSide::Left)
+                .to_vec(),
+        )
+        .unwrap();
+        let right = String::from_utf8(
+            drawer_silhouette(200., 100., 16., 12., CoveSide::Right)
+                .to_vec(),
+        )
+        .unwrap();
+        // left dock: the left edge hangs flat toward the dock, coves
+        // flare at its ends, rounded corners on the right end
+        assert!(left.starts_with("<svg viewBox=\"0 0 200 100\""), "{left}");
+        assert!(left.contains("M 0 0 A 16 16 0 0 0 16 16"), "{left}");
+        assert!(left.contains("A 16 16 0 0 0 0 100"), "{left}");
+        assert!(left.contains("A 12 12 0 0 1 200 28"), "{left}");
+        // right dock: mirrored, coves at the right, rounded corners at
+        // the left
+        assert!(right.contains("M 200 0 A 16 16 0 0 1 184 16"), "{right}");
+        assert!(right.contains("A 16 16 0 0 1 200 100"), "{right}");
+        assert!(right.contains("A 12 12 0 0 0 0 28"), "{right}");
+    }
+
+    #[test]
+    fn a_dock_menus_coves_face_the_dock_not_the_bar() {
+        let at = |dock| PanelPlacement::At {
+            x: 0.,
+            y: 0.,
+            dock,
+            offset: 72.,
+        };
+        // a top bar: bar panels cove up, but a bottom dock's menu must
+        // cove down toward the dock
+        assert_eq!(
+            cove_side_for(
+                at(crate::settings::DockPosition::Bottom),
+                crate::settings::BarPosition::Top
+            ),
+            CoveSide::Bottom
+        );
+        assert_eq!(
+            cove_side_for(
+                at(crate::settings::DockPosition::Top),
+                crate::settings::BarPosition::Top
+            ),
+            CoveSide::Top
+        );
+        assert_eq!(
+            cove_side_for(
+                at(crate::settings::DockPosition::Left),
+                crate::settings::BarPosition::Top
+            ),
+            CoveSide::Left
+        );
+        assert_eq!(
+            cove_side_for(
+                at(crate::settings::DockPosition::Right),
+                crate::settings::BarPosition::Top
+            ),
+            CoveSide::Right
+        );
+        // bar and widget panels keep facing the bar either way
+        assert_eq!(
+            cove_side_for(PanelPlacement::Bar, crate::settings::BarPosition::Bottom),
+            CoveSide::Bottom
+        );
+        assert_eq!(
+            cove_side_for(
+                PanelPlacement::Widget { x: 0. },
+                crate::settings::BarPosition::Top
+            ),
+            CoveSide::Top
+        );
     }
 
     #[test]
