@@ -103,5 +103,12 @@ local patches, which should be recorded here.
   fell through to a notdef box in the terminal's primary mono face
   (found shaping the kuma-term grid, issue: emoji and CJK fallback).
   Upstream gets away with it because Segoe Fluent Icons was the only
-  letter-less face its test suite ever met.
+  letter-less face its test suite ever met. On formats: swash paints
+  bitmap (CBDT/CBLC) emoji faces and cannot rasterize COLRv1, whose
+  base outlines are empty. Fedora's noto-emoji packaging switched to
+  COLRv1 in April 2025 and no longer packages a bitmap build, so
+  kumaOS vendors the CBDT NotoColorEmoji.ttf into its image (kuma
+  repo, `assets/noto-emoji/`); this patch is what lets that vendored
+  face survive the eviction its letter-less charmap would otherwise
+  trigger.
 
