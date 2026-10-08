@@ -38,9 +38,13 @@ if [ "${1:-}" = "build" ]; then
   # kuma-term: binary plus menu entry, so Mod+T and the launcher find it
   cp target/release/kuma-term ~/.local/bin/kuma-term.new
   mv -f ~/.local/bin/kuma-term.new ~/.local/bin/kuma-term
-  mkdir -p ~/.local/share/applications
+  mkdir -p ~/.local/share/applications \
+    ~/.local/share/icons/hicolor/256x256/apps
   sed "s|@HOME@|$HOME|" kuma-term/packaging/kuma-term.desktop.in \
     > ~/.local/share/applications/kuma-term.desktop
+  # png, not svg: same reason as Koguma's, the shell tints svgs
+  cp kuma-term/packaging/kuma-term.png \
+    ~/.local/share/icons/hicolor/256x256/apps/kuma-term.png
   if [ -f target/release/kuma-files ]; then
     cp target/release/kuma-files ~/.local/bin/kuma-files.new
     mv -f ~/.local/bin/kuma-files.new ~/.local/bin/kuma-files

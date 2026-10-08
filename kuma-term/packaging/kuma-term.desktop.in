@@ -7,4 +7,5 @@ Keywords=terminal;shell;console;kuma;higuma;
 Exec=@HOME@/.local/bin/kuma-term
 Terminal=false
 Categories=System;TerminalEmulator;
+Icon=kuma-term
 StartupNotify=true
