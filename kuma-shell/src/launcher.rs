@@ -233,16 +233,16 @@ pub fn launch(exec: &str, terminal: bool) -> anyhow::Result<()> {
     use std::process::Command;
 
     let child = if terminal {
-        Command::new("kitty")
-            .arg("-e")
-            .arg("sh")
-            .arg("-c")
-            .arg(exec)
+        // terminal-type desktop entries open in kuma-term; the exec
+        // string rides KUMA_TERM_COMMAND (kuma-term runs it as
+        // /bin/sh -c) instead of a terminal emulator flag
+        Command::new("kuma-term")
+            .env("KUMA_TERM_COMMAND", exec)
             .spawn()?
     } else {
         Command::new("sh").arg("-c").arg(exec).spawn()?
     };
-    reap(child);
+    scope_and_reap(child, exec);
     Ok(())
 }
 
@@ -253,6 +253,65 @@ pub fn reap(mut child: std::process::Child) {
     std::thread::spawn(move || {
         let _ = child.wait();
     });
+}
+
+/// Scope an app into its own transient unit, then reap it. Apps the
+/// shell launches must not share the shell's cgroup: the service runs
+/// with KillMode=control-group, so `systemctl --user restart
+/// kuma-shell` would otherwise SIGTERM every open app along with the
+/// shell. The scope (named like niri's, `app-kuma-shell-<prog>-<pid>`
+/// in app.slice) survives shell restarts. The move races the child's
+/// exit, which is fine: a dead pid fails the scope call and the empty
+/// unit is collected, and a failed scoping never fails the launch.
+fn scope_and_reap(mut child: std::process::Child, exec: &str) {
+    let pid = child.id();
+    let name = scope_name(exec, pid);
+    std::thread::spawn(move || {
+        // still running? (a fast exit skips the scope call entirely)
+        if matches!(child.try_wait(), Ok(None)) {
+            if let Err(err) = scope_app(pid, &name) {
+                log::warn!("scoping {name} failed, app runs in the shell's cgroup: {err}");
+            }
+        }
+        let _ = child.wait();
+    });
+}
+
+/// `app-kuma-shell-<program>-<pid>.scope`, mirroring niri's
+/// `app-niri-<program>-<pid>` scopes: the program is the exec line's
+/// first token's basename, with anything outside [A-Za-z0-9-] folded
+/// to a dash.
+fn scope_name(exec: &str, pid: u32) -> String {
+    let first = exec.split_whitespace().next().unwrap_or("app");
+    let basename = first.rsplit('/').next().unwrap_or(first);
+    let prog: String = basename
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    format!("app-kuma-shell-{prog}-{pid}.scope")
+}
+
+/// Move a running pid into a transient scope over systemd's D-Bus
+/// API (the same StartTransientUnit call niri and GNOME shell make;
+/// no systemd-run process needed).
+fn scope_app(pid: u32, name: &str) -> anyhow::Result<()> {
+    use zbus::zvariant::{Array, Value};
+
+    let conn = zbus::blocking::Connection::session()?;
+    let systemd = zbus::blocking::Proxy::new(
+        &conn,
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+    )?;
+    let properties: Vec<(&str, Value)> = vec![
+        ("PIDs", Value::Array(Array::from(vec![pid]))),
+        ("Slice", Value::Str("app.slice".into())),
+    ];
+    let aux: Vec<(&str, Vec<(&str, Value)>)> = Vec::new();
+    let _job: zbus::zvariant::OwnedObjectPath =
+        systemd.call("StartTransientUnit", &(name, "fail", properties, aux))?;
+    Ok(())
 }
 
 pub struct LauncherView {
@@ -751,6 +810,26 @@ mod tests {
         let umbrella = fuzzy_score("um", "umbrella");
         let volume = fuzzy_score("um", "volume");
         assert!(umbrella.unwrap() > volume.unwrap());
+    }
+
+    #[test]
+    fn scope_names_follow_the_niri_shape() {
+        // plain name, path binary, arguments, odd characters: the
+        // program is the exec's first token's basename, sanitized
+        assert_eq!(
+            scope_name("kuma-term", 42),
+            "app-kuma-shell-kuma-term-42.scope"
+        );
+        assert_eq!(
+            scope_name("/usr/bin/kuma-files --hidden", 7),
+            "app-kuma-shell-kuma-files-7.scope"
+        );
+        assert_eq!(
+            scope_name("org.foo.Bar --flag=x", 9),
+            "app-kuma-shell-org-foo-Bar-9.scope"
+        );
+        // no exec text at all still yields a valid unique name
+        assert_eq!(scope_name("", 5), "app-kuma-shell-app-5.scope");
     }
 
     #[test]
