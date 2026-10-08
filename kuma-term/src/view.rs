@@ -6,6 +6,8 @@
 //! per-cell layout nodes, so a full-screen TUI costs the same handful of
 //! quads a frame regardless of how many cells it touches.
 
+use std::hash::Hasher;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -16,6 +18,7 @@ use gpui::{
     fill, point, px, prelude::*, size,
 };
 use log::warn;
+use rustc_hash::FxHashMap;
 
 use crate::encoder;
 use crate::font;
@@ -26,6 +29,15 @@ use crate::term::{CellEdge, Engine, GridPoint, Row, SelectMode, SelectSpan, UiEv
 use crate::theme::Theme;
 
 const PADDING: f32 = 8.0;
+
+/// Bound on the shaped-row cache: entries are small and a full clear on
+/// overflow just costs one rebuild burst after very long scrolls.
+const ROW_SHAPE_CACHE_CAP: usize = 4096;
+
+/// Domain tags mixed into the line-layout cache keys, so a row hash can
+/// never collide with a bar hash (both feed the same text-system cache).
+const SHAPE_DOMAIN_ROW: u64 = 0x524f5730;
+const SHAPE_DOMAIN_BAR: u64 = 0x42415230;
 
 fn hsla_of(c: Rgb8) -> gpui::Hsla {
     let hex = ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | c.2 as u32;
@@ -46,6 +58,10 @@ pub struct TerminalView {
     selecting: bool,
     /// prompt-bar data, maintained from shell-integration markers
     bar: BarState,
+    /// shaped rows keyed on the row's cell-content hash: a row the grid
+    /// did not change skips the cell walk, the string build, and (through
+    /// gpui's hash-keyed layout cache) the shaper itself
+    row_shapes: FxHashMap<u64, Arc<RowRender>>,
     /// the bar's git facts for the bar's cwd, refreshed off the render
     /// path whenever the cwd changes or a command finishes
     git: Option<crate::git::GitSummary>,
@@ -142,6 +158,7 @@ impl TerminalView {
             title: None,
             selecting: false,
             bar: BarState::default(),
+            row_shapes: FxHashMap::default(),
             git: None,
             git_generation: 0,
             _git_task: Task::ready(()),
@@ -202,6 +219,27 @@ impl TerminalView {
             self.engine.set_theme(self.theme.clone());
             cx.notify();
         }
+    }
+
+    /// The shaped render for one grid row: cache hit returns the stored
+    /// build, miss builds and stores. The key doubles as the text hash for
+    /// gpui's line-layout cache, so an unchanged row pays neither the cell
+    /// walk nor the shaper.
+    fn row_render(&mut self, row: &Row) -> Arc<RowRender> {
+        let key = SHAPE_DOMAIN_ROW ^ hash_row(row);
+        if let Some(cached) = self.row_shapes.get(&key) {
+            return cached.clone();
+        }
+        let built = RowRender {
+            key,
+            ..build_row(row, &self.font, &self.theme)
+        };
+        let built = Arc::new(built);
+        if self.row_shapes.len() >= ROW_SHAPE_CACHE_CAP {
+            self.row_shapes.clear();
+        }
+        self.row_shapes.insert(key, built.clone());
+        built
     }
 
     /// Refresh the bar's git segment for the bar's cwd. Runs on the
@@ -438,11 +476,7 @@ impl Render for TerminalView {
 
         let snapshot = self.engine.snapshot();
         let font_size = px(self.theme.font_size_px());
-        let rows = snapshot
-            .rows
-            .iter()
-            .map(|row| build_row(row, &self.font, &self.theme))
-            .collect();
+        let rows = snapshot.rows.iter().map(|row| self.row_render(row)).collect();
 
         // one div for interactivity, one canvas per painted strip: the
         // prompt bar (when on), then the grid. Painting never goes through
@@ -479,7 +513,6 @@ impl Render for TerminalView {
             },
         };
         let grid_h = snapshot.rows.len() as f32 * self.cell_h;
-
         // background alpha: the focused window shows the most wallpaper,
         // inactive windows dim toward solid for contrast
         let opacity = if window.is_window_active() {
@@ -639,11 +672,13 @@ impl BarPaint {
                 strikethrough: None,
             });
         }
-        let shaped = window.text_system().shape_line(
-            SharedString::from(joined),
+        let shaped = window.text_system().shape_line_by_hash(
+            SHAPE_DOMAIN_BAR ^ hash_str(&joined),
+            joined.len(),
             self.font_size,
             &runs,
             None,
+            || SharedString::from(joined),
         );
         if let Err(err) = shaped.paint(
             bounds.origin,
@@ -656,6 +691,38 @@ impl BarPaint {
             warn!("bar paint failed: {err}");
         }
     }
+}
+
+/// Content hash of an arbitrary string (the bar's joined line).
+fn hash_str(text: &str) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(text.as_bytes());
+    hasher.finish()
+}
+
+/// Content hash of a row's cells. Every input build_row reads lives in the
+/// cells (the engine resolves theme colors into them), so this is a sound
+/// key for the RowRender cache, and a fortiori for the text hash contract
+/// of gpui's line-layout cache: same hash implies the same text.
+fn hash_row(row: &Row) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write_usize(row.cells.len());
+    for cell in &row.cells {
+        hasher.write_u32(cell.c as u32);
+        hasher.write_u8(cell.fg.0);
+        hasher.write_u8(cell.fg.1);
+        hasher.write_u8(cell.fg.2);
+        hasher.write_u8(cell.bg.0);
+        hasher.write_u8(cell.bg.1);
+        hasher.write_u8(cell.bg.2);
+        let flags = cell.bold as u8
+            | (cell.italic as u8) << 1
+            | (cell.underline as u8) << 2
+            | (cell.strikeout as u8) << 3
+            | (cell.spacer as u8) << 4;
+        hasher.write_u8(flags);
+    }
+    hasher.finish()
 }
 
 /// Measure the monospace cell from the real font: the shaped advance of `M`
@@ -692,6 +759,9 @@ fn cell_metrics(
 /// One painted row: the shaped text plus everything painted behind or
 /// instead of it.
 struct RowRender {
+    /// this row's content hash: the key into both the view's cache and
+    /// gpui's line-layout cache
+    key: u64,
     text: String,
     runs: Vec<TextRun>,
     /// background rects, cell aligned: (column, length, color)
@@ -836,7 +906,7 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
     }
     flush_bg_at_end(&mut bg_quads, bg_open.take());
 
-    RowRender { text, runs, bg_quads, glyphs }
+    RowRender { key: 0, text, runs, bg_quads, glyphs }
 }
 
 /// Push a finished background quad if it covers anything.
@@ -864,7 +934,7 @@ fn cell_width(row: &Row, i: usize) -> usize {
 /// the hot path, and the data is rebuilt from the engine snapshot every
 /// frame.
 struct GridPaint {
-    rows: Vec<RowRender>,
+    rows: Vec<Arc<RowRender>>,
     font_size: Pixels,
     cell_w: f32,
     cell_h: f32,
@@ -912,13 +982,17 @@ impl GridPaint {
                 }
             }
 
-            // the text itself
+            // the text itself; the layout comes from gpui's hash-keyed
+            // cache, so an unchanged row never re-shapes (and never
+            // materializes its text)
             if !row.text.is_empty() {
-                let shaped = window.text_system().shape_line(
-                    SharedString::from(row.text.clone()),
+                let shaped = window.text_system().shape_line_by_hash(
+                    row.key,
+                    row.text.len(),
                     self.font_size,
                     &row.runs,
                     None,
+                    || SharedString::from(row.text.clone()),
                 );
                 if let Err(err) = shaped.paint(
                     point(origin.x, row_y),
@@ -1083,5 +1157,52 @@ mod tests {
         let rendered = build_row(&row, &font, &t);
         assert_eq!(rendered.text, "\u{2500}");
         assert!(rendered.glyphs.is_empty());
+    }
+
+    #[test]
+    fn row_hash_is_stable_per_content_and_sensitive_to_changes() {
+        let mut a = Row { cells: vec![RenderCell {
+            c: 'x', fg: Rgb8(1, 2, 3), bg: Rgb8(0, 0, 0),
+            bold: false, italic: false, underline: false, strikeout: false, spacer: false,
+        }] };
+        let b = Row { cells: vec![RenderCell {
+            c: 'x', fg: Rgb8(1, 2, 3), bg: Rgb8(0, 0, 0),
+            bold: false, italic: false, underline: false, strikeout: false, spacer: false,
+        }] };
+        assert_eq!(hash_row(&a), hash_row(&b));
+
+        // every field build_row reads must move the hash
+        a.cells[0].c = 'y';
+        assert_ne!(hash_row(&a), hash_row(&b));
+        a.cells[0].c = 'x';
+        a.cells[0].fg = Rgb8(9, 2, 3);
+        assert_ne!(hash_row(&a), hash_row(&b));
+        a.cells[0].fg = Rgb8(1, 2, 3);
+        a.cells[0].bg = Rgb8(9, 9, 9);
+        assert_ne!(hash_row(&a), hash_row(&b));
+        a.cells[0].bg = Rgb8(0, 0, 0);
+        a.cells[0].bold = true;
+        assert_ne!(hash_row(&a), hash_row(&b));
+        a.cells[0].bold = false;
+        a.cells[0].spacer = true;
+        assert_ne!(hash_row(&a), hash_row(&b));
+    }
+
+    #[test]
+    fn row_hash_collapses_equivalent_flag_truthiness() {
+        // identical cells built twice hash identically regardless of
+        // struct instance
+        let mk = |bold| Row { cells: vec![RenderCell {
+            c: 'q', fg: Rgb8(5, 5, 5), bg: Rgb8(0, 0, 0),
+            bold, italic: false, underline: false, strikeout: false, spacer: false,
+        }] };
+        assert_eq!(hash_row(&mk(true)), hash_row(&mk(true)));
+        assert_ne!(hash_row(&mk(true)), hash_row(&mk(false)));
+    }
+
+    #[test]
+    fn str_hash_is_stable_and_content_sensitive() {
+        assert_eq!(hash_str("kuma"), hash_str("kuma"));
+        assert_ne!(hash_str("kuma"), hash_str("kumb"));
     }
 }
