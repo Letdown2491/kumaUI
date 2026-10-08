@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use gpui::{
     App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight,
-    Keystroke, MouseButton, ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, Task, TextRun, UnderlineStyle, Window, WindowTextSystem, canvas, div, fill,
-    point, prelude::*, px, size, underline_y_offset,
+    KeyDownEvent, Keystroke, MouseButton, ParentElement, Pixels, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, Task, TextRun, UnderlineStyle, Window, WindowTextSystem,
+    canvas, div, fill, point, prelude::*, px, size, underline_y_offset,
 };
 use log::warn;
 use rustc_hash::FxHashMap;
@@ -55,8 +55,13 @@ fn hsla_of(c: Rgb8) -> gpui::Hsla {
 /// new output keep the highlights glued to their text.
 struct SearchState {
     query: String,
+    /// the query reads as a regex (ctrl+enter toggles); literal text
+    /// otherwise
+    regex: bool,
     /// all matches, oldest history first
     matches: Vec<SearchMatch>,
+    /// regex mode rejected the pattern outright; the bar says so
+    bad_pattern: bool,
     /// which match enter / shift+enter cycles to
     current: usize,
     /// a rescan is in flight: the bar shows dots, the old highlights stay
@@ -331,8 +336,14 @@ impl TerminalView {
             .selection_text()
             .filter(|text| text.len() <= 200 && !text.contains(['\n', '\r']))
             .unwrap_or_default();
-        self.search =
-            Some(SearchState { query, matches: Vec::new(), current: 0, stale: false });
+        self.search = Some(SearchState {
+            query,
+            regex: false,
+            matches: Vec::new(),
+            bad_pattern: false,
+            current: 0,
+            stale: false,
+        });
         self.schedule_search(true, cx);
         cx.notify();
     }
@@ -350,11 +361,12 @@ impl TerminalView {
             return;
         }
         let query = search.query.clone();
+        let regex = search.regex;
         let handle = self.engine.search_handle();
         self._search_task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(150)).await;
-            let matches =
-                cx.background_executor().spawn(async move { handle.search(&query) }).await;
+            let scan =
+                cx.background_executor().spawn(async move { handle.search(&query, regex) }).await;
             let _ = this.update(cx, |this, cx| {
                 if this.search_generation != generation {
                     return; // a newer scan owns the result
@@ -366,7 +378,8 @@ impl TerminalView {
                 let was_empty = search.matches.is_empty();
                 let keep = search.matches.get(search.current).copied();
                 let keep_index = search.current;
-                search.matches = matches;
+                search.matches = scan.matches;
+                search.bad_pattern = scan.bad_pattern;
                 search.stale = false;
                 search.current = if was_empty {
                     0
@@ -396,7 +409,10 @@ impl TerminalView {
             cx.notify();
             return;
         }
+        // an edit invalidates the old scan's verdicts, bad pattern
+        // included; the rescan produces the fresh ones
         search.stale = true;
+        search.bad_pattern = false;
         self.schedule_search(true, cx);
     }
 
@@ -414,6 +430,14 @@ impl TerminalView {
                 self.cycle_search(-1);
                 cx.notify();
                 return;
+            }
+            // ctrl+enter flips the query's reading: literal text or a
+            // regex, kitty's convention. A stale pattern never lingers:
+            // the flip rescans
+            "enter" if k.modifiers.control => {
+                let Some(search) = self.search.as_mut() else { return };
+                search.regex = !search.regex;
+                true
             }
             "enter" | "down" => {
                 self.cycle_search(1);
@@ -486,7 +510,7 @@ impl TerminalView {
         self.engine.scroll_to_offset(target.max(0) as usize);
     }
 
-    fn on_key(&mut self, event: &gpui::KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let k: &Keystroke = &event.keystroke;
 
         // clipboard chords first; the shell never sees these
@@ -1331,10 +1355,14 @@ fn search_view_spans(
 
 /// The floating search bar: a solid strip over the bottom row with the
 /// query, a cursor mark, and the match status. No grid row is reserved,
-/// so opening it never reflows the terminal.
+/// so opening it never reflows the terminal. A `regex` badge marks the
+/// pattern mode; the stored bad-pattern flag names a rejected pattern
+/// inline, no per-frame DFA build.
 fn search_bar(search: &SearchState, theme: &Theme, family: &gpui::SharedString) -> gpui::AnyElement {
     let status = if search.query.is_empty() {
         "type to search".to_string()
+    } else if search.bad_pattern {
+        "bad pattern".to_string()
     } else if search.stale {
         "…".to_string()
     } else if search.matches.is_empty() {
@@ -1346,6 +1374,11 @@ fn search_bar(search: &SearchState, theme: &Theme, family: &gpui::SharedString) 
     bg.a = 1.0;
     let mut dim = hsla_of(theme.foreground);
     dim.a *= 0.6;
+    let (badge_color, badge_text) = if search.regex {
+        (hsla_of(theme.cursor), "regex")
+    } else {
+        (dim, "text")
+    };
     div()
         .absolute()
         .bottom(px(0.0))
@@ -1363,6 +1396,7 @@ fn search_bar(search: &SearchState, theme: &Theme, family: &gpui::SharedString) 
         .text_size(px(theme.font_size_px()))
         .text_color(hsla_of(theme.foreground))
         .child(format!("{}\u{258e}", search.query))
+        .child(div().text_color(badge_color).child(badge_text))
         .child(div().text_color(dim).child(status))
         .into_any_element()
 }
@@ -1939,5 +1973,100 @@ mod tests {
         }] };
         assert_eq!(hash_row(&mk(true)), hash_row(&mk(true)));
         assert_ne!(hash_row(&mk(true)), hash_row(&mk(false)));
+    }
+
+    /// A full-window view test: the search bar's ctrl+enter toggle and
+    /// its regex-mode rescan, driven through the real key path. The
+    /// fixture command never reads stdin, so the grid shows exactly the
+    /// tty's own echo of the typing and nothing else.
+    #[test]
+    fn ctrl_enter_toggles_regex_mode_and_rescans() {
+        if std::env::var("KUMA_TERM_SKIP_PTY_TEST").is_ok() {
+            return;
+        }
+        let _env = crate::PTY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var("KUMA_TERM_COMMAND", "sleep 300") };
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| TerminalView::new(window, cx));
+        drop(_env);
+        app.run_until_parked();
+
+        let typed = |s: &str| -> Vec<KeyDownEvent> {
+            s.chars()
+                .map(|c| KeyDownEvent {
+                    keystroke: Keystroke {
+                        key: c.to_string(),
+                        key_char: Some(c.to_string()),
+                        ..Keystroke::parse(&c.to_string()).unwrap()
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                })
+                .collect()
+        };
+        let chord = |s: &str| KeyDownEvent {
+            keystroke: Keystroke::parse(s).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+
+        // fixture text via the shell's own echo, then wait for it to
+        // actually land on the grid: a pty round-trip is real time, not
+        // executor time, and a loaded machine can stretch it
+        window.update(|view, window, cx| {
+            for event in typed("a.b cxx axb\r") {
+                view.on_key(&event, window, cx);
+            }
+        });
+        let mut landed = false;
+        for _ in 0..100 {
+            landed = window.update(|view, _, _| {
+                view.engine.snapshot(false).rows.iter().any(|r| {
+                    let text: String = r.cells.iter().map(|c| c.c).collect();
+                    text.contains("a.b") && text.contains("axb")
+                })
+            });
+            if landed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            app.run_until_parked();
+        }
+        assert!(landed, "the typed fixture never echoed onto the grid");
+
+        // ctrl+shift+f opens the bar; the query types into it, not the
+        // shell
+        window.update(|view, window, cx| {
+            view.on_key(&chord("ctrl-shift-f"), window, cx);
+            for event in typed("a.b") {
+                view.on_key(&event, window, cx);
+            }
+        });
+        // pass the debounce, then the scan
+        app.advance_clock(Duration::from_millis(200));
+        app.run_until_parked();
+        window.update(|view, _, _| {
+            let search = view.search.as_ref().expect("bar never opened");
+            assert_eq!(search.query, "a.b");
+            assert!(!search.regex, "literal by default");
+            // the echoed line holds `a.b` once and `axb` once: literal
+            // mode matches only the dotted one
+            assert_eq!(search.matches.len(), 1, "literal mode must match only a dot");
+        });
+
+        // ctrl+enter flips to regex mode and rescans
+        window.update(|view, window, cx| {
+            view.on_key(&chord("ctrl-enter"), window, cx);
+        });
+        app.advance_clock(Duration::from_millis(200));
+        app.run_until_parked();
+        window.update(|view, _, _| {
+            let search = view.search.as_ref().expect("bar closed by the toggle?");
+            assert!(search.regex, "the toggle flipped the mode");
+            assert_eq!(search.matches.len(), 2, "regex mode matches the dot too");
+        });
     }
 }

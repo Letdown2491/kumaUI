@@ -9,6 +9,12 @@ mod term;
 mod theme;
 mod view;
 
+/// Serializes the tests that mutate `KUMA_TERM_COMMAND` and then spawn
+/// an engine: the env read happens inside the spawn, so both steps must
+/// hold the lock or the tests race each other's fixture.
+#[cfg(test)]
+pub(crate) static PTY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use std::io::Write as _;
 
 use gpui::{App, AppContext, TitlebarOptions, WindowBounds, WindowOptions, px, size, SharedString};

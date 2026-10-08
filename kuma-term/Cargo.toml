@@ -6,6 +6,11 @@ description = "Terminal emulator spike: alacritty_terminal behind an engine seam
 license = "MIT"
 repository = "https://github.com/Letdown2491/kumaUI"
 
+[dev-dependencies]
+# view-level tests drive the real gpui event loop
+gpui = { workspace = true, features = ["test-support"] }
+gpui_wgpu = { workspace = true }
+
 [dependencies]
 gpui = { workspace = true }
 gpui_platform = { workspace = true }

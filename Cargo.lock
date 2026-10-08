@@ -3084,6 +3084,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_platform",
+ "gpui_wgpu",
  "libc",
  "log",
  "rustc-hash 1.1.0",

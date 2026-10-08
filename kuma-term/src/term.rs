@@ -295,13 +295,26 @@ pub struct SearchHandle {
 }
 
 impl SearchHandle {
-    /// All matches of the plain-text `query` across the whole buffer,
-    /// oldest history first. Holds the term lock for the scan; the pump
-    /// and the renderer interleave behind the same fair mutex.
-    pub fn search(&self, query: &str) -> Vec<SearchMatch> {
+    /// All matches of the `query` across the whole buffer, oldest
+    /// history first. Literal text by default; `regex` treats the query
+    /// as a regex instead (ctrl+enter in the bar toggles it). Holds the
+    /// term lock for the scan; the pump and the renderer interleave
+    /// behind the same fair mutex.
+    pub fn search(&self, query: &str, regex: bool) -> SearchScan {
         let term = self.term.lock();
-        search_term(&term, query)
+        search_scan(&term, query, regex)
     }
+}
+
+/// The scan's outcome: matches plus a bad-pattern flag, so the search
+/// bar can name a rejected pattern instead of calling it no matches.
+/// Building the flag into the scan also keeps the DFA construction off
+/// the render path: the bar reads the stored result, it never rebuilds
+/// the pattern per frame.
+pub struct SearchScan {
+    pub matches: Vec<SearchMatch>,
+    /// regex mode rejected the pattern outright
+    pub bad_pattern: bool,
 }
 
 /// The scan behind `SearchHandle::search`: enumerate alacritty's own
@@ -310,29 +323,51 @@ impl SearchHandle {
 /// `total_lines - 1` or the scan silently covers nothing, and past the
 /// last match it falls back to the window's first match (search wraps in
 /// the emulator), so any result before the origin ends the walk.
-fn search_term(term: &Term<UiProxy>, query: &str) -> Vec<SearchMatch> {
+/// The scan as a bare match list: the tests' view. Production callers
+/// go through `search_scan`, whose bad-pattern flag the bar reports.
+#[cfg(test)]
+fn search_term(term: &Term<UiProxy>, query: &str, regex: bool) -> Vec<SearchMatch> {
+    search_scan(term, query, regex).matches
+}
+
+/// The scan behind `SearchHandle::search`: enumerate alacritty's own
+/// matches from the topmost buffer line forward. Two quirks of the
+/// emulator's search shape the loop: the window bound must stay below
+/// `total_lines - 1` or the scan silently covers nothing, and past the
+/// last match it falls back to the window's first match (search wraps in
+/// the emulator), so any result before the origin ends the walk.
+fn search_scan(term: &Term<UiProxy>, query: &str, regex: bool) -> SearchScan {
     let mut out = Vec::new();
     if query.is_empty() {
-        return out;
+        return SearchScan { matches: out, bad_pattern: false };
     }
-    let mut regex = match RegexSearch::new(&escape_regex(query)) {
-        Ok(regex) => regex,
-        Err(_) => return out,
+    // literal mode escapes the metacharacters; regex mode hands the
+    // query over as typed. Both share the emulator's smart case: an
+    // uppercase anywhere makes the scan case-sensitive.
+    let pattern = if regex { query.to_string() } else { escape_regex(query) };
+    let mut regex_engine = match RegexSearch::new(&pattern) {
+        Ok(regex_engine) => regex_engine,
+        // a rejected pattern is information, not an empty result
+        Err(_) => return SearchScan { matches: out, bad_pattern: true },
     };
     let columns = term.columns();
     let bottommost = term.bottommost_line().0;
     let max_lines = term.total_lines().saturating_sub(2);
     if max_lines == 0 {
-        return out;
+        return SearchScan { matches: out, bad_pattern: false };
     }
     let mut origin = Point::new(term.topmost_line(), Column(0));
     for _ in 0..SEARCH_MATCH_CAP {
         if origin.line.0 > bottommost {
             break;
         }
-        let Some(found) =
-            term.search_next(&mut regex, origin, Direction::Right, Side::Left, Some(max_lines))
-        else {
+        let Some(found) = term.search_next(
+            &mut regex_engine,
+            origin,
+            Direction::Right,
+            Side::Left,
+            Some(max_lines),
+        ) else {
             break;
         };
         // the wrap fallback: a match starting before the origin means
@@ -355,7 +390,7 @@ fn search_term(term: &Term<UiProxy>, query: &str) -> Vec<SearchMatch> {
             origin = Point::new(Line(line), Column(col + 1));
         }
     }
-    out
+    SearchScan { matches: out, bad_pattern: false }
 }
 
 /// Scroll the viewport to an absolute history offset (0 = live), clamped
@@ -924,7 +959,7 @@ mod tests {
         for _ in 0..30 {
             feed(&mut term, b"pad pad pad\r\n");
         }
-        let matches = search_term(&term, "needle");
+        let matches = search_term(&term, "needle", false);
         assert_eq!(matches.len(), 1);
         // buffer coordinates: the live screen is rows 0..3, history is
         // negative, and the needle scrolled off 30 lines ago
@@ -1099,7 +1134,7 @@ mod tests {
             feed(&mut term, b"find me\r\n");
         }
         feed(&mut term, b"nothing");
-        let hits = search_term(&term, "find");
+        let hits = search_term(&term, "find", false);
         assert_eq!(hits.len(), 6);
         // oldest history first, and never out of buffer order
         for pair in hits.windows(2) {
@@ -1117,11 +1152,11 @@ mod tests {
         let mut term = test_term(10, 3);
         feed(&mut term, b"a.b c*x");
         // metacharacters in the query match themselves, not patterns
-        assert_eq!(search_term(&term, "a.b").len(), 1);
-        assert_eq!(search_term(&term, "aXb").len(), 0);
-        assert_eq!(search_term(&term, "c*x").len(), 1);
-        assert_eq!(search_term(&term, "cXx").len(), 0);
-        assert!(search_term(&term, "").is_empty());
+        assert_eq!(search_term(&term, "a.b", false).len(), 1);
+        assert_eq!(search_term(&term, "aXb", false).len(), 0);
+        assert_eq!(search_term(&term, "c*x", false).len(), 1);
+        assert_eq!(search_term(&term, "cXx", false).len(), 0);
+        assert!(search_term(&term, "", false).is_empty());
     }
 
     #[test]
@@ -1130,8 +1165,34 @@ mod tests {
         feed(&mut term, b"Kuma KUMA kuma");
         // a lowercase query ignores case, an uppercase one demands it:
         // the DFA builder's own rule, kitty's too
-        assert_eq!(search_term(&term, "kuma").len(), 3);
-        assert_eq!(search_term(&term, "Kuma").len(), 1);
+        assert_eq!(search_term(&term, "kuma", false).len(), 3);
+        assert_eq!(search_term(&term, "Kuma", false).len(), 1);
+    }
+
+    #[test]
+    fn regex_mode_takes_the_query_as_typed() {
+        let mut term = test_term(10, 3);
+        feed(&mut term, b"a.b cxx axb c*x");
+        // literal mode: the dot matches a dot
+        assert_eq!(search_term(&term, "a.b", false).len(), 1);
+        // regex mode: the dot matches any character
+        assert_eq!(search_term(&term, "a.b", true).len(), 2);
+        // alternation and classes work
+        assert_eq!(search_term(&term, "c[xy]+x", true).len(), 1);
+        assert_eq!(search_term(&term, "cxx|c\\*x", true).len(), 2);
+    }
+
+    #[test]
+    fn regex_mode_keeps_smart_case_and_rejects_bad_patterns() {
+        let mut term = test_term(10, 3);
+        feed(&mut term, b"Kuma kuma");
+        assert_eq!(search_term(&term, "k.ma", true).len(), 2);
+        assert_eq!(search_term(&term, "K.ma", true).len(), 1);
+        // an unbalanced pattern builds no DFA: no matches, no panic
+        assert!(search_term(&term, "(unclosed", true).is_empty());
+        // an empty match pattern also builds, but the scan's dedup keeps
+        // the walk finite; it just finds nothing useful to report
+        assert!(search_term(&term, "x*", true).is_empty());
     }
 
     #[test]
@@ -1139,7 +1200,7 @@ mod tests {
         let mut term = test_term(10, 3);
         // 12 characters on a 10-column grid wrap onto the next row
         feed(&mut term, b"abcdefghijkl");
-        let hits = search_term(&term, "hijk");
+        let hits = search_term(&term, "hijk", false);
         assert_eq!(hits.len(), 1);
         // h, i, j fill row 0's last three columns; k opens row 1
         assert_eq!(hits[0].from, GridPoint { line: 0, column: 7 });
@@ -1177,8 +1238,9 @@ mod tests {
         };
         // the child prints visible text then exits: exercises the pump,
         // the parser, and the EIO exit path in one go. Env mutation is
-        // safe here: the test binary is single-threaded until the engine
-        // spawns.
+        // safe here: the PTY_ENV_LOCK keeps the other engine-spawning
+        // test from reading a clobbered fixture.
+        let _env = crate::PTY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::set_var("KUMA_TERM_COMMAND", "echo kuma") };
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<UiEvent>();
         let mut engine = Engine::new(window_size, crate::theme::Theme::builtin(), tx)

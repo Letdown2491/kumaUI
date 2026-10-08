@@ -46,7 +46,7 @@ Runtime requirements: a Wayland compositor with `wlr-layer-shell` and `ext-sessi
 
 kuma-term works with any shell out of the box; no shell integration is required. It exports `KUMA_TERM=1` into the shell's environment so dotfiles can recognize it (the fish prompt and greeting in the kumaOS image key on it), and nothing else. Its theme is a line-based key value config at `$XDG_CONFIG_HOME/kuma-term/kuma-term.conf` with kitty-compatible key names, so a kitty theme's colors block pastes in unchanged, and it honors `kuma-shell`'s published wallpaper palette when the shell is present. The built-in theme, used when no conf exists, is the shipped pastel palette (the ANSI 16 and the chrome colors).
 
-Everyday terminal features: scrollback search (`ctrl+shift+f`, kitty's binding: a floating bar that never reflows the grid, case-insensitive matching unless the query has uppercase, enter and the arrows cycle matches through history, `esc` closes), URL click-to-open through the desktop handler, and vector-drawn box drawing and powerline glyphs.
+Everyday terminal features: scrollback search (`ctrl+shift+f`, kitty's binding: a floating bar that never reflows the grid, case-insensitive matching unless the query has uppercase, `ctrl+enter` toggles regex mode with an inline "bad pattern" status, enter and the arrows cycle matches through history, `esc` closes), URL click-to-open through the desktop handler, and vector-drawn box drawing and powerline glyphs.
 
 ## Vendored gpui
 
