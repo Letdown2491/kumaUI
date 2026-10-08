@@ -385,7 +385,9 @@ impl Default for BackgroundConfig {
     }
 }
 
-/// Wallpaper-derived theming: off until proven.
+/// Wallpaper-derived theming: on by default. The shipped wallpaper
+/// themes well, and a new box should land with a cohesive palette and
+/// nothing to configure.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
@@ -395,7 +397,7 @@ pub struct ThemeConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            wallpaper_derived: false,
+            wallpaper_derived: true,
         }
     }
 }
@@ -791,7 +793,10 @@ pub struct DockSettings {
 impl Default for DockSettings {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // the dock ships off: the bar already carries everything a
+            // new user needs, and enabling it here is one setting away,
+            // starting from the first-run pins below
+            enabled: false,
             position: DockPosition::default(),
             pinned: default_pins(),
         }
@@ -843,17 +848,43 @@ impl Default for Settings {
                 mode: WidgetMode::default(),
             }
         }
+        fn icon(kind: WidgetKind) -> WidgetConfig {
+            WidgetConfig {
+                kind,
+                mode: WidgetMode::Icon,
+            }
+        }
+        // The shipped arrangement: apps and workspaces on the left, the
+        // clock alone in the center, and the status cluster on the right
+        // (tray, notifications, volume, internet, battery), the gear
+        // after it as the bar's fixed last element. Simple and fully
+        // functional out of the box; a user's first settings commit
+        // takes over from there.
         Self {
             bar: BarConfig {
-                left: vec![widget(WidgetKind::Workspaces)],
-                center: vec![widget(WidgetKind::WindowTitle)],
+                height: 32.0,
+                offset_top: 0.0,
+                width: BarWidth::TwoThirds,
+                align: BarAlign::Center,
+                position: BarPosition::Top,
+                radius: BarRadius::Xl,
+                corners: CornerRounding {
+                    top_left: false,
+                    top_right: false,
+                    ..CornerRounding::default()
+                },
+                left: vec![widget(WidgetKind::Apps), widget(WidgetKind::Workspaces)],
+                center: vec![WidgetConfig {
+                    kind: WidgetKind::Clock,
+                    mode: WidgetMode::Text,
+                }],
                 right: vec![
-                    widget(WidgetKind::Cpu),
-                    widget(WidgetKind::Volume),
-                    widget(WidgetKind::Battery),
-                    widget(WidgetKind::Clock),
+                    icon(WidgetKind::Tray),
+                    icon(WidgetKind::Notifications),
+                    icon(WidgetKind::Volume),
+                    icon(WidgetKind::Internet),
+                    icon(WidgetKind::Battery),
                 ],
-                ..Default::default()
             },
             background: BackgroundConfig::default(),
             theme: ThemeConfig::default(),
@@ -1408,27 +1439,28 @@ mod tests {
         let settings = Settings::default();
         let missing = settings.missing_kinds();
         assert!(missing.contains(&WidgetKind::Bluetooth));
-        assert!(missing.contains(&WidgetKind::Internet));
-        assert!(!missing.contains(&WidgetKind::Cpu));
+        assert!(missing.contains(&WidgetKind::Cpu));
+        assert!(!missing.contains(&WidgetKind::Internet));
     }
 
     #[test]
     fn move_widget_crosses_sections_and_reorders() {
         let mut settings = Settings::default();
-        // left: [Workspaces, ...]; right: [Cpu, Volume, Battery, Clock]
+        // left: [Apps, Workspaces, ...]; center: [Clock]
         assert!(settings.move_widget_impl(Section::Left, 0, Section::Center, 0));
-        assert!(settings.widgets(Section::Left).is_empty());
-        assert_eq!(
-            settings.widgets(Section::Center)[0].kind,
-            WidgetKind::Workspaces
-        );
+        assert_eq!(settings.widgets(Section::Left).len(), 1);
+        assert_eq!(settings.widgets(Section::Left)[0].kind, WidgetKind::Workspaces);
+        assert_eq!(settings.widgets(Section::Center)[0].kind, WidgetKind::Apps);
 
         // within a section: dropping two chips down moves past one;
         // dropping on the immediately next chip would be a no-op
         assert!(!settings.move_widget_impl(Section::Right, 0, Section::Right, 1));
         assert!(settings.move_widget_impl(Section::Right, 0, Section::Right, 2));
-        assert_eq!(settings.widgets(Section::Right)[0].kind, WidgetKind::Volume);
-        assert_eq!(settings.widgets(Section::Right)[1].kind, WidgetKind::Cpu);
+        assert_eq!(
+            settings.widgets(Section::Right)[0].kind,
+            WidgetKind::Notifications
+        );
+        assert_eq!(settings.widgets(Section::Right)[1].kind, WidgetKind::Tray);
 
         // out-of-bounds source does nothing
         assert!(!settings.move_widget_impl(Section::Left, 5, Section::Right, 0));
@@ -1442,25 +1474,25 @@ mod tests {
         assert!(!settings.move_widget_impl(Section::Right, 1, Section::Right, 2));
         // a real same-section move still works
         assert!(settings.move_widget_impl(Section::Right, 0, Section::Right, 3));
-        assert_eq!(settings.widgets(Section::Right)[2].kind, WidgetKind::Cpu);
+        assert_eq!(settings.widgets(Section::Right)[2].kind, WidgetKind::Tray);
     }
 
     #[test]
     fn remove_and_add_round_trip() {
         let mut settings = Settings::default();
-        assert!(settings.remove_impl(Section::Right, 0)); // Cpu
-        assert!(!settings.is_present(WidgetKind::Cpu));
-        assert!(settings.missing_kinds().contains(&WidgetKind::Cpu));
+        assert!(settings.remove_impl(Section::Right, 0)); // Tray
+        assert!(!settings.is_present(WidgetKind::Tray));
+        assert!(settings.missing_kinds().contains(&WidgetKind::Tray));
 
-        assert!(settings.add_impl(WidgetKind::Cpu));
-        assert!(settings.is_present(WidgetKind::Cpu));
+        assert!(settings.add_impl(WidgetKind::Tray));
+        assert!(settings.is_present(WidgetKind::Tray));
         // adding a present widget is a no-op
-        assert!(!settings.add_impl(WidgetKind::Cpu));
+        assert!(!settings.add_impl(WidgetKind::Tray));
         assert_eq!(
             settings
                 .widgets(Section::Right)
                 .iter()
-                .filter(|w| w.kind == WidgetKind::Cpu)
+                .filter(|w| w.kind == WidgetKind::Tray)
                 .count(),
             1
         );
