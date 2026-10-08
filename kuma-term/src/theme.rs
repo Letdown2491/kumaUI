@@ -33,29 +33,33 @@ pub struct Theme {
 
 impl Theme {
     pub fn builtin() -> Self {
+        // The noctalia pastels: the palette the author's terminal settled
+        // on through kumaOS's daily life, now the shipped look. A
+        // kuma-term.conf overrides any of it, and on kumaOS the shell's
+        // wallpaper palette still wins for the chrome colors.
         Self {
             named: [
-                Rgb8(0, 0, 0),
-                Rgb8(205, 0, 0),
-                Rgb8(0, 205, 0),
-                Rgb8(205, 205, 0),
-                Rgb8(0, 0, 238),
-                Rgb8(205, 0, 205),
-                Rgb8(0, 205, 205),
-                Rgb8(229, 229, 229),
-                Rgb8(127, 127, 127),
-                Rgb8(255, 0, 0),
-                Rgb8(0, 255, 0),
-                Rgb8(255, 255, 0),
-                Rgb8(92, 92, 255),
-                Rgb8(255, 0, 255),
-                Rgb8(0, 255, 255),
-                Rgb8(255, 255, 255),
+                Rgb8(0x45, 0x46, 0x4f),
+                Rgb8(0xff, 0xb4, 0xab),
+                Rgb8(0xb5, 0xc5, 0xfd),
+                Rgb8(0xc0, 0xc5, 0xde),
+                Rgb8(0xe7, 0xb6, 0xed),
+                Rgb8(0xb5, 0xc5, 0xfd),
+                Rgb8(0xc0, 0xc5, 0xde),
+                Rgb8(0xe4, 0xe2, 0xe6),
+                Rgb8(0x8f, 0x90, 0x9a),
+                Rgb8(0xff, 0xb4, 0xab),
+                Rgb8(0xb5, 0xc5, 0xfd),
+                Rgb8(0xc0, 0xc5, 0xde),
+                Rgb8(0xe7, 0xb6, 0xed),
+                Rgb8(0xb5, 0xc5, 0xfd),
+                Rgb8(0xc0, 0xc5, 0xde),
+                Rgb8(0xe4, 0xe2, 0xe6),
             ],
-            foreground: Rgb8(224, 226, 228),
-            background: Rgb8(24, 26, 31),
-            cursor: Rgb8(224, 226, 228),
-            cursor_text: Rgb8(24, 26, 31),
+            foreground: Rgb8(0xe4, 0xe2, 0xe6),
+            background: Rgb8(0x13, 0x13, 0x17),
+            cursor: Rgb8(0xe4, 0xe2, 0xe6),
+            cursor_text: Rgb8(0x13, 0x13, 0x17),
             font_family: None,
             font_size_pt: 11.0,
             background_opacity: 0.80,
@@ -301,7 +305,7 @@ mod tests {
         apply_config(&mut theme, &path, 0);
         std::fs::remove_file(&path).ok();
         assert_eq!(theme.font_size_pt, 11.0);
-        assert_eq!(theme.named[0], Rgb8(0, 0, 0));
+        assert_eq!(theme.named[0], Rgb8(0x45, 0x46, 0x4f));
     }
 
     #[test]
