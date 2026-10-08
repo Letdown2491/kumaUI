@@ -17,9 +17,13 @@ use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::search::RegexSearch;
-use alacritty_terminal::term::{Term, TermMode};
+use alacritty_terminal::term::{RenderableContent, Term, TermMode};
 use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
+use alacritty_terminal::vte::ansi::{Processor, Rgb};
+
+/// The cursor shape rides through the term seam so the view never
+/// touches alacritty directly.
+pub use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle};
 
 use crate::palette::{self, Rgb8};
 use crate::theme::Theme;
@@ -144,11 +148,16 @@ pub struct Row {
 
 /// What the cursor looks like, in viewport coordinates.
 #[derive(Clone, Copy, Debug)]
+/// Where the cursor paints this frame, and what it looks like: the
+/// block's colors bake into the row's own cells, the other shapes
+/// paint as overlays in the view.
 pub struct CursorSpot {
     pub row: usize,
-    /// kept for the hit-testing and overlay cursor work after the spike
-    #[allow(dead_code)]
     pub col: usize,
+    /// the DECSCUSR shape in effect this frame
+    pub shape: CursorShape,
+    /// the style asks for a blink; the view animates it while focused
+    pub blinking: bool,
 }
 
 /// A grid position for selection, in buffer coordinates: line 0 is the top
@@ -463,6 +472,12 @@ impl Engine {
         let term = Term::new(
             alacritty_terminal::term::Config {
                 scrolling_history: theme.scrollback_lines,
+                // kitty parity: the plain prompt cursor blinks; apps
+                // that manage the cursor send DECSCUSR and take over
+                default_cursor_style: CursorStyle {
+                    shape: CursorShape::Block,
+                    blinking: true,
+                },
                 ..Default::default()
             },
             &GridDims::from_window_size(window_size),
@@ -622,7 +637,11 @@ impl Engine {
     }
 
     /// Take a snapshot of the visible grid for the renderer.
-    pub fn snapshot(&self) -> Snapshot {
+    /// A frame's worth of terminal state, plain data for the renderer.
+    /// `cursor_visible` says whether a blinking style is in its lit
+    /// phase right now (the view folds in focus and typing); the block
+    /// bakes its colors into the cell only when it would paint.
+    pub fn snapshot(&self, cursor_visible: bool) -> Snapshot {
         let term = self.term.lock();
         let content = term.renderable_content();
         let offset = content.display_offset;
@@ -634,6 +653,32 @@ impl Engine {
         for _ in 0..screen_lines {
             rows.push(Row { cells: Vec::with_capacity(columns) });
         }
+
+        // the cursor: decided up front (before the cell walk moves
+        // pieces of the content), baked after it. The block restyles the
+        // cell under it (cursor color behind, the theme's cursor text on
+        // the glyph); the bar, underline, and hollow shapes paint as
+        // overlays in the view so the cell's own colors survive. The
+        // spot carries the shape and blink flag either way, so the view
+        // can paint the overlays and gate them on the blink phase.
+        let cursor = if offset == 0 {
+            let spot = cursor_spot(&term, &content);
+            if let Some(spot) = &spot {
+                if cursor_visible && spot.shape == CursorShape::Block {
+                    if spot.row < rows.len() && spot.col < rows[spot.row].cells.len() {
+                        let cell = &mut rows[spot.row].cells[spot.col];
+                        // cursor color behind, the theme's cursor text
+                        // color for the glyph, regardless of what the
+                        // cell wore
+                        cell.bg = self.theme.cursor;
+                        cell.fg = self.theme.cursor_text;
+                    }
+                }
+            }
+            spot
+        } else {
+            None
+        };
 
         for indexed in content.display_iter {
             let viewport_row = indexed.point.line.0 + offset as i32;
@@ -682,19 +727,14 @@ impl Engine {
             });
         }
 
-        // block cursor, rendered by restyling the cell under it
-        let mut cursor = None;
-        if offset == 0 && content.cursor.shape != CursorShape::Hidden {
-            let point = content.cursor.point;
-            let line = point.line.0 as usize;
-            let col = point.column.0;
-            if line < screen_lines && col < columns {
-                let cell = &mut rows[line].cells[col];
-                // the block: cursor color behind, the theme's cursor text
-                // color for the glyph, regardless of what the cell wore
+        // the block's bake lands on the filled cells
+        if let Some(spot) = &cursor {
+            if cursor_visible && spot.shape == CursorShape::Block {
+                let cell = &mut rows[spot.row].cells[spot.col];
+                // cursor color behind, the theme's cursor text color
+                // for the glyph, regardless of what the cell wore
                 cell.bg = self.theme.cursor;
                 cell.fg = self.theme.cursor_text;
-                cursor = Some(CursorSpot { row: line, col });
             }
         }
 
@@ -722,6 +762,35 @@ impl Engine {
             selection,
         }
     }
+}
+
+/// The frame's cursor spot: position, the DECSCUSR shape in effect,
+/// and the style's blink flag. None when the cursor is hidden or off
+/// the live screen (a vi-mode cursor can sit in history).
+fn cursor_spot(term: &Term<UiProxy>, content: &RenderableContent) -> Option<CursorSpot> {
+    if content.cursor.shape == CursorShape::Hidden {
+        return None;
+    }
+    let point = content.cursor.point;
+    let row = point.line.0 as usize;
+    let col = point.column.0;
+    if row >= term.screen_lines() || col >= term.columns() {
+        return None;
+    }
+    Some(CursorSpot {
+        row,
+        col,
+        shape: content.cursor.shape,
+        blinking: term.cursor_style().blinking,
+    })
+}
+
+/// The block cursor bakes its colors into the cell under it; the bar,
+/// underline, and hollow shapes paint as overlays, leaving the cell's
+/// own colors alone. `visible` folds in focus and the blink phase.
+#[cfg(test)]
+fn bakes_block(shape: CursorShape, visible: bool) -> bool {
+    shape == CursorShape::Block && visible
 }
 
 #[cfg(test)]
@@ -775,6 +844,53 @@ mod tests {
         assert_eq!(term.grid().display_offset(), 0);
         term.scroll_display(Scroll::Delta(10));
         assert!(term.grid().display_offset() > 0);
+    }
+
+    #[test]
+    fn decscusr_rides_the_snapshot() {
+        let mut term = test_term(10, 3);
+        feed(&mut term, b"\x1b[?25h"); // DECTCEM: the cursor shows
+        feed(&mut term, b"\x1b[2 q"); // DECSCUSR 2: steady block
+        let spot = cursor_spot(&term, &term.renderable_content()).unwrap();
+        assert_eq!(spot.shape, CursorShape::Block);
+        assert!(!spot.blinking);
+        // the block's restyle bakes into the cell only when lit
+        assert!(bakes_block(spot.shape, true));
+        assert!(!bakes_block(spot.shape, false));
+    }
+
+    #[test]
+    fn decscusr_underline_beam_and_blink() {
+        let mut term = test_term(10, 3);
+        feed(&mut term, b"\x1b[?25h");
+        feed(&mut term, b"\x1b[4 q"); // steady underline
+        let spot = cursor_spot(&term, &term.renderable_content()).unwrap();
+        assert_eq!(spot.shape, CursorShape::Underline);
+        assert!(!spot.blinking);
+        // overlay shapes leave the cell's own colors alone
+        assert!(!bakes_block(spot.shape, true));
+
+        feed(&mut term, b"\x1b[5 q"); // blinking beam
+        let spot = cursor_spot(&term, &term.renderable_content()).unwrap();
+        assert_eq!(spot.shape, CursorShape::Beam);
+        assert!(spot.blinking);
+
+        // DECSCUSR 0 resets to the term's default style
+        feed(&mut term, b"\x1b[0 q");
+        assert_eq!(
+            cursor_spot(&term, &term.renderable_content()).unwrap().shape,
+            CursorShape::Block
+        );
+    }
+
+    #[test]
+    fn decscusr_hidden_cursor_has_no_spot() {
+        let mut term = test_term(10, 3);
+        feed(&mut term, b"\x1b[?25h");
+        feed(&mut term, b"\x1b[2 q"); // steady block
+        assert!(cursor_spot(&term, &term.renderable_content()).is_some());
+        feed(&mut term, b"\x1b[?25l"); // DECTCEM: hide the cursor
+        assert!(cursor_spot(&term, &term.renderable_content()).is_none());
     }
 
     #[test]
@@ -1077,7 +1193,7 @@ mod tests {
             let event = futures::executor::block_on(rx.next());
             match event {
                 Some(UiEvent::Wakeup) => {
-                    if engine.snapshot().rows.iter().any(|r| {
+                    if engine.snapshot(true).rows.iter().any(|r| {
                         r.cells.iter().any(|c| c.c == 'k')
                             && r.cells.iter().any(|c| c.c == 'a')
                             && r.cells.iter().any(|c| c.c == 'm')

@@ -8,7 +8,7 @@
 
 use std::hash::Hasher;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
@@ -24,10 +24,16 @@ use crate::encoder;
 use crate::font;
 use crate::glyphs;
 use crate::palette::Rgb8;
-use crate::term::{CellEdge, Engine, GridPoint, Row, SearchMatch, SelectMode, SelectSpan, UiEvent};
+use crate::term::{
+    CellEdge, CursorShape, Engine, GridPoint, Row, SearchMatch, SelectMode, SelectSpan, UiEvent,
+};
 use crate::theme::Theme;
 
 const PADDING: f32 = 8.0;
+
+/// The cursor blink period, kitty's. Only a blinking DECSCUSR style
+/// uses it; steady shapes never wake the paint.
+const BLINK_PERIOD: Duration = Duration::from_millis(600);
 
 /// Bound on the shaped-row cache: entries are small and a full clear on
 /// overflow just costs one rebuild burst after very long scrolls.
@@ -85,9 +91,21 @@ pub struct TerminalView {
     _search_task: Task<()>,
     /// bumped on every schedule, so a stale scan's late result is dropped
     search_generation: u64,
+    /// the blink phase for a blinking DECSCUSR style; typing forces it
+    /// lit for one period, the blink task toggles it afterwards
+    blink_visible: bool,
+    /// when the last key reached the shell, so typing holds the cursor
+    /// lit instead of blinking under it
+    last_input: Instant,
+    /// whether the last snapshot's cursor style asked for a blink
+    cursor_blinking: bool,
+    /// mirrored from the window each render; the blink task stays quiet
+    /// while the window cannot see the cursor
+    window_active: bool,
     // the pump task aborts if dropped, so it stays owned by the view
     _pump: Task<()>,
     _palette_tick: Task<()>,
+    _blink: Task<()>,
 }
 
 impl TerminalView {
@@ -158,6 +176,31 @@ impl TerminalView {
             }
         });
 
+        // the cursor blink: one task for the view's life. It advances
+        // the phase and wakes the paint only while a blinking style is
+        // live and the window can see the cursor; typing resets the
+        // phase through last_input, so the cursor holds lit under it
+        let blink = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(BLINK_PERIOD).await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.last_input.elapsed() < BLINK_PERIOD {
+                            this.blink_visible = true;
+                        } else {
+                            this.blink_visible = !this.blink_visible;
+                        }
+                        if this.cursor_blinking && this.window_active {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         Self {
             engine,
             theme,
@@ -175,8 +218,13 @@ impl TerminalView {
             search: None,
             _search_task: Task::ready(()),
             search_generation: 0,
+            blink_visible: true,
+            last_input: Instant::now(),
+            cursor_blinking: false,
+            window_active: false,
             _pump: pump,
             _palette_tick: palette_tick,
+            _blink: blink,
         }
     }
 
@@ -260,7 +308,7 @@ impl TerminalView {
         // discipline expects from a paste
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
         let mut bytes = Vec::with_capacity(text.len() + 16);
-        if self.engine.snapshot().bracketed_paste {
+        if self.engine.snapshot(false).bracketed_paste {
             bytes.extend_from_slice(b"\x1b[200~");
             bytes.extend_from_slice(text.as_bytes());
             bytes.extend_from_slice(b"\x1b[201~");
@@ -479,6 +527,9 @@ impl TerminalView {
             // landing input collapses any active selection, like every
             // terminal; bare modifier presses do not
             self.engine.clear_selection();
+            // typing holds the cursor lit through the next blink period
+            self.blink_visible = true;
+            self.last_input = Instant::now();
             cx.stop_propagation();
             self.engine.input(bytes);
         }
@@ -499,7 +550,7 @@ impl TerminalView {
     /// The URL under a viewport cell, if any: the span that covers it,
     /// rebuilt from the row's cells. Bare www. hosts get the scheme.
     fn url_at(&self, row: usize, col: usize) -> Option<String> {
-        let snapshot = self.engine.snapshot();
+        let snapshot = self.engine.snapshot(false);
         let grid_row = snapshot.rows.get(row)?;
         let spans = url_spans(grid_row, grid_row.cells.len());
         let &(start, len) = spans
@@ -603,7 +654,7 @@ impl TerminalView {
             return;
         }
 
-        let snapshot = self.engine.snapshot();
+        let snapshot = self.engine.snapshot(false);
         if snapshot.alt_screen {
             // full-screen programs own the viewport: wheel becomes arrows,
             // which is what they expect
@@ -653,7 +704,38 @@ impl Render for TerminalView {
             cx.notify();
         }
 
-        let snapshot = self.engine.snapshot();
+        // the cursor: kitty's convention paints it hollow when the
+        // window loses focus, and a blinking style holds steady while
+        // the window cannot see it. The bake decision folds the same
+        // facts so the block only restyles its cell when it would paint.
+        let focused = window.is_window_active();
+        let cursor_visible = focused && (!self.cursor_blinking || self.blink_visible);
+        let snapshot = self.engine.snapshot(cursor_visible);
+
+        // a fresh blinking style starts lit, not mid-off
+        let blinking_now = snapshot.cursor.as_ref().is_some_and(|spot| spot.blinking);
+        if blinking_now && !self.cursor_blinking {
+            self.blink_visible = true;
+        }
+        self.cursor_blinking = blinking_now;
+        self.window_active = focused;
+
+        // the overlay the paint draws for the cursor, if any: the
+        // block's colors ride the row's own cells, and the unfocused
+        // window's hollow shape replaces whatever DECSCUSR asked for
+        let cursor_overlay = snapshot.cursor.as_ref().and_then(|spot| {
+            if !focused {
+                return Some((spot.row, spot.col, CursorShape::HollowBlock));
+            }
+            if spot.blinking && !self.blink_visible {
+                return None;
+            }
+            match spot.shape {
+                CursorShape::Block | CursorShape::Hidden => None,
+                shape => Some((spot.row, spot.col, shape)),
+            }
+        });
+
         let font_size = px(self.theme.font_size_px());
         let rows: Vec<Arc<RowRender>> =
             snapshot.rows.iter().map(|row| self.row_render(row)).collect();
@@ -691,6 +773,8 @@ impl Render for TerminalView {
             fg: self.theme.foreground,
             display_offset: snapshot.display_offset,
             selection: snapshot.selection,
+            cursor: cursor_overlay,
+            cursor_color: hsla_of(self.theme.cursor),
             url_hover,
             selection_color: {
                 let mut color = hsla_of(self.theme.cursor);
@@ -1305,6 +1389,12 @@ struct GridPaint {
     /// the hovered URL: (row, start column, length), empty when the
     /// pointer is not over a link
     url_hover: Option<(usize, usize, usize)>,
+    /// the cursor overlay this frame: row, column, and the resolved
+    /// shape (hollow when the window lost focus). The block's colors
+    /// ride the row's own cells, so it needs no overlay; a blink phase
+    /// in the off position leaves None here.
+    cursor: Option<(usize, usize, CursorShape)>,
+    cursor_color: gpui::Hsla,
 }
 impl GridPaint {
     fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) {
@@ -1382,6 +1472,49 @@ impl GridPaint {
                     window,
                 ) {
                     warn!("row paint failed: {err}");
+                }
+            }
+
+            // the cursor overlay: beam, underline, and the unfocused
+            // hollow stroke; the block paints through the row's own
+            // baked cell colors and needs nothing here
+            if let Some((crow, ccol, shape)) = &self.cursor {
+                if *crow == iy {
+                    let cell_x = origin.x + px(*ccol as f32 * self.cell_w);
+                    match shape {
+                        CursorShape::Beam => {
+                            let quad_bounds = Bounds::new(
+                                point(cell_x, row_y),
+                                size(px(2.0), px(self.cell_h)),
+                            );
+                            window.paint_quad(fill(quad_bounds, self.cursor_color));
+                        }
+                        CursorShape::Underline => {
+                            let h = (self.cell_h / 10.0).max(2.0);
+                            let quad_bounds = Bounds::new(
+                                point(cell_x, row_y + px(self.cell_h - h)),
+                                size(px(self.cell_w), px(h)),
+                            );
+                            window.paint_quad(fill(quad_bounds, self.cursor_color));
+                        }
+                        CursorShape::HollowBlock => {
+                            // a 1px stroke around the cell, four quads
+                            let stroke = 1.0;
+                            for (x, y, w, h) in [
+                                (0.0, 0.0, self.cell_w, stroke),
+                                (0.0, self.cell_h - stroke, self.cell_w, stroke),
+                                (0.0, 0.0, stroke, self.cell_h),
+                                (self.cell_w - stroke, 0.0, stroke, self.cell_h),
+                            ] {
+                                let quad_bounds = Bounds::new(
+                                    point(cell_x + px(x), row_y + px(y)),
+                                    size(px(w), px(h)),
+                                );
+                                window.paint_quad(fill(quad_bounds, self.cursor_color));
+                            }
+                        }
+                        CursorShape::Block | CursorShape::Hidden => {}
+                    }
                 }
             }
 
