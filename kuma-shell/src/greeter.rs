@@ -231,7 +231,6 @@ fn parse_session(path: &Path) -> Option<Session> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     /// A fake greetd: one end of a socket pair, a scripted reply list
     /// served frame by frame, and the requests it received returned
