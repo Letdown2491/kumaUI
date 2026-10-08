@@ -44,6 +44,8 @@ Runtime requirements: a Wayland compositor with `wlr-layer-shell` and `ext-sessi
 
 kuma-term works with any shell out of the box; no shell integration is required. It exports `KUMA_TERM=1` into the shell's environment so dotfiles can recognize it (the bundled fish prompt override in the kumaOS image keys on it), and nothing else. It reads kitty color configs for its palette and honors `kuma-shell`'s published wallpaper palette.
 
+Everyday terminal features: scrollback search (`ctrl+shift+f`, kitty's binding: a floating bar that never reflows the grid, case-insensitive matching unless the query has uppercase, enter and the arrows cycle matches through history, `esc` closes), URL click-to-open through the desktop handler, and vector-drawn box drawing and powerline glyphs.
+
 ## Vendored gpui
 
 kuma-shell depends on gpui via a path dependency into `vendor/zed/` (gitignored, regenerated from a pinned zed `main` commit). The crates.io `gpui` release (0.2.2) predates the Wayland layer-shell API this shell is built on. See [VENDORED.md](VENDORED.md) for the why and the re-vendoring script.

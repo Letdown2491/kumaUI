@@ -12,10 +12,11 @@ use std::thread;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{CursorShape, Processor, Rgb};
@@ -242,6 +243,123 @@ fn selection_spans(
     spans
 }
 
+/// One scrollback-search match, in buffer coordinates: line 0 is the top
+/// of the live screen, negative lines are history. Columns are inclusive
+/// on both ends; a match can wrap rows and the view expands it into
+/// per-row spans at paint time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub from: GridPoint,
+    pub to: GridPoint,
+}
+
+/// The cap on reported matches: a pathological buffer full of hits ends
+/// the scan and the user narrows the query instead.
+const SEARCH_MATCH_CAP: usize = 10_000;
+
+/// Escape a plain-text query into a regex literal: every regex
+/// metacharacter becomes a literal. Case handling stays with the search
+/// DFA, which is case-insensitive unless the query has uppercase.
+fn escape_regex(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 8);
+    for c in query.chars() {
+        if matches!(
+            c,
+            '\\' | '^' | '.' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '*' | '+' | '?'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A thread-safe scan handle: a background task runs buffer searches
+/// through it without dragging the engine (and its PTY handles) across
+/// threads.
+pub struct SearchHandle {
+    term: Arc<FairMutex<Term<UiProxy>>>,
+}
+
+impl SearchHandle {
+    /// All matches of the plain-text `query` across the whole buffer,
+    /// oldest history first. Holds the term lock for the scan; the pump
+    /// and the renderer interleave behind the same fair mutex.
+    pub fn search(&self, query: &str) -> Vec<SearchMatch> {
+        let term = self.term.lock();
+        search_term(&term, query)
+    }
+}
+
+/// The scan behind `SearchHandle::search`: enumerate alacritty's own
+/// matches from the topmost buffer line forward. Two quirks of the
+/// emulator's search shape the loop: the window bound must stay below
+/// `total_lines - 1` or the scan silently covers nothing, and past the
+/// last match it falls back to the window's first match (search wraps in
+/// the emulator), so any result before the origin ends the walk.
+fn search_term(term: &Term<UiProxy>, query: &str) -> Vec<SearchMatch> {
+    let mut out = Vec::new();
+    if query.is_empty() {
+        return out;
+    }
+    let mut regex = match RegexSearch::new(&escape_regex(query)) {
+        Ok(regex) => regex,
+        Err(_) => return out,
+    };
+    let columns = term.columns();
+    let bottommost = term.bottommost_line().0;
+    let max_lines = term.total_lines().saturating_sub(2);
+    if max_lines == 0 {
+        return out;
+    }
+    let mut origin = Point::new(term.topmost_line(), Column(0));
+    for _ in 0..SEARCH_MATCH_CAP {
+        if origin.line.0 > bottommost {
+            break;
+        }
+        let Some(found) =
+            term.search_next(&mut regex, origin, Direction::Right, Side::Left, Some(max_lines))
+        else {
+            break;
+        };
+        // the wrap fallback: a match starting before the origin means
+        // the buffer behind us is all that is left
+        if (found.start().line, found.start().column) < (origin.line, origin.column) {
+            break;
+        }
+        out.push(SearchMatch {
+            from: GridPoint { line: found.start().line.0, column: found.start().column.0 },
+            to: GridPoint { line: found.end().line.0, column: found.end().column.0 },
+        });
+        // continue one cell past the match's last cell
+        let (line, col) = (found.end().line.0, found.end().column.0);
+        if col + 1 >= columns {
+            if line >= bottommost {
+                break;
+            }
+            origin = Point::new(Line(line + 1), Column(0));
+        } else {
+            origin = Point::new(Line(line), Column(col + 1));
+        }
+    }
+    out
+}
+
+/// Scroll the viewport to an absolute history offset (0 = live), clamped
+/// to the buffer's actual history. No-op on the alternate screen, where
+/// the program owns the viewport.
+fn scroll_display_to(term: &mut Term<UiProxy>, offset: usize) {
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        return;
+    }
+    let max = term.grid().history_size();
+    let target = offset.min(max);
+    let delta = target as i32 - term.grid().display_offset() as i32;
+    if delta != 0 {
+        term.scroll_display(Scroll::Delta(delta));
+    }
+}
+
 /// The PTY master out of alacritty's Pty: the pump owns reading, input
 /// writes own the same fd through a clone. The child handle stays inside
 /// the Pty (its Drop sends SIGHUP and reaps), which the Engine keeps.
@@ -423,6 +541,20 @@ impl Engine {
     /// How far the viewport is scrolled back into history (0 = live).
     pub fn display_offset(&self) -> usize {
         self.term.lock().grid().display_offset()
+    }
+
+    /// A handle for background search scans: shares the term behind its
+    /// fair mutex without moving the engine across threads.
+    pub fn search_handle(&self) -> SearchHandle {
+        SearchHandle { term: self.term.clone() }
+    }
+
+    /// Scroll the viewport to an absolute history offset (0 = live),
+    /// clamped to the buffer's actual history. No-op on the alternate
+    /// screen.
+    pub fn scroll_to_offset(&self, offset: usize) {
+        let mut term = self.term.lock();
+        scroll_display_to(&mut term, offset);
     }
 
     /// Start a selection: a pointer press at `point` anchors one end.
@@ -787,6 +919,84 @@ mod tests {
         );
         let spans = selection_spans(&range, SelectMode::Char, 0, 2, 10);
         assert_eq!(spans, vec![SelectSpan { row: 0, start: 2, len: 1 }]);
+    }
+
+    #[test]
+    fn escape_regex_makes_metacharacters_literal() {
+        assert_eq!(
+            escape_regex("a.b*c?d[e]f(g)h|i^j$k\\l{m}"),
+            "a\\.b\\*c\\?d\\[e\\]f\\(g\\)h\\|i\\^j\\$k\\\\l\\{m\\}"
+        );
+        assert_eq!(escape_regex("plain text"), "plain text");
+        assert_eq!(escape_regex(""), "");
+    }
+
+    #[test]
+    fn search_finds_matches_across_history_oldest_first() {
+        let mut term = test_term(10, 3);
+        for _ in 0..6 {
+            feed(&mut term, b"find me\r\n");
+        }
+        feed(&mut term, b"nothing");
+        let hits = search_term(&term, "find");
+        assert_eq!(hits.len(), 6);
+        // oldest history first, and never out of buffer order
+        for pair in hits.windows(2) {
+            assert!(
+                (pair[0].from.line, pair[0].from.column)
+                    < (pair[1].from.line, pair[1].from.column)
+            );
+        }
+        // "find" occupies columns 0..=3 of its row
+        assert!(hits.iter().all(|m| m.from.column == 0 && m.to.column == 3));
+    }
+
+    #[test]
+    fn search_is_literal_text() {
+        let mut term = test_term(10, 3);
+        feed(&mut term, b"a.b c*x");
+        // metacharacters in the query match themselves, not patterns
+        assert_eq!(search_term(&term, "a.b").len(), 1);
+        assert_eq!(search_term(&term, "aXb").len(), 0);
+        assert_eq!(search_term(&term, "c*x").len(), 1);
+        assert_eq!(search_term(&term, "cXx").len(), 0);
+        assert!(search_term(&term, "").is_empty());
+    }
+
+    #[test]
+    fn search_is_smart_case() {
+        let mut term = test_term(10, 3);
+        feed(&mut term, b"Kuma KUMA kuma");
+        // a lowercase query ignores case, an uppercase one demands it:
+        // the DFA builder's own rule, kitty's too
+        assert_eq!(search_term(&term, "kuma").len(), 3);
+        assert_eq!(search_term(&term, "Kuma").len(), 1);
+    }
+
+    #[test]
+    fn search_matches_wrap_across_rows() {
+        let mut term = test_term(10, 3);
+        // 12 characters on a 10-column grid wrap onto the next row
+        feed(&mut term, b"abcdefghijkl");
+        let hits = search_term(&term, "hijk");
+        assert_eq!(hits.len(), 1);
+        // h, i, j fill row 0's last three columns; k opens row 1
+        assert_eq!(hits[0].from, GridPoint { line: 0, column: 7 });
+        assert_eq!(hits[0].to, GridPoint { line: 1, column: 0 });
+    }
+
+    #[test]
+    fn scroll_display_to_clamps_and_sets() {
+        let mut term = test_term(10, 3);
+        for _ in 0..10 {
+            feed(&mut term, b"line\r\n");
+        }
+        let max = term.grid().history_size();
+        assert!(max >= 8);
+        scroll_display_to(&mut term, usize::MAX);
+        assert_eq!(term.grid().display_offset(), max);
+        scroll_display_to(&mut term, 2);
+        assert_eq!(term.grid().display_offset(), 2);
     }
 
     /// A real PTY end to end: a child writes bytes, the pump parses them

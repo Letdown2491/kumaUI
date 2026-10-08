@@ -24,7 +24,7 @@ use crate::encoder;
 use crate::font;
 use crate::glyphs;
 use crate::palette::Rgb8;
-use crate::term::{CellEdge, Engine, GridPoint, Row, SelectMode, SelectSpan, UiEvent};
+use crate::term::{CellEdge, Engine, GridPoint, Row, SearchMatch, SelectMode, SelectSpan, UiEvent};
 use crate::theme::Theme;
 
 const PADDING: f32 = 8.0;
@@ -41,6 +41,20 @@ const SHAPE_DOMAIN_ROW: u64 = 0x524f5730;
 fn hsla_of(c: Rgb8) -> gpui::Hsla {
     let hex = ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | c.2 as u32;
     gpui::rgb(hex).into()
+}
+
+/// Scrollback-search state, present only while the search bar is open.
+/// Matches are buffer coordinates (the engine's own currency); the paint
+/// pass projects them into viewport spans each frame, so scrolling and
+/// new output keep the highlights glued to their text.
+struct SearchState {
+    query: String,
+    /// all matches, oldest history first
+    matches: Vec<SearchMatch>,
+    /// which match enter / shift+enter cycles to
+    current: usize,
+    /// a rescan is in flight: the bar shows dots, the old highlights stay
+    stale: bool,
 }
 
 pub struct TerminalView {
@@ -65,6 +79,12 @@ pub struct TerminalView {
     /// did not change skips the cell walk, the string build, and (through
     /// gpui's hash-keyed layout cache) the shaper itself
     row_shapes: FxHashMap<u64, Arc<RowRender>>,
+    /// scrollback search; None means the bar is closed
+    search: Option<SearchState>,
+    /// the debounced rescan task; dropping it cancels the pending scan
+    _search_task: Task<()>,
+    /// bumped on every schedule, so a stale scan's late result is dropped
+    search_generation: u64,
     // the pump task aborts if dropped, so it stays owned by the view
     _pump: Task<()>,
     _palette_tick: Task<()>,
@@ -152,6 +172,9 @@ impl TerminalView {
             hover: None,
             down_cell: None,
             row_shapes: FxHashMap::default(),
+            search: None,
+            _search_task: Task::ready(()),
+            search_generation: 0,
             _pump: pump,
             _palette_tick: palette_tick,
         }
@@ -159,7 +182,21 @@ impl TerminalView {
 
     fn handle_event(&mut self, event: UiEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            UiEvent::Wakeup => cx.notify(),
+            UiEvent::Wakeup => {
+                // while the search bar is open, output shifts the buffer:
+                // rescan (debounced) so the count and highlights follow
+                if self
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| !search.query.is_empty() && !search.stale)
+                {
+                    if let Some(search) = self.search.as_mut() {
+                        search.stale = true;
+                    }
+                    self.schedule_search(false, cx);
+                }
+                cx.notify();
+            }
             UiEvent::Title(title) => {
                 self.title = Some(title);
                 // dynamic window titles are a later concern (needs the
@@ -233,6 +270,174 @@ impl TerminalView {
         self.engine.input(bytes);
     }
 
+    /// Open the search bar, prefilled from the selection when it is a
+    /// single line; closing clears the highlights. No grid row is
+    /// reserved either way: the bar floats over the bottom row.
+    fn toggle_search(&mut self, cx: &mut Context<Self>) {
+        if self.search.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let query = self
+            .engine
+            .selection_text()
+            .filter(|text| text.len() <= 200 && !text.contains(['\n', '\r']))
+            .unwrap_or_default();
+        self.search =
+            Some(SearchState { query, matches: Vec::new(), current: 0, stale: false });
+        self.schedule_search(true, cx);
+        cx.notify();
+    }
+
+    /// Rescan the buffer for the current query: debounced, generation
+    /// guarded, scan on the background executor through the engine's
+    /// search handle (the term lock is fair, so the pump and renderer
+    /// interleave with the scan).
+    fn schedule_search(&mut self, fresh: bool, cx: &mut Context<Self>) {
+        self.search_generation += 1;
+        let generation = self.search_generation;
+        let Some(search) = self.search.as_ref() else { return };
+        if search.query.is_empty() {
+            cx.notify();
+            return;
+        }
+        let query = search.query.clone();
+        let handle = self.engine.search_handle();
+        self._search_task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(150)).await;
+            let matches =
+                cx.background_executor().spawn(async move { handle.search(&query) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.search_generation != generation {
+                    return; // a newer scan owns the result
+                }
+                let Some(search) = this.search.as_mut() else { return };
+                // a rescan keeps the cycled match when it still exists
+                // (new output shifts buffer lines); a fresh query starts
+                // at the oldest match
+                let was_empty = search.matches.is_empty();
+                let keep = search.matches.get(search.current).copied();
+                let keep_index = search.current;
+                search.matches = matches;
+                search.stale = false;
+                search.current = if was_empty {
+                    0
+                } else {
+                    keep.and_then(|hit| search.matches.iter().position(|m| *m == hit))
+                        .unwrap_or_else(|| keep_index.min(search.matches.len().saturating_sub(1)))
+                };
+                // a fresh query reveals the oldest match when it is
+                // off-screen, so typing jumps straight to the first hit
+                let jump = fresh.then(|| search.matches.first().copied()).flatten();
+                if let Some(hit) = jump {
+                    this.reveal_match(hit);
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    /// The query changed: drop the stale highlights and rescan.
+    fn query_edited(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = self.search.as_mut() else { return };
+        search.matches.clear();
+        search.current = 0;
+        if search.query.is_empty() {
+            search.stale = false;
+            self.search_generation += 1; // any in-flight scan is moot
+            cx.notify();
+            return;
+        }
+        search.stale = true;
+        self.schedule_search(true, cx);
+    }
+
+    /// Keys while the search bar is open: the query gets the typing,
+    /// enter and the arrows cycle, esc closes, and nothing reaches the
+    /// shell until the bar is gone. Always consumes.
+    fn search_key(&mut self, k: &Keystroke, cx: &mut Context<Self>) {
+        let edit = match k.key.as_str() {
+            "escape" => {
+                self.search = None;
+                cx.notify();
+                return;
+            }
+            "enter" if k.modifiers.shift => {
+                self.cycle_search(-1);
+                cx.notify();
+                return;
+            }
+            "enter" | "down" => {
+                self.cycle_search(1);
+                cx.notify();
+                return;
+            }
+            "up" => {
+                self.cycle_search(-1);
+                cx.notify();
+                return;
+            }
+            "backspace" => {
+                let Some(search) = self.search.as_mut() else { return };
+                search.query.pop();
+                true
+            }
+            // ctrl+u clears the line, shell habit
+            "u" if k.modifiers.control => {
+                let Some(search) = self.search.as_mut() else { return };
+                search.query.clear();
+                true
+            }
+            _ => {
+                let printable = !k.modifiers.control
+                    && !k.modifiers.alt
+                    && !k.modifiers.platform
+                    && k.key_char.is_some();
+                if printable {
+                    let Some(search) = self.search.as_mut() else { return };
+                    search.query.push_str(k.key_char.as_deref().unwrap_or_default());
+                    true
+                } else {
+                    // swallowed: the shell must not see stray chords
+                    // while the bar is open
+                    false
+                }
+            }
+        };
+        if edit {
+            self.query_edited(cx);
+        }
+    }
+
+    /// Step the current match by `delta` (-1 or 1, wrapping) and reveal it.
+    fn cycle_search(&mut self, delta: i32) {
+        let Some(search) = self.search.as_mut() else { return };
+        if search.matches.is_empty() {
+            return;
+        }
+        let count = search.matches.len() as i32;
+        search.current = ((search.current as i32 + delta).rem_euclid(count)) as usize;
+        let hit = search.matches[search.current];
+        self.reveal_match(hit);
+    }
+
+    /// Scroll the viewport so a match's first row is visible, with the
+    /// minimal movement: a match above the viewport lands on the top
+    /// row, one below on the last row. No-op when already visible.
+    fn reveal_match(&mut self, hit: SearchMatch) {
+        let lines = self.lines as i32;
+        let offset = self.engine.display_offset() as i32;
+        let top = hit.from.line + offset;
+        let target = if top < 0 {
+            -hit.from.line
+        } else if top >= lines {
+            lines - 1 - hit.from.line
+        } else {
+            return;
+        };
+        self.engine.scroll_to_offset(target.max(0) as usize);
+    }
+
     fn on_key(&mut self, event: &gpui::KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let k: &Keystroke = &event.keystroke;
 
@@ -251,8 +456,22 @@ impl TerminalView {
                     self.paste(cx);
                     return;
                 }
+                // scrollback search, kitty's binding
+                "f" => {
+                    self.toggle_search(cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 _ => {}
             }
+        }
+
+        // while the search bar is open it eats the keyboard: typing goes
+        // to the query, not to the shell
+        if self.search.is_some() {
+            self.search_key(k, cx);
+            cx.stop_propagation();
+            return;
         }
 
         let app_cursor = self.engine.app_cursor();
@@ -449,6 +668,18 @@ impl Render for TerminalView {
                 .map(|&(start, len)| (row, start, len))
         });
 
+        // scrollback search: project the buffer matches into viewport row
+        // spans for this frame's paint
+        let (search_spans, search_current) = match &self.search {
+            Some(search) => search_view_spans(
+                &search.matches,
+                search.current,
+                snapshot.display_offset,
+                &snapshot.rows,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+
         // one div for interactivity, one canvas for the painted grid. No
         // flex layout in the paint path
         let grid_w = self.cols as f32 * self.cell_w;
@@ -466,6 +697,18 @@ impl Render for TerminalView {
                 color.a *= 0.35;
                 color
             },
+            search: search_spans,
+            search_color: {
+                let mut color = hsla_of(self.theme.named[3]);
+                color.a *= 0.30;
+                color
+            },
+            search_current,
+            search_current_color: {
+                let mut color = hsla_of(self.theme.cursor);
+                color.a *= 0.50;
+                color
+            },
         };
         let grid_h = snapshot.rows.len() as f32 * self.cell_h;
         // background alpha: the focused window shows the most wallpaper,
@@ -478,9 +721,14 @@ impl Render for TerminalView {
         let mut bg = hsla_of(self.theme.background);
         bg.a *= opacity;
 
+        let bar = self.search.as_ref().map(|search| {
+            search_bar(search, &self.theme, &self.font.family)
+        });
+
         div()
             .id("terminal")
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .p(px(PADDING))
@@ -505,6 +753,7 @@ impl Render for TerminalView {
                     .w(px(grid_w))
                     .h(px(grid_h)),
             )
+            .when_some(bar, |root, bar| root.child(bar))
     }
 }
 
@@ -817,6 +1066,90 @@ fn cell_width(row: &Row, i: usize) -> usize {
     }
 }
 
+/// Project buffer-coordinate matches into viewport row spans for the
+/// paint pass: (all matches, the cycled match). A match wrapping rows
+/// expands into one span per covered row; a span's tail grows over a
+/// wide char's spacer so the whole glyph highlights. Off-viewport rows
+/// drop out; scrolling re-projects the same matches next frame.
+fn search_view_spans(
+    matches: &[SearchMatch],
+    current: usize,
+    offset: usize,
+    rows: &[Row],
+) -> (Vec<SelectSpan>, Vec<SelectSpan>) {
+    let screen_lines = rows.len();
+    if screen_lines == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let last_col = rows[0].cells.len().saturating_sub(1);
+    let mut all = Vec::new();
+    let mut focused = Vec::new();
+    for (mi, hit) in matches.iter().enumerate() {
+        for line in hit.from.line..=hit.to.line {
+            let row = line + offset as i32;
+            if row < 0 || row as usize >= screen_lines {
+                continue;
+            }
+            let start = if line == hit.from.line { hit.from.column } else { 0 };
+            let end = if line == hit.to.line { hit.to.column } else { last_col };
+            let start = start.min(last_col);
+            let mut end = end.min(last_col);
+            let cells = &rows[row as usize].cells;
+            if cells.get(end + 1).is_some_and(|c| c.spacer) {
+                end += 1;
+            }
+            if end < start {
+                continue;
+            }
+            let span = SelectSpan { row: row as usize, start, len: end - start + 1 };
+            if mi == current {
+                focused.push(span);
+            } else {
+                all.push(span);
+            }
+        }
+    }
+    (all, focused)
+}
+
+/// The floating search bar: a solid strip over the bottom row with the
+/// query, a cursor mark, and the match status. No grid row is reserved,
+/// so opening it never reflows the terminal.
+fn search_bar(search: &SearchState, theme: &Theme, family: &gpui::SharedString) -> gpui::AnyElement {
+    let status = if search.query.is_empty() {
+        "type to search".to_string()
+    } else if search.stale {
+        "…".to_string()
+    } else if search.matches.is_empty() {
+        "no matches".to_string()
+    } else {
+        format!("{}/{}", search.current + 1, search.matches.len())
+    };
+    let mut bg = hsla_of(theme.background);
+    bg.a = 1.0;
+    let mut dim = hsla_of(theme.foreground);
+    dim.a *= 0.6;
+    div()
+        .absolute()
+        .bottom(px(0.0))
+        .left(px(PADDING))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(8.0))
+        .py(px(1.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(hsla_of(theme.foreground))
+        .bg(bg)
+        .font_family(family.clone())
+        .text_size(px(theme.font_size_px()))
+        .text_color(hsla_of(theme.foreground))
+        .child(format!("{}\u{258e}", search.query))
+        .child(div().text_color(dim).child(status))
+        .into_any_element()
+}
+
 /// The whole visible grid, painted directly: run backgrounds and vector
 /// glyphs as quads, each row's text shaped and painted. No flex layout in
 /// the hot path, and the data is rebuilt from the engine snapshot every
@@ -831,6 +1164,11 @@ struct GridPaint {
     /// selection highlight, viewport row spans
     selection: Vec<SelectSpan>,
     selection_color: gpui::Hsla,
+    /// search highlights: every visible match, then the cycled one
+    search: Vec<SelectSpan>,
+    search_color: gpui::Hsla,
+    search_current: Vec<SelectSpan>,
+    search_current_color: gpui::Hsla,
     /// the hovered URL: (row, start column, length), empty when the
     /// pointer is not over a link
     url_hover: Option<(usize, usize, usize)>,
@@ -850,16 +1188,40 @@ impl GridPaint {
                 window.paint_quad(fill(quad_bounds, hsla_of(color)));
             }
 
-            // the selection wash sits over cell backgrounds, under text
+            // the selection wash sits over cell backgrounds, under text;
+            // only this row's spans, so nothing overdraws per iteration
             for span in &self.selection {
+                if span.row != iy {
+                    continue;
+                }
                 let quad_bounds = Bounds::new(
-                    point(
-                        origin.x + px(span.start as f32 * self.cell_w),
-                        origin.y + px(span.row as f32 * self.cell_h),
-                    ),
+                    point(origin.x + px(span.start as f32 * self.cell_w), row_y),
                     size(px(span.len as f32 * self.cell_w), px(self.cell_h)),
                 );
                 window.paint_quad(fill(quad_bounds, self.selection_color));
+            }
+
+            // search washes at the same depth: dim over every visible
+            // match, strong over the one enter is parked on
+            for span in &self.search {
+                if span.row != iy {
+                    continue;
+                }
+                let quad_bounds = Bounds::new(
+                    point(origin.x + px(span.start as f32 * self.cell_w), row_y),
+                    size(px(span.len as f32 * self.cell_w), px(self.cell_h)),
+                );
+                window.paint_quad(fill(quad_bounds, self.search_color));
+            }
+            for span in &self.search_current {
+                if span.row != iy {
+                    continue;
+                }
+                let quad_bounds = Bounds::new(
+                    point(origin.x + px(span.start as f32 * self.cell_w), row_y),
+                    size(px(span.len as f32 * self.cell_w), px(self.cell_h)),
+                );
+                window.paint_quad(fill(quad_bounds, self.search_current_color));
             }
 
             // vector glyphs: box drawing, block elements, braille
@@ -1058,7 +1420,7 @@ mod tests {
         assert_eq!(spans, vec![(4, 17)]);
         // the span reaches the row's last cell
         assert_eq!(spans[0].0 + spans[0].1, row.cells.len());
-        for clicked in 4..row.cells.len() {
+        for _clicked in 4..row.cells.len() {
             let (start, len) = spans[0];
             assert_eq!(span_cells_text(&row, start, len), "https://x.io/edge");
         }
@@ -1078,6 +1440,60 @@ mod tests {
                 assert!(start + len <= row.cells.len(), "{text}: {start}+{len}");
             }
         }
+    }
+
+    fn search_hit(from: (i32, usize), to: (i32, usize)) -> SearchMatch {
+        SearchMatch {
+            from: GridPoint { line: from.0, column: from.1 },
+            to: GridPoint { line: to.0, column: to.1 },
+        }
+    }
+
+    #[test]
+    fn search_spans_project_with_display_offset() {
+        let rows: Vec<Row> = (0..3).map(|_| row_of("find me xx")).collect();
+        let matches = vec![search_hit((-2, 0), (-2, 3)), search_hit((1, 5), (1, 6))];
+        // scrolled back two lines: the history match rides up to row 0,
+        // the screen match falls off the bottom of the viewport
+        let (all, focused) = search_view_spans(&matches, 1, 2, &rows);
+        assert_eq!(all, vec![SelectSpan { row: 0, start: 0, len: 4 }]);
+        assert!(focused.is_empty());
+        // live viewport: the history match is gone, the screen match shows
+        let (all, focused) = search_view_spans(&matches, 1, 0, &rows);
+        assert!(all.is_empty());
+        assert_eq!(focused, vec![SelectSpan { row: 1, start: 5, len: 2 }]);
+    }
+
+    #[test]
+    fn search_spans_expand_wrapped_matches() {
+        let rows = vec![
+            row_of("abcdefghij"),
+            row_of("kl        "),
+            row_of("mn        "),
+        ];
+        let (all, focused) = search_view_spans(&[search_hit((0, 7), (2, 1))], 0, 0, &rows);
+        assert!(all.is_empty());
+        // first row clamps right, middle rows run full width, last row
+        // clamps left
+        assert_eq!(
+            focused,
+            vec![
+                SelectSpan { row: 0, start: 7, len: 3 },
+                SelectSpan { row: 1, start: 0, len: 10 },
+                SelectSpan { row: 2, start: 0, len: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn search_spans_cover_wide_char_tails() {
+        // a match ending on a wide char grows over its spacer column
+        let mut cells = vec![cell('a'), cell('漢'), cell(' '), cell('b')];
+        cells[2].spacer = true;
+        let rows = vec![Row { cells }];
+        let (all, focused) = search_view_spans(&[search_hit((0, 1), (0, 1))], 0, 0, &rows);
+        assert!(all.is_empty());
+        assert_eq!(focused, vec![SelectSpan { row: 0, start: 1, len: 2 }]);
     }
 
     #[test]
