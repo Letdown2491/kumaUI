@@ -489,6 +489,7 @@ pub struct DockMenuContext {
 pub struct DockMenuView {
     settings: Entity<Settings>,
     context: Option<DockMenuContext>,
+    geometry: crate::panel::PanelGeometry,
 }
 
 impl DockMenuView {
@@ -497,24 +498,28 @@ impl DockMenuView {
         settings: Entity<Settings>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
-        _geometry: crate::panel::PanelGeometry,
+        geometry: crate::panel::PanelGeometry,
     ) -> Self {
-        Self { settings, context }
+        Self { settings, context, geometry }
     }
 }
 
 impl Render for DockMenuView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // the host's drawer chrome: the card rides the shared panel
+        // surface at the placement rect, and the input region maps to it
+        let content = self.menu_content();
+        crate::panel::chrome(self.geometry, window, cx, content)
+    }
+}
+
+impl DockMenuView {
+    fn menu_content(&mut self) -> gpui::AnyElement {
         div()
             .id("dock-menu")
-            .size_full()
             .flex()
             .flex_col()
             .p(px(4.))
-            .rounded_xl()
-            .bg(rgba(crate::theme::current().panel_bg))
-            .border_1()
-            .border_color(rgb(crate::theme::current().divider))
             .when_some(self.context.clone(), |el, context| {
                 let settings = self.settings.clone();
                 el.child(
@@ -548,6 +553,7 @@ impl Render for DockMenuView {
                     )
                 })
             })
+            .into_any_element()
     }
 }
 
