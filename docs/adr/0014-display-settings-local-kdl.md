@@ -61,6 +61,23 @@ the page is its only client):
   the commanding seam, and commanding is where the compositors genuinely
   differ.
 
+## Addendum (2026-10-07): the store carries a second tenant
+
+The store as accepted holds output deltas. It also carries one window-rule
+the shell writes: the kuma-term ring rule, serialized ahead of the output
+blocks on every write. /usr is immutable, so before the image baked the rule
+the include was the one niri-writable seam a running shell had, and the rule
+rode along. The 44.6.0 image bakes the same rule into its Kuma look
+window-rule, which makes the store's copy a shim for installs older than
+that image: the rules are additive and identical, so the shim is redundant
+there, not conflicting.
+
+The parser still accepts exactly that one rule and refuses any other
+window-rule, so a hand edit is never destroyed silently. When the minimum
+supported image carries the baked rule, the shim can retire: the shell wrote
+the rule, so it understands it, and a rewrite that stops emitting it drops
+the copy on the next pin.
+
 ## Consequences
 
 - Display choices survive reboot because niri reads them as its own config,

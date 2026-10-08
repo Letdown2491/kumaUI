@@ -8,8 +8,8 @@ The binary is `kuma-shell`: a top bar, an app launcher, drawer panels, and a ses
 
 ## What's in the shell
 
-- **Bar**: a top strip of widgets (workspaces, window title, apps, cpu, volume, brightness, media, battery, clock, bluetooth, internet, notifications, system tray, nostr signer), each enable/disable and placeable from the settings panel. Geometry applies live; the layer surface is always a full-width transparent window.
-- **Dock**: pinned favorites plus running windows on its own layer-shell surface at a screen edge. Click cycles an app's windows (or focuses its first), right-click pins or unpins, and position and visibility come from the settings panel live.
+- **Bar**: a top strip of widgets (workspaces, window title, apps, cpu, volume, brightness, media, battery, clock, bluetooth, internet, notifications, system tray, nostr signer), each enable/disable and placeable from the settings panel. Geometry applies live; the layer surface is always a full-width transparent window. New boxes ship apps and workspaces on the left, the clock alone in the center, and the status cluster (system tray, notifications, volume, internet, battery) on the right.
+- **Dock**: pinned favorites plus running windows on its own layer-shell surface at a screen edge. Click cycles an app's windows (or focuses its first), right-click pins or unpins, and position and visibility come from the settings panel live. The dock ships off; enabling it starts from first-run pins (a terminal and a browser).
 - **Launcher**: an app-list panel with search-as-you-type, fuzzy scoring, and most-used-first ordering from per-app usage counts.
 - **Panels**: drawer surfaces hanging flush under the bar (concave cove silhouette), opened with a scrim click-catcher. Panels with tabs use the shared panel kit: an icon-only rail with hover tooltips and the tab header over the right pane; settings carries the Widgets and Ordering pages.
 - **Lock screen**: opened by logind's session `Lock` signal. Opaque wallpaper-backed surfaces on every display, exclusive keyboard, one shared password field, and PAM authentication through a service chain (`kuma-lock` → `swaylock` → `vlock`; the first installed service wins, see [ADR-0008](docs/adr/0008-pam-chain-skips-uninstalled-services.md)).
@@ -28,6 +28,8 @@ Koguma (`kuma-files`) is the workspace's second app: kuma's own file manager, re
 - **Theming**: reads the shell's palette opportunistically and recolors on wallpaper changes; built-ins everywhere else. Accent picker.
 - **Installed**: `build.sh` puts the binary in `~/.local/bin`, the menu entry and app icon in the user XDG dirs, and registers Koguma as the directory handler.
 
+A fresh start opens at 125% zoom with the info rail docked at the bottom; the state file keeps whatever you change.
+
 ## Building
 
 ```
@@ -42,7 +44,7 @@ Runtime requirements: a Wayland compositor with `wlr-layer-shell` and `ext-sessi
 
 ## kuma-term
 
-kuma-term works with any shell out of the box; no shell integration is required. It exports `KUMA_TERM=1` into the shell's environment so dotfiles can recognize it (the fish prompt and greeting in the kumaOS image key on it), and nothing else. Its theme is a line-based key value config at `$XDG_CONFIG_HOME/kuma-term/kuma-term.conf` with kitty-compatible key names, so a kitty theme's colors block pastes in unchanged, and it honors `kuma-shell`'s published wallpaper palette when the shell is present.
+kuma-term works with any shell out of the box; no shell integration is required. It exports `KUMA_TERM=1` into the shell's environment so dotfiles can recognize it (the fish prompt and greeting in the kumaOS image key on it), and nothing else. Its theme is a line-based key value config at `$XDG_CONFIG_HOME/kuma-term/kuma-term.conf` with kitty-compatible key names, so a kitty theme's colors block pastes in unchanged, and it honors `kuma-shell`'s published wallpaper palette when the shell is present. The built-in theme, used when no conf exists, is the shipped pastel palette (the ANSI 16 and the chrome colors).
 
 Everyday terminal features: scrollback search (`ctrl+shift+f`, kitty's binding: a floating bar that never reflows the grid, case-insensitive matching unless the query has uppercase, enter and the arrows cycle matches through history, `esc` closes), URL click-to-open through the desktop handler, and vector-drawn box drawing and powerline glyphs.
 
