@@ -1,8 +1,11 @@
-//! The theme: palette and font, read from kitty's config for the spike so
-//! the terminal matches the look the user already has. Built-in defaults
-//! sit underneath. This is the stand-in for the real config story (kumaOS
-//! pushes the shell's palette; other distros get a config file): the
-//! parsing shape here carries over, only the source changes.
+//! The theme: palette and font, read from kuma-term's own config over
+//! built-in defaults. The config lives at
+//! $XDG_CONFIG_HOME/kuma-term/kuma-term.conf (default ~/.config), and the
+//! grammar is line-based key value with kitty-compatible key names, so a
+//! colors block copied from a kitty theme pastes in unchanged. On kumaOS
+//! the session's look flows from kuma-shell's published wallpaper
+//! palette, which wins for the chrome colors; without kuma-shell the
+//! config file is the whole story, and with neither the built-ins hold.
 
 use std::path::{Path, PathBuf};
 
@@ -17,14 +20,12 @@ pub struct Theme {
     pub cursor: Rgb8,
     pub cursor_text: Rgb8,
     /// Font family set in the config, if any. Without one the fontconfig
-    /// "monospace" alias resolves at view creation (what kitty itself
-    /// does); see font.rs.
+    /// "monospace" alias resolves at view creation; see font.rs.
     pub font_family: Option<String>,
-    /// Font size in points (kitty's unit); rendered as pt * 96/72.
+    /// Font size in points, rendered as pt * 96/72.
     pub font_size_pt: f32,
-    /// Terminal background alpha when the window has focus (kitty's
-    /// background_opacity). The focused window shows the most wallpaper;
-    /// inactive windows dim toward solid.
+    /// Terminal background alpha when the window has focus. The focused
+    /// window shows the most wallpaper; inactive windows dim toward solid.
     pub background_opacity: f32,
     /// Terminal background alpha when it does not.
     pub background_opacity_unfocused: f32,
@@ -64,8 +65,8 @@ impl Theme {
 
     pub fn load() -> Self {
         let mut theme = Self::builtin();
-        if let Some(path) = kitty_config() {
-            apply_kitty_config(&mut theme, &path, 0);
+        if let Some(path) = config_path() {
+            apply_config(&mut theme, &path, 0);
         }
         // the session's look: kuma-shell publishes the wallpaper palette
         // for its neighbors and it wins for the chrome colors (the ANSI 16
@@ -132,16 +133,32 @@ impl Theme {
     }
 }
 
-fn kitty_config() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let path = PathBuf::from(home).join(".config/kitty/kitty.conf");
-    path.exists().then_some(path)
+/// The config file: $XDG_CONFIG_HOME/kuma-term/kuma-term.conf, or
+/// ~/.config/kuma-term/kuma-term.conf when XDG_CONFIG_HOME is unset (a
+/// non-absolute XDG value is not the spec's path and is ignored).
+fn config_path() -> Option<PathBuf> {
+    config_path_for(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
 }
 
-/// Parse kitty's key value format (and its includes, one branch at a time,
+/// The pure rule behind `config_path`, so the XDG handling is testable
+/// without mutating process environment.
+fn config_path_for(xdg: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let explicit = xdg.map(PathBuf::from).filter(|dir| dir.is_absolute());
+    let dir = match explicit {
+        Some(dir) => dir,
+        None => PathBuf::from(home?).join(".config"),
+    };
+    Some(dir.join("kuma-term/kuma-term.conf"))
+}
+
+/// Parse the key value grammar (and its includes, one branch at a time,
 /// relative to the including file). Unknown keys are ignored; values that
-/// fail to parse leave the builtin in place.
-fn apply_kitty_config(theme: &mut Theme, path: &Path, depth: u8) {
+/// fail to parse leave the built-in in place. The key names follow
+/// kitty's theme block on purpose: a kitty theme pastes in unedited.
+fn apply_config(theme: &mut Theme, path: &Path, depth: u8) {
     let Ok(text) = std::fs::read_to_string(path) else { return };
     for line in text.lines() {
         let line = line.trim();
@@ -156,7 +173,7 @@ fn apply_kitty_config(theme: &mut Theme, path: &Path, depth: u8) {
             if depth < 4 {
                 let included = path.parent().unwrap_or(Path::new(".")).join(value);
                 if included.exists() {
-                    apply_kitty_config(theme, &included, depth + 1);
+                    apply_config(theme, &included, depth + 1);
                 }
             }
             continue;
@@ -214,7 +231,7 @@ fn apply_kitty_config(theme: &mut Theme, path: &Path, depth: u8) {
                     }
                 }
             }
-            // kuma-term's own key: unfocused alpha, kitty has no equivalent
+            // kuma-term's own key: unfocused alpha
             "background_opacity_unfocused" => {
                 if let Ok(alpha) = value.parse::<f32>() {
                     if (0.0..=1.0).contains(&alpha) {
@@ -281,14 +298,14 @@ mod tests {
         // a bogus file must leave the builtin untouched
         let path = std::env::temp_dir().join(format!("kuma-term-test-{}.conf", std::process::id()));
         std::fs::write(&path, "garbage line\nfont_size zero\ncolor0 #zzz\n").unwrap();
-        apply_kitty_config(&mut theme, &path, 0);
+        apply_config(&mut theme, &path, 0);
         std::fs::remove_file(&path).ok();
         assert_eq!(theme.font_size_pt, 11.0);
         assert_eq!(theme.named[0], Rgb8(0, 0, 0));
     }
 
     #[test]
-    fn kitty_keys_parse() {
+    fn config_keys_parse() {
         let mut theme = Theme::builtin();
         let path = std::env::temp_dir().join(format!("kuma-term-test2-{}.conf", std::process::id()));
         std::fs::write(
@@ -296,7 +313,7 @@ mod tests {
             "# comment\nbackground #131317\nforeground  #e4e2e6 \ncolor1 #ffb4ab\nfont_size 12.5\nfont_family \"JetBrains Mono\"\nbackground_opacity 0.85\n",
         )
         .unwrap();
-        apply_kitty_config(&mut theme, &path, 0);
+        apply_config(&mut theme, &path, 0);
         std::fs::remove_file(&path).ok();
         assert_eq!(theme.background, Rgb8(0x13, 0x13, 0x17));
         assert_eq!(theme.foreground, Rgb8(0xe4, 0xe2, 0xe6));
@@ -313,9 +330,32 @@ mod tests {
         std::fs::write(dir.join("themes/t.conf"), "color3 #112233\n").unwrap();
         std::fs::write(dir.join("main.conf"), "include themes/t.conf\n").unwrap();
         let mut theme = Theme::builtin();
-        apply_kitty_config(&mut theme, &dir.join("main.conf"), 0);
+        apply_config(&mut theme, &dir.join("main.conf"), 0);
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(theme.named[3], Rgb8(0x11, 0x22, 0x33));
+    }
+
+    #[test]
+    fn config_path_follows_the_xdg_rule() {
+        use std::ffi::OsStr;
+        use std::path::PathBuf;
+        // an absolute XDG_CONFIG_HOME wins
+        assert_eq!(
+            config_path_for(Some(OsStr::new("/x")), Some(OsStr::new("/h"))),
+            Some(PathBuf::from("/x/kuma-term/kuma-term.conf"))
+        );
+        // without it, HOME's .config
+        assert_eq!(
+            config_path_for(None, Some(OsStr::new("/h"))),
+            Some(PathBuf::from("/h/.config/kuma-term/kuma-term.conf"))
+        );
+        // a relative XDG value is not the spec's path: ignored
+        assert_eq!(
+            config_path_for(Some(OsStr::new("rel")), Some(OsStr::new("/h"))),
+            Some(PathBuf::from("/h/.config/kuma-term/kuma-term.conf"))
+        );
+        // neither set: no path at all
+        assert_eq!(config_path_for(None, None), None);
     }
 
     #[test]
