@@ -23,7 +23,6 @@ use rustc_hash::FxHashMap;
 use crate::encoder;
 use crate::font;
 use crate::glyphs;
-use crate::osc::BarState;
 use crate::palette::Rgb8;
 use crate::term::{CellEdge, Engine, GridPoint, Row, SelectMode, SelectSpan, UiEvent};
 use crate::theme::Theme;
@@ -34,10 +33,10 @@ const PADDING: f32 = 8.0;
 /// overflow just costs one rebuild burst after very long scrolls.
 const ROW_SHAPE_CACHE_CAP: usize = 4096;
 
-/// Domain tags mixed into the line-layout cache keys, so a row hash can
-/// never collide with a bar hash (both feed the same text-system cache).
+/// Domain tag mixed into the line-layout cache keys, so a row hash can
+/// never collide with another text-system user's hash (we all feed the
+/// same text-system cache).
 const SHAPE_DOMAIN_ROW: u64 = 0x524f5730;
-const SHAPE_DOMAIN_BAR: u64 = 0x42415230;
 
 fn hsla_of(c: Rgb8) -> gpui::Hsla {
     let hex = ((c.0 as u32) << 16) | ((c.1 as u32) << 8) | c.2 as u32;
@@ -56,23 +55,10 @@ pub struct TerminalView {
     title: Option<String>,
     /// a left-drag is actively stretching the selection
     selecting: bool,
-    /// prompt-bar data, maintained from shell-integration markers
-    bar: BarState,
     /// shaped rows keyed on the row's cell-content hash: a row the grid
     /// did not change skips the cell walk, the string build, and (through
     /// gpui's hash-keyed layout cache) the shaper itself
     row_shapes: FxHashMap<u64, Arc<RowRender>>,
-    /// the bar's git facts for the bar's cwd, refreshed off the render
-    /// path whenever the cwd changes or a command finishes
-    git: Option<crate::git::GitSummary>,
-    /// bumped on every git request; a result whose generation no longer
-    /// matches is stale (the cwd moved on) and gets dropped
-    git_generation: u64,
-    _git_task: Task<()>,
-    /// the bar's duration ticks once a second while a command runs; this
-    /// guard keeps one tick task alive at a time
-    bar_tick_active: bool,
-    _bar_tick: Task<()>,
     // the pump task aborts if dropped, so it stays owned by the view
     _pump: Task<()>,
     _palette_tick: Task<()>,
@@ -157,13 +143,7 @@ impl TerminalView {
             lines: 24,
             title: None,
             selecting: false,
-            bar: BarState::default(),
             row_shapes: FxHashMap::default(),
-            git: None,
-            git_generation: 0,
-            _git_task: Task::ready(()),
-            bar_tick_active: false,
-            _bar_tick: Task::ready(()),
             _pump: pump,
             _palette_tick: palette_tick,
         }
@@ -194,20 +174,6 @@ impl TerminalView {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             UiEvent::PtyWrite(bytes) => self.engine.input(bytes),
-            UiEvent::Marker(marker) => {
-                self.bar.apply(&marker, std::time::Instant::now());
-                // the git segment refreshes when the cwd changes or a
-                // command finishes: those are the moments the tree can
-                // have changed under it
-                if matches!(
-                    marker,
-                    crate::osc::Marker::Cwd { .. } | crate::osc::Marker::CommandDone(_)
-                ) {
-                    self.refresh_git(cx);
-                }
-                self.spawn_bar_tick(cx);
-                cx.notify();
-            }
         }
     }
 
@@ -242,64 +208,9 @@ impl TerminalView {
         built
     }
 
-    /// Refresh the bar's git segment for the bar's cwd. Runs on the
-    /// background executor after a short delay (collapses bursts of cwd
-    /// changes), and a generation guard drops results that went stale
-    /// while the query ran. Never called from the render path.
-    fn refresh_git(&mut self, cx: &mut Context<Self>) {
-        self.git_generation += 1;
-        let generation = self.git_generation;
-        let cwd = self.bar.cwd.clone();
-        self._git_task = cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(150))
-                .await;
-            let summary = cx
-                .background_executor()
-                .spawn(async move { cwd.and_then(|cwd| crate::git::summary(&cwd)) })
-                .await;
-            this.update(cx, |this, cx| {
-                if this.git_generation == generation {
-                    this.git = summary;
-                    cx.notify();
-                }
-            })
-            .ok();
-        });
-    }
-
-    /// While a command runs, the bar's duration ticks; one re-render a
-    /// second is plenty and the tick only lives while `running`.
-    fn spawn_bar_tick(&mut self, cx: &mut Context<Self>) {
-        if !self.bar.running || self.bar_tick_active {
-            return;
-        }
-        self.bar_tick_active = true;
-        self._bar_tick = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(1))
-                    .await;
-                let still = this
-                    .update(cx, |this, cx| {
-                        if this.bar.running {
-                            cx.notify();
-                            true
-                        } else {
-                            // the command finished under us: retire the tick
-                            this.bar_tick_active = false;
-                            false
-                        }
-                    })
-                    .unwrap_or(false);
-                if !still {
-                    return;
-                }
-            }
-        });
-    }
-
-    fn paste(&mut self, cx: &mut Context<Self>) {        let Some(item) = cx.read_from_clipboard() else { return };
+    /// Paste from the clipboard, bracketed when the shell asked for it.
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else { return };
         let Some(text) = item.text() else { return };
         // newlines become carriage returns: that is what the shell's line
         // discipline expects from a paste
@@ -458,13 +369,10 @@ impl Focusable for TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // fit the grid to the viewport: rounded-down cell counts, so the
-        // last row and column never clip. With the prompt bar on, it
-        // reserves one cell row at the top (alt screen included: no
-        // layout jump); with it off the grid takes the whole viewport.
+        // last row and column never clip
         let viewport = window.viewport_size();
         let usable_w = (viewport.width - px(PADDING * 2.0)).as_f32().max(1.0);
-        let bar_h = if self.theme.prompt_bar { self.cell_h } else { 0.0 };
-        let usable_h = (viewport.height - px(PADDING * 2.0) - px(bar_h)).as_f32().max(1.0);
+        let usable_h = (viewport.height - px(PADDING * 2.0)).as_f32().max(1.0);
         let want_cols = ((usable_w / self.cell_w).floor() as u16).max(2);
         let want_lines = ((usable_h / self.cell_h).floor() as u16).max(2);
         if want_cols != self.cols || want_lines != self.lines {
@@ -478,26 +386,9 @@ impl Render for TerminalView {
         let font_size = px(self.theme.font_size_px());
         let rows = snapshot.rows.iter().map(|row| self.row_render(row)).collect();
 
-        // one div for interactivity, one canvas per painted strip: the
-        // prompt bar (when on), then the grid. Painting never goes through
-        // flex layout
+        // one div for interactivity, one canvas for the painted grid. No
+        // flex layout in the paint path
         let grid_w = self.cols as f32 * self.cell_w;
-        let mut content: Vec<gpui::AnyElement> = Vec::new();
-        if self.theme.prompt_bar {
-            let bar = BarPaint {
-                text: self.bar_line(snapshot.alt_screen),
-                font: self.font.clone(),
-                font_size,
-                cell_w: self.cell_w,
-                cell_h: self.cell_h,
-            };
-            content.push(
-                canvas(|_, _, _| (), move |bounds, _, window, cx| bar.paint(bounds, window, cx))
-                    .w(px(grid_w))
-                    .h(px(self.cell_h))
-                    .into_any_element(),
-            );
-        }
         let grid = GridPaint {
             rows,
             font_size,
@@ -539,165 +430,12 @@ impl Render for TerminalView {
             .on_click(cx.listener(|this, _event: &gpui::ClickEvent, window, cx| {
                 window.focus(&this.focus, cx);
             }))
-            .children(content)
             .child(
                 canvas(|_, _, _| (), move |bounds, _, window, cx| grid.paint(bounds, window, cx))
                     .w(px(grid_w))
                     .h(px(grid_h)),
             )
     }
-}
-
-impl TerminalView {
-    /// The bar's segments left to right: cwd, last command status +
-    /// duration, running state. Each carries its color. On the alt screen
-    /// the bar goes quiet (cwd and the running indicator only): commands
-    /// like vim redraw constantly and a frozen status line would lie about
-    /// the shell underneath.
-    fn bar_line(&self, alt_screen: bool) -> Vec<(String, gpui::Hsla)> {
-        let theme = &self.theme;
-        let dim = hsla_of(theme.foreground.scale(0.6));
-        let mut segments: Vec<(String, gpui::Hsla)> = Vec::new();
-
-        if let Some(cwd) = &self.bar.cwd_short {
-            segments.push((cwd.clone(), hsla_of(theme.foreground)));
-        }
-
-        // git: branch in the accent color, dirty count and ahead/behind in
-        // the ANSI yellow; absent outside a repo
-        if let Some(git) = &self.git {
-            segments.push((git.branch.clone(), hsla_of(theme.cursor)));
-            let mut details = String::new();
-            if git.dirty > 0 {
-                details.push_str(&format!("✚{} ", git.dirty));
-            }
-            if git.ahead > 0 {
-                details.push_str(&format!("↑{} ", git.ahead));
-            }
-            if git.behind > 0 {
-                details.push_str(&format!("↓{} ", git.behind));
-            }
-            if !details.is_empty() {
-                segments.push((details.trim_end().to_string(), hsla_of(theme.named[3])));
-            }
-        }
-
-        // quiet mode: cwd + running indicator stay, the rest is held back
-        if alt_screen {
-            if self.bar.running {
-                let elapsed = self
-                    .bar
-                    .started_at
-                    .map(|s| std::time::Instant::now() - s)
-                    .unwrap_or_default();
-                segments.push((
-                    format!("▶ {:.1}s", elapsed.as_secs_f32()),
-                    hsla_of(theme.cursor),
-                ));
-            }
-            return segments;
-        }
-
-        if let Some(exit) = self.bar.last_exit {
-            let duration = self
-                .bar
-                .last_duration
-                .filter(|d| d.as_secs_f32() >= 1.0)
-                .map(|d| format!(" {:.1}s", d.as_secs_f32()))
-                .unwrap_or_default();
-            if exit == 0 {
-                segments.push((format!("✓{duration}"), dim));
-            } else {
-                segments.push((
-                    format!("✗ {exit}{duration}"),
-                    hsla_of(Rgb8(255, 102, 102)),
-                ));
-            }
-        }
-
-        if self.bar.running {
-            let elapsed = self
-                .bar
-                .started_at
-                .map(|s| std::time::Instant::now() - s)
-                .unwrap_or_default();
-            segments.push((
-                format!("▶ {:.1}s", elapsed.as_secs_f32()),
-                hsla_of(theme.cursor),
-            ));
-        }
-
-        segments
-    }
-}
-
-/// The prompt bar: one shaped line of context segments, painted as part of
-/// the same canvas pass as the grid.
-struct BarPaint {
-    text: Vec<(String, gpui::Hsla)>,
-    font: gpui::Font,
-    font_size: Pixels,
-    cell_w: f32,
-    cell_h: f32,
-}
-
-impl BarPaint {
-    fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
-        if self.text.is_empty() {
-            return;
-        }
-        // join the segments into one string with two-space separators,
-        // runs carrying each segment's color
-        let mut joined = String::new();
-        let mut runs: Vec<gpui::TextRun> = Vec::new();
-        for (i, (segment, color)) in self.text.iter().enumerate() {
-            if i > 0 {
-                joined.push_str("  ");
-                runs.push(gpui::TextRun {
-                    len: 2,
-                    font: self.font.clone(),
-                    color: hsla_of(Rgb8(0, 0, 0)),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                });
-            }
-            joined.push_str(segment);
-            runs.push(gpui::TextRun {
-                len: segment.len(),
-                font: self.font.clone(),
-                color: *color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-        }
-        let shaped = window.text_system().shape_line_by_hash(
-            SHAPE_DOMAIN_BAR ^ hash_str(&joined),
-            joined.len(),
-            self.font_size,
-            &runs,
-            None,
-            || SharedString::from(joined),
-        );
-        if let Err(err) = shaped.paint(
-            bounds.origin,
-            px(self.cell_h),
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        ) {
-            warn!("bar paint failed: {err}");
-        }
-    }
-}
-
-/// Content hash of an arbitrary string (the bar's joined line).
-fn hash_str(text: &str) -> u64 {
-    let mut hasher = rustc_hash::FxHasher::default();
-    hasher.write(text.as_bytes());
-    hasher.finish()
 }
 
 /// Content hash of a row's cells. Every input build_row reads lives in the
@@ -1198,11 +936,5 @@ mod tests {
         }] };
         assert_eq!(hash_row(&mk(true)), hash_row(&mk(true)));
         assert_ne!(hash_row(&mk(true)), hash_row(&mk(false)));
-    }
-
-    #[test]
-    fn str_hash_is_stable_and_content_sensitive() {
-        assert_eq!(hash_str("kuma"), hash_str("kuma"));
-        assert_ne!(hash_str("kuma"), hash_str("kumb"));
     }
 }

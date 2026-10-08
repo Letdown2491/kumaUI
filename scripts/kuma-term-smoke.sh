@@ -81,27 +81,25 @@ else
 	pass "log is clean"
 fi
 
-# the prompt bar: drive a fresh instance with a command that emits the
-# shell-integration fixtures (OSC 133 lifecycle, OSC 7 cwd) and then
-# stays alive (the terminal closes when its child exits, so the fixture
-# must not finish). Pixels cannot be asserted here, but the bar's data
-# path is: markers tapped, state applied, nothing panicked while
-# painting the extra row.
+# shell-integration bytes: fish emits OSC 133/7 markers and OSC 7 cwd on
+# its own, so a real session feeds these to the parser constantly. The
+# emulator does not consume them; the property under test is that the
+# unknown-OSC stream rides through harmlessly and nothing panics.
 KUMA_TERM_COMMAND="printf '\033]133;A\033\\\\'; printf '\033]7;file://smokehost/tmp\033\\\\'; echo smoke; printf '\033]133;D;3\033\\\\'; sleep 30" \
 	"$TERM_BIN" >/tmp/kuma-term-bar.log 2>&1 &
 BAR_PID=$!
 sleep 3
-kill -0 "$BAR_PID" 2>/dev/null || { cat /tmp/kuma-term-bar.log; fail "kuma-term died under bar fixtures"; }
+kill -0 "$BAR_PID" 2>/dev/null || { cat /tmp/kuma-term-bar.log; fail "kuma-term died under OSC fixtures"; }
 if swaymsg -t get_tree | grep -q '"app_id": "kuma-term"'; then
-	pass "bar-fixture instance mapped"
+	pass "OSC-fixture instance mapped"
 else
-	fail "bar-fixture instance never mapped"
+	fail "OSC-fixture instance never mapped"
 fi
 kill "$BAR_PID" 2>/dev/null || true
 sleep 1
 if grep -E "panicked at| ERROR " /tmp/kuma-term-bar.log; then
 	fail "bar run logged panics or errors"
 else
-	pass "bar fixtures rode clean"
+	pass "OSC fixtures rode clean"
 fi
 echo "SMOKE OK"

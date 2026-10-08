@@ -40,47 +40,9 @@ On a regular Linux box, a plain `cargo build --release` works too; you need a Ru
 
 Runtime requirements: a Wayland compositor with `wlr-layer-shell` and `ext-session-lock`, and PAM. niri is the primary target; sway works end to end (the bar's workspaces, window title, and dock ride a compositor-neutral session mirror, [ADR-0012](docs/adr/0012-compositor-neutral-session-state.md)). Hyprland speaks the same protocols but is untested. Koguma's requirements are lighter: any Wayland compositor or X11, no layer-shell.
 
-## kuma-term shell integration
+## kuma-term
 
-kuma-term works with any shell out of the box. Shell integration feeds its prompt bar (cwd, exit code, command duration) and is opt-in per shell: kuma-term exports `KUMA_TERM=1` into the shell's environment, and snippets key on it, so the same dotfiles stay inert in every other terminal.
-
-- **fish**: the reference integration lives in `kuma-term/integration/kuma-term.fish`; copy it to `~/.config/fish/conf.d/`. fish reports the cwd (OSC 7) and prompt markers (OSC 133;A/B) natively; the snippet adds the command-start and command-end markers plus the slim one-cell prompt (`KUMA_TERM_BAR` gates it; `KUMA_TERM_BAR=0` in the environment dismisses the bar and restores the full prompt).
-- **bash**: add to `~/.bashrc` (verified against bash 5.3):
-
-  ```bash
-  if [ -n "$KUMA_TERM" ]; then
-      # D for the previous command, then A for the fresh prompt
-      __kuma_precmd() { local s=$?; printf '\e]133;D;%s\e\\' "$s"; printf '\e]133;A\e\\'; }
-      # C just before the command runs; the DEBUG trap also fires for the
-      # commands inside compound commands, so the guard keeps C one-shot
-      # per command line and PS0 re-arms it after the prompt
-      __kuma_preexec() {
-          if [ -z "$__kuma_seen" ]; then
-              __kuma_seen=yes
-              printf '\e]133;C\e\\'
-          fi
-      }
-      PROMPT_COMMAND="__kuma_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-      trap '__kuma_preexec' DEBUG
-      PS0='\e]133;C\e\\'$PS0
-  fi
-  ```
-
-  With PS0 carrying C, the marker fires exactly once per command line, right after you press enter and before the output starts. The DEBUG-trap preexec above is the belt-and-suspenders for shells where PS0 is unavailable; the verified stream is one `C` per command line, `D;<code>` after it, `A` on the next prompt. Drop the trap lines if you use PS0 alone.
-- **zsh**: add to `~/.zshrc` (standard `precmd`/`preexec` hook arrays; not machine-verified here, no zsh on the dev box):
-
-  ```zsh
-  if [ -n "$KUMA_TERM" ]; then
-      typeset -ga precmd_functions preexec_functions
-      # D for the previous command, then A for the fresh prompt
-      precmd_functions+=(__kuma_precmd)
-      preexec_functions+=(__kuma_preexec)
-      __kuma_precmd() { local s=$?; printf '\e]133;D;%s\e\\' "$s"; printf '\e]133;A\e\\'; }
-      __kuma_preexec() { printf '\e]133;C\e\\'; }
-  fi
-  ```
-
-Without integration the bar simply shows less: the cwd segment still works in fish (native OSC 7) and nothing else renders.
+kuma-term works with any shell out of the box; no shell integration is required. It exports `KUMA_TERM=1` into the shell's environment so dotfiles can recognize it (the bundled fish prompt override in the kumaOS image keys on it), and nothing else. It reads kitty color configs for its palette and honors `kuma-shell`'s published wallpaper palette.
 
 ## Vendored gpui
 

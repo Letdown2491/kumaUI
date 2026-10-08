@@ -28,10 +28,6 @@ pub struct Theme {
     pub background_opacity: f32,
     /// Terminal background alpha when it does not.
     pub background_opacity_unfocused: f32,
-    /// the prompt bar above the grid (cwd, git, exit/duration). Off means
-    /// the grid takes the whole viewport and the conf.d snippet keeps the
-    /// full in-grid prompt.
-    pub prompt_bar: bool,
 }
 
 impl Theme {
@@ -63,7 +59,6 @@ impl Theme {
             font_size_pt: 11.0,
             background_opacity: 0.80,
             background_opacity_unfocused: 0.90,
-            prompt_bar: true,
         }
     }
 
@@ -71,12 +66,6 @@ impl Theme {
         let mut theme = Self::builtin();
         if let Some(path) = kitty_config() {
             apply_kitty_config(&mut theme, &path, 0);
-        }
-        // the prompt bar is on unless the environment opted out; the same
-        // variable gates the conf.d prompt slimming, so one toggle moves
-        // both sides
-        if matches!(std::env::var("KUMA_TERM_BAR").as_deref(), Ok("0" | "false" | "no")) {
-            theme.prompt_bar = false;
         }
         // the session's look: kuma-shell publishes the wallpaper palette
         // for its neighbors and it wins for the chrome colors (the ANSI 16
