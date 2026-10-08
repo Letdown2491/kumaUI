@@ -93,6 +93,10 @@ impl EventListener for UiProxy {
 }
 
 /// Grid dimensions for term construction and resize.
+/// Grid dimensions for term construction and resize. Scrollback is NOT
+/// carried here: the emulator's Term::new reads only columns and
+/// screen_lines off the dims, and the history size rides the term
+/// config's scrolling_history instead.
 struct GridDims {
     columns: usize,
     screen_lines: usize,
@@ -457,7 +461,10 @@ impl Engine {
 
         let proxy = UiProxy { tx };
         let term = Term::new(
-            alacritty_terminal::term::Config::default(),
+            alacritty_terminal::term::Config {
+                scrolling_history: theme.scrollback_lines,
+                ..Default::default()
+            },
             &GridDims::from_window_size(window_size),
             proxy.clone(),
         );
@@ -768,6 +775,44 @@ mod tests {
         assert_eq!(term.grid().display_offset(), 0);
         term.scroll_display(Scroll::Delta(10));
         assert!(term.grid().display_offset() > 0);
+    }
+
+    #[test]
+    fn scrollback_size_rides_the_term_config() {
+        // the default grid keeps 10,000 history lines; a config can keep
+        // fewer (or none), and the cap is honored exactly
+        let (tx, _rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+        let mut term = Term::new(
+            alacritty_terminal::term::Config { scrolling_history: 5, ..Default::default() },
+            &GridDims { columns: 10, screen_lines: 3 },
+            UiProxy { tx },
+        );
+        for _ in 0..50 {
+            feed(&mut term, b"line\r\n");
+        }
+        assert_eq!(term.grid().history_size(), 5);
+    }
+
+    #[test]
+    fn search_reaches_the_configured_scrollback() {
+        // a needle 30 lines above the live screen, on a 3-line viewport:
+        // finding it means the history the config asked for is really
+        // there and the scan spans it
+        let (tx, _rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+        let mut term = Term::new(
+            alacritty_terminal::term::Config { scrolling_history: 100, ..Default::default() },
+            &GridDims { columns: 20, screen_lines: 3 },
+            UiProxy { tx },
+        );
+        feed(&mut term, b"needle\r\n");
+        for _ in 0..30 {
+            feed(&mut term, b"pad pad pad\r\n");
+        }
+        let matches = search_term(&term, "needle");
+        assert_eq!(matches.len(), 1);
+        // buffer coordinates: the live screen is rows 0..3, history is
+        // negative, and the needle scrolled off 30 lines ago
+        assert!(matches[0].from.line < 0);
     }
 
     #[test]

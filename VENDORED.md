@@ -96,4 +96,12 @@ local patches, which should be recorded here.
   toplevel app needs; drag-out and drop-in ride the same
   `start_external_drag` / `FileDragPaths` plumbing the shell never
   touches.
+- `crates/gpui_wgpu/src/cosmic_text_system.rs`: color emoji faces are
+  exempted from the "no 'm' in the charmap" face eviction. A color
+  emoji font carries no letters, so eviction deleted Noto Color Emoji
+  from the session's whole font database and every emoji character
+  fell through to a notdef box in the terminal's primary mono face
+  (found shaping the kuma-term grid, issue: emoji and CJK fallback).
+  Upstream gets away with it because Segoe Fluent Icons was the only
+  letter-less face its test suite ever met.
 

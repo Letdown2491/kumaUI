@@ -14,8 +14,8 @@ use futures::StreamExt;
 use gpui::{
     App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight,
     Keystroke, MouseButton, ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent,
-    SharedString, Task, TextAlign, TextRun, UnderlineStyle, Window, WindowTextSystem, canvas, div,
-    fill, point, px, prelude::*, size,
+    SharedString, Task, TextRun, UnderlineStyle, Window, WindowTextSystem, canvas, div, fill,
+    point, prelude::*, px, size, underline_y_offset,
 };
 use log::warn;
 use rustc_hash::FxHashMap;
@@ -827,6 +827,22 @@ struct RowRender {
     glyphs: Vec<CellGlyph>,
     /// URLs in the row, cell aligned: (start column, length)
     url_spans: Vec<(usize, usize)>,
+    /// where every cell lives in the display string: its byte offset,
+    /// grid column, and columns covered. Paint snaps glyphs to these
+    /// origins instead of trusting shaped advances, so a fallback font's
+    /// metrics (emoji, CJK) can never drift the grid.
+    cells: Vec<CellSpan>,
+}
+
+/// One cell's place in the display string.
+#[derive(Clone, Copy)]
+struct CellSpan {
+    /// byte offset of the cell's text in RowRender.text
+    byte: usize,
+    /// grid column the cell starts at
+    col: usize,
+    /// columns the cell covers: 1, or 2 for a wide-char leader
+    span: usize,
 }
 
 /// A cell the vector layer draws: grid column, the glyph, its color.
@@ -882,6 +898,7 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
     let mut text = String::new();
     let mut runs: Vec<TextRun> = Vec::new();
     let mut glyphs: Vec<CellGlyph> = Vec::new();
+    let mut cells: Vec<CellSpan> = Vec::new();
     let mut bg_quads: Vec<(usize, usize, Rgb8)> = Vec::new();
     // (bold, italic, underline, strikeout, fg) of the run being built
     let mut current: Option<(bool, bool, bool, bool, Rgb8)> = None;
@@ -932,6 +949,11 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
             cell.c
         };
         text.push(drawn);
+        cells.push(CellSpan {
+            byte: text.len() - drawn.len_utf8(),
+            col: col_of[i],
+            span: cell_width(row, i),
+        });
 
         let key = (cell.bold, cell.italic, cell.underline, cell.strikeout, cell.fg);
         let len_in_text = drawn.len_utf8();
@@ -965,7 +987,7 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
     }
     flush_bg_at_end(&mut bg_quads, bg_open.take());
 
-    RowRender { key: 0, text, runs, bg_quads, glyphs, url_spans: url_spans(row, end) }
+    RowRender { key: 0, text, runs, bg_quads, glyphs, url_spans: url_spans(row, end), cells }
 }
 
 /// True when `c` may appear inside a URL run. Everything RFC 3986 allows
@@ -1064,6 +1086,117 @@ fn cell_width(row: &Row, i: usize) -> usize {
     } else {
         1
     }
+}
+
+/// Paint one row's text with every glyph snapped to its cell origin.
+///
+/// The row shapes once through gpui's hash-keyed layout cache, exactly as
+/// before, but the shaped advances are not trusted: a fallback font's
+/// glyph for an emoji or a CJK char carries that font's own advance,
+/// which is never a whole number of cells. Each glyph paints at the
+/// origin its CellSpan names instead, the way a terminal paints; a
+/// ligature spanning several cells snaps to its first cell and keeps its
+/// natural width. Underline and strikethrough paint cell-aligned for the
+/// same reason, so they keep spanning whole cells under fallback text.
+fn paint_row_text(
+    row: &RowRender,
+    x: Pixels,
+    y: Pixels,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: Pixels,
+    window: &mut Window,
+) -> gpui::Result<()> {
+    let shaped = window.text_system().shape_line_by_hash(
+        row.key,
+        row.text.len(),
+        font_size,
+        &row.runs,
+        None,
+        || SharedString::from(row.text.clone()),
+    );
+    let padding_top = (cell_h - f32::from(shaped.ascent) - f32::from(shaped.descent)) / 2.0;
+    let baseline = y + px(padding_top + f32::from(shaped.ascent));
+
+    for run in &shaped.runs {
+        for glyph in &run.glyphs {
+            // combining marks re-use their base cell; a glyph whose byte
+            // is mid-cluster cannot happen, clusters start at char bounds
+            let Some(cell) = cell_for_byte(&row.cells, glyph.index) else {
+                continue;
+            };
+            let at = point(x + px(cell.col as f32 * cell_w), baseline + glyph.position.y);
+            let painted = if glyph.is_emoji {
+                window.paint_emoji(at, run.font_id, glyph.id, font_size)
+            } else {
+                let color = color_for_byte(&row.runs, glyph.index);
+                window.paint_glyph(at, run.font_id, glyph.id, font_size, color)
+            };
+            if let Err(err) = painted {
+                warn!("glyph paint failed: {err}");
+            }
+        }
+    }
+
+    // underline and strikethrough, cell aligned: runs are cell-aligned
+    // (one starts at each cell that changes style), so a run's column
+    // span runs from its first cell to its last cell's end
+    let mut run_start = 0usize;
+    let mut cell_ix = 0usize;
+    for run in &row.runs {
+        let run_end = run_start + run.len;
+        while cell_ix < row.cells.len() && row.cells[cell_ix].byte < run_start {
+            cell_ix += 1;
+        }
+        if run.underline.is_some() || run.strikethrough.is_some() {
+            if let Some(first) = row.cells.get(cell_ix) {
+                let mut last_ix = cell_ix;
+                while last_ix + 1 < row.cells.len() && row.cells[last_ix + 1].byte < run_end {
+                    last_ix += 1;
+                }
+                let last = &row.cells[last_ix];
+                let left = x + px(first.col as f32 * cell_w);
+                let width = px(((last.col + last.span - first.col) as f32) * cell_w);
+                if let Some(style) = &run.underline {
+                    let underline_y =
+                        y + underline_y_offset(px(cell_h), shaped.ascent, shaped.descent);
+                    window.paint_underline(point(left, underline_y), width, style);
+                }
+                if let Some(style) = &run.strikethrough {
+                    let mid_y = y
+                        + px((f32::from(shaped.ascent) * 0.5 + padding_top
+                            + f32::from(shaped.ascent))
+                            * 0.5);
+                    window.paint_strikethrough(point(left, mid_y), width, style);
+                }
+            }
+        }
+        run_start = run_end;
+    }
+    Ok(())
+}
+
+/// The CellSpan a shaped glyph belongs to: the last cell whose text byte
+/// is at or before the glyph's cluster start. Cells are byte-ordered, so
+/// this is a binary search.
+fn cell_for_byte(cells: &[CellSpan], byte: usize) -> Option<&CellSpan> {
+    let ix = cells.partition_point(|cell| cell.byte <= byte);
+    let ix = ix.checked_sub(1)?;
+    let cell = &cells[ix];
+    (cell.byte <= byte).then_some(cell)
+}
+
+/// The foreground color of the run covering a text byte. Runs are
+/// byte-ordered and contiguous.
+fn color_for_byte(runs: &[TextRun], byte: usize) -> gpui::Hsla {
+    let mut start = 0usize;
+    for run in runs {
+        if byte < start + run.len {
+            return run.color;
+        }
+        start += run.len;
+    }
+    runs.last().map(|run| run.color).unwrap_or_else(gpui::black)
 }
 
 /// Project buffer-coordinate matches into viewport row spans for the
@@ -1174,7 +1307,7 @@ struct GridPaint {
     url_hover: Option<(usize, usize, usize)>,
 }
 impl GridPaint {
-    fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) {
         let origin = bounds.origin;
         for (iy, row) in self.rows.iter().enumerate() {
             let row_y = origin.y + px(iy as f32 * self.cell_h);
@@ -1235,25 +1368,18 @@ impl GridPaint {
                 }
             }
 
-            // the text itself; the layout comes from gpui's hash-keyed
-            // cache, so an unchanged row never re-shapes (and never
-            // materializes its text)
+            // the text itself: every glyph snapped to its cell's left
+            // edge, so a fallback font's own advances can never drift
+            // the grid (see paint_row_text)
             if !row.text.is_empty() {
-                let shaped = window.text_system().shape_line_by_hash(
-                    row.key,
-                    row.text.len(),
+                if let Err(err) = paint_row_text(
+                    row,
+                    origin.x,
+                    row_y,
+                    self.cell_w,
+                    self.cell_h,
                     self.font_size,
-                    &row.runs,
-                    None,
-                    || SharedString::from(row.text.clone()),
-                );
-                if let Err(err) = shaped.paint(
-                    point(origin.x, row_y),
-                    px(self.cell_h),
-                    TextAlign::Left,
-                    None,
                     window,
-                    cx,
                 ) {
                     warn!("row paint failed: {err}");
                 }
@@ -1508,6 +1634,39 @@ mod tests {
         assert_eq!(rendered.runs.len(), 1);
         assert_eq!(rendered.runs[0].len, 2);
         assert!(rendered.bg_quads.is_empty());
+    }
+
+    #[test]
+    fn cell_map_records_bytes_columns_and_spans() {
+        let mut spacer = cell(' ');
+        spacer.spacer = true;
+        let row = Row { cells: vec![cell('a'), cell('漢'), spacer, cell('b')] };
+        let font = font();
+        let t = theme();
+        let rendered = build_row(&row, &font, &t);
+        // the display string has the spacer dropped: "a漢b"
+        assert_eq!(rendered.text, "a\u{6f22}b");
+        // 'a' at column 0, the wide leader covers columns 1..3, 'b' lands
+        // at column 3
+        assert_eq!(rendered.cells.len(), 3);
+        assert_eq!(rendered.cells[0].byte, 0);
+        assert_eq!(rendered.cells[0].col, 0);
+        assert_eq!(rendered.cells[0].span, 1);
+        assert_eq!(rendered.cells[1].byte, 1);
+        assert_eq!(rendered.cells[1].col, 1);
+        assert_eq!(rendered.cells[1].span, 2);
+        assert_eq!(rendered.cells[2].byte, 1 + '漢'.len_utf8());
+        assert_eq!(rendered.cells[2].col, 3);
+        assert_eq!(rendered.cells[2].span, 1);
+        // byte lookups: the wide char's three bytes all resolve to the
+        // leader's span, the next char to the following cell
+        let map = rendered.cells;
+        assert_eq!(cell_for_byte(&map, 0).unwrap().col, 0);
+        assert_eq!(cell_for_byte(&map, 1).map(|c| (c.col, c.span)), Some((1, 2)));
+        // byte 3 is the wide char's last byte, still the leader's span;
+        // 'b' starts at byte 4, at column 3
+        assert_eq!(cell_for_byte(&map, 3).map(|c| (c.col, c.span)), Some((1, 2)));
+        assert_eq!(cell_for_byte(&map, 4).unwrap().col, 3);
     }
 
     #[test]

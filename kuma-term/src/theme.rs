@@ -29,6 +29,13 @@ pub struct Theme {
     pub background_opacity: f32,
     /// Terminal background alpha when it does not.
     pub background_opacity_unfocused: f32,
+    /// Families tried when the primary mono font lacks a glyph: emoji,
+    /// CJK, misc symbols. Missing families are dropped when the chain
+    /// loads, so naming a face a distro does not ship is harmless.
+    pub font_fallbacks: Vec<String>,
+    /// Scrolled-off lines the grid keeps. Read once at startup: changing
+    /// it needs a restart, the grid is sized at term creation.
+    pub scrollback_lines: usize,
 }
 
 impl Theme {
@@ -64,6 +71,14 @@ impl Theme {
             font_size_pt: 11.0,
             background_opacity: 0.80,
             background_opacity_unfocused: 0.90,
+            // emoji and CJK are the glyphs every mono font lacks; DejaVu
+            // Sans picks up the remaining math and arrow odds and ends.
+            font_fallbacks: vec![
+                "Noto Color Emoji".to_string(),
+                "Noto Sans CJK JP".to_string(),
+                "DejaVu Sans".to_string(),
+            ],
+            scrollback_lines: 10_000,
         }
     }
 
@@ -118,18 +133,10 @@ impl Theme {
         std::fs::metadata(path).ok()?.modified().ok()
     }
 
-    /// Fallback families for the glyphs a mono terminal leans on (box
-    /// drawing, block elements, braille). Noto Sans Mono, the fontconfig
-    /// "monospace" answer here, carries none of them; without a chain they
-    /// fall through to a proportional face and aligned grids garble. For
-    /// the spike these two are picked for coverage on this system; the real
-    /// config story owns the list later.
+    /// The fallback chain the grid's font carries: the config's list (or
+    /// the builtin default), verbatim.
     pub fn font_fallbacks(&self) -> gpui::FontFallbacks {
-        gpui::FontFallbacks::from_fonts(vec![
-            "DejaVu Sans Mono".to_string(),
-            "Adwaita Mono".to_string(),
-            "Liberation Mono".to_string(),
-        ])
+        gpui::FontFallbacks::from_fonts(self.font_fallbacks.clone())
     }
 
     pub fn font_size_px(&self) -> f32 {
@@ -226,6 +233,28 @@ fn apply_config(theme: &mut Theme, path: &Path, depth: u8) {
                     if size > 0.0 {
                         theme.font_size_pt = size;
                     }
+                }
+            }
+            // kuma-term's own key, comma-separated family list. "none"
+            // disables fallback entirely: missing glyphs then draw as
+            // notdef boxes, which is sometimes what a purist wants.
+            "font_fallbacks" => {
+                if value.trim().eq_ignore_ascii_case("none") {
+                    theme.font_fallbacks = Vec::new();
+                } else {
+                    theme.font_fallbacks = value
+                        .split(',')
+                        .map(|name| name.trim_matches('"').trim().to_string())
+                        .filter(|name| !name.is_empty())
+                        .collect();
+                }
+            }
+            // kitty's key name. A value of 0 keeps no history at all.
+            "scrollback_lines" => {
+                if let Ok(lines) = value.trim().parse::<usize>() {
+                    // the grid is preallocated: cap the knob so a fat
+                    // finger cannot ask the terminal for gigabytes
+                    theme.scrollback_lines = lines.clamp(0, 1_000_000);
                 }
             }
             "background_opacity" => {
@@ -325,6 +354,46 @@ mod tests {
         assert_eq!(theme.font_size_pt, 12.5);
         assert_eq!(theme.font_family.as_deref(), Some("JetBrains Mono"));
         assert_eq!(theme.background_opacity, 0.85);
+    }
+
+    #[test]
+    fn fallback_and_scrollback_keys_parse() {
+        let mut theme = Theme::builtin();
+        let path = std::env::temp_dir().join(format!("kuma-term-test4-{}.conf", std::process::id()));
+        std::fs::write(
+            &path,
+            "font_fallbacks \"Noto Color Emoji\", Noto Sans CJK SC, none-of-these\nscrollback_lines 250000\n",
+        )
+        .unwrap();
+        apply_config(&mut theme, &path, 0);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            theme.font_fallbacks,
+            vec!["Noto Color Emoji", "Noto Sans CJK SC", "none-of-these"]
+        );
+        assert_eq!(theme.scrollback_lines, 250_000);
+        // the chain a font loads from is the parsed list, verbatim
+        assert_eq!(
+            theme.font_fallbacks().fallback_list(),
+            theme.font_fallbacks
+        );
+    }
+
+    #[test]
+    fn fallback_none_disables_and_scrollback_clamps() {
+        let mut theme = Theme::builtin();
+        let path = std::env::temp_dir().join(format!("kuma-term-test5-{}.conf", std::process::id()));
+        std::fs::write(&path, "font_fallbacks none\nscrollback_lines 999999999\n").unwrap();
+        apply_config(&mut theme, &path, 0);
+        std::fs::remove_file(&path).ok();
+        assert!(theme.font_fallbacks.is_empty());
+        assert_eq!(theme.scrollback_lines, 1_000_000);
+        // a bogus value leaves the default
+        let mut theme = Theme::builtin();
+        std::fs::write(&path, "scrollback_lines lots\n").unwrap();
+        apply_config(&mut theme, &path, 0);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(theme.scrollback_lines, 10_000);
     }
 
     #[test]
