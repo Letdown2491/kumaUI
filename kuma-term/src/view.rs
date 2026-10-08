@@ -420,11 +420,13 @@ impl Focusable for TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // fit the grid to the viewport: rounded-down cell counts, so the
-        // last row and column never clip. The prompt bar reserves one cell
-        // row at the top, in both normal and alt screen (no layout jump).
+        // last row and column never clip. With the prompt bar on, it
+        // reserves one cell row at the top (alt screen included: no
+        // layout jump); with it off the grid takes the whole viewport.
         let viewport = window.viewport_size();
         let usable_w = (viewport.width - px(PADDING * 2.0)).as_f32().max(1.0);
-        let usable_h = (viewport.height - px(PADDING * 2.0) - px(self.cell_h)).as_f32().max(1.0);
+        let bar_h = if self.theme.prompt_bar { self.cell_h } else { 0.0 };
+        let usable_h = (viewport.height - px(PADDING * 2.0) - px(bar_h)).as_f32().max(1.0);
         let want_cols = ((usable_w / self.cell_w).floor() as u16).max(2);
         let want_lines = ((usable_h / self.cell_h).floor() as u16).max(2);
         if want_cols != self.cols || want_lines != self.lines {
@@ -443,14 +445,25 @@ impl Render for TerminalView {
             .collect();
 
         // one div for interactivity, one canvas per painted strip: the
-        // prompt bar, then the grid. Painting never goes through flex layout
-        let bar = BarPaint {
-            text: self.bar_line(snapshot.alt_screen),
-            font: self.font.clone(),
-            font_size,
-            cell_w: self.cell_w,
-            cell_h: self.cell_h,
-        };
+        // prompt bar (when on), then the grid. Painting never goes through
+        // flex layout
+        let grid_w = self.cols as f32 * self.cell_w;
+        let mut content: Vec<gpui::AnyElement> = Vec::new();
+        if self.theme.prompt_bar {
+            let bar = BarPaint {
+                text: self.bar_line(snapshot.alt_screen),
+                font: self.font.clone(),
+                font_size,
+                cell_w: self.cell_w,
+                cell_h: self.cell_h,
+            };
+            content.push(
+                canvas(|_, _, _| (), move |bounds, _, window, cx| bar.paint(bounds, window, cx))
+                    .w(px(grid_w))
+                    .h(px(self.cell_h))
+                    .into_any_element(),
+            );
+        }
         let grid = GridPaint {
             rows,
             font_size,
@@ -465,7 +478,6 @@ impl Render for TerminalView {
                 color
             },
         };
-        let grid_w = self.cols as f32 * self.cell_w;
         let grid_h = snapshot.rows.len() as f32 * self.cell_h;
 
         // background alpha: the focused window shows the most wallpaper,
@@ -494,11 +506,7 @@ impl Render for TerminalView {
             .on_click(cx.listener(|this, _event: &gpui::ClickEvent, window, cx| {
                 window.focus(&this.focus, cx);
             }))
-            .child(
-                canvas(|_, _, _| (), move |bounds, _, window, cx| bar.paint(bounds, window, cx))
-                    .w(px(grid_w))
-                    .h(px(self.cell_h)),
-            )
+            .children(content)
             .child(
                 canvas(|_, _, _| (), move |bounds, _, window, cx| grid.paint(bounds, window, cx))
                     .w(px(grid_w))
