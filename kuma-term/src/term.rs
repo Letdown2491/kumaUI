@@ -597,6 +597,7 @@ impl Engine {
 mod tests {
     use super::*;
     use alacritty_terminal::vte::ansi::Processor;
+    use futures::StreamExt;
 
     /// A term wired to a dead channel: events are fire-and-forget in tests.
     fn test_term(cols: usize, lines: usize) -> Term<UiProxy> {
@@ -794,5 +795,78 @@ mod tests {
         );
         let spans = selection_spans(&range, SelectMode::Char, 0, 2, 10);
         assert_eq!(spans, vec![SelectSpan { row: 0, start: 2, len: 1 }]);
+    }
+
+    /// A real PTY end to end: the child emits OSC 133/7 markers, the pump
+    /// taps them out of the raw stream, the UI channel receives Marker
+    /// events, and the grid still gets the visible text. Skipped when the
+    /// sandbox has no /bin/sh (the container has it).
+    #[test]
+    fn pump_taps_markers_from_a_live_pty() {
+        if std::env::var("KUMA_TERM_SKIP_PTY_TEST").is_ok() {
+            return;
+        }
+        let window_size = WindowSize {
+            num_cols: 20,
+            num_lines: 5,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        // the child prints a prompt marker, a cwd marker, visible text,
+        // and a done marker, then exits: exercises the tap, the parser,
+        // and the EIO exit path in one go. Env mutation is safe here: the
+        // test binary is single-threaded until the engine spawns.
+        unsafe {
+            std::env::set_var(
+                "KUMA_TERM_COMMAND",
+                "printf '\\033]133;A\\033\\\\'; printf '\\033]7;file://host/tmp\\033\\\\'; echo kuma; printf '\\033]133;D;42\\033\\\\'",
+            );
+        }
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+        let mut engine = Engine::new(window_size, crate::theme::Theme::builtin(), tx)
+            .expect("engine with a live pty");
+
+        // pump the event channel until the child exits, with a wall clock
+        // bound so a broken pump fails instead of hanging the suite
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut markers = Vec::new();
+        let mut saw_text = false;
+        let mut saw_exit = false;
+        while std::time::Instant::now() < deadline && !saw_exit {
+            let event = futures::executor::block_on(rx.next());
+            match event {
+                Some(UiEvent::Marker(m)) => markers.push(m),
+                Some(UiEvent::Wakeup) => {
+                    if engine.snapshot().rows.iter().any(|r| {
+                        r.cells.iter().any(|c| c.c == 'k')
+                            && r.cells.iter().any(|c| c.c == 'a')
+                            && r.cells.iter().any(|c| c.c == 'm')
+                            && r.cells.iter().any(|c| c.c == 'u')
+                    }) {
+                        saw_text = true;
+                    }
+                },
+                Some(UiEvent::Exit) => saw_exit = true,
+                Some(_) => {},
+                None => break,
+            }
+        }
+        unsafe { std::env::remove_var("KUMA_TERM_COMMAND") };
+
+        assert!(saw_text, "grid never received the visible text");
+        assert!(saw_exit, "pump never reported the child exit");
+        assert!(
+            markers.contains(&Marker::PromptStart),
+            "no prompt marker tapped: {markers:?}"
+        );
+        assert!(
+            markers.contains(&Marker::Cwd { host: "host".into(), path: "/tmp".into() }),
+            "no cwd marker tapped: {markers:?}"
+        );
+        assert!(
+            markers.contains(&Marker::CommandDone(Some(42))),
+            "no done marker tapped: {markers:?}"
+        );
+        engine.resize(19, 4);
     }
 }
