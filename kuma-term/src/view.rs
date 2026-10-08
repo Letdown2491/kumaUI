@@ -283,15 +283,10 @@ impl TerminalView {
         let snapshot = self.engine.snapshot();
         let grid_row = snapshot.rows.get(row)?;
         let spans = url_spans(grid_row, grid_row.cells.len());
-        let &(_, len) = spans
+        let &(start, len) = spans
             .iter()
-            .find(|(start, len)| col >= *start && col < start + len)?;
-        let mut url = String::new();
-        for cell in &grid_row.cells[col..col + len] {
-            if !cell.spacer {
-                url.push(cell.c);
-            }
-        }
+            .find(|(s, len)| col >= *s && col < s + len)?;
+        let mut url = span_cells_text(grid_row, start, len);
         if url.starts_with("www.") {
             url.insert_str(0, "http://");
         }
@@ -744,6 +739,17 @@ fn is_url_trailing(c: char) -> bool {
     matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"')
 }
 
+/// The URL text of one span, read back from the row's cells.
+fn span_cells_text(row: &Row, start: usize, len: usize) -> String {
+    let mut out = String::new();
+    for cell in &row.cells[start..start + len] {
+        if !cell.spacer {
+            out.push(cell.c);
+        }
+    }
+    out
+}
+
 /// URL spans as (start column, length) over the row's visible cells up to
 /// `end`. A run starts at a scheme or a bare www. and extends over
 /// URL-safe characters; runs are ASCII only, so length in characters is
@@ -1038,6 +1044,40 @@ mod tests {
         let row = Row { cells };
         let spans = url_spans(&row, row.cells.len());
         assert_eq!(spans, vec![(0, 13)]);
+    }
+
+    #[test]
+    fn url_at_reads_the_whole_span_from_any_clicked_cell() {
+        // regression: the click handler sliced [clicked_col..clicked_col
+        // + len] instead of the span's own start, so a mid-link click
+        // returned a truncated URL and a click right of the span start
+        // near the row end panicked the UI thread (closing the window)
+        let text = "see https://x.io/edge";
+        let row = row_of(text);
+        let spans = url_spans(&row, row.cells.len());
+        assert_eq!(spans, vec![(4, 17)]);
+        // the span reaches the row's last cell
+        assert_eq!(spans[0].0 + spans[0].1, row.cells.len());
+        for clicked in 4..row.cells.len() {
+            let (start, len) = spans[0];
+            assert_eq!(span_cells_text(&row, start, len), "https://x.io/edge");
+        }
+    }
+
+    #[test]
+    fn url_spans_never_exceed_the_row() {
+        // the invariant the old slice violated: every span fits in the
+        // cells it was scanned from
+        for text in [
+            "https://x.io",
+            "prefix https://x.io/long/path?q=1 suffix",
+            "https://very.long.url/that/fills/the/whole/row/exactly/end",
+        ] {
+            let row = row_of(text);
+            for (start, len) in url_spans(&row, row.cells.len()) {
+                assert!(start + len <= row.cells.len(), "{text}: {start}+{len}");
+            }
+        }
     }
 
     #[test]
