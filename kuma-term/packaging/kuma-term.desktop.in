@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=kuma-term
+Name=Higuma
 GenericName=Terminal
 Comment=The kumaOS terminal
-Keywords=terminal;shell;console;kuma;
+Keywords=terminal;shell;console;kuma;higuma;
 Exec=@HOME@/.local/bin/kuma-term
 Terminal=false
 Categories=System;TerminalEmulator;
