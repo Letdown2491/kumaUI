@@ -55,6 +55,12 @@ pub struct TerminalView {
     title: Option<String>,
     /// a left-drag is actively stretching the selection
     selecting: bool,
+    /// the cell the pointer is over, viewport coordinates: drives the URL
+    /// hover underline and pointing-hand cursor
+    hover: Option<(usize, usize)>,
+    /// where the current left-press started, to tell a click (open URL)
+    /// from a drag (selection)
+    down_cell: Option<(usize, usize, CellEdge)>,
     /// shaped rows keyed on the row's cell-content hash: a row the grid
     /// did not change skips the cell walk, the string build, and (through
     /// gpui's hash-keyed layout cache) the shaper itself
@@ -143,6 +149,8 @@ impl TerminalView {
             lines: 24,
             title: None,
             selecting: false,
+            hover: None,
+            down_cell: None,
             row_shapes: FxHashMap::default(),
             _pump: pump,
             _palette_tick: palette_tick,
@@ -210,8 +218,7 @@ impl TerminalView {
 
     /// Paste from the clipboard, bracketed when the shell asked for it.
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = cx.read_from_clipboard() else { return };
-        let Some(text) = item.text() else { return };
+        let Some(item) = cx.read_from_clipboard() else { return };        let Some(text) = item.text() else { return };
         // newlines become carriage returns: that is what the shell's line
         // discipline expects from a paste
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
@@ -270,6 +277,27 @@ impl TerminalView {
         (row, col, edge)
     }
 
+    /// The URL under a viewport cell, if any: the span that covers it,
+    /// rebuilt from the row's cells. Bare www. hosts get the scheme.
+    fn url_at(&self, row: usize, col: usize) -> Option<String> {
+        let snapshot = self.engine.snapshot();
+        let grid_row = snapshot.rows.get(row)?;
+        let spans = url_spans(grid_row, grid_row.cells.len());
+        let &(_, len) = spans
+            .iter()
+            .find(|(start, len)| col >= *start && col < start + len)?;
+        let mut url = String::new();
+        for cell in &grid_row.cells[col..col + len] {
+            if !cell.spacer {
+                url.push(cell.c);
+            }
+        }
+        if url.starts_with("www.") {
+            url.insert_str(0, "http://");
+        }
+        Some(url)
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &gpui::MouseDownEvent,
@@ -280,6 +308,8 @@ impl TerminalView {
             return;
         }
         let (row, col, edge) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
+        self.hover = Some((row, col));
+        self.down_cell = Some((row, col, edge));
         let mode = match event.click_count {
             2 => SelectMode::Word,
             3.. => SelectMode::Line,
@@ -301,14 +331,19 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.selecting {
-            return;
-        }
         let (row, col, edge) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
-        let offset = self.engine.display_offset();
-        self.engine
-            .update_selection(GridPoint { line: row as i32 - offset as i32, column: col }, edge);
-        cx.notify();
+        // only repaint on cell changes: the underline appears when the
+        // pointer crosses onto a URL, not per pixel
+        if self.hover != Some((row, col)) {
+            self.hover = Some((row, col));
+            cx.notify();
+        }
+        if self.selecting {
+            let offset = self.engine.display_offset();
+            self.engine
+                .update_selection(GridPoint { line: row as i32 - offset as i32, column: col }, edge);
+            cx.notify();
+        }
     }
 
     fn on_mouse_up(
@@ -321,6 +356,15 @@ impl TerminalView {
             return;
         }
         self.selecting = false;
+        let (row, col, edge) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
+        // a plain click that stayed on one cell is an open when that cell
+        // sits in a URL; double and triple clicks are word/line selection
+        if event.click_count == 1 && self.down_cell == Some((row, col, edge)) {
+            if let Some(url) = self.url_at(row, col) {
+                open_url(&url);
+            }
+        }
+        self.down_cell = None;
         self.engine.finish_selection();
         cx.notify();
     }
@@ -366,6 +410,19 @@ impl Focusable for TerminalView {
     }
 }
 
+/// Open a URL through the desktop handler: fire and forget, reaped on a
+/// side thread so the child cannot zombie and the UI never blocks.
+fn open_url(url: &str) {
+    match std::process::Command::new("xdg-open").arg(url).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        },
+        Err(err) => warn!("opening {url}: {err}"),
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // fit the grid to the viewport: rounded-down cell counts, so the
@@ -384,7 +441,18 @@ impl Render for TerminalView {
 
         let snapshot = self.engine.snapshot();
         let font_size = px(self.theme.font_size_px());
-        let rows = snapshot.rows.iter().map(|row| self.row_render(row)).collect();
+        let rows: Vec<Arc<RowRender>> =
+            snapshot.rows.iter().map(|row| self.row_render(row)).collect();
+
+        // the URL under the pointer, if the pointer is over one: the paint
+        // pass underlines it and claims the pointing-hand cursor
+        let url_hover = self.hover.and_then(|(row, col)| {
+            let spans = &rows.get(row)?.url_spans;
+            spans
+                .iter()
+                .find(|(start, len)| col >= *start && col < start + len)
+                .map(|&(start, len)| (row, start, len))
+        });
 
         // one div for interactivity, one canvas for the painted grid. No
         // flex layout in the paint path
@@ -397,6 +465,7 @@ impl Render for TerminalView {
             fg: self.theme.foreground,
             display_offset: snapshot.display_offset,
             selection: snapshot.selection,
+            url_hover,
             selection_color: {
                 let mut color = hsla_of(self.theme.cursor);
                 color.a *= 0.35;
@@ -427,6 +496,12 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                // leaving the window must not leave a stale underline
+                if !hovered && this.hover.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_click(cx.listener(|this, _event: &gpui::ClickEvent, window, cx| {
                 window.focus(&this.focus, cx);
             }))
@@ -506,6 +581,8 @@ struct RowRender {
     bg_quads: Vec<(usize, usize, Rgb8)>,
     /// cells the vector layer draws
     glyphs: Vec<CellGlyph>,
+    /// URLs in the row, cell aligned: (start column, length)
+    url_spans: Vec<(usize, usize)>,
 }
 
 /// A cell the vector layer draws: grid column, the glyph, its color.
@@ -644,7 +721,74 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
     }
     flush_bg_at_end(&mut bg_quads, bg_open.take());
 
-    RowRender { key: 0, text, runs, bg_quads, glyphs }
+    RowRender { key: 0, text, runs, bg_quads, glyphs, url_spans: url_spans(row, end) }
+}
+
+/// True when `c` may appear inside a URL run. Everything RFC 3986 allows
+/// in a path or query, minus the brackets (they glue markdown links) and
+/// quotes (they glue prose like www.example.com's; real URLs
+/// percent-encode them). Trailing punctuation is handled by the trim,
+/// not by exclusion.
+fn is_url_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '-' | '.' | '_' | '~' | ':' | '/' | '?' | '#' | '@' | '!' | '$' | '&' | '*' | '+'
+                | ',' | ';' | '=' | '%' | '('
+        )
+}
+
+/// Characters trimmed off a URL run's end: a link inside a sentence does
+/// not include the sentence's punctuation.
+fn is_url_trailing(c: char) -> bool {
+    matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"')
+}
+
+/// URL spans as (start column, length) over the row's visible cells up to
+/// `end`. A run starts at a scheme or a bare www. and extends over
+/// URL-safe characters; runs are ASCII only, so length in characters is
+/// length in columns.
+fn url_spans(row: &Row, end: usize) -> Vec<(usize, usize)> {
+    const SCHEMES: [&str; 4] = ["https://", "http://", "file://", "mailto:"];
+
+    // visible characters with their grid columns
+    let mut chars: Vec<(char, usize)> = Vec::with_capacity(end);
+    let mut col = 0usize;
+    for i in 0..end {
+        if row.cells[i].spacer {
+            continue;
+        }
+        chars.push((row.cells[i].c, col));
+        col += cell_width(row, i);
+    }
+
+    let starts = |at: usize, pattern: &str| {
+        pattern.chars().enumerate().all(|(k, pc)| {
+            chars.get(at + k).is_some_and(|&(c, _)| c == pc)
+        })
+    };
+
+    let mut spans = Vec::new();
+    let mut at = 0usize;
+    while at < chars.len() {
+        let scheme = SCHEMES.iter().find(|s| starts(at, s));
+        let bare_www = starts(at, "www.")
+            && at.checked_sub(1).is_none_or(|prev| !is_url_char(chars[prev].0));
+        let head = scheme.map_or_else(|| bare_www.then_some(4), |s| Some(s.len()));
+        if let Some(mut len) = head {
+            while at + len < chars.len() && is_url_char(chars[at + len].0) {
+                len += 1;
+            }
+            while len > head.unwrap() && is_url_trailing(chars[at + len - 1].0) {
+                len -= 1;
+            }
+            spans.push((chars[at].1, len));
+            at += len;
+        } else {
+            at += 1;
+        }
+    }
+    spans
 }
 
 /// Push a finished background quad if it covers anything.
@@ -681,6 +825,9 @@ struct GridPaint {
     /// selection highlight, viewport row spans
     selection: Vec<SelectSpan>,
     selection_color: gpui::Hsla,
+    /// the hovered URL: (row, start column, length), empty when the
+    /// pointer is not over a link
+    url_hover: Option<(usize, usize, usize)>,
 }
 impl GridPaint {
     fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
@@ -743,6 +890,35 @@ impl GridPaint {
                     warn!("row paint failed: {err}");
                 }
             }
+
+            // the hovered URL: underline under its columns
+            if let Some((row, start, len)) = self.url_hover {
+                if row == iy {
+                    let quad_bounds = Bounds::new(
+                        point(
+                            origin.x + px(start as f32 * self.cell_w),
+                            row_y + px(self.cell_h - 2.0),
+                        ),
+                        size(px(len as f32 * self.cell_w), px(1.5)),
+                    );
+                    window.paint_quad(fill(quad_bounds, hsla_of(self.fg)));
+                }
+            }
+        }
+
+        // the pointing hand over the hovered link: a hitbox exactly the
+        // span's cell rect, so the cursor reverts the moment the pointer
+        // leaves it (or the link scrolls away)
+        if let Some((row, start, len)) = self.url_hover {
+            let rect = Bounds::new(
+                point(
+                    origin.x + px(start as f32 * self.cell_w),
+                    origin.y + px(row as f32 * self.cell_h),
+                ),
+                size(px(len as f32 * self.cell_w), px(self.cell_h)),
+            );
+            let hitbox = window.insert_hitbox(rect, gpui::HitboxBehavior::Normal);
+            window.set_cursor_style(gpui::CursorStyle::PointingHand, &hitbox);
         }
 
         // scrolled back into history: a thin edge mark, since the
@@ -783,6 +959,85 @@ mod tests {
 
     fn font() -> gpui::Font {
         gpui::Font { family: "monospace".into(), ..Default::default() }
+    }
+
+    fn row_of(s: &str) -> Row {
+        Row { cells: s.chars().map(cell).collect() }
+    }
+
+    fn spans_of(s: &str) -> Vec<(usize, usize)> {
+        let row = row_of(s);
+        url_spans(&row, row.cells.len())
+    }
+
+    fn span_text(s: &str, span: (usize, usize)) -> String {
+        s[span.0..span.0 + span.1].to_string()
+    }
+
+    #[test]
+    fn url_spans_catch_schemes_and_bare_www() {
+        assert_eq!(
+            spans_of("see https://kuma.dev/x?q=1 now").iter().map(|&s| span_text("see https://kuma.dev/x?q=1 now", s)).collect::<Vec<_>>(),
+            vec!["https://kuma.dev/x?q=1"]
+        );
+        assert_eq!(spans_of("http://a.b"), vec![(0, 10)]);
+        assert_eq!(
+            spans_of("at www.example.com's page, ok").iter().map(|&s| span_text("at www.example.com's page, ok", s)).collect::<Vec<_>>(),
+            vec!["www.example.com"]
+        );
+        assert_eq!(spans_of("mailto:a@b.co"), vec![(0, 13)]);
+        assert_eq!(spans_of("file:///tmp/x"), vec![(0, 13)]);
+    }
+
+    #[test]
+    fn url_spans_trim_trailing_punctuation() {
+        // a link in a sentence does not include the full stop
+        assert_eq!(span_text("(go https://x.io/a.)", spans_of("(go https://x.io/a.)")[0]), "https://x.io/a");
+        assert_eq!(span_text("https://x.io/a,", spans_of("https://x.io/a,")[0]), "https://x.io/a");
+        // commas inside paths stay
+        assert_eq!(span_text("https://x.io/a,b", spans_of("https://x.io/a,b")[0]), "https://x.io/a,b");
+    }
+
+    #[test]
+    fn url_spans_ignore_plain_words_and_partial_schemes() {
+        assert!(spans_of("https is a word").is_empty());
+        assert!(spans_of("htps://typo.io").is_empty());
+        assert!(spans_of("plain text only").is_empty());
+        // a scheme needs its slashes
+        assert!(spans_of("http:x").is_empty());
+    }
+
+    #[test]
+    fn url_spans_survive_wide_neighbors() {
+        // wide chars before the link: columns still line up
+        let mut cells = vec![cell('字'), cell(' '), cell(' '), cell('文'), cell(' ')];
+        cells[1].spacer = true;
+        cells[4].spacer = true;
+        cells.extend("https://x.io".chars().map(cell));
+        let row = Row { cells };
+        let spans = url_spans(&row, row.cells.len());
+        // 字(2 cols) spacer(0) space(1) 文(2) spacer(0): the URL starts
+        // at column 5, and ASCII length is column length
+        assert_eq!(spans, vec![(5, 12)]);
+        let mut url = String::new();
+        for cell in &row.cells[5..5 + 12] {
+            if !cell.spacer {
+                url.push(cell.c);
+            }
+        }
+        assert_eq!(url, "https://x.io");
+    }
+
+    #[test]
+    fn url_spans_stop_at_wide_chars() {
+        let mut cells: Vec<RenderCell> = "https://x.io/".chars().map(cell).collect();
+        let wide = cell('字');
+        cells.push(wide);
+        cells.push(cell(' '));
+        cells.push(RenderCell { spacer: true, ..cell(' ') });
+        let row = Row { cells };
+        let spans = url_spans(&row, row.cells.len());
+        assert_eq!(spans, vec![(0, 13)]);
     }
 
     #[test]
