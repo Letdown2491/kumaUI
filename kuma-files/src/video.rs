@@ -55,12 +55,18 @@ pub(crate) fn duration_label(seconds: f64) -> Option<String> {
 /// comes up empty. None when the file is unreadable, undecodable,
 /// or has no video stream.
 pub(crate) fn decode_poster(path: &Path, max: u32) -> Option<gpui::RenderImage> {
+    poster_dynamic(path, max).map(|image| icons::decode_to_render(image, max, max))
+}
+
+/// The poster's dynamic twin: the fitted RGBA pixels as a plain
+/// `DynamicImage`, pre-swap, for the grid thumb job's disk cache.
+pub(crate) fn poster_dynamic(path: &Path, max: u32) -> Option<image::DynamicImage> {
     ffmpeg::init().ok()?;
     ffmpeg::log::set_level(ffmpeg::log::Level::Error);
     poster(path, max, false).or_else(|| poster(path, max, true))
 }
 
-fn poster(path: &Path, max: u32, from_head: bool) -> Option<gpui::RenderImage> {
+fn poster(path: &Path, max: u32, from_head: bool) -> Option<image::DynamicImage> {
     let mut ictx = ffmpeg::format::input(path).ok()?;
     let stream = ictx.streams().best(ffmpeg::media::Type::Video)?;
     let video_index = stream.index();
@@ -110,11 +116,7 @@ fn poster(path: &Path, max: u32, from_head: bool) -> Option<gpui::RenderImage> {
                 buf.extend_from_slice(&data[row * stride..row * stride + w * 4]);
             }
             let image = image::RgbaImage::from_raw(w as u32, h as u32, buf)?;
-            return Some(icons::decode_to_render(
-                image::DynamicImage::ImageRgba8(image),
-                max,
-                max,
-            ));
+            return Some(image::DynamicImage::ImageRgba8(image));
         }
     }
     None
