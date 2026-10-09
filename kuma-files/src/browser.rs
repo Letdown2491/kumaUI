@@ -1302,12 +1302,21 @@ pub(crate) struct Browser {
     /// The open epub's metadata (title, author, cover flag), landed
     /// by the same background decode; reset on file flips.
     ql_book: Option<epub::BookMeta>,
-    /// The one held epub chapter's glance blocks, keyed by path and
-    /// page (chapters count from 1; the cover is page 0). Plain
-    /// data, no atlas tile: replacing it is enough.
-    ql_chapter: Option<(PathBuf, usize, Vec<epub::ChapterBlock>)>,
-    /// The chapter read in flight, if any.
-    ql_chapter_inflight: Option<(PathBuf, usize)>,
+    /// The open epub's reading pane: spine chapters decoded in order
+    /// by one background chain, blocks appending as each lands.
+    /// Plain data, no tile.
+    ql_text_blocks: Arc<Vec<epub::ChapterBlock>>,
+    /// Block index where each decoded chapter starts (chapter k is
+    /// starts[k - 1]); a failed chapter's marker gets one too.
+    ql_text_starts: Vec<usize>,
+    /// The book the accumulation belongs to; set once starts the
+    /// chain, cleared on flip kills it.
+    ql_text_for: Option<PathBuf>,
+    /// Where the reader is in an epub: 0 is the cover, k >= 1 is
+    /// chapter k at the last jump or scroll.
+    ql_book_at: usize,
+    /// The epub reading pane's list state (item counts ride it).
+    ql_book_state: gpui::ListState,
     /// The overlay's text column scrolls through the snippet.
     ql_scroll: gpui::ScrollHandle,
     /// Hand-rolled right-click menu: position plus a flat item list.
@@ -1410,8 +1419,11 @@ impl Browser {
             ql_failed: None,
             ql_counting: false,
             ql_book: None,
-            ql_chapter: None,
-            ql_chapter_inflight: None,
+            ql_text_blocks: Arc::new(Vec::new()),
+            ql_text_starts: Vec::new(),
+            ql_text_for: None,
+            ql_book_at: 0,
+            ql_book_state: gpui::ListState::new(0, gpui::ListAlignment::Top, px(256.)),
             ql_scroll: gpui::ScrollHandle::new(),
             menu: None,
             grid_row_len: Arc::new(AtomicUsize::new(0)),
@@ -1445,6 +1457,26 @@ impl Browser {
             search_gen: 0,
             searching: false,
         };
+        // the epub reading pane's indicator follows the wheel: the
+        // chapter under the visible top becomes the position, so the
+        // label never lies about where the reader is
+        let entity = cx.entity();
+        browser.ql_book_state.set_scroll_handler(move |event, _, cx| {
+            entity.update(cx, |browser, cx| {
+                if browser.ql_book_at == 0 {
+                    return;
+                }
+                let at = browser
+                    .ql_text_starts
+                    .iter()
+                    .rposition(|&start| start <= event.visible_range.start)
+                    .map_or(1, |i| i + 1);
+                if at != browser.ql_book_at {
+                    browser.ql_book_at = at;
+                    cx.notify();
+                }
+            });
+        });
         browser.load_state(cli_dir.as_deref());
         let show_hidden = browser.show_hidden;
         browser.tab_mut().reload(show_hidden);
@@ -4064,8 +4096,13 @@ impl Browser {
                 ql.page = if icons::is_epub(&entry.name) { 0 } else { 1 };
                 ql.pages = None;
                 self.ql_counting = false;
-                self.ql_chapter = None;
-                self.ql_chapter_inflight = None;
+                // the epub reading chain dies here: the next landing
+                // sees a foreign book and stops
+                self.ql_text_for = None;
+                self.ql_text_blocks = Arc::new(Vec::new());
+                self.ql_text_starts = Vec::new();
+                self.ql_book_at = 0;
+                self.ql_book_state.reset(0);
                 self.ql_text = None;
                 self.ql_text_inflight = None;
                 self.ql_text_failed = None;
@@ -4138,11 +4175,11 @@ impl Browser {
     }
 
     /// PageUp/PageDown/Home/End: turn pages of the document under
-    /// view, a PDF's pages or an epub's spine chapters (an epub's
-    /// cover is page 0, so PageUp from chapter 1 lands back on it).
-    /// No-ops while the count is unknown. Zoom and pan reset with
-    /// the page, same as a file flip: a page is a new picture; the
-    /// scroll resets too, a chapter starts at its top.
+    /// view. A PDF pages through its pages. An epub has no pages, so
+    /// the pager jumps spine chapters: position 0 is the cover
+    /// (PageUp from chapter 1 settles back onto it), k >= 1 is
+    /// chapter k, and the reading pane scrolls to that chapter's
+    /// first block. No-ops while the count is unknown.
     fn quicklook_page(&mut self, target: usize, cx: &mut Context<Self>) {
         let Some(ql) = self.quicklook.as_mut() else {
             return;
@@ -4150,9 +4187,22 @@ impl Browser {
         let Some(pages) = ql.pages else {
             return;
         };
-        let name = ql.path.file_name().unwrap_or_default().to_string_lossy();
-        let min = if icons::is_epub(&name) { 0 } else { 1 };
-        let next = target.clamp(min, pages);
+        let is_epub = icons::is_epub(&ql.path.file_name().unwrap_or_default().to_string_lossy());
+        if is_epub {
+            let next = target.clamp(0, pages);
+            if next == self.ql_book_at {
+                return;
+            }
+            self.ql_book_at = next;
+            cx.notify();
+            if next == 0 {
+                // the cover: the image slot already holds it
+                return;
+            }
+            self.jump_book_chapter(next);
+            return;
+        }
+        let next = target.clamp(1, pages);
         if next == ql.page {
             return;
         }
@@ -4163,27 +4213,24 @@ impl Browser {
         cx.notify();
         self.ql_scroll.set_offset(point(px(0.), px(0.)));
         let path = ql.path.clone();
-        if next == 0 {
-            // the cover: the image slot already holds it, no read
-            return;
-        }
-        if min == 0 {
-            self.request_quicklook_chapter(path, next, cx);
-        } else {
-            self.request_quicklook_render(path, next, cx);
-        }
+        self.request_quicklook_render(path, next, cx);
     }
 
-    /// One page step from the current page (negative is back),
+    /// One page step from the current position (negative is back),
     /// clamped by the known count. The keyboard twin of the header
     /// chevrons: arrows step by file, shift+arrows and the page keys
-    /// step by page. Steps may reach 0 before the clamp: that is an
-    /// epub settling back on its cover.
+    /// step by page or chapter. Steps may reach 0 before the clamp:
+    /// that is an epub settling back on its cover.
     fn quicklook_page_step(&mut self, step: isize, cx: &mut Context<Self>) {
-        let Some(page) = self.quicklook.as_ref().map(|ql| ql.page) else {
-            return;
+        let is_epub = self.quicklook.as_ref().is_some_and(|ql| {
+            icons::is_epub(&ql.path.file_name().unwrap_or_default().to_string_lossy())
+        });
+        let at = if is_epub {
+            self.ql_book_at
+        } else {
+            self.quicklook.as_ref().map(|ql| ql.page).unwrap_or(1)
         };
-        let target = (page as isize + step).max(0) as usize;
+        let target = (at as isize + step).max(0) as usize;
         self.quicklook_page(target, cx);
     }
 
@@ -4232,12 +4279,22 @@ impl Browser {
                     }
                 })
                 .await;
+            let open_path = path.clone();
             let update = this.update(cx, |this, cx| {
                 if let Some(ql) = this.quicklook.as_mut()
                     && ql.path == path
                 {
                     ql.pages = pages;
                     cx.notify();
+                }
+                // an epub's spine count wakes the reading chain: the
+                // whole book decodes in order while the cover shows
+                let is_epub = this
+                    .quicklook
+                    .as_ref()
+                    .is_some_and(|ql| ql.path == open_path);
+                if pages.is_some() && is_epub {
+                    this.request_book_text(open_path, cx);
                 }
             });
             if let Err(err) = update {
@@ -4383,78 +4440,90 @@ impl Browser {
         .detach();
     }
 
-    /// Kick the background read for an epub chapter (spine order;
-    /// chapters count from 1, the cover is page 0). Same supersede
-    /// discipline as the decode slot, but chapters are plain text,
-    /// so there are no atlas tiles to drop (ADR-0016 does not
-    /// apply): a stale landing drops itself. A failed chapter
-    /// reverts the counter to the held chapter, or turns paging
-    /// dormant when nothing is held and nothing else is pending (a
-    /// spine that would not read twice will not read third time).
-    fn request_quicklook_chapter(&mut self, path: PathBuf, page: usize, cx: &mut Context<Self>) {
-        if self
-            .ql_chapter
-            .as_ref()
-            .is_some_and(|(p, pg, _)| *p == path && *pg == page)
-            || self.ql_chapter_inflight.as_ref() == Some(&(path.clone(), page))
-        {
+    /// Scroll the epub reading pane to a chapter's first block once
+    /// the chain has decoded it. A jump onto not-yet-decoded text
+    /// re-applies from each chain landing, so an early PageDown
+    /// settles when the chapter arrives.
+    fn jump_book_chapter(&self, chapter: usize) {
+        if let Some(&ix) = self.ql_text_starts.get(chapter - 1) {
+            self.ql_book_state
+                .scroll_to(gpui::ListOffset {
+                    item_ix: ix,
+                    offset_in_item: px(0.),
+                });
+        }
+    }
+
+    /// Start the epub reading chain: spine chapters decode in order
+    /// in the background, blocks appending as each lands, until the
+    /// book ends or a chapter fails (the tail then carries a marker
+    /// and the chain stops: a corrupt container rarely heals between
+    /// chapters). One chain per open book; a flip clears the book
+    /// slot and the next landing dies.
+    fn request_book_text(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.ql_text_for.as_ref() == Some(&path) {
             return;
         }
-        self.ql_chapter_inflight = Some((path.clone(), page));
+        let Some(pages) = self.quicklook.as_ref().and_then(|ql| ql.pages) else {
+            return;
+        };
+        self.ql_text_for = Some(path.clone());
         cx.spawn(async move |this, cx| {
-            let bg_path = path.clone();
-            let text = cx
-                .background_spawn(async move {
-                    std::panic::catch_unwind(|| crate::epub::read_chapter(&bg_path, page))
-                        .unwrap_or(None)
-                })
-                .await;
-            let update = this.update(cx, |this, cx| {
-                if this.ql_chapter_inflight.as_ref() == Some(&(path.clone(), page)) {
-                    this.ql_chapter_inflight = None;
-                }
-                let Some(text) = text else {
-                    let held = this
-                        .ql_chapter
-                        .as_ref()
-                        .filter(|(p, _, _)| *p == path)
-                        .map(|(_, pg, _)| *pg);
-                    // another chapter may already be in flight: it
-                    // decides what shows, so do not fight it here
-                    let pending = this
-                        .ql_chapter_inflight
-                        .as_ref()
-                        .is_some_and(|(p, _)| *p == path);
-                    if let Some(ql) = this.quicklook.as_mut()
-                        && ql.path == path
-                    {
-                        match held {
-                            Some(held_page) if ql.page != held_page => {
-                                ql.page = held_page;
-                                cx.notify();
-                            }
-                            None if !pending => {
-                                ql.pages = None;
-                                cx.notify();
-                            }
-                            _ => {}
-                        }
+            for chapter in 1..=pages {
+                let bg_path = path.clone();
+                let blocks = cx
+                    .background_spawn(async move {
+                        std::panic::catch_unwind(|| crate::epub::read_chapter(&bg_path, chapter))
+                            .unwrap_or(None)
+                    })
+                    .await;
+                let mut stop = false;
+                let update = this.update(cx, |this, cx| {
+                    // flipped away: the chain dies here
+                    if this.ql_text_for.as_ref() != Some(&path) {
+                        stop = true;
+                        return;
                     }
-                    return;
-                };
-                // only the open file's current page shows; a stale
-                // landing just drops (there is no tile)
-                if this
-                    .quicklook
-                    .as_ref()
-                    .is_some_and(|ql| ql.path == path && ql.page == page)
-                {
-                    this.ql_chapter = Some((path, page, text));
+                    let Some(text) = blocks else {
+                        stop = true;
+                        let marker = format!("… chapter {chapter} failed to read");
+                        let len = marker.len();
+                        let mut grown = (*this.ql_text_blocks).clone();
+                        this.ql_text_starts.push(grown.len());
+                        grown.push(epub::ChapterBlock::Para {
+                            text: marker,
+                            runs: vec![epub::ChapterRun {
+                                len,
+                                italic: true,
+                                bold: false,
+                            }],
+                            quote: true,
+                        });
+                        this.ql_text_blocks = Arc::new(grown);
+                        this.ql_book_state.reset(this.ql_text_blocks.len());
+                        cx.notify();
+                        return;
+                    };
+                    // append the chapter's blocks and remember where
+                    // it starts so jumps can land on it
+                    let mut all = (*this.ql_text_blocks).clone();
+                    this.ql_text_starts.push(all.len());
+                    all.extend(text);
+                    this.ql_text_blocks = Arc::new(all);
+                    this.ql_book_state.reset(this.ql_text_blocks.len());
+                    // honor a pending jump onto not-yet-decoded text
+                    if this.ql_book_at >= 1 {
+                        this.jump_book_chapter(this.ql_book_at);
+                    }
                     cx.notify();
+                });
+                if let Err(err) = update {
+                    log::error!("book text chain failed: {err:#}");
+                    return;
                 }
-            });
-            if let Err(err) = update {
-                log::error!("quick look chapter failed: {err:#}");
+                if stop {
+                    return;
+                }
             }
         })
         .detach();
@@ -6689,11 +6758,12 @@ impl Browser {
             .as_ref()
             .filter(|_| is_pdf || is_epub)
             .and_then(|ql| ql.pages.map(|pages| (ql.page, pages)));
+        let book_at = self.ql_book_at;
         let page_label = paging.and_then(|(page, pages)| {
             if is_pdf {
                 Some(format!("page {page} / {pages}"))
-            } else if page >= 1 {
-                Some(format!("chapter {page} / {pages}"))
+            } else if book_at >= 1 {
+                Some(format!("chapter {book_at} / {pages}"))
             } else {
                 None
             }
@@ -6786,21 +6856,14 @@ impl Browser {
             );
 
         // the pane: what renders depends on what the entry is.
-        // An epub chapter's text wins when one is showing; the cover
-        // lingers while the next chapter reads (same book, close
-        // content: the stale-tile rule applied to text). A held tile
-        // for this file stays up while the next page decodes; file
-        // flips drop the tile in sync, so a foreign file never shows
-        // here
+        // An epub's reading pane wins once the reader has left the
+        // cover; the cover lingers until the first chapter's blocks
+        // land (same book, close content: the stale-tile rule
+        // applied to text). A held tile for this file stays up while
+        // the next page decodes; file flips drop the tile in sync,
+        // so a foreign file never shows here
         let ql_page = self.quicklook.as_ref().map(|ql| ql.page).unwrap_or(0);
-        let chapter = if is_epub && ql_page >= 1 {
-            self.ql_chapter
-                .as_ref()
-                .filter(|(p, pg, _)| *p == entry.path && *pg == ql_page)
-                .map(|(_, _, blocks)| blocks.clone())
-        } else {
-            None
-        };
+        let reading = is_epub && self.ql_book_at >= 1 && !self.ql_text_blocks.is_empty();
         let image = self.ql_render.as_ref().and_then(|(path, _, render)| {
             // on an epub only the cover (page 0) shows as an image
             (path == &entry.path && !entry.is_dir && (!is_epub || ql_page == 0))
@@ -6810,29 +6873,18 @@ impl Browser {
         let full_text = self.ql_text.as_ref().and_then(|(p, preview)| {
             (p == &entry.path && !entry.is_dir).then(|| preview.clone())
         });
-        let pane: Div = if let Some(blocks) = chapter {
-            // tag-carried typography only: paragraphs wrap, headings
-            // size, quotes indent; no CSS is honored here
-            let column = div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .text_size(px(13.))
-                .text_color(theme::text())
-                .children(blocks.iter().map(chapter_block_view));
+        let pane: Div = if reading {
+            // the whole spine as one continuous scroll: deferred
+            // blocks (list, variable heights), chapters decoded in
+            // order by the background chain
+            let blocks = self.ql_text_blocks.clone();
             div()
                 .flex_1()
                 .overflow_hidden()
                 .m_3()
-                .child(
-                    div()
-                        .id("quicklook-chapter")
-                        .overflow_y_scroll()
-                        .track_scroll(&self.ql_scroll)
-                        .w_full()
-                        .child(column),
-                )
+                .child(list(self.ql_book_state.clone(), move |ix, _, _| {
+                    chapter_block_view(&blocks[ix]).into_any_element()
+                }))
         } else if let Some(render) = image {
             let viewport = window.viewport_size();
             // the pane's own budget: this overlay's top row and the
@@ -6884,7 +6936,14 @@ impl Browser {
                 TextKind::Markdown => match preview.blocks.filter(|b| !b.is_empty()) {
                     Some(blocks) => div().flex_1().overflow_hidden().m_3().child(list(
                         self.ql_md_state.clone(),
-                        move |ix, _, _| md_block_view(&blocks[ix]),
+                        move |ix, _, _| {
+                            div()
+                                .text_size(px(13.))
+                                .pb_2()
+                                .text_color(theme::text())
+                                .child(md_block_view(&blocks[ix]))
+                                .into_any_element()
+                        },
                     )),
                     None => line_list_pane(preview.lines.clone(), &self.ql_text_scroll),
                 },
@@ -9518,7 +9577,8 @@ struct TextPreview {
 /// the image zoom and pan, an active drag's anchor (the pointer
 /// position the press started at, plus the pan it started from), and
 /// the PDF page under view (`pages` is the count from pdfinfo, `None`
-/// while unknown: paging hides itself).
+/// while unknown: paging hides itself). For an epub `page` stays 0,
+/// the cover; the reader's position lives in `ql_book_at`.
 #[derive(Clone, Debug, PartialEq)]
 struct QuickLook {
     path: PathBuf,
@@ -9589,12 +9649,13 @@ fn chapter_block_view(block: &epub::ChapterBlock) -> Div {
             };
             div()
                 .w_full()
+                .pb_2()
                 .text_size(px(size))
                 .child(chapter_runs_view(text, runs, theme::text(), true))
         }
         epub::ChapterBlock::Para { text, runs, quote } => {
             let color = if *quote { theme::text_dim() } else { theme::text() };
-            let mut pane = div().w_full();
+            let mut pane = div().w_full().text_size(px(13.)).pb_2();
             if *quote {
                 pane = pane.ml_4();
             }
@@ -11370,8 +11431,8 @@ mod browser_ux_keys {
     }
 
     #[test]
-    fn quick_look_epub_pages_flip_through_spine_chapters() {
-        let lab = Lab::new("quicklook-epub-chapters");
+    fn quick_look_epub_reads_continuously_and_the_pager_jumps_chapters() {
+        let lab = Lab::new("quicklook-epub-continuous");
         let opf = br#"<?xml version="1.0"?>
             <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
               <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -11408,54 +11469,103 @@ mod browser_ux_keys {
             browser.route_key(&key("space"), cx);
             assert!(browser.quicklook.is_some());
         });
-        app.run_until_parked(); // meta, cover slot, and spine count land
+        app.run_until_parked(); // count, cover, and the whole spine land
         window.update(|browser, _, cx| {
             let ql = browser.quicklook.as_ref().unwrap();
-            // an epub opens on its cover: page 0, count known
+            // an epub opens on its cover: position 0, count known
             assert_eq!(ql.page, 0);
             assert_eq!(ql.pages, Some(2));
-            // into chapter 1, then chapter 2
+            assert_eq!(browser.ql_book_at, 0);
+            // the chain decoded the whole spine while the cover showed
+            let blocks = browser.ql_text_blocks.clone();
+            assert_eq!(blocks.len(), 3, "h1 + para, then the second para");
+            assert_eq!(browser.ql_text_starts, vec![0, 2]);
+            let text = crate::epub::tests::blocks_text(&blocks);
+            assert!(text.contains("alpha body text"));
+            assert!(text.contains("beta body text"));
+            // pagedown leaves the cover for chapter 1, then 2
             browser.route_key(&key("pagedown"), cx);
-            assert_eq!(browser.quicklook.as_ref().unwrap().page, 1);
+            assert_eq!(browser.ql_book_at, 1);
             browser.route_key(&key("pagedown"), cx);
-            assert_eq!(browser.quicklook.as_ref().unwrap().page, 2);
+            assert_eq!(browser.ql_book_at, 2);
             // pagedown at the last chapter: clamped no-op
             browser.route_key(&key("pagedown"), cx);
-            assert_eq!(browser.quicklook.as_ref().unwrap().page, 2);
-        });
-        app.run_until_parked(); // the chapter reads land
-        window.update(|browser, _, cx| {
-            // the held chapter is the one the counter shows; chapter
-            // 1's earlier landing was already stale and dropped
-            let (p, pg, blocks) = browser.ql_chapter.as_ref().unwrap();
-            assert_eq!(*p, lab.dir.join("zz.epub"));
-            assert_eq!(*pg, 2);
-            let text = crate::epub::tests::blocks_text(blocks);
-            assert!(text.contains("beta body text"));
-            assert!(!text.contains("alpha body text"));
-            // pageup: back to chapter 1 (a fresh read), then the cover
+            assert_eq!(browser.ql_book_at, 2);
+            // pageup: chapter 1, then the cover, floored there
             browser.route_key(&key("pageup"), cx);
-            assert_eq!(browser.quicklook.as_ref().unwrap().page, 1);
+            assert_eq!(browser.ql_book_at, 1);
             browser.route_key(&key("pageup"), cx);
-            assert_eq!(browser.quicklook.as_ref().unwrap().page, 0);
-            // pageup at the cover: the floor for an epub is 0
+            assert_eq!(browser.ql_book_at, 0);
             browser.route_key(&key("pageup"), cx);
-            assert_eq!(browser.quicklook.as_ref().unwrap().page, 0);
-        });
-        app.run_until_parked();
-        // back into chapter 1: a fresh read (the earlier landing was
-        // stale by the cover)
-        window.update(|browser, _, cx| {
-            browser.route_key(&key("pagedown"), cx);
+            assert_eq!(browser.ql_book_at, 0);
+            // end and home: the last chapter, then the first
+            browser.route_key(&key("end"), cx);
+            assert_eq!(browser.ql_book_at, 2);
+            browser.route_key(&key("home"), cx);
+            assert_eq!(browser.ql_book_at, 1);
+            // back to the cover: the text pane stays; the cover shows
+            browser.route_key(&key("pageup"), cx);
+            assert_eq!(browser.ql_book_at, 0);
+            // flipping files resets the reader: chain killed, panes empty
+            browser.quicklook_flip(-1, cx);
         });
         app.run_until_parked();
         window.update(|browser, _, _| {
-            let (_, pg, blocks) = browser.ql_chapter.as_ref().unwrap();
-            assert_eq!(*pg, 1);
-            assert!(crate::epub::tests::blocks_text(blocks).contains("alpha body text"));
+            assert!(browser.ql_text_blocks.is_empty());
+            assert!(browser.ql_text_starts.is_empty());
+            assert_eq!(browser.ql_text_for, None);
+            assert_eq!(browser.ql_book_at, 0);
         });
     }
 
+    #[test]
+    fn quick_look_epub_chain_marks_a_failed_chapter_and_stops() {
+        let lab = Lab::new("quicklook-epub-gap");
+        let opf = br#"<?xml version="1.0"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"/>
+              <manifest>
+                <item id="c1" href="ch1.xhtml"/>
+                <item id="c2" href="missing.xhtml"/>
+                <item id="c3" href="ch3.xhtml"/>
+              </manifest>
+              <spine><itemref idref="c1"/><itemref idref="c2"/><itemref idref="c3"/></spine>
+            </package>"#;
+        let container = br#"<?xml version="1.0"?>
+            <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+              <rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles>
+            </container>"#;
+        let ch1: &[u8] = b"<html><body><p>alpha body text</p></body></html>";
+        let ch3: &[u8] = b"<html><body><p>gamma body text</p></body></html>";
+        let bytes = crate::epub::tests::write_epub(&[
+            ("META-INF/container.xml", container),
+            ("OEBPS/content.opf", opf),
+            ("OEBPS/ch1.xhtml", ch1),
+            ("OEBPS/ch3.xhtml", ch3),
+        ]);
+        fs::write(lab.dir.join("zz.epub"), bytes).unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.jump_cursor(4, cx); // zz.epub
+            browser.route_key(&key("space"), cx);
+        });
+        app.run_until_parked(); // the chain runs and hits the gap
+        window.update(|browser, _, _| {
+            let blocks = browser.ql_text_blocks.clone();
+            let text = crate::epub::tests::blocks_text(&blocks);
+            assert!(text.contains("alpha body text"));
+            assert!(text.contains("chapter 2 failed to read"));
+            // the chain stopped: chapter 3 never renders behind the gap
+            assert!(!text.contains("gamma body text"));
+            // the marker is a chapter for the pager too
+            assert_eq!(browser.ql_text_starts.len(), 2);
+            assert_eq!(browser.quicklook.as_ref().unwrap().pages, Some(3));
+        });
+    }
     #[test]
     fn quick_look_corrupt_epub_fails_into_the_card() {
         let lab = Lab::new("quicklook-epub-bad");
