@@ -1308,6 +1308,19 @@ pub(crate) struct Browser {
     /// ask per open path; reset on file flips). Absent tools and
     /// failed reads just leave the label out.
     video_meta_asked: bool,
+    /// The selected video's poster for the details pane, keyed by
+    /// entry key like the text snippet. Grid and search previews
+    /// keep type icons; Quick Look has its own pane-scale poster.
+    sel_video: Option<(PathBuf, Arc<gpui::RenderImage>)>,
+    /// The selected video's duration label, same keying.
+    sel_video_len: Option<(PathBuf, String)>,
+    /// The armed settle kick (key, path): the decode spawns only
+    /// after the selection rests out the delay, and a spent kick
+    /// stays armed so an absent tool cannot respawn per frame.
+    sel_video_kick: Option<(PathBuf, PathBuf)>,
+    /// Bumps on every selection change so a resting timer can tell
+    /// it lost the race.
+    sel_video_gen: usize,
     /// The open epub's reading pane: spine chapters decoded in order
     /// by one background chain, blocks appending as each lands.
     /// Plain data, no tile.
@@ -1427,6 +1440,10 @@ impl Browser {
             ql_book: None,
             ql_video_len: None,
             video_meta_asked: false,
+            sel_video: None,
+            sel_video_len: None,
+            sel_video_kick: None,
+            sel_video_gen: 0,
             ql_text_blocks: Arc::new(Vec::new()),
             ql_text_starts: Vec::new(),
             ql_text_for: None,
@@ -6301,6 +6318,104 @@ impl Browser {
 
     /// The modal overlay for unresolved paste conflicts. `None` (rendered
     /// as no child) when no paste is waiting on a decision.
+    /// Render-time sync for the details pane's video poster: while a
+    /// video sits selected with the pane open, arm a settle kick on
+    /// the first paint and spawn one poster decode (256, the same fn
+    /// the Quick Look pane uses) plus one ffprobe ask once the
+    /// selection has rested out the delay. A fast arrow-through a
+    /// video folder therefore spends one or two ffmpegs, not one per
+    /// entry passed. The grid and the search preview keep type
+    /// icons, always.
+    fn sync_sel_video(&mut self, cx: &mut Context<Self>) {
+        if !self.inspector || self.quicklook.is_some() {
+            // nothing feeds while the pane is closed or Quick Look
+            // owns the preview; a spent kick re-arms on its return
+            self.sel_video_kick = None;
+            return;
+        }
+        let entry = self
+            .tab()
+            .cursor
+            .and_then(|ix| self.tab().entries.get(ix).cloned());
+        let entry = match entry {
+            Some(entry) if !entry.is_dir && icons::is_video(&entry.name) => entry,
+            _ => {
+                // not a video under the cursor: nothing may paint
+                // from a stale slot, and a resting timer must learn
+                // it lost the race
+                if let Some((_, image)) = self.sel_video.take() {
+                    cx.drop_image(image, None);
+                }
+                self.sel_video_len = None;
+                self.sel_video_kick = None;
+                self.sel_video_gen += 1;
+                return;
+            }
+        };
+        let key = entry.key.clone();
+        if self.sel_video.as_ref().is_some_and(|(k, _)| *k == key)
+            && self.sel_video_len.as_ref().is_some_and(|(k, _)| *k == key)
+        {
+            return; // both landed for this selection
+        }
+        if self.sel_video_kick.as_ref().is_some_and(|(k, _)| *k == key) {
+            return; // settle already armed (or spent) for this selection
+        }
+        self.sel_video_len = None;
+        self.sel_video_kick = Some((key.clone(), entry.path.clone()));
+        self.sel_video_gen += 1;
+        let generation = self.sel_video_gen;
+        let path = entry.path.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(200))
+                .await;
+            let still = this
+                .update(cx, |this, _| this.sel_video_gen == generation)
+                .unwrap_or(false);
+            if !still {
+                return;
+            }
+            let bg_path = path.clone();
+            let poster = cx
+                .background_spawn(async move {
+                    std::panic::catch_unwind(|| icons::decode_video_poster(&bg_path, 256))
+                        .unwrap_or(None)
+                })
+                .await;
+            let bg_path = path.clone();
+            let len = cx.background_spawn(async move { icons::video_duration(&bg_path) }).await;
+            let update = this.update(cx, |this, cx| {
+                if this.sel_video_gen != generation {
+                    return; // the selection moved on; both lands are stale
+                }
+                if let Some(render) = poster {
+                    if let Some((_, old)) = this.sel_video.replace((key.clone(), Arc::new(render)))
+                    {
+                        cx.drop_image(old, None);
+                    }
+                }
+                if let Some(len) = len {
+                    this.sel_video_len = Some((key.clone(), len));
+                }
+                cx.notify();
+            });
+            if let Err(err) = update {
+                log::error!("details video poster failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// The length row's value for the selected video, when its
+    /// ffprobe ask landed under the entry's key.
+    fn video_len_label(&self, entry: &Entry) -> Option<String> {
+        self.sel_video_len
+            .as_ref()
+            .filter(|(k, _)| *k == entry.key)
+            .map(|(_, len)| len.clone())
+    }
+
     /// The info panel: preview plus metadata, following the cursor
     /// entry. Nothing is snapshotted; metadata is read fresh each
     /// render (one stat syscall while open). Docked right by default,
@@ -6375,6 +6490,16 @@ impl Browser {
                 ),
             }
             .into_any_element()
+        } else if let Some(render) = entry.and_then(|e| {
+            self.sel_video
+                .as_ref()
+                .filter(|(k, _)| *k == e.key)
+                .map(|(_, r)| r.clone())
+        }) {
+            img(ImageSource::Render(render))
+                .size_full()
+                .object_fit(ObjectFit::Contain)
+                .into_any_element()
         } else if let Some(entry) = entry {
             self.entry_icon(entry, px(56.))
         } else {
@@ -6495,6 +6620,9 @@ impl Browser {
                         .map(|secs| relative_time(secs, now_secs()))
                         .unwrap_or_default(),
                 )
+            }))
+            .children(entry.and_then(|e| self.video_len_label(&e)).map(|len| {
+                prop_row("length", len)
             }))
             .children(entry.map(|_| prop_row("permissions", mode.map(mode_string).unwrap_or_default())));
 
@@ -7941,6 +8069,7 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.arm_watcher();
         self.auto_dock(window);
+        self.sync_sel_video(cx);
         let inspector_docked_bottom = self.inspector_bottom;
 
         // the info rail follows the cursor entry; keep its preview fed
@@ -11783,6 +11912,65 @@ mod browser_ux_keys {
             assert!(!browser.thumbs.contains_key(&lab.dir.join("bad.epub")));
         });
         app.run_until_parked();
+    }
+
+    #[test]
+    fn details_video_settles_then_fails_soft() {
+        let lab = Lab::new("details-video");
+        // the container has no ffmpeg: the poster decode and the
+        // duration ask both come up empty, the icon stands in, and
+        // the spent kick keeps the misses from respawning
+        fs::write(lab.dir.join("clip.mp4"), b"not a video").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // dirs first: sub, a.txt, b.txt, c.txt, clip.mp4
+            browser.jump_cursor(4, cx);
+        });
+        app.run_until_parked(); // the render arms the settle kick
+        window.update(|browser, _, _| {
+            assert!(browser.sel_video_kick.is_some());
+            assert!(browser.sel_video.is_none());
+        });
+        app.advance_clock(std::time::Duration::from_millis(250));
+        app.run_until_parked(); // the timer wakes, the decodes fail soft
+        window.update(|browser, _, _| {
+            // spent, not re-armed: no respawn per frame
+            assert!(browser.sel_video_kick.is_some());
+            assert!(browser.sel_video.is_none());
+            assert!(browser.sel_video_len.is_none());
+        });
+        // selecting a non-video drops everything and kills the timer
+        window.update(|browser, _, cx| {
+            browser.jump_cursor(1, cx); // a.txt
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            assert!(browser.sel_video_kick.is_none());
+            assert!(browser.sel_video_gen > 1);
+        });
+    }
+
+    #[test]
+    fn details_video_length_row_follows_the_key() {
+        let lab = Lab::new("details-video-len");
+        fs::write(lab.dir.join("clip.mp4"), b"not a video").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, _| {
+            let key = browser.tab().entries[4].key.clone();
+            browser.sel_video_len = Some((key, "3:25".to_string()));
+            let entry = browser.tab().entries[4].clone();
+            assert_eq!(browser.video_len_label(&entry).as_deref(), Some("3:25"));
+            let other = browser.tab().entries[1].clone();
+            assert_eq!(browser.video_len_label(&other), None);
+        });
     }
 
     #[test]
