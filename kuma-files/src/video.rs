@@ -15,8 +15,7 @@ use crate::icons;
 /// The container header's facts: duration in seconds when the
 /// container reports one, plus the coded dimensions. No frame is
 /// decoded; everything here is container and codec header.
-pub(crate) fn probe(path: &Path) -> Option<(f64, u32, u32)> {
-    ffmpeg::init().ok()?;
+pub(crate) fn probe(path: &Path) -> Option<(f64, u32, u32)> {    ffmpeg::init().ok()?;
     // libav logs misdetections straight to stderr; the None return
     // is the real signal, keep the journal clean
     ffmpeg::log::set_level(ffmpeg::log::Level::Error);
@@ -31,6 +30,22 @@ pub(crate) fn probe(path: &Path) -> Option<(f64, u32, u32)> {
         .ok()?;
     let (width, height) = (decoder.width(), decoder.height());
     (width > 0 && height > 0).then_some((duration, width, height))
+}
+
+/// Seconds into a wall-clock label ("3.42" reads as "0:03", "3621.4"
+/// as "1:00:21"). NaN, negatives, and other junk read as None.
+pub(crate) fn duration_label(seconds: f64) -> Option<String> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let total = seconds.round() as u64;
+    let (h, rem) = (total / 3600, total % 3600);
+    let (m, s) = (rem / 60, rem % 60);
+    if h > 0 {
+        Some(format!("{h}:{m:02}:{s:02}"))
+    } else {
+        Some(format!("{m}:{s:02}"))
+    }
 }
 
 /// One representative frame as a BGRA `RenderImage`, no more than
@@ -225,5 +240,14 @@ mod tests {
         assert_eq!(probe(Path::new("tests/fixtures/none.mp4")), None);
         assert!(decode_poster(Path::new("Cargo.toml"), 256).is_none());
         assert!(decode_poster(Path::new("tests/fixtures/none.mp4"), 256).is_none());
+    }
+
+    #[test]
+    fn duration_labels() {
+        assert_eq!(duration_label(3.42), Some("0:03".to_string()));
+        assert_eq!(duration_label(59.9), Some("1:00".to_string()));
+        assert_eq!(duration_label(3621.4), Some("1:00:21".to_string()));
+        assert_eq!(duration_label(-5.0), None);
+        assert_eq!(duration_label(f64::NAN), None);
     }
 }

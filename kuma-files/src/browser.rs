@@ -1302,11 +1302,12 @@ pub(crate) struct Browser {
     /// The open epub's metadata (title, author, cover flag), landed
     /// by the same background decode; reset on file flips.
     ql_book: Option<epub::BookMeta>,
-    /// The open video's duration label, when ffprobe answered.
+    /// The open video's duration label, when the container header
+    /// answered.
     ql_video_len: Option<(PathBuf, String)>,
-    /// ffprobe has been asked for the current video's duration (one
-    /// ask per open path; reset on file flips). Absent tools and
-    /// failed reads just leave the label out.
+    /// The container header has been read for the current video's
+    /// duration (one ask per open path; reset on file flips). A
+    /// header that will not read just leaves the label out.
     video_meta_asked: bool,
     /// The selected video's poster for the details pane, keyed by
     /// entry key like the text snippet. Grid and search previews
@@ -4337,10 +4338,11 @@ impl Browser {
         .detach();
     }
 
-    /// ffprobe's duration for the video under Quick Look, one ask
-    /// per open path: the label rides the header like an epub's book
-    /// label. A missing tool or a failed read just leaves the label
-    /// out; the pane still shows its poster or its card.
+    /// The open video's header facts: duration and coded dimensions
+    /// from the container, no decode. One ask per open path; the
+    /// label rides the header like an epub's book label. A header
+    /// that will not read just leaves the label out; the pane still
+    /// shows its poster or its card.
     fn request_video_duration(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.video_meta_asked {
             return;
@@ -4349,7 +4351,13 @@ impl Browser {
         cx.spawn(async move |this, cx| {
             let bg_path = path.clone();
             let label = cx
-                .background_spawn(async move { icons::video_duration(&bg_path) })
+                .background_spawn(async move {
+                    crate::video::probe(&bg_path).and_then(|(secs, w, h)| {
+                        crate::video::duration_label(secs).map(|len| {
+                            format!("{len} · {}\u{d7}{}", w, h)
+                        })
+                    })
+                })
                 .await;
             let update = this.update(cx, |this, cx| {
                 if let Some(label) = label
@@ -4400,7 +4408,7 @@ impl Browser {
         let is_video = icons::is_video(&name);
         // decoding cost is in the file read, not the resize; cap it.
         // epubs read selectively (zip directory, manifest, cover
-        // bytes) and videos stream through ffmpeg's seek, so the
+        // bytes) and videos stream through libav's seek, so the
         // file-size cap does not apply to them
         if !is_epub && !is_video && meta.len() > 32 * 1024 * 1024 {
             self.ql_failed = Some(path);
@@ -4432,7 +4440,7 @@ impl Browser {
                             }
                         } else if is_video {
                             (
-                                icons::decode_video_poster(&bg_path, QL_DECODE_MAX),
+                                crate::video::decode_poster(&bg_path, QL_DECODE_MAX),
                                 None,
                             )
                         } else {
@@ -6321,11 +6329,11 @@ impl Browser {
     /// Render-time sync for the details pane's video poster: while a
     /// video sits selected with the pane open, arm a settle kick on
     /// the first paint and spawn one poster decode (256, the same fn
-    /// the Quick Look pane uses) plus one ffprobe ask once the
+    /// the Quick Look pane uses) plus one header read once the
     /// selection has rested out the delay. A fast arrow-through a
-    /// video folder therefore spends one or two ffmpegs, not one per
-    /// entry passed. The grid and the search preview keep type
-    /// icons, always.
+    /// video folder therefore spends one or two in-process decodes,
+    /// not one per entry passed. The grid and the search preview
+    /// keep type icons, always.
     fn sync_sel_video(&mut self, cx: &mut Context<Self>) {
         if !self.inspector || self.quicklook.is_some() {
             // nothing feeds while the pane is closed or Quick Look
@@ -6379,12 +6387,18 @@ impl Browser {
             let bg_path = path.clone();
             let poster = cx
                 .background_spawn(async move {
-                    std::panic::catch_unwind(|| icons::decode_video_poster(&bg_path, 256))
+                    std::panic::catch_unwind(|| crate::video::decode_poster(&bg_path, 256))
                         .unwrap_or(None)
                 })
                 .await;
             let bg_path = path.clone();
-            let len = cx.background_spawn(async move { icons::video_duration(&bg_path) }).await;
+            let len = cx
+                .background_spawn(async move {
+                    crate::video::probe(&bg_path).and_then(|(secs, _, _)| {
+                        crate::video::duration_label(secs)
+                    })
+                })
+                .await;
             let update = this.update(cx, |this, cx| {
                 if this.sel_video_gen != generation {
                     return; // the selection moved on; both lands are stale
@@ -6408,7 +6422,7 @@ impl Browser {
     }
 
     /// The length row's value for the selected video, when its
-    /// ffprobe ask landed under the entry's key.
+    /// header read landed under the entry's key.
     fn video_len_label(&self, entry: &Entry) -> Option<String> {
         self.sel_video_len
             .as_ref()
@@ -6965,27 +6979,11 @@ impl Browser {
             }
             if label.is_empty() { None } else { Some(label) }
         });
-        // a video's glance: duration plus the poster's own
-        // resolution ("3:25 · 1920×1080")
-        let video_label = self.ql_video_len.as_ref().and_then(|(p, len)| {
-            if *p != entry.path || entry.is_dir || !icons::is_video(&entry.name) {
-                return None;
-            }
-            match self
-                .ql_render
-                .as_ref()
-                .filter(|(rp, _, _)| *rp == entry.path)
-            {
-                Some((_, _, render)) => {
-                    let size = render.size(0);
-                    Some(format!(
-                        "{len} · {}\u{d7}{}",
-                        u32::from(size.width),
-                        u32::from(size.height)
-                    ))
-                }
-                None => Some(len.clone()),
-            }
+        // a video's glance: duration and dimensions straight from
+        // the container header ("3:25 · 1920×1080"), no decode
+        let video_label = self.ql_video_len.as_ref().and_then(|(p, label)| {
+            (*p == entry.path && !entry.is_dir && icons::is_video(&entry.name))
+                .then(|| label.clone())
         });
 
         // the top row: name, position in the listing, the close road
@@ -11814,8 +11812,9 @@ mod browser_ux_keys {
     #[test]
     fn quick_look_video_fails_soft_into_the_card() {
         let lab = Lab::new("quicklook-video");
-        // the container has no ffmpeg: the poster decode fails soft,
-        // the card stands in, and the duration ask is spent quietly
+        // a junk mp4 decodes to nothing in-process: the poster
+        // fails soft, the card stands in, and the header ask is
+        // spent quietly
         fs::write(lab.dir.join("clip.mp4"), b"not a video").unwrap();
         let mut app = gpui::TestApp::with_text_system_and_assets(
             Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
@@ -11917,8 +11916,8 @@ mod browser_ux_keys {
     #[test]
     fn details_video_settles_then_fails_soft() {
         let lab = Lab::new("details-video");
-        // the container has no ffmpeg: the poster decode and the
-        // duration ask both come up empty, the icon stands in, and
+        // a junk mp4 decodes to nothing in-process: the poster and
+        // the length both come up empty, the icon stands in, and
         // the spent kick keeps the misses from respawning
         fs::write(lab.dir.join("clip.mp4"), b"not a video").unwrap();
         let mut app = gpui::TestApp::with_text_system_and_assets(
