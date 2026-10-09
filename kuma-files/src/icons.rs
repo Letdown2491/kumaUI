@@ -168,7 +168,11 @@ pub(crate) fn decode_pdf_thumbnail(
 }
 
 /// Convert a decoded image into the BGRA `RenderImage` gpui expects.
-fn decode_to_render(image: image::DynamicImage, max_width: u32, max_height: u32) -> gpui::RenderImage {
+pub(crate) fn decode_to_render(
+    image: image::DynamicImage,
+    max_width: u32,
+    max_height: u32,
+) -> gpui::RenderImage {
     let mut thumb = image.thumbnail(max_width, max_height).to_rgba8();
     for pixel in thumb.chunks_exact_mut(4) {
         pixel.swap(0, 2);
