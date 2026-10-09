@@ -8,10 +8,6 @@ use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::Path;
 
-/// Chapter text caps at a thousand lines with a tail marker: a glance
-/// pane, not a bottomless scroll.
-const CHAPTER_LINES_MAX: usize = 1000;
-
 /// What an epub's manifest says about itself.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BookMeta {
@@ -69,15 +65,15 @@ pub(crate) fn read_spine(path: &Path) -> Option<Vec<String>> {
     (!spine.is_empty()).then_some(spine)
 }
 
-/// One spine chapter as glance text (1-based). None past the end or
-/// on an unreadable container or entry.
-pub(crate) fn read_chapter(path: &Path, chapter: usize) -> Option<String> {
+/// One spine chapter as glance blocks (1-based). None past the end
+/// or on an unreadable container or entry.
+pub(crate) fn read_chapter(path: &Path, chapter: usize) -> Option<Vec<ChapterBlock>> {
     let spine = read_spine(path)?;
     let href = spine.get(chapter.checked_sub(1)?)?;
     let file = std::fs::File::open(path).ok()?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let bytes = read_entry(&mut zip, href)?;
-    Some(strip_html(&bytes))
+    Some(chapter_blocks(&bytes))
 }
 
 /// The container.xml-to-OPF road every reader takes: the OPF's
@@ -152,20 +148,53 @@ fn opf_entry(opf_path: &str, href: &str) -> String {
     }
 }
 
-/// XHTML to glance text. A hand-rolled scanner rather than a strict
-/// XML parse because real-world epub XHTML uses HTML entities
+/// One block of chapter content for the glance pane.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ChapterBlock {
+    /// A paragraph of prose with tag-carried runs.
+    Para {
+        text: String,
+        runs: Vec<ChapterRun>,
+        /// Inside a blockquote: rendered indented and dim.
+        quote: bool,
+    },
+    /// A heading, level 1..=6; renders bold at a size by level.
+    Heading { level: u8, text: String, runs: Vec<ChapterRun> },
+    /// A horizontal rule.
+    Rule,
+}
+
+/// A styled run: a byte length of the block's text plus the flags
+/// the surrounding tags carried. Tags only, no CSS is honored here:
+/// italic from em/i/cite/dfn/var, bold from strong/b.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChapterRun {
+    pub(crate) len: usize,
+    pub(crate) italic: bool,
+    pub(crate) bold: bool,
+}
+
+/// Chapter prose caps at this many blocks, with a tail marker: a
+/// glance pane, not a bottomless scroll.
+const CHAPTER_BLOCKS_MAX: usize = 400;
+
+/// XHTML to glance blocks. A hand-rolled scanner rather than a
+/// strict XML parse because real-world epub XHTML uses HTML entities
 /// (&nbsp;) that strict parsing rejects; a weird document degrades
 /// to plain text, never to a hang. Script and style drop with their
-/// content; block boundaries become newlines; common entities
-/// decode; whitespace collapses; the result caps at CHAPTER_LINES_MAX
-/// lines with a tail marker.
-pub(crate) fn strip_html(bytes: &[u8]) -> String {
+/// content; block tags open paragraphs and headings; styling tags
+/// open runs; common entities decode; whitespace collapses; the
+/// result caps at CHAPTER_BLOCKS_MAX blocks with a tail marker. The
+/// head's title drops too: the book label already names the thing.
+pub(crate) fn chapter_blocks(bytes: &[u8]) -> Vec<ChapterBlock> {
     let raw = String::from_utf8_lossy(bytes);
-    let cleaned = drop_blocks(raw.as_ref(), &["script", "style"]);
-    // pass 2: tags out, block boundaries to newlines, entities decoded
-    let mut out = String::with_capacity(cleaned.len());
+    let cleaned = drop_blocks(raw.as_ref(), &["script", "style", "title"]);
+    let mut b = Builder::default();
     let mut i = 0;
     while i < cleaned.len() {
+        if b.capped {
+            break;
+        }
         let rest = &cleaned[i..];
         if rest.starts_with('<') {
             // comments and CDATA swallow to their ends
@@ -184,21 +213,63 @@ pub(crate) fn strip_html(bytes: &[u8]) -> String {
                 continue;
             }
             let after = &rest[1..];
-            let name: String = after
+            let closing = after.starts_with('/');
+            let name: String = after[if closing { 1 } else { 0 }..]
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric())
                 .collect::<String>()
                 .to_ascii_lowercase();
             // a '>' inside a quoted attribute would end the tag
-            // early: glance grade, the damage is one stray newline
+            // early: glance grade, the damage is one stray boundary
             match rest.find('>') {
-                Some(end) => {
-                    i += end + 1;
-                    if name == "br" || is_block(&name) {
-                        out.push('\n');
+                Some(end) => i += end + 1,
+                None => break,
+            }
+            // styling flags change inside the current block, so any
+            // pending space joins the run it belongs to first
+            match name.as_str() {
+                "em" | "i" | "cite" | "dfn" | "var" => {
+                    b.flush_space();
+                    if closing {
+                        b.italics = b.italics.saturating_sub(1);
+                    } else {
+                        b.italics += 1;
                     }
                 }
-                None => break,
+                "strong" | "b" => {
+                    b.flush_space();
+                    if closing {
+                        b.bolds = b.bolds.saturating_sub(1);
+                    } else {
+                        b.bolds += 1;
+                    }
+                }
+                "hr" => {
+                    b.flush();
+                    b.blocks.push(ChapterBlock::Rule);
+                }
+                // a br splits the paragraph: close enough for a glance
+                "br" => b.flush(),
+                "blockquote" => {
+                    b.flush();
+                    if closing {
+                        b.quote_depth = b.quote_depth.saturating_sub(1);
+                    } else {
+                        b.quote_depth += 1;
+                    }
+                }
+                name if is_block(name) => {
+                    b.flush();
+                    if !closing {
+                        b.kind = match name.strip_prefix('h') {
+                            Some(digits) if digits.len() == 1 => {
+                                digits.parse::<u8>().unwrap_or(0).clamp(1, 6)
+                            }
+                            _ => 0,
+                        };
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -206,50 +277,117 @@ pub(crate) fn strip_html(bytes: &[u8]) -> String {
             let up_to = rest.len().min(12);
             if let Some(end) = rest[..up_to].find(';').filter(|d| *d > 0) {
                 if let Some(text) = decode_entity(&rest[1..end]) {
-                    out.push_str(&text);
+                    b.flush_space();
+                    b.push_raw(&text);
                     i += end + 1;
                     continue;
                 }
             }
-            out.push('&');
+            b.flush_space();
+            b.push_raw("&");
             i += 1;
             continue;
         }
-        // whitespace collapses to one space, text copies through
+        // source whitespace collapses to one lazy space; text copies
         let ch = rest.chars().next().unwrap();
         if ch.is_whitespace() {
-            if !out.ends_with(' ') && !out.ends_with('\n') && !out.is_empty() {
-                out.push(' ');
-            }
+            b.push_ws();
         } else {
-            out.push(ch);
+            b.flush_space();
+            let mut buf = [0u8; 4];
+            b.push_raw(ch.encode_utf8(&mut buf));
         }
         i += ch.len_utf8();
     }
-    // collapse blank runs, trim edges, cap the line count
-    let mut lines: Vec<String> = Vec::new();
-    for line in out.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            if lines.last().map(String::is_empty) == Some(true) {
-                continue;
-            }
-            lines.push(String::new());
-        } else {
-            lines.push(line.to_string());
+    b.flush();
+    if b.capped {
+        let tail = "\u{2026} the chapter continues in the reader";
+        b.blocks.push(ChapterBlock::Para {
+            text: tail.to_string(),
+            runs: vec![ChapterRun { len: tail.len(), italic: true, bold: false }],
+            quote: false,
+        });
+    }
+    b.blocks
+}
+
+/// Assembles the block list: the paragraph under construction, the
+/// run flags in force, and the cap state.
+#[derive(Default)]
+struct Builder {
+    blocks: Vec<ChapterBlock>,
+    text: String,
+    runs: Vec<ChapterRun>,
+    /// 0 is a paragraph, 1..=6 a heading level
+    kind: u8,
+    italics: u32,
+    bolds: u32,
+    quote_depth: u32,
+    pending_space: bool,
+    /// the cap rejected a flush: content after the cap is not read
+    capped: bool,
+}
+
+impl Builder {
+    fn push_raw(&mut self, text: &str) {
+        let extend = self.runs.last_mut().filter(|run| {
+            run.italic == (self.italics > 0) && run.bold == (self.bolds > 0)
+        });
+        match extend {
+            Some(run) => run.len += text.len(),
+            None => self.runs.push(ChapterRun {
+                len: text.len(),
+                italic: self.italics > 0,
+                bold: self.bolds > 0,
+            }),
         }
+        self.text.push_str(text);
     }
-    while lines.last().map(String::is_empty) == Some(true) {
-        lines.pop();
+
+    /// Whitespace collapses to one space, applied lazily so a block
+    /// never starts or ends with it.
+    fn push_ws(&mut self) {
+        self.pending_space = true;
     }
-    while lines.first().map(String::is_empty) == Some(true) {
-        lines.remove(0);
+
+    /// Land a pending space on the open block; called before any run
+    /// flag change or block flush so the space joins the right run.
+    fn flush_space(&mut self) {
+        if self.pending_space && !self.text.is_empty() && !self.text.ends_with(' ') {
+            self.push_raw(" ");
+        }
+        self.pending_space = false;
     }
-    if lines.len() > CHAPTER_LINES_MAX {
-        lines.truncate(CHAPTER_LINES_MAX);
-        lines.push("\u{2026} the chapter continues in the reader".to_string());
+
+    /// Close the open block into the list; an empty one just resets
+    /// the kind so stray text after it builds plain paragraphs.
+    fn flush(&mut self) {
+        self.flush_space();
+        let quote = self.quote_depth > 0;
+        let kind = self.kind;
+        self.kind = 0;
+        if self.text.is_empty() {
+            self.runs.clear();
+            return;
+        }
+        if self.blocks.len() >= CHAPTER_BLOCKS_MAX {
+            self.capped = true;
+            return;
+        }
+        let block = match kind {
+            0 => ChapterBlock::Para {
+                text: std::mem::take(&mut self.text),
+                runs: std::mem::take(&mut self.runs),
+                quote,
+            },
+            level => ChapterBlock::Heading {
+                level,
+                text: std::mem::take(&mut self.text),
+                runs: std::mem::take(&mut self.runs),
+            },
+        };
+        self.blocks.push(block);
     }
-    lines.join("\n")
 }
 
 /// Remove <block ...> ... </block> spans, content and all, case
@@ -430,6 +568,20 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The blocks' prose, one block per line; rules become a bare
+    /// newline. For content assertions in and out of this module.
+    pub(crate) fn blocks_text(blocks: &[ChapterBlock]) -> String {
+        blocks
+            .iter()
+            .map(|block| match block {
+                ChapterBlock::Rule => "\n".to_string(),
+                ChapterBlock::Para { text, .. } | ChapterBlock::Heading { text, .. } => {
+                    format!("{text}\n")
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn spine_walks_manifest_order_and_chapters_read_stripped() {
         let ch1 = b"<html><head><style>p { color: red }</style></head>\
@@ -452,39 +604,90 @@ pub(crate) mod tests {
             vec!["OEBPS/text/ch1.xhtml".to_string(), "OEBPS/text/ch2.xhtml".to_string()]
         );
         let one = read_chapter(&path, 1).unwrap();
-        assert!(one.contains("First"));
-        assert!(one.contains("alpha & omega"));
-        // nbsp decodes to a plain space in a glance
-        assert!(one.contains("second line"));
-        assert!(!one.contains("color: red"), "style content leaked");
-        assert!(!one.contains("bad()"), "script content leaked");
+        // the heading structured, the entities decoded, nbsp a plain
+        // space, style and script content gone with their blocks
+        assert_eq!(
+            one[0],
+            ChapterBlock::Heading {
+                level: 1,
+                text: "First".to_string(),
+                runs: vec![ChapterRun { len: 5, italic: false, bold: false }],
+            }
+        );
+        assert!(matches!(&one[1], ChapterBlock::Para { text, quote: false, .. } if text == "alpha & omega"));
+        assert!(matches!(&one[2], ChapterBlock::Para { text, quote: false, .. } if text == "second line"));
+        assert_eq!(one.len(), 3);
         let two = read_chapter(&path, 2).unwrap();
-        assert!(two.contains("beta <tag> text"));
-        assert!(two.contains("more A here"), "numeric entity undecoded");
+        let two_text = blocks_text(&two);
+        assert!(two_text.contains("beta <tag> text"), "entity undecoded: {two_text:?}");
+        assert!(two_text.contains("more A here"), "numeric entity undecoded");
         assert_eq!(read_chapter(&path, 3), None, "past the end");
         assert_eq!(read_chapter(&path, 0), None, "cover has no chapter");
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn strip_html_degrades_and_caps() {
+    fn tags_become_structures_and_runs() {
+        let blocks = chapter_blocks(
+            br#"<h2>Title</h2><blockquote><p>quoted <em>deep</em> words</p></blockquote>
+                <p>plain <strong>bold</strong> &amp; <em>both</em></p><hr/><p>after</p>"#,
+        );
+        assert_eq!(
+            blocks[0],
+            ChapterBlock::Heading {
+                level: 2,
+                text: "Title".to_string(),
+                runs: vec![ChapterRun { len: 5, italic: false, bold: false }],
+            }
+        );
+        assert_eq!(
+            blocks[1],
+            ChapterBlock::Para {
+                text: "quoted deep words".to_string(),
+                runs: vec![
+                    ChapterRun { len: 7, italic: false, bold: false },
+                    ChapterRun { len: 4, italic: true, bold: false },
+                    ChapterRun { len: 6, italic: false, bold: false },
+                ],
+                quote: true,
+            }
+        );
+        assert_eq!(
+            blocks[2],
+            ChapterBlock::Para {
+                text: "plain bold & both".to_string(),
+                runs: vec![
+                    ChapterRun { len: 6, italic: false, bold: false },
+                    ChapterRun { len: 4, italic: false, bold: true },
+                    ChapterRun { len: 3, italic: false, bold: false },
+                    ChapterRun { len: 4, italic: true, bold: false },
+                ],
+                quote: false,
+            }
+        );
+        assert_eq!(blocks[3], ChapterBlock::Rule);
+        assert!(matches!(&blocks[4], ChapterBlock::Para { text, quote: false, .. } if text == "after"));
+    }
+
+    #[test]
+    fn chapter_blocks_degrade_and_cap() {
         // a '>' inside an attribute: one stray boundary, no hang
         let weird = br#"<p title="a>b">text</p><p>more</p>"#;
-        let text = strip_html(weird);
+        let text = blocks_text(&chapter_blocks(weird));
         assert!(text.contains("text"));
         assert!(text.contains("more"));
-        // unterminated tag swallows the rest instead of looping
-        assert_eq!(strip_html(b"<p>tail"), "tail");
-        assert_eq!(strip_html(b"<p open"), "");
-        // the cap: a thousand lines plus the tail marker
+        // unterminated tags swallow the rest instead of looping
+        assert_eq!(blocks_text(&chapter_blocks(b"<p>tail")), "tail\n");
+        assert!(chapter_blocks(b"<p open").is_empty());
+        // the cap: CHAPTER_BLOCKS_MAX blocks plus the tail marker
         let mut many = String::from("<body>");
         for i in 0..1500 {
             many.push_str(&format!("<p>line {i}</p>"));
         }
         many.push_str("</body>");
-        let capped = strip_html(many.as_bytes());
-        assert_eq!(capped.lines().count(), CHAPTER_LINES_MAX + 1);
-        assert!(capped.lines().last().unwrap().contains("continues"));
+        let capped = chapter_blocks(many.as_bytes());
+        assert_eq!(capped.len(), CHAPTER_BLOCKS_MAX + 1);
+        assert!(blocks_text(&capped).contains("continues"));
     }
 
     #[test]

@@ -13,11 +13,11 @@ use std::io::{BufRead as _, Write as _};
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent,
-    ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, HighlightStyle,
+    ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, Font, HighlightStyle,
     ImageSource, KeyDownEvent, MouseDownEvent, MouseMoveEvent, MouseButton, MouseUpEvent,
-    ObjectFit, Pixels, Point, Render, RenderImage, ScrollWheelEvent, Stateful, StyledText,
-    UnderlineStyle, Window, div, img, point, prelude::*, px, relative, rgba, rgb, svg, FontStyle,
-    FontWeight, SharedString,
+    ObjectFit, Pixels, Point, Render, RenderImage, Rgba, ScrollWheelEvent, Stateful, StyledText,
+    TextRun, UnderlineStyle, Window, div, img, point, prelude::*, px, relative, rgba, rgb, svg,
+    FontStyle, FontWeight, SharedString,
 };
 use trash::{os_limited, TrashItem};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1281,10 +1281,10 @@ pub(crate) struct Browser {
     /// The open epub's metadata (title, author, cover flag), landed
     /// by the same background decode; reset on file flips.
     ql_book: Option<epub::BookMeta>,
-    /// The one held epub chapter's stripped text, keyed by path and
-    /// page (chapters count from 1; the cover is page 0). Plain text,
-    /// so there is no atlas tile: replacing it is enough.
-    ql_chapter: Option<(PathBuf, usize, String)>,
+    /// The one held epub chapter's glance blocks, keyed by path and
+    /// page (chapters count from 1; the cover is page 0). Plain
+    /// data, no atlas tile: replacing it is enough.
+    ql_chapter: Option<(PathBuf, usize, Vec<epub::ChapterBlock>)>,
     /// The chapter read in flight, if any.
     ql_chapter_inflight: Option<(PathBuf, usize)>,
     /// The overlay's text column scrolls through the snippet.
@@ -6654,7 +6654,7 @@ impl Browser {
             self.ql_chapter
                 .as_ref()
                 .filter(|(p, pg, _)| *p == entry.path && *pg == ql_page)
-                .map(|(_, _, text)| text.clone())
+                .map(|(_, _, blocks)| blocks.clone())
         } else {
             None
         };
@@ -6663,7 +6663,17 @@ impl Browser {
             (path == &entry.path && !entry.is_dir && (!is_epub || ql_page == 0))
                 .then(|| render.clone())
         });
-        let pane: Div = if let Some(text) = chapter {
+        let pane: Div = if let Some(blocks) = chapter {
+            // tag-carried typography only: paragraphs wrap, headings
+            // size, quotes indent; no CSS is honored here
+            let column = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .text_size(px(13.))
+                .text_color(theme::text())
+                .children(blocks.iter().map(chapter_block_view));
             div()
                 .flex_1()
                 .overflow_hidden()
@@ -6674,12 +6684,7 @@ impl Browser {
                         .overflow_y_scroll()
                         .track_scroll(&self.ql_scroll)
                         .w_full()
-                        .text_size(px(13.))
-                        .text_color(theme::text())
-                        .font_family("monospace")
-                        .children(text.lines().map(|line| {
-                            preview_line(line.to_string()).text_color(theme::text())
-                        })),
+                        .child(column),
                 )
         } else if let Some(render) = image {
             let viewport = window.viewport_size();
@@ -9378,6 +9383,68 @@ fn preview_line(line: String) -> Div {
     div().w_full().truncate().child(line)
 }
 
+/// One chapter block for the glance pane: tag-carried typography
+/// only, no CSS. Headings size by level and render bold; quotes
+/// indent and dim; rules are hairlines.
+fn chapter_block_view(block: &epub::ChapterBlock) -> Div {
+    match block {
+        epub::ChapterBlock::Rule => div().w_full().h(px(1.)).bg(theme::row_hover()),
+        epub::ChapterBlock::Heading { level, text, runs } => {
+            let size = match level {
+                1 => 20.0,
+                2 => 18.0,
+                3 => 17.0,
+                _ => 16.0,
+            };
+            div()
+                .w_full()
+                .text_size(px(size))
+                .child(chapter_runs_view(text, runs, theme::text(), true))
+        }
+        epub::ChapterBlock::Para { text, runs, quote } => {
+            let color = if *quote { theme::text_dim() } else { theme::text() };
+            let mut pane = div().w_full();
+            if *quote {
+                pane = pane.ml_4();
+            }
+            pane.child(chapter_runs_view(text, runs, color, false))
+        }
+    }
+}
+
+/// A block's runs as one StyledText: the family is the system UI
+/// font, size and line height come from the wrapping div's text
+/// style, and the runs carry slant, weight, and color. Run lengths
+/// are byte counts summing to the text; the scanner guarantees it.
+fn chapter_runs_view(
+    text: &str,
+    runs: &[epub::ChapterRun],
+    color: Rgba,
+    heading: bool,
+) -> StyledText {
+    let runs = runs
+        .iter()
+        .map(|run| {
+            let mut font = Font::default();
+            if run.italic {
+                font.style = FontStyle::Italic;
+            }
+            if run.bold || heading {
+                font.weight = FontWeight::BOLD;
+            }
+            TextRun {
+                len: run.len,
+                font,
+                color: color.into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }
+        })
+        .collect();
+    StyledText::new(text.to_string()).with_runs(runs)
+}
+
 /// Page count out of pdfinfo's stdout: the "Pages:" line. None when
 /// the tool said nothing usable (or said zero).
 fn parse_pdf_pages(info: &str) -> Option<usize> {
@@ -11066,9 +11133,10 @@ mod browser_ux_keys {
         window.update(|browser, _, cx| {
             // the held chapter is the one the counter shows; chapter
             // 1's earlier landing was already stale and dropped
-            let (p, pg, text) = browser.ql_chapter.as_ref().unwrap();
+            let (p, pg, blocks) = browser.ql_chapter.as_ref().unwrap();
             assert_eq!(*p, lab.dir.join("zz.epub"));
             assert_eq!(*pg, 2);
+            let text = crate::epub::tests::blocks_text(blocks);
             assert!(text.contains("beta body text"));
             assert!(!text.contains("alpha body text"));
             // pageup: back to chapter 1 (a fresh read), then the cover
@@ -11088,9 +11156,9 @@ mod browser_ux_keys {
         });
         app.run_until_parked();
         window.update(|browser, _, _| {
-            let (_, pg, text) = browser.ql_chapter.as_ref().unwrap();
+            let (_, pg, blocks) = browser.ql_chapter.as_ref().unwrap();
             assert_eq!(*pg, 1);
-            assert!(text.contains("alpha body text"));
+            assert!(crate::epub::tests::blocks_text(blocks).contains("alpha body text"));
         });
     }
 
