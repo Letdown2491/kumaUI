@@ -4,19 +4,27 @@
 # leak; growth that plateaus is allocator retention or a cache. The
 # point is the table, not a pass/fail: read the deltas per phase.
 #
-#   podman run --rm -v "$PWD":/work:Z localhost/kuma-test-compositor \
-#     /work/scripts/memory-probe.sh [more-seconds-idle]
+#   podman run --rm --device /dev/dri -v "$PWD":/work:Z \
+#     localhost/kuma-test-compositor /work/scripts/memory-probe.sh [more-seconds-idle]
+#
+# The GPU passthrough matters: without it the renderer falls back to
+# llvmpipe and the shell's process RSS is dominated by software-render
+# allocations that no real session has. Read deltas, not absolutes.
 #
 # Loads driven, in order, each isolated in time so its RSS delta reads
 # clean:
 #   idle        settle after startup
 #   notify      60 notifications over the session bus
 #   panels      20 settings-panel open/close cycles over the msg CLI
+#   launcher    3 launcher open/close cycles
+#   tray        2 minutes of one fat static pixmap item under the 2s poll
 #   hotplug     10 create_output/unplug cycles
 #   settle      idle again; what stayed grown here is what leaked
 set -euo pipefail
 
 SHELL_BIN="${SHELL_BIN:-/work/target/release/kuma-shell}"
+FAKE_TRAY_BIN="${FAKE_TRAY_BIN:-/work/target/release/kuma-fake-tray}"
+TRAY_SECS="${TRAY_SECS:-120}"
 IDLE_EXTRA="${1:-0}"
 LOAD_SCALE="${LOAD_SCALE:-1}"
 
@@ -105,6 +113,17 @@ for i in $(seq 3); do
 done
 sleep 8
 
+set_phase tray
+# one fat static pixmap item under the 2s poll: the phase is the tray
+# pipeline's whole job, per poll. A shell that re-mints the image every
+# read climbs 1 MiB a poll; one that pins by content hash stays flat.
+"$FAKE_TRAY_BIN" >/tmp/fake-tray.log 2>&1 &
+fake_pid=$!
+sleep 2
+for _ in $(seq $((TRAY_SECS / 2))); do sample; sleep 2; done
+kill "$fake_pid" 2>/dev/null || true
+sleep 8
+
 set_phase hotplug
 for i in $(seq $((10 * LOAD_SCALE))); do
 	swaymsg create_output >/dev/null
@@ -126,13 +145,22 @@ for _ in $(seq 15); do sample; sleep 2; done
 
 kill "$shell_pid" 2>/dev/null || true
 
-# the readout: first and last sample of each phase
+# the readout: first, median, and last sample of each phase. The
+# median is the headline: a transient allocation burst (hundreds of MB
+# for one sample, gone the next) lands on single samples and would
+# otherwise masquerade as a phase delta.
 awk -F'\t' '
 $1 == "phase" { next }
-!($1 in first) { first[$1] = $3; fswap[$1] = $4; ffds[$1] = $6 }
-{ last[$1] = $3; lswap[$1] = $4; lfds[$1] = $6 }
+!($1 in first) { first[$1] = $3; fswap[$1] = $4; ffds[$1] = $6; n[$1] = 0 }
+{ last[$1] = $3; lswap[$1] = $4; lfds[$1] = $6; n[$1]++; rss[$1, n[$1]] = $3 }
 END {
-	printf "%-10s %10s %10s %10s %8s %8s\n", "phase", "rss_first", "rss_last", "rss_delta", "fds_f", "fds_l"
-	for (p in first)
-		printf "%-10s %10d %10d %10d %8s %8s\n", p, first[p], last[p], last[p]-first[p], ffds[p], lfds[p]
+	printf "%-10s %10s %10s %10s %10s %8s %8s\n", "phase", "rss_first", "rss_med", "rss_last", "rss_delta", "fds_f", "fds_l"
+	for (p in first) {
+		m = n[p]
+		for (i = 1; i <= m; i++)
+			for (j = i + 1; j <= m; j++)
+				if (rss[p, j] < rss[p, i]) { t = rss[p, i]; rss[p, i] = rss[p, j]; rss[p, j] = t }
+		med = (m % 2) ? rss[p, (m + 1) / 2] : int((rss[p, m / 2] + rss[p, m / 2 + 1]) / 2)
+		printf "%-10s %10d %10d %10d %10d %8s %8s\n", p, first[p], med, last[p], last[p] - first[p], ffds[p], lfds[p]
+	}
 }' /tmp/mem.tsv | sort -k2 -n
