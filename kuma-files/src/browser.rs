@@ -4091,6 +4091,44 @@ impl Browser {
         self.request_quicklook_render(path, next, cx);
     }
 
+    /// One page step from the current page (negative is back),
+    /// clamped by the known count. The keyboard twin of the header
+    /// chevrons: arrows step by file, shift+arrows and the page keys
+    /// step by page.
+    fn quicklook_page_step(&mut self, step: isize, cx: &mut Context<Self>) {
+        let Some((page, pages)) = self
+            .quicklook
+            .as_ref()
+            .and_then(|ql| ql.pages.map(|pages| (ql.page, pages)))
+        else {
+            return;
+        };
+        let target = (page as isize + step).clamp(1, pages as isize) as usize;
+        self.quicklook_page(target, cx);
+    }
+
+    /// A clickable page chevron for the Quick Look header: the mouse
+    /// road into paging, for people without (or without reach of)
+    /// the page keys. Clamped by quicklook_page at the ends.
+    fn quicklook_chevron(
+        &self,
+        id: &'static str,
+        glyph: &'static str,
+        step: isize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .cursor_pointer()
+            .px_1()
+            .rounded_sm()
+            .text_size(px(12.))
+            .text_color(theme::text_dim())
+            .hover(|this| this.text_color(theme::text()).bg(theme::row_hover()))
+            .on_click(cx.listener(move |this, _, _, cx| this.quicklook_page_step(step, cx)))
+            .child(glyph)
+    }
+
     /// Ask pdfinfo (poppler ships it beside pdftocairo) how many
     /// pages the PDF has. One ask per open path; a missing tool or a
     /// failed call lands as None and paging stays dormant.
@@ -4640,6 +4678,14 @@ impl Browser {
                 // space toggles shut, escape closes: both keep the
                 // cursor where it was
                 "space" | "escape" => self.close_quicklook(cx),
+                // shift+arrows: same direction, bigger step, a page
+                // instead of a file
+                "up" | "left" if keystroke.modifiers.shift => {
+                    self.quicklook_page_step(-1, cx)
+                }
+                "down" | "right" if keystroke.modifiers.shift => {
+                    self.quicklook_page_step(1, cx)
+                }
                 "up" | "left" => self.quicklook_flip(-1, cx),
                 "down" | "right" => self.quicklook_flip(1, cx),
                 // enter hands off: a file goes to the system opener
@@ -4652,22 +4698,8 @@ impl Browser {
                 "=" | "+" => self.quicklook_zoom_step(1.2, cx),
                 "-" | "_" => self.quicklook_zoom_step(1.0 / 1.2, cx),
                 // PDF paging: no-ops while the count is unknown
-                "pageup" => {
-                    let page = self
-                        .quicklook
-                        .as_ref()
-                        .map(|ql| ql.page.saturating_sub(1))
-                        .unwrap_or(1);
-                    self.quicklook_page(page, cx);
-                }
-                "pagedown" => {
-                    let page = self
-                        .quicklook
-                        .as_ref()
-                        .map(|ql| ql.page + 1)
-                        .unwrap_or(1);
-                    self.quicklook_page(page, cx);
-                }
+                "pageup" => self.quicklook_page_step(-1, cx),
+                "pagedown" => self.quicklook_page_step(1, cx),
                 "home" => self.quicklook_page(1, cx),
                 "end" => {
                     let last = self
@@ -6365,9 +6397,17 @@ impl Browser {
             )
             .children(page_label.clone().map(|label| {
                 div()
-                    .text_size(px(12.))
-                    .text_color(theme::text_dim())
-                    .child(label)
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(self.quicklook_chevron("quicklook-page-back", "‹", -1, cx))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_dim())
+                            .child(label),
+                    )
+                    .child(self.quicklook_chevron("quicklook-page-fwd", "›", 1, cx))
             }))
             .child(
                 div()
@@ -6384,7 +6424,7 @@ impl Browser {
                     .text_size(px(11.))
                     .text_color(theme::text_dim())
                     .child(if page_label.is_some() {
-                        "PgUp/PgDn pages · Esc closes"
+                        "PgUp/PgDn or Shift+arrows pages · Esc closes"
                     } else {
                         "Esc closes"
                     }),
@@ -10615,6 +10655,44 @@ mod browser_ux_keys {
             assert_eq!(ql.page, 2);
             assert_eq!(ql.zoom, 1.0);
             assert_eq!(ql.pan, (0.0, 0.0));
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_shift_arrows_page_without_moving_the_file() {
+        let lab = Lab::new("quicklook-shift-pages");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.jump_cursor(1, cx); // a.txt
+            browser.route_key(&key("space"), cx);
+            browser.quicklook.as_mut().unwrap().pages = Some(3);
+            // shift+down: a page turn, not a file flip
+            let mut shift_down = key("down");
+            shift_down.keystroke.modifiers.shift = true;
+            browser.route_key(&shift_down, cx);
+            let ql = browser.quicklook.as_ref().unwrap();
+            assert_eq!(ql.page, 2);
+            assert_eq!(ql.path, lab.dir.join("a.txt"));
+            // plain down still flips the file (and resets the page)
+            browser.route_key(&key("down"), cx);
+            let ql = browser.quicklook.as_ref().unwrap();
+            assert_eq!(ql.path, lab.dir.join("b.txt"));
+            assert_eq!(ql.page, 1);
+            // shift+up at the first page: clamped no-op
+            browser.quicklook.as_mut().unwrap().pages = Some(3);
+            let mut shift_up = key("up");
+            shift_up.keystroke.modifiers.shift = true;
+            browser.route_key(&shift_up, cx);
+            assert_eq!(browser.quicklook.as_ref().unwrap().page, 1);
+            // count unknown: shift+arrows idle too
+            browser.quicklook.as_mut().unwrap().pages = None;
+            browser.route_key(&shift_down, cx);
+            assert_eq!(browser.quicklook.as_ref().unwrap().page, 1);
         });
         app.run_until_parked();
     }
