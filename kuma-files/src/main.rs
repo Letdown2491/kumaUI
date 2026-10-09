@@ -7,6 +7,7 @@ use gpui_platform::application;
 mod browser;
 mod epub;
 mod icons;
+mod video;
 mod input;
 mod theme;
 

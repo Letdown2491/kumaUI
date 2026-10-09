@@ -24,6 +24,9 @@ libc = "0.2"
 # epub glances: container reads plus the two small XML docs
 zip = { version = "2", default-features = false, features = ["deflate"] }
 roxmltree = "0.20"
+# video: in-process libav decode (kumaOS ships ffmpeg-libs, no CLI;
+# headers are the free build's, same sonames as the runtime libs)
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
 
 [dev-dependencies]
 # only test builds pull this in; the release binary stays lean
