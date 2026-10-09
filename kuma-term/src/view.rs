@@ -649,6 +649,9 @@ impl TerminalView {
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k: &Keystroke = &event.keystroke;
+        // the raw names, for chord debugging: RUST_LOG=debug names
+        // exactly what the platform handed the view
+        log::debug!("key: {:?} modifiers {:?}", k.key, k.modifiers);
 
         // tab management, kitty's chords: the shell never sees these
         if k.modifiers.control && k.modifiers.shift {
@@ -664,19 +667,40 @@ impl TerminalView {
                     cx.stop_propagation();
                     return;
                 }
-                // jump to a tab by index, kitty's convention. Wayland
-                // delivers shift+digit as its glyph (!@#.. for 1..9);
-                // the keypad keeps the digit name
-                "1" | "!" => self.jump_tab(0, cx),
-                "2" | "@" => self.jump_tab(1, cx),
-                "3" | "#" => self.jump_tab(2, cx),
-                "4" | "$" => self.jump_tab(3, cx),
-                "5" | "%" => self.jump_tab(4, cx),
-                "6" | "^" => self.jump_tab(5, cx),
-                "7" | "&" => self.jump_tab(6, cx),
-                "8" | "*" => self.jump_tab(7, cx),
-                "9" | "(" => self.jump_tab(8, cx),
                 _ => {}
+            }
+        }
+        // jump to a tab: ctrl+shift+1..9, kitty's goto_tab. The wayland
+        // key path clears the shift flag from single-char symbol keys
+        // (shift+1 arrives as "!", shift=false), so a glyph under
+        // control implies shift was held; the digit names keep the
+        // flag requirement, or plain ctrl+1..9 would stop reaching the
+        // shell
+        if k.modifiers.control {
+            let index = match k.key.as_str() {
+                "!" => Some(0),
+                "@" => Some(1),
+                "#" => Some(2),
+                "$" => Some(3),
+                "%" => Some(4),
+                "^" => Some(5),
+                "&" => Some(6),
+                "*" => Some(7),
+                "(" => Some(8),
+                "1" if k.modifiers.shift => Some(0),
+                "2" if k.modifiers.shift => Some(1),
+                "3" if k.modifiers.shift => Some(2),
+                "4" if k.modifiers.shift => Some(3),
+                "5" if k.modifiers.shift => Some(4),
+                "6" if k.modifiers.shift => Some(5),
+                "7" if k.modifiers.shift => Some(6),
+                "8" if k.modifiers.shift => Some(7),
+                "9" if k.modifiers.shift => Some(8),
+                _ => None,
+            };
+            if let Some(index) = index {
+                self.jump_tab(index, cx);
+                return;
             }
         }
         // ctrl+tab / ctrl+shift+tab cycle, kitty's convention
@@ -2428,6 +2452,11 @@ mod tests {
             assert_eq!(view.active, 0, "an out of range jump is a no-op");
             view.on_key(&chord("ctrl-shift-2"), window, cx);
             assert_eq!(view.active, 1, "ctrl+shift+@ jumps to the second tab");
+
+            // a digit under control alone is the shell's chord, not a
+            // jump
+            view.on_key(&chord("ctrl-2"), window, cx);
+            assert_eq!(view.active, 1, "ctrl+digit without shift is not a jump");
 
             // closing the focused one falls back to the neighbor
             view.on_key(&chord("ctrl-shift-w"), window, cx);
