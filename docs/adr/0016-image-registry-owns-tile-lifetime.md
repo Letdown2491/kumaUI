@@ -66,9 +66,14 @@ key, no reuse, and no business inside an icon cache.
   the 300-thumb working set. ADR-0011's consequence sentence is now true at
   every image call site, not just notifications.
 - The launcher's open cost drops to a one-time decode of 44px thumbnails
-  shared with the dock's pipeline; the probe's launcher phase delta should
-  approach zero. The probe remains the acceptance measurement; the tray itself
-  needs unit tests (the probe's container has no tray items).
+  shared with the dock's pipeline. The acceptance gate for the drops
+  themselves is unit tests (the tray's pin-and-release, thumb eviction,
+  registry bounds): the probe's container has no tray items and no wallpaper
+  rotation, and its run-to-run noise swamps per-phase deltas at this effect
+  size (the same binary measured 1.6 and 2.2 GB at settle across
+  back-to-back runs on 2026-10-08). The probe stays in the loop for gross
+  regressions, read as ranges across repeated runs, never as single-run
+  before/after tables.
 - Three icon pipelines (registry cache, tray's private index, launcher's and
   the slider panel's per-open walks) become one.
 - Explicit release remains a per-caller act; the registry cannot force it. The
