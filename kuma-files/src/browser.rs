@@ -30,6 +30,30 @@ use crate::input;
 /// most memory the cache can hold (about 75 MiB worst case).
 const THUMB_CACHE_MAX: usize = 300;
 
+/// Insertion-order trim for the thumb cache: evicts down to the cap,
+/// oldest first (dropping the oldest keeps the visible window's thumbs
+/// warm, where a wholesale clear re-decoded everything at once), and
+/// returns the evicted images so the caller drops their atlas tiles:
+/// the img element never drops the tile it paints, so a heap-only
+/// eviction would leave every thumbnail ever scrolled past painted
+/// until the window closed (ADR-0016).
+fn trim_thumbs(
+    thumbs: &mut HashMap<PathBuf, Arc<RenderImage>>,
+    order: &mut VecDeque<PathBuf>,
+) -> Vec<Arc<RenderImage>> {
+    let mut droplets = Vec::new();
+    while thumbs.len() >= THUMB_CACHE_MAX {
+        let Some(oldest) = order.pop_front() else {
+            droplets.extend(thumbs.drain().map(|(_, image)| image));
+            break;
+        };
+        if let Some(image) = thumbs.remove(&oldest) {
+            droplets.push(image);
+        }
+    }
+    droplets
+}
+
 /// Undo memory bound: individual file operations, not steps, so a
 /// thousand-file paste is a thousand undo records.
 const UNDO_MAX_OPS: usize = 1000;
@@ -1642,15 +1666,13 @@ impl Browser {
             let update = this.update(cx, |this, cx| {
                 this.thumbs_inflight.remove(&path);
                 if let Some(render) = render {
-                    // insertion-order trim: dropping the oldest keeps
-                    // the visible window's thumbs warm, where a
-                    // wholesale clear re-decoded everything at once
-                    while this.thumbs.len() >= THUMB_CACHE_MAX {
-                        let Some(oldest) = this.thumb_order.pop_front() else {
-                            this.thumbs.clear();
-                            break;
-                        };
-                        this.thumbs.remove(&oldest);
+                    // evicted thumbs release their atlas tiles: the img
+                    // element never drops the tile it paints, so a
+                    // heap-only eviction would leave every thumbnail
+                    // ever scrolled past painted until the window
+                    // closed (ADR-0016)
+                    for image in trim_thumbs(&mut this.thumbs, &mut this.thumb_order) {
+                        cx.drop_image(image, None);
                     }
                     this.thumb_order.push_back(path.clone());
                     this.thumbs.insert(path, Arc::new(render));
@@ -8900,6 +8922,48 @@ impl Render for Ghost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumb_eviction_drops_the_oldest_and_reports_the_droplets() {
+        let mut thumbs: HashMap<PathBuf, Arc<RenderImage>> = HashMap::new();
+        let mut order: VecDeque<PathBuf> = VecDeque::new();
+        for i in 0..THUMB_CACHE_MAX {
+            let path = PathBuf::from(format!("/tmp/thumb-{i}.png"));
+            thumbs.insert(path.clone(), Arc::new(render_image()));
+            order.push_back(path);
+        }
+        let oldest_key = order.front().unwrap().clone();
+
+        // one over the cap: exactly one eviction, the oldest, with a
+        // droplet whose tile the caller must release
+        let new_key = PathBuf::from("/tmp/thumb-new.png");
+        let droplets = trim_thumbs(&mut thumbs, &mut order);
+        thumbs.insert(new_key.clone(), Arc::new(render_image()));
+        order.push_back(new_key);
+
+        assert_eq!(droplets.len(), 1);
+        assert!(!thumbs.contains_key(&oldest_key), "the oldest left the cache");
+        assert_eq!(thumbs.len(), THUMB_CACHE_MAX);
+        assert!(!order.contains(&oldest_key));
+    }
+
+    #[test]
+    fn thumb_trim_drains_stray_entries_when_the_order_lags() {
+        // the defensive path: thumbs populated without order entries
+        // (should not happen) must still come back under the cap
+        let mut thumbs: HashMap<PathBuf, Arc<RenderImage>> = HashMap::new();
+        let mut order: VecDeque<PathBuf> = VecDeque::new();
+        for i in 0..THUMB_CACHE_MAX {
+            thumbs.insert(PathBuf::from(format!("/tmp/stray-{i}.png")), Arc::new(render_image()));
+        }
+        let droplets = trim_thumbs(&mut thumbs, &mut order);
+        assert_eq!(droplets.len(), THUMB_CACHE_MAX);
+        assert!(thumbs.is_empty());
+    }
+
+    fn render_image() -> RenderImage {
+        RenderImage::new(smallvec::smallvec![image::Frame::new(image::RgbaImage::new(1, 1))])
+    }
 
     #[test]
     fn markdown_parses_into_blocks() {
