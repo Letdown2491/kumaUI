@@ -3960,6 +3960,9 @@ impl Browser {
                 drag_from: None,
             });
             self.sync_quicklook(cx);
+            // open must paint even when the preview is already
+            // cached: nothing else lands afterward to notify
+            cx.notify();
         }
     }
 
