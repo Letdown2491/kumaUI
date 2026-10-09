@@ -6876,15 +6876,22 @@ impl Browser {
         let pane: Div = if reading {
             // the whole spine as one continuous scroll: deferred
             // blocks (list, variable heights), chapters decoded in
-            // order by the background chain
+            // order by the background chain. The wrapper flexes the
+            // list into a definite height: Auto-sized deferred
+            // elements are zero-content divs to taffy
             let blocks = self.ql_text_blocks.clone();
             div()
                 .flex_1()
                 .overflow_hidden()
                 .m_3()
+                .flex()
+                .flex_col()
                 .child(list(self.ql_book_state.clone(), move |ix, _, _| {
-                    chapter_block_view(&blocks[ix]).into_any_element()
-                }))
+                    chapter_block_view(&blocks[ix])
+                        .debug_selector(|| "ql-chapter-block".into())
+                        .into_any_element()
+                })
+                .flex_1())
         } else if let Some(render) = image {
             let viewport = window.viewport_size();
             // the pane's own budget: this overlay's top row and the
@@ -6934,17 +6941,22 @@ impl Browser {
             // file renders only what is on screen
             match preview.kind {
                 TextKind::Markdown => match preview.blocks.filter(|b| !b.is_empty()) {
-                    Some(blocks) => div().flex_1().overflow_hidden().m_3().child(list(
-                        self.ql_md_state.clone(),
-                        move |ix, _, _| {
+                    Some(blocks) => div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .m_3()
+                        .flex()
+                        .flex_col()
+                        .child(list(self.ql_md_state.clone(), move |ix, _, _| {
                             div()
                                 .text_size(px(13.))
                                 .pb_2()
                                 .text_color(theme::text())
+                                .debug_selector(|| "ql-md-block".into())
                                 .child(md_block_view(&blocks[ix]))
                                 .into_any_element()
-                        },
-                    )),
+                        })
+                        .flex_1()),
                     None => line_list_pane(preview.lines.clone(), &self.ql_text_scroll),
                 },
                 TextKind::Csv | TextKind::Code | TextKind::Plain => {
@@ -9611,10 +9623,12 @@ fn preview_line(line: String) -> Div {
 
 /// The line-rows reading pane: a uniform list of truncated mono
 /// rows, deferred so only the visible window lays out (a 2 MB read
-/// is tens of thousands of lines).
+/// is tens of thousands of lines). The wrapper is a flex column and
+/// the list grows into it: an Auto-sized deferred element is a
+/// zero-content div to taffy and paints nothing without a height.
 fn line_list_pane(lines: Arc<Vec<String>>, scroll: &gpui::UniformListScrollHandle) -> Div {
     let count = lines.len();
-    div().flex_1().overflow_hidden().m_3().child(
+    div().flex_1().overflow_hidden().m_3().flex().flex_col().child(
         uniform_list("quicklook-text-list", count, move |range, _, _| {
             lines[range.clone()]
                 .iter()
@@ -9622,6 +9636,7 @@ fn line_list_pane(lines: Arc<Vec<String>>, scroll: &gpui::UniformListScrollHandl
                     div()
                         .h(px(20.))
                         .w_full()
+                        .debug_selector(|| "ql-row".into())
                         .truncate()
                         .text_size(px(13.))
                         .font_family("monospace")
@@ -9630,6 +9645,7 @@ fn line_list_pane(lines: Arc<Vec<String>>, scroll: &gpui::UniformListScrollHandl
                 })
                 .collect()
         })
+        .flex_1()
         .track_scroll(scroll),
     )
 }
@@ -11368,11 +11384,16 @@ mod browser_ux_keys {
             browser.quicklook_flip(2, cx);
         });
         app.run_until_parked();
-        window.update(|browser, _, _| {
+        window.update(|browser, window, _| {
             let (p, preview) = browser.ql_text.as_ref().unwrap();
             assert_eq!(*p, lab.dir.join("note.md"));
             let blocks = preview.blocks.as_ref().unwrap();
             assert!(blocks.len() >= 10, "markdown blocks unparsed");
+            // paint-level guard for the other deferred list too
+            let block = window
+                .debug_element_bounds("ql-md-block")
+                .expect("markdown pane never painted a block");
+            assert!(block.size.height > px(0.));
         });
         // the whole-file read of big.txt checked apart
         window.update(|browser, _, cx| {
@@ -11381,12 +11402,20 @@ mod browser_ux_keys {
             browser.route_key(&key("space"), cx);
         });
         app.run_until_parked();
-        window.update(|browser, _, _| {
+        window.update(|browser, window, _| {
             let (p, preview) = browser.ql_text.as_ref().unwrap();
             assert_eq!(*p, lab.dir.join("big.txt"));
             assert_eq!(preview.lines.len(), 20_000);
             assert_eq!(preview.lines.first().unwrap(), "line 0");
             assert_eq!(preview.lines.last().unwrap(), "line 19999");
+            // paint-level guard: a row really painted, with height.
+            // An Auto-sized deferred list without a flexed height is
+            // a zero-content div to taffy: a blank pane paints
+            // nothing
+            let row = window
+                .debug_element_bounds("ql-row")
+                .expect("reading pane never painted a row");
+            assert!(row.size.height > px(0.));
         });
     }
 
@@ -11483,9 +11512,20 @@ mod browser_ux_keys {
             let text = crate::epub::tests::blocks_text(&blocks);
             assert!(text.contains("alpha body text"));
             assert!(text.contains("beta body text"));
-            // pagedown leaves the cover for chapter 1, then 2
+            // pagedown leaves the cover for chapter 1
             browser.route_key(&key("pagedown"), cx);
             assert_eq!(browser.ql_book_at, 1);
+        });
+        app.run_until_parked(); // the reading pane paints
+        window.update(|_, window, _| {
+            // paint-level guard: the deferred list really painted a
+            // block, with height
+            let block = window
+                .debug_element_bounds("ql-chapter-block")
+                .expect("the epub reading pane never painted a block");
+            assert!(block.size.height > px(0.));
+        });window.update(|browser, _, cx| {
+            // pagedown: chapter 2
             browser.route_key(&key("pagedown"), cx);
             assert_eq!(browser.ql_book_at, 2);
             // pagedown at the last chapter: clamped no-op
