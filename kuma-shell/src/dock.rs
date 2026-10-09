@@ -24,6 +24,9 @@ use crate::settings::{DockPosition, Settings};
 const CELL: f32 = 48.;
 const GAP: f32 = 8.;
 const PADDING: f32 = 8.;
+
+/// Dock icons decode at twice the painted size for hidpi screens.
+const ICON_RESOLVE_SIZE: u32 = 64;
 /// The window's fixed axis (64 = 48 + 2×8 padding).
 const STRIP: f32 = CELL + 2. * PADDING;
 
@@ -361,14 +364,19 @@ impl DockView {
             .map(|app| (app.desktop_path.clone(), app.icon.clone()))
             .collect();
         cx.spawn(async move |this, cx| {
-            // the cache makes recreations instant; the first build walks
-            // the theme once, in the background
+            // the registry makes recreations instant and pins one atlas
+            // tile per icon: these Arcs are shared with every other
+            // resolver of the same name (ADR-0016)
             let decoded: Vec<(String, Option<IconImage>)> = cx
                 .background_spawn(async move {
                     icon_keys
                         .into_iter()
                         .map(|(desktop_path, icon)| {
-                            (desktop_path, crate::imaging::cached_icon(&icon))
+                            (
+                                desktop_path,
+                                crate::imaging::resolve(&icon, ICON_RESOLVE_SIZE)
+                                    .map(|shared| shared.clone_shared()),
+                            )
                         })
                         .collect()
                 })

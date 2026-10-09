@@ -6,9 +6,12 @@ use gpui::{
 };
 
 use crate::controls::{self, TrackStash};
-use crate::imaging::{IconImage, build_icon_index, decode_icon_file, icon_roots};
+use crate::imaging::IconImage;
 use crate::panel_kit as kit;
 use crate::sysmon::{Stream, SysMon};
+
+/// Slider-row icons decode at twice the painted size for hidpi screens.
+const ICON_RESOLVE_SIZE: u32 = 48;
 
 /// One widget, one control: the mini panel a value widget opens under
 /// itself. Volume adds a mute toggle; the microphone is the capture
@@ -89,17 +92,14 @@ impl SliderPanelView {
         this
     }
 
-    /// The stream rows' icons: one background pass decodes every
-    /// desktop file's icon once per panel open; matching a stream to
-    /// its app stays a cheap lookup after that.
+    /// The stream rows' icons: one background pass resolves every
+    /// desktop file's icon through the image registry (stable Arcs, one
+    /// atlas tile per icon, shared with the dock's) once per panel
+    /// open; matching a stream to its app stays a cheap lookup after that.
     fn build_app_icons(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let (apps, index) = cx
-                .background_spawn(async move {
-                    let apps = crate::launcher::load_apps();
-                    let index = build_icon_index(&icon_roots());
-                    (apps, index)
-                })
+            let apps = cx
+                .background_spawn(async move { crate::launcher::load_apps() })
                 .await;
             let mut icons: HashMap<String, Option<IconImage>> = HashMap::new();
             for app in &apps {
@@ -108,7 +108,8 @@ impl SliderPanelView {
                 }
                 icons.insert(
                     app.icon.clone(),
-                    index.get(&app.icon).and_then(|path| decode_icon_file(path)),
+                    crate::imaging::resolve(&app.icon, ICON_RESOLVE_SIZE)
+                        .map(|shared| shared.clone_shared()),
                 );
             }
             let _ = this.update(cx, |this, cx| {

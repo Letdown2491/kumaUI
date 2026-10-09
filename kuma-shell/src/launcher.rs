@@ -6,8 +6,11 @@ use gpui::{
     SharedString, Window, div, img, point, prelude::*, px, rgb, rgba,
 };
 
-use crate::imaging::{IconImage, decode_icon_file, icon_roots};
+use crate::imaging::IconImage;
 use crate::panel_kit as kit;
+
+/// The launcher grid's 22px cells decode at twice that for hidpi screens.
+const ICON_RESOLVE_SIZE: u32 = 44;
 
 #[derive(Clone, Debug)]
 pub struct AppEntry {
@@ -404,16 +407,25 @@ impl LauncherView {
         focus_handle.focus(window, cx);
         let icon_keys: Vec<String> = apps.iter().map(|app| app.icon.clone()).collect();
         cx.spawn(async move |this, cx| {
-            let index = cx
-                .background_spawn(async move { crate::imaging::build_icon_index(&icon_roots()) })
+            // the registry makes re-opens a map lookup and pins one atlas
+            // tile per icon; these Arcs are shared with the dock's (and the
+            // grid's icons decode at the grid's size, not the theme's)
+            let decoded: Vec<(String, Option<IconImage>)> = cx
+                .background_spawn(async move {
+                    icon_keys
+                        .into_iter()
+                        .filter(|key| !key.is_empty())
+                        .map(|key| {
+                            let icon = crate::imaging::resolve(&key, ICON_RESOLVE_SIZE)
+                                .map(|shared| shared.clone_shared());
+                            (key, icon)
+                        })
+                        .collect()
+                })
                 .await;
-            for key in icon_keys {
-                if key.is_empty() {
-                    continue;
-                }
-                let decoded = index.get(&key).and_then(|path| decode_icon_file(path));
+            for (key, icon) in decoded {
                 let _ = this.update(cx, |this, cx| {
-                    this.icons.insert(key, decoded);
+                    this.icons.insert(key, icon);
                     cx.notify();
                 });
             }

@@ -19,6 +19,8 @@ use crate::settings::Settings;
 const OBJECT_PATH: &str = "/org/freedesktop/Notifications";
 /// The history cap: the list keeps the newest N.
 const MAX_HISTORY: usize = 50;
+/// Icons decode at twice the painted 14px for hidpi screens.
+const ICON_RESOLVE_SIZE: u32 = 32;
 /// Toast duration when the client leaves it to us (-1).
 const DEFAULT_EXPIRE: Duration = Duration::from_secs(5);
 /// The cap: clients may ask for anything (0 = never, 600000 = ten minutes),
@@ -100,7 +102,9 @@ impl KumaDaemon {
         let icon = if icon_spec.is_empty() {
             None
         } else {
-            smol::unblock(move || crate::imaging::resolve_icon(&icon_spec)).await
+            smol::unblock(move || crate::imaging::resolve(&icon_spec, ICON_RESOLVE_SIZE))
+                .await
+                .map(|shared| shared.clone_shared())
         };
         let notification = Notification {
             id,
