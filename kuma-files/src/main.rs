@@ -5,6 +5,7 @@ use gpui::{App, AppContext, WindowBounds, WindowOptions, TitlebarOptions, px, si
 use gpui_platform::application;
 
 mod browser;
+mod epub;
 mod icons;
 mod input;
 mod theme;

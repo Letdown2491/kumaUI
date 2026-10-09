@@ -21,6 +21,9 @@ nucleo = "0.5"
 futures = "0.3"
 pulldown-cmark = "0.13"
 libc = "0.2"
+# epub glances: container reads plus the two small XML docs
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.20"
 
 [dev-dependencies]
 # only test builds pull this in; the release binary stays lean
