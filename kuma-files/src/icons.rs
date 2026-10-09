@@ -106,7 +106,7 @@ pub(crate) fn is_thumbable(name: &str) -> bool {
     is_image(name) || is_pdf(name)
 }
 
-/// PDF files: page 1 rendered by pdftocairo, falling back to the icon.
+/// PDF files: a page rendered by pdftocairo, falling back to the icon.
 pub(crate) fn is_pdf(name: &str) -> bool {
     Path::new(name)
         .extension()
@@ -121,12 +121,17 @@ pub(crate) fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> 
     Some(decode_to_render(image, max_width, max_height))
 }
 
-/// Render a PDF's first page to a thumbnail by shelling out to
-/// pdftocairo (poppler-utils). None when the tool is missing or the
-/// file is not a readable PDF, so callers fall back to the type icon.
-pub(crate) fn decode_pdf_thumbnail(path: &Path, max: u32) -> Option<gpui::RenderImage> {
+/// Render one PDF page to a thumbnail by shelling out to pdftocairo
+/// (poppler-utils). None when the tool is missing or the file is not
+/// a readable PDF, so callers fall back to the type icon.
+pub(crate) fn decode_pdf_thumbnail(
+    path: &Path,
+    page: usize,
+    max: u32,
+) -> Option<gpui::RenderImage> {
+    let page = page.to_string();
     let out = std::process::Command::new("pdftocairo")
-        .args(["-png", "-f", "1", "-l", "1", "-singlefile", "-scale-to"])
+        .args(["-png", "-f", &page, "-l", &page, "-singlefile", "-scale-to"])
         .arg(max.to_string())
         .arg(path)
         .arg("-")
@@ -156,7 +161,7 @@ mod tests {
     fn pdf_decode_fails_soft() {
         // a text file is not a pdf: no panic, just None
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-        assert!(decode_pdf_thumbnail(&path, 256).is_none());
+        assert!(decode_pdf_thumbnail(&path, 1, 256).is_none());
     }
 
     #[test]
