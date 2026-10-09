@@ -77,6 +77,7 @@ impl AssetSource for KumaAssets {
             }
             "icons/enter.svg" => Some(include_bytes!("../icons/enter.svg").as_slice()),
             "icons/terminal.svg" => Some(include_bytes!("../icons/terminal.svg").as_slice()),
+            "icons/calc.svg" => Some(include_bytes!("../icons/calc.svg").as_slice()),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))

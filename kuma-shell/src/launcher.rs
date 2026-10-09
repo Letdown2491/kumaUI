@@ -232,6 +232,169 @@ fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
     Some(score)
 }
 
+/// The launcher's calculator: a query that is entirely one arithmetic
+/// expression evaluates to a result row. Anything else (letters,
+/// syntax errors, non-finite results) returns None and the query
+/// stays a plain app search.
+fn calc_result(query: &str) -> Option<String> {
+    // a long input is never arithmetic worth evaluating; cap the work
+    if query.chars().count() > 64 {
+        return None;
+    }
+    let tokens = tokenize(query)?;
+    // a bare number ("1234") is an app search, not a calculation:
+    // an operator is what makes an expression
+    if !tokens.iter().any(|token| matches!(token, Token::Op(_))) {
+        return None;
+    }
+    let mut parser = Parser { tokens, position: 0 };
+    let value = parser.expression(0)?;
+    if parser.position != parser.tokens.len() {
+        // the parse stopped short of the end ("2 3", "2+2("), so the
+        // query was not one expression
+        return None;
+    }
+    // division by zero, 0 % 0, and overflow all land here: the row
+    // simply never appears, rather than showing a wrong answer
+    if !value.is_finite() {
+        return None;
+    }
+    Some(format_value(value))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Token {
+    Number(f64),
+    Op(char),
+    LeftParen,
+    RightParen,
+}
+
+fn tokenize(query: &str) -> Option<Vec<Token>> {
+    let mut tokens = Vec::new();
+    let mut chars = query.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            ' ' => {
+                chars.next();
+            }
+            '+' | '-' | '*' | '/' | '%' | '^' => {
+                tokens.push(Token::Op(ch));
+                chars.next();
+            }
+            '(' => {
+                tokens.push(Token::LeftParen);
+                chars.next();
+            }
+            ')' => {
+                tokens.push(Token::RightParen);
+                chars.next();
+            }
+            digit if digit.is_ascii_digit() || digit == '.' => {
+                let mut number = String::new();
+                let mut dots = 0;
+                while let Some(&ch) = chars.peek() {
+                    if ch.is_ascii_digit() || (ch == '.' && dots == 0) {
+                        if ch == '.' {
+                            dots += 1;
+                        }
+                        number.push(ch);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(Token::Number(number.parse().ok()?));
+            }
+            _ => return None,
+        }
+    }
+    Some(tokens)
+}
+
+/// Precedence climbing over the tokens. `min_binding` is the operator
+/// precedence an iteration must clear to consume: `^` binds tighter
+/// than `* / %`, which bind tighter than `+ -`, and `^` is right
+/// associative, so 2^3^2 is 2^(3^2).
+struct Parser {
+    tokens: Vec<Token>,
+    position: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.position)
+    }
+
+    fn expression(&mut self, min_binding: u8) -> Option<f64> {
+        let mut lhs = self.primary()?;
+        while let Some(Token::Op(op)) = self.peek().cloned() {
+            let (binding, right_binding) = match op {
+                '+' | '-' => (2, 3),
+                '*' | '/' | '%' => (3, 4),
+                '^' => (4, 4),
+                // the tokenizer mints no other operators
+                _ => break,
+            };
+            if binding < min_binding {
+                break;
+            }
+            self.position += 1;
+            let rhs = self.expression(right_binding)?;
+            lhs = match op {
+                '+' => lhs + rhs,
+                '-' => lhs - rhs,
+                '*' => lhs * rhs,
+                '/' => lhs / rhs,
+                '%' => lhs % rhs,
+                '^' => lhs.powf(rhs),
+                // the tokenizer mints no other operators
+                _ => break,
+            };
+        }
+        Some(lhs)
+    }
+
+    /// A number, a parenthesized expression, or a negation. The
+    /// negation recurses at `^`'s binding so -2^2 is -(2^2), the
+    /// written-math convention.
+    fn primary(&mut self) -> Option<f64> {
+        match self.tokens.get(self.position)? {
+            Token::Number(value) => {
+                self.position += 1;
+                Some(*value)
+            }
+            Token::LeftParen => {
+                self.position += 1;
+                let value = self.expression(0)?;
+                match self.tokens.get(self.position)? {
+                    Token::RightParen => {
+                        self.position += 1;
+                        Some(value)
+                    }
+                    _ => None,
+                }
+            }
+            Token::Op('-') => {
+                self.position += 1;
+                Some(-self.expression(4)?)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whole values print without the decimal tail (2.5 + 2.5 is "5", not
+/// "5.0"); fractional values print as Rust's shortest round-trip form,
+/// which keeps 10/4 honest at "2.5".
+fn format_value(value: f64) -> String {
+    if value == value.trunc() && value.abs() < 1e15 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
 pub fn launch(exec: &str, terminal: bool) -> anyhow::Result<()> {
     use std::process::Command;
 
@@ -360,23 +523,34 @@ fn filtered_indices(apps: &[AppEntry], query: &str) -> Vec<usize> {
 /// How many most-used apps the idle list pins under Frequent.
 const FREQUENT_LIMIT: usize = 4;
 
-/// One entry of the visible list: a section marker or an app row.
+/// One entry of the visible list: a section marker, an app row, or a
+/// calculator result.
 #[derive(Clone, Debug, PartialEq)]
 enum LauncherItem {
     Section(&'static str),
     /// The app's index in the loaded list.
     Row(usize),
+    /// The evaluated query: copied to the clipboard on Enter.
+    Calc(String),
 }
 
 /// The visible list: while idle, the most-used apps pinned under
 /// Frequent ahead of the catalog; while a query is active, one ranked
-/// list with the sections flattened away.
+/// list with the sections flattened away, led by the calculator's
+/// result when the query evaluates (an expression is an answer, not a
+/// search).
 fn sectioned_items(apps: &[AppEntry], query: &str) -> Vec<LauncherItem> {
     if !query.is_empty() {
-        return filtered_indices(apps, query)
-            .into_iter()
-            .map(LauncherItem::Row)
-            .collect();
+        let mut items = Vec::new();
+        if let Some(result) = calc_result(query) {
+            items.push(LauncherItem::Calc(result));
+        }
+        items.extend(
+            filtered_indices(apps, query)
+                .into_iter()
+                .map(LauncherItem::Row),
+        );
+        return items;
     }
     let frequent: Vec<usize> = (0..apps.len())
         .filter(|&index| apps[index].usage > 0)
@@ -453,16 +627,31 @@ impl LauncherView {
         crate::panel::close_panels(cx);
     }
 
+    /// Activate the selected row: an app launches (usage recorded, a
+    /// failed launch leaves the panel open), a calculator result
+    /// copies. The usage file stays desktop-path keyed, so a calc
+    /// activation never counts as anything.
+    fn activate(&mut self, item: LauncherItem, cx: &mut Context<Self>) {
+        match item {
+            LauncherItem::Calc(result) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(result));
+            }
+            LauncherItem::Row(app_index) => self.launch_at(app_index, cx),
+            LauncherItem::Section(_) => {}
+        }
+        crate::panel::close_panels(cx);
+    }
+
     /// The visible rows in selection order, each with its child index
     /// in the scrolled list: section markers sit between the rows, so
     /// scrolling targets the child, not the row number.
-    fn rows(&self) -> Vec<(usize, usize)> {
+    fn rows(&self) -> Vec<(LauncherItem, usize)> {
         self.items()
             .into_iter()
             .enumerate()
             .filter_map(|(child, item)| match item {
-                LauncherItem::Row(app_index) => Some((app_index, child)),
                 LauncherItem::Section(_) => None,
+                _ => Some((item, child)),
             })
             .collect()
     }
@@ -471,7 +660,7 @@ impl LauncherView {
         sectioned_items(&self.apps, &self.query)
     }
 
-    fn scroll_selected_into_view(&self, rows: &[(usize, usize)]) {
+    fn scroll_selected_into_view(&self, rows: &[(LauncherItem, usize)]) {
         if let Some((_, child)) = rows.get(self.selected) {
             self.results_scroll.scroll_to_item(*child);
         }
@@ -494,8 +683,8 @@ impl LauncherView {
                 }
             }
             "enter" => {
-                if let Some(&(app_index, _)) = rows.get(self.selected) {
-                    self.launch_at(app_index, cx);
+                if let Some((item, _)) = rows.get(self.selected) {
+                    self.activate(item.clone(), cx);
                 }
             }
             "up" => {
@@ -553,8 +742,18 @@ impl Render for LauncherView {
         let items = self.items();
         let rows_count = items
             .iter()
-            .filter(|item| matches!(item, LauncherItem::Row(_)))
+            .filter(|item| !matches!(item, LauncherItem::Section(_)))
             .count();
+        // the count's noun: with a calc row in the list the entries
+        // are no longer all apps
+        let noun = if items
+            .iter()
+            .any(|item| matches!(item, LauncherItem::Calc(_)))
+        {
+            if rows_count == 1 { "result" } else { "results" }
+        } else {
+            "apps"
+        };
         let selected = self.selected;
         // the rows are built up front: the hover listeners mint here,
         // before chrome borrows cx
@@ -563,6 +762,22 @@ impl Render for LauncherView {
             .into_iter()
             .map(|item| match item {
                 LauncherItem::Section(label) => section_header(label).into_any_element(),
+                LauncherItem::Calc(result) => {
+                    let at = position;
+                    position += 1;
+                    // the pointer and the keyboard share one selection:
+                    // hovering a row moves the selection to it
+                    let hover = cx.listener(
+                        move |this: &mut Self, _: &gpui::MouseMoveEvent, _, cx| {
+                            if this.selected != at {
+                                this.selected = at;
+                                cx.notify();
+                            }
+                        },
+                    );
+                    calc_row(self.query.clone(), result, at == selected, hover)
+                        .into_any_element()
+                }
                 LauncherItem::Row(app_index) => {
                     let at = position;
                     position += 1;
@@ -636,7 +851,7 @@ impl Render for LauncherView {
                                 div()
                                     .text_size(px(12.))
                                     .text_color(rgb(crate::theme::current().text_dim))
-                                    .child(format!("· {rows_count} apps")),
+                                    .child(format!("· {rows_count} {noun}")),
                             )
                             .child(div().flex_1())
                             .child(
@@ -813,6 +1028,96 @@ fn app_row(
         })
 }
 
+/// The calculator's row, the app row's shape: result up front, the
+/// query it came from beneath, and the Enter affordance on selection.
+/// Click and Enter do the same thing: the result lands on the
+/// clipboard and the panel closes, the same dismissal a launch gets.
+fn calc_row(
+    query: String,
+    result: String,
+    is_selected: bool,
+    on_hover: impl Fn(&gpui::MouseMoveEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<Div> {
+    div()
+        .id("calc")
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        // the app row's fills: inset at rest, surface when selected
+        .bg(rgb(if is_selected {
+            crate::theme::current().surface
+        } else {
+            crate::theme::current().inset
+        }))
+        .on_mouse_move(on_hover)
+        .on_mouse_down(gpui::MouseButton::Left, {
+            // the row hands its own copy to the click; the live one
+            // stays for the "= result" line
+            let clipboard = result.clone();
+            move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(clipboard.clone()));
+                crate::panel::close_panels(cx);
+            }
+        })
+        .hover(|style| style.bg(rgb(crate::theme::current().surface_hover)))
+        .child(
+            // the glyph sits directly on the row, tinting accent when
+            // the row is selected, like the app rows' icons
+            div()
+                .w(px(24.))
+                .flex()
+                .justify_center()
+                .child(
+                    gpui::svg()
+                        .path("icons/calc.svg")
+                        .size(px(18.))
+                        .text_color(rgb(if is_selected {
+                            crate::theme::current().accent
+                        } else {
+                            crate::theme::current().text
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .font_weight(if is_selected {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::NORMAL
+                        })
+                        .text_color(rgb(crate::theme::current().text))
+                        .truncate()
+                        .child(format!("= {result}")),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(crate::theme::current().text_dim))
+                        .truncate()
+                        .child(format!("Enter copies · {query}")),
+                ),
+        )
+        .when(is_selected, |el| {
+            el.child(
+                gpui::svg()
+                    .path("icons/enter.svg")
+                    .size(px(11.))
+                    .text_color(rgb(crate::theme::current().accent)),
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,5 +1281,68 @@ mod tests {
             sectioned_items(&apps, "fil"),
             [LauncherItem::Row(0)]
         );
+    }
+
+    #[test]
+    fn calc_evaluates_arithmetic_queries() {
+        assert_eq!(calc_result("12*34").as_deref(), Some("408"));
+        // precedence: multiplication before addition
+        assert_eq!(calc_result("2+3*4").as_deref(), Some("14"));
+        assert_eq!(calc_result("10/4").as_deref(), Some("2.5"));
+        assert_eq!(calc_result("2^10").as_deref(), Some("1024"));
+        assert_eq!(calc_result("(1+2)*3").as_deref(), Some("9"));
+        assert_eq!(calc_result("7%3").as_deref(), Some("1"));
+        assert_eq!(calc_result("1.5+1").as_deref(), Some("2.5"));
+        // written-math convention: the negation binds looser than ^
+        assert_eq!(calc_result("-2^2").as_deref(), Some("-4"));
+        // ^ is right associative
+        assert_eq!(calc_result("2^3^2").as_deref(), Some("512"));
+        // spaces ride along
+        assert_eq!(calc_result("1 + 2").as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn calc_rejects_non_expressions() {
+        // a bare number is an app search, not a calculation
+        assert_eq!(calc_result("1234"), None);
+        assert_eq!(calc_result("1.5"), None);
+        // syntax errors: the row just never appears
+        assert_eq!(calc_result("2+"), None);
+        assert_eq!(calc_result("*2"), None);
+        assert_eq!(calc_result("2 3"), None);
+        assert_eq!(calc_result("2+2("), None);
+        assert_eq!(calc_result("1.2.3"), None);
+        // letters make it an app search again
+        assert_eq!(calc_result("obs"), None);
+        assert_eq!(calc_result("2b"), None);
+        // non-finite results (division by zero, overflow) hide the row
+        assert_eq!(calc_result("1/0"), None);
+        assert_eq!(calc_result("9^9^9"), None);
+        // beyond the size cap
+        let long = "1+".repeat(40) + "1";
+        assert_eq!(calc_result(&long), None);
+    }
+
+    #[test]
+    fn a_calc_query_leads_the_result_list() {
+        // the app's name doubles as an expression, so both rows fire
+        let apps = vec![entry("1+1", 0)];
+        assert_eq!(
+            sectioned_items(&apps, "1+1"),
+            [LauncherItem::Calc("2".into()), LauncherItem::Row(0)]
+        );
+        // an expression that matches no app stands alone
+        assert_eq!(
+            sectioned_items(&apps, "2+2"),
+            [LauncherItem::Calc("4".into())]
+        );
+    }
+
+    #[test]
+    fn calc_never_appears_without_a_query() {
+        let apps = vec![entry("Files", 0)];
+        assert!(!sectioned_items(&apps, "")
+            .iter()
+            .any(|item| matches!(item, LauncherItem::Calc(_))));
     }
 }
