@@ -28,6 +28,14 @@ const LOOP_TICK_MS: i32 = 500;
 /// the window's grain is a minute.
 const APPLY_TICK_SECS: u64 = 60;
 
+/// A Failed control's output re-asks after this long, doubling per
+/// failure to the cap: a compositor that rejects gamma outright (a
+/// headless output, a driver without tables) settles at one rebind a
+/// minute instead of a tight loop that out-races the compositor's
+/// dispatch and logs tens of thousands of lines a second.
+const REBIND_COOLDOWN_START_MS: u64 = 1_000;
+const REBIND_COOLDOWN_MAX_MS: u64 = 60_000;
+
 /// One Wayland connection for the shell's lifetime: the config
 /// arrives through shared state and the loop reads it each tick, so
 /// a settings change never re-mints the client (a new connection
@@ -89,9 +97,11 @@ fn apply_loop(shared: SharedConfig) -> anyhow::Result<()> {
         )
     })?;
 
-    let mut app = NightApp {        manager,
+    let mut app = NightApp {
+        manager,
         outputs: Vec::new(),
         controls: Vec::new(),
+        rebind_at: Vec::new(),
     };
 
     // Every output that exists now, and every one that arrives later
@@ -202,19 +212,36 @@ struct NightApp {
     outputs: Vec<wl_output::WlOutput>,
     /// The live controls and the ramp size each has reported.
     controls: Vec<(wl_output::WlOutput, ZwlrGammaControlV1, Option<u16>)>,
+    /// Outputs whose control Failed, with the time of the last failure
+    /// and the wait before re-asking (doubles per failure, capped).
+    rebind_at: Vec<(wl_output::WlOutput, std::time::Instant, u64)>,
 }
 
 impl NightApp {
-    /// Ask for a control on every output that lacks one. A control
-    /// can fail transiently (the old client's exclusive hold during a
+    /// Ask for a control on every output that lacks one. A control can
+    /// fail transiently (the old client's exclusive hold during a
     /// settings change, an output re-configuring), so this runs every
-    /// loop and the failures are retried away.
+    /// loop and the failures are retried after a cooldown that doubles
+    /// per failure: a permanent rejection costs a rebind a minute,
+    /// not a loop that never lets the connection sleep.
     fn bind_missing(&mut self, qh: &QueueHandle<Self>) {
         for output in &self.outputs {
-            if !self.controls.iter().any(|(known, _, _)| known == output) {
-                let control = self.manager.get_gamma_control(output, qh, ());
-                self.controls.push((output.clone(), control, None));
+            if self.controls.iter().any(|(known, _, _)| known == output) {
+                continue;
             }
+            if let Some((_, at, wait)) = self
+                .rebind_at
+                .iter_mut()
+                .find(|(known, _, _)| known == output)
+            {
+                if at.elapsed() < std::time::Duration::from_millis(*wait) {
+                    continue;
+                }
+                *at = std::time::Instant::now();
+                *wait = (*wait * 2).min(REBIND_COOLDOWN_MAX_MS);
+            }
+            let control = self.manager.get_gamma_control(output, qh, ());
+            self.controls.push((output.clone(), control, None));
         }
     }
 
@@ -336,11 +363,35 @@ impl Dispatch<ZwlrGammaControlV1, ()> for NightApp {
                 }
             }
             // the output or the ramp was rejected: drop the control so
-            // the loop stops pushing to it; the next output change
-            // rebinds
+            // the loop stops pushing to it, and arm the rebind
+            // cooldown (a transient failure rebinds after a second; a
+            // permanent one backs off to a minute)
             GammaEvent::Failed => {
                 log::info!("night light: a gamma control failed; dropping it");
+                let owner = state
+                    .controls
+                    .iter()
+                    .find(|(_, c, _)| c == control)
+                    .map(|(o, _, _)| o.clone());
                 state.controls.retain(|(_, c, _)| c != control);
+                let _ = control.destroy();
+                if let Some(output) = owner {
+                    match state
+                        .rebind_at
+                        .iter_mut()
+                        .find(|(known, _, _)| known == &output)
+                    {
+                        Some((_, at, wait)) => {
+                            *at = std::time::Instant::now();
+                            *wait = (*wait * 2).min(REBIND_COOLDOWN_MAX_MS);
+                        }
+                        None => state.rebind_at.push((
+                            output,
+                            std::time::Instant::now(),
+                            REBIND_COOLDOWN_START_MS,
+                        )),
+                    }
+                }
             }
             _ => {}
         }
