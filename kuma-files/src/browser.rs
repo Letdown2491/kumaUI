@@ -1701,19 +1701,32 @@ impl Browser {
         let Ok(meta) = fs::symlink_metadata(&path) else {
             return;
         };
-        // decoding cost is in the file read, not the resize; cap it
-        if meta.len() > 32 * 1024 * 1024 {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let is_pdf = icons::is_pdf(&name);
+        let is_epub = icons::is_epub(&name);
+        // decoding cost is in the file read, not the resize; cap it.
+        // epubs read selectively (zip directory, manifest, cover
+        // bytes), so the file-size cap does not apply to them
+        if !is_epub && meta.len() > 32 * 1024 * 1024 {
             return;
         }
         self.thumbs_inflight.insert(path.clone());
         cx.spawn(async move |this, cx| {
             let bg_path = path.clone();
-            let is_pdf = icons::is_pdf(&bg_path.file_name().unwrap_or_default().to_string_lossy());
             let render = cx
                 .background_spawn(async move {
                     std::panic::catch_unwind(|| {
                         if is_pdf {
                             icons::decode_pdf_thumbnail(&bg_path, 1, 256)
+                        } else if is_epub {
+                            // a pathological cover stays sane: cap the
+                            // bytes handed to the decoder
+                            crate::epub::read_epub_meta(&bg_path).and_then(|meta| {
+                                let bytes = meta.cover?;
+                                (bytes.len() <= 16 * 1024 * 1024)
+                                    .then_some(bytes)
+                                    .and_then(|bytes| icons::decode_cover(&bytes, 256))
+                            })
                         } else {
                             icons::decode_thumbnail(&bg_path, 256, 256)
                         }
@@ -5509,7 +5522,8 @@ impl Browser {
 
         // thumbnails only for local image files: trash entries point at
         // paths that no longer exist
-        let show_thumb = !in_trash && !entry.is_dir && icons::is_thumbable(&entry.name);
+        let show_thumb =
+            !in_trash && !entry.is_dir && (icons::is_thumbable(&entry.name) || icons::is_epub(&entry.name));
         let thumb = if show_thumb {
             self.request_thumb(entry.path.clone(), cx);
             self.thumbs.get(&entry.path).cloned()
@@ -7477,7 +7491,10 @@ impl Render for Browser {
                         self.text_preview = None;
                         let entry = self.tab().entries.iter().find(|e| e.key == key).cloned();
                         if let Some(entry) = entry.filter(|e| e.item.is_none()) {
-                            if !entry.is_dir && icons::is_thumbable(&entry.name) {
+                            if !entry.is_dir
+                                && (icons::is_thumbable(&entry.name)
+                                    || icons::is_epub(&entry.name))
+                            {
                                 self.request_thumb(entry.path.clone(), cx);
                             } else if !entry.is_dir {
                                 self.request_text_preview(entry.path.clone(), cx);
@@ -10832,6 +10849,56 @@ mod browser_ux_keys {
             assert!(browser.ql_render.is_none());
             // still open, showing the card
             assert!(browser.quicklook.is_some());
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn details_pane_shows_epub_covers_and_skips_corrupt_ones() {
+        let lab = Lab::new("rail-epub-thumb");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let opf = br#"<?xml version="1.0"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>Neuromancer</dc:title>
+              </metadata>
+              <manifest>
+                <item id="cover" href="cover.png" properties="cover-image"/>
+              </manifest>
+              <spine/>
+            </package>"#;
+        let container = br#"<?xml version="1.0"?>
+            <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+              <rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles>
+            </container>"#;
+        fs::write(
+            lab.dir.join("zz.epub"),
+            crate::epub::tests::write_epub(&[
+                ("META-INF/container.xml", container),
+                ("OEBPS/content.opf", opf),
+                ("OEBPS/cover.png", &png),
+            ]),
+        )
+        .unwrap();
+        // a second, corrupt epub: decode lands empty, no thumb
+        fs::write(lab.dir.join("bad.epub"), b"not a zip").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.inspector = true;
+            // dirs first: sub, a.txt, b.txt, c.txt, bad.epub, zz.epub
+            browser.jump_cursor(5, cx);
+        });
+        app.run_until_parked(); // the rail feed + cover decode land
+        window.update(|browser, _, _| {
+            assert!(browser.thumbs.contains_key(&lab.dir.join("zz.epub")));
+            assert!(!browser.thumbs.contains_key(&lab.dir.join("bad.epub")));
         });
         app.run_until_parked();
     }
