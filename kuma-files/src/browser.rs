@@ -5139,6 +5139,10 @@ impl Browser {
         };
         tab.renaming = Some(entry.path.clone());
         tab.rename_field = input::Field::new(entry.name.clone());
+        // the name starts selected: typing replaces it, which is what
+        // "rename" almost always means. The caret used to park at the
+        // end, which read as the editor ignoring keystrokes
+        tab.rename_field.select_all();
         cx.notify();
     }
 
@@ -10778,6 +10782,30 @@ mod browser_ux_keys {
     }
 
     #[test]
+    fn rename_opens_with_the_name_selected_so_typing_replaces() {
+        let lab = Lab::new("rename-select-all");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.jump_cursor(1, cx); // a.txt
+            browser.start_rename(cx);
+            assert_eq!(browser.tab().rename_field.sel, Some((0, 5)));
+            // a typed character replaces the whole selection
+            let mut typed = key("x");
+            typed.keystroke.key_char = Some("X".into());
+            browser.route_key(&typed, cx);
+            assert_eq!(browser.tab().rename_field.text(), "X");
+            browser.route_key(&key("enter"), cx);
+        });
+        app.run_until_parked();
+        assert!(lab.dir.join("X").exists());
+        assert!(!lab.dir.join("a.txt").exists());
+    }
+
+    #[test]
     fn quick_look_epub_lands_cover_and_metadata() {
         let lab = Lab::new("quicklook-epub");
         let mut png = Vec::new();
@@ -11150,7 +11178,10 @@ mod browser_rename {
             browser.tab_mut().cursor = Some(0);
             browser.start_rename(cx);
             assert!(browser.tab().renaming.is_some(), "F2 path never entered rename");
-            // append a 2, then commit
+            // the name opens selected (typing replaces it); end
+            // collapses to the caret, then append a 2 and commit
+            assert_eq!(browser.tab().rename_field.sel, Some((0, 9)));
+            browser.route_key(&key("end"), cx);
             browser.route_key(&key("2"), cx);
             assert_eq!(browser.tab().rename_field.text(), "notes.txt2");
             browser.route_key(&key("enter"), cx);
@@ -11197,8 +11228,10 @@ mod browser_rename {
                 .unwrap_or(false)
         });
         assert!(painted, "icon view never painted the rename box");
-        // and the flow still commits
+        // and the flow still commits (end collapses the opening
+        // selection to the caret, then append a 2)
         window.update(|browser, _, cx| {
+            browser.route_key(&key("end"), cx);
             browser.route_key(&key("2"), cx);
             browser.route_key(&key("enter"), cx);
         });
