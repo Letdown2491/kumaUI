@@ -14,9 +14,10 @@ use std::io::{BufRead as _, Write as _};
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent,
     ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, HighlightStyle,
-    ImageSource, KeyDownEvent, MouseDownEvent, MouseButton, MouseUpEvent, ObjectFit, Pixels,
-    Point, Render, RenderImage, Stateful, StyledText, UnderlineStyle, Window, div, img,
-    prelude::*, px, relative, rgba, rgb, svg, FontStyle, FontWeight, SharedString,
+    ImageSource, KeyDownEvent, MouseDownEvent, MouseMoveEvent, MouseButton, MouseUpEvent,
+    ObjectFit, Pixels, Point, Render, RenderImage, ScrollWheelEvent, Stateful, StyledText,
+    UnderlineStyle, Window, div, img, point, prelude::*, px, relative, rgba, rgb, svg, FontStyle,
+    FontWeight, SharedString,
 };
 use trash::{os_limited, TrashItem};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,6 +58,33 @@ fn trim_thumbs(
 /// Undo memory bound: individual file operations, not steps, so a
 /// thousand-file paste is a thousand undo records.
 const UNDO_MAX_OPS: usize = 1000;
+
+/// Quick Look's decode bound: page-style files decode once at glance
+/// scale (the listing's 256px thumbs are too small for a pane). Zoom
+/// past the decoded pixels goes soft; re-decode-on-zoom is out of
+/// scope (see #34).
+const QL_DECODE_MAX: u32 = 2048;
+
+/// Quick Look's zoom bounds around the fit: 1.0 is fit, 6x is as deep
+/// as a glance needs.
+const QL_ZOOM_MAX: f32 = 6.0;
+
+/// Contain-scale for the Quick Look pane: the image fills the smaller
+/// ratio, never crops. Degenerate sizes read as "already fit".
+fn ql_fit_scale(natural: (f32, f32), avail: (f32, f32)) -> f32 {
+    if natural.0 <= 0.0 || natural.1 <= 0.0 || avail.0 <= 0.0 || avail.1 <= 0.0 {
+        return 1.0;
+    }
+    (avail.0 / natural.0).min(avail.1 / natural.1)
+}
+
+/// Pan clamps so a zoomed image still covers the pane: at most half
+/// the overflow to each side, none when fit.
+fn ql_clamp_pan(pan: (f32, f32), display: (f32, f32), avail: (f32, f32)) -> (f32, f32) {
+    let max_x = ((display.0 - avail.0) / 2.0).max(0.0);
+    let max_y = ((display.1 - avail.1) / 2.0).max(0.0);
+    (pan.0.clamp(-max_x, max_x), pan.1.clamp(-max_y, max_y))
+}
 
 use crate::{icons, theme};
 
@@ -1232,6 +1260,22 @@ pub(crate) struct Browser {
     text_preview: Option<TextPreview>,
     preview_key: Option<PathBuf>,
     preview_inflight: HashSet<PathBuf>,
+    /// Quick Look: the full-pane preview overlay. `None` when closed;
+    /// while open it owns the keyboard (route_key's rung) and follows
+    /// the cursor entry. `zoom` is 1.0 = fit; pan only matters zoomed.
+    quicklook: Option<QuickLook>,
+    /// The one held Quick Look decode, keyed by the path it belongs
+    /// to. Dropped via `cx.drop_image` on close and flip: the img
+    /// element never drops its own atlas tile (ADR-0016).
+    ql_render: Option<(PathBuf, Arc<RenderImage>)>,
+    /// The decode in flight, if any.
+    ql_inflight: Option<PathBuf>,
+    /// The path whose decode landed empty (corrupt file, missing
+    /// pdftocairo): stands in as the card so sync does not re-spawn
+    /// the decode every frame.
+    ql_failed: Option<PathBuf>,
+    /// The overlay's text column scrolls through the snippet.
+    ql_scroll: gpui::ScrollHandle,
     /// Hand-rolled right-click menu: position plus a flat item list.
     menu: Option<ContextMenu>,
     /// Cells in the first grid row, captured at paint time; 0 means
@@ -1321,6 +1365,11 @@ impl Browser {
             text_preview: None,
             preview_key: None,
             preview_inflight: HashSet::new(),
+            quicklook: None,
+            ql_render: None,
+            ql_inflight: None,
+            ql_failed: None,
+            ql_scroll: gpui::ScrollHandle::new(),
             menu: None,
             grid_row_len: Arc::new(AtomicUsize::new(0)),
             status: String::new(),
@@ -3895,6 +3944,181 @@ impl Browser {
         cx.notify();
     }
 
+    /// Space: open Quick Look over the cursor entry, or close it when
+    /// open. Trash rows preview nothing (their key is a .trashinfo
+    /// path, not a file worth showing).
+    fn toggle_quicklook(&mut self, cx: &mut Context<Self>) {
+        if self.quicklook.is_some() {
+            self.close_quicklook(cx);
+            return;
+        }
+        if self.tab().cursor.is_some() {
+            self.quicklook = Some(QuickLook {
+                path: PathBuf::new(),
+                zoom: 1.0,
+                pan: (0.0, 0.0),
+                drag_from: None,
+            });
+            self.sync_quicklook(cx);
+        }
+    }
+
+    fn close_quicklook(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, image)) = self.ql_render.take() {
+            cx.drop_image(image, None);
+        }
+        self.ql_inflight = None;
+        self.quicklook = None;
+        cx.notify();
+    }
+
+    /// Re-point the open overlay at the cursor entry. Flips land
+    /// here, and so does the render after a watcher reshuffle moves
+    /// the listing under the overlay. A cursor with nothing to show
+    /// closes it.
+    fn sync_quicklook(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .tab()
+            .cursor
+            .and_then(|ix| self.tab().entries.get(ix))
+            .filter(|entry| entry.item.is_none())
+            .cloned()
+        else {
+            self.close_quicklook(cx);
+            return;
+        };
+        let moved = self
+            .quicklook
+            .as_ref()
+            .is_some_and(|ql| ql.path != entry.path);
+        if moved {
+            if let Some(ql) = self.quicklook.as_mut() {
+                ql.path = entry.path.clone();
+                ql.zoom = 1.0;
+                ql.pan = (0.0, 0.0);
+                ql.drag_from = None;
+            }
+            if let Some((_, image)) = self.ql_render.take() {
+                cx.drop_image(image, None);
+            }
+            self.ql_scroll.set_offset(point(px(0.), px(0.)));
+        }
+        self.feed_quicklook(&entry, cx);
+    }
+
+    /// Flip inside Quick Look: one step of cursor movement through the
+    /// visible listing, then the overlay follows.
+    fn quicklook_flip(&mut self, step: isize, cx: &mut Context<Self>) {
+        self.move_cursor(step, cx);
+        self.sync_quicklook(cx);
+        cx.notify();
+    }
+
+    /// +/- keys: multiplicative zoom steps; back at fit, the pan
+    /// resets.
+    fn quicklook_zoom_step(&mut self, step: f32, cx: &mut Context<Self>) {
+        let Some(ql) = self.quicklook.as_mut() else {
+            return;
+        };
+        ql.zoom = (ql.zoom * step).clamp(1.0, QL_ZOOM_MAX);
+        if ql.zoom <= 1.0 {
+            ql.pan = (0.0, 0.0);
+        }
+        cx.notify();
+    }
+
+    /// Kick the right pipeline for the entry under Quick Look: a
+    /// pane-scale decode for page-style files, the text snippet for
+    /// the rest. While Quick Look is open it owns the preview; the
+    /// render's rail feed re-syncs the same keys, so double requests
+    /// collapse in the guards.
+    fn feed_quicklook(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+        if entry.is_dir {
+            return;
+        }
+        if icons::is_thumbable(&entry.name) {
+            self.request_quicklook_render(entry.path.clone(), cx);
+        } else {
+            let key = entry.key.clone();
+            if self.preview_key.as_ref() != Some(&key) {
+                self.preview_key = Some(key);
+                self.text_preview = None;
+                self.request_text_preview(entry.path.clone(), cx);
+            }
+        }
+    }
+
+    /// Kick the background decode for Quick Look's own render (the
+    /// listing's thumbs are 256px; a pane wants more). One decode in
+    /// flight; the result lands only if Quick Look is still open on
+    /// that path. Failures mark the path so sync does not re-spawn
+    /// the decode every frame.
+    fn request_quicklook_render(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.ql_render.as_ref().is_some_and(|(p, _)| *p == path)
+            || self.ql_inflight.as_ref() == Some(&path)
+            || self.ql_failed.as_ref() == Some(&path)
+        {
+            return;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            self.ql_failed = Some(path);
+            return;
+        };
+        // decoding cost is in the file read, not the resize; cap it
+        if meta.len() > 32 * 1024 * 1024 {
+            self.ql_failed = Some(path);
+            return;
+        }
+        self.ql_inflight = Some(path.clone());
+        let is_pdf = icons::is_pdf(&path.file_name().unwrap_or_default().to_string_lossy());
+        cx.spawn(async move |this, cx| {
+            let bg_path = path.clone();
+            let render = cx
+                .background_spawn(async move {
+                    std::panic::catch_unwind(|| {
+                        if is_pdf {
+                            icons::decode_pdf_thumbnail(&bg_path, QL_DECODE_MAX)
+                        } else {
+                            icons::decode_thumbnail(&bg_path, QL_DECODE_MAX, QL_DECODE_MAX)
+                        }
+                    })
+                    .unwrap_or(None)
+                })
+                .await;
+            let update = this.update(cx, |this, cx| {
+                this.ql_inflight = None;
+                // landed empty (corrupt file, missing pdftocairo):
+                // remember it so the overlay shows the card and the
+                // decode does not re-spawn
+                let Some(render) = render else {
+                    if this.quicklook.as_ref().is_some_and(|ql| ql.path == path) {
+                        this.ql_failed = Some(path);
+                        cx.notify();
+                    }
+                    return;
+                };
+                // the overlay may have closed or flipped mid-decode
+                if this
+                    .quicklook
+                    .as_ref()
+                    .is_some_and(|ql| ql.path == path)
+                {
+                    // the previous tile goes the moment the new one
+                    // lands (ADR-0016)
+                    if let Some((_, old)) = this.ql_render.take() {
+                        cx.drop_image(old, None);
+                    }
+                    this.ql_render = Some((path, Arc::new(render)));
+                    cx.notify();
+                }
+            });
+            if let Err(err) = update {
+                log::error!("quick look decode failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
     /// Load the rail's text snippet in the background: first lines of a
     /// small file that does not smell binary (no NUL in the head). The
     /// kind comes from the extension; styling happens at render.
@@ -4305,6 +4529,34 @@ impl Browser {
             return;
         }
 
+        if self.quicklook.is_some() {
+            match keystroke.key.as_str() {
+                // space toggles shut, escape closes: both keep the
+                // cursor where it was
+                "space" | "escape" => self.close_quicklook(cx),
+                "up" | "left" => self.quicklook_flip(-1, cx),
+                "down" | "right" => self.quicklook_flip(1, cx),
+                // enter hands off: a file goes to the system opener
+                // (the ADR-0013 road), a folder navigates; the overlay
+                // closes either way
+                "enter" => {
+                    self.close_quicklook(cx);
+                    self.open_selection(cx);
+                }
+                "=" | "+" => self.quicklook_zoom_step(1.2, cx),
+                "-" | "_" => self.quicklook_zoom_step(1.0 / 1.2, cx),
+                "0" => {
+                    if let Some(ql) = self.quicklook.as_mut() {
+                        ql.zoom = 1.0;
+                        ql.pan = (0.0, 0.0);
+                    }
+                    cx.notify();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.accent_picker {
             if keystroke.key == "escape" {
                 self.accent_picker = false;
@@ -4385,6 +4637,9 @@ impl Browser {
         match keystroke.key.as_str() {
             "enter" if keystroke.modifiers.alt => self.toggle_inspector(cx),
             "enter" => self.open_selection(cx),
+            // space: Quick Look over the cursor entry (route_key's
+            // rung owns it once open)
+            "space" => self.toggle_quicklook(cx),
             // Backspace edits the filter while one is active, otherwise
             // it goes to the parent directory
             "backspace" => {
@@ -5922,11 +6177,296 @@ impl Browser {
         )
     }
 
+    /// The Quick Look overlay: a full-pane takeover above the
+    /// listing. Nothing renders when closed. Images decode at pane
+    /// scale and zoom/pan; text renders the rail's snippet at read
+    /// size, scrollable; dirs and unknown files render a card.
+    fn quicklook_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
+        self.quicklook.as_ref()?;
+        let cursor = self.tab().cursor;
+        let entry = cursor
+            .and_then(|ix| self.tab().entries.get(ix))
+            .cloned()
+            .filter(|entry| entry.item.is_none());
+        let Some(entry) = entry else {
+            // the listing moved out from under the overlay: a bare
+            // catcher so nothing beneath is clickable; the next sync
+            // (or this click) closes it
+            return Some(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .bg(theme::sidebar())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.close_quicklook(cx)),
+                    ),
+            );
+        };
+        let visible = self.visible_indices();
+        let pos = cursor.and_then(|ix| visible.iter().position(|&v| v == ix));
+
+        // the top row: name, position in the listing, the close road
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .flex_none()
+            .h(px(40.))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .truncate()
+                    .child(entry.name.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme::text_dim())
+                    .child(match pos {
+                        Some(pos) => format!("{} of {}", pos + 1, visible.len()),
+                        None => String::new(),
+                    }),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme::text_dim())
+                    .child("Esc closes"),
+            )
+            .child(
+                div()
+                    .id("quicklook-close")
+                    .cursor_pointer()
+                    .px_2()
+                    .rounded_sm()
+                    .text_size(px(16.))
+                    .text_color(theme::text_dim())
+                    .hover(|this| this.text_color(theme::text()).bg(theme::row_hover()))
+                    .on_click(cx.listener(|this, _, _, cx| this.close_quicklook(cx)))
+                    .child("×"),
+            );
+
+        // the pane: what renders depends on what the entry is
+        let image = self.ql_render.as_ref().and_then(|(path, render)| {
+            (path == &entry.path && !entry.is_dir).then(|| render.clone())
+        });
+        let pane: Div = if let Some(render) = image {
+            let viewport = window.viewport_size();
+            // the pane's own budget: this overlay's top row and the
+            // pane's margin, which the layout below owns
+            let avail_w = (viewport.width - px(48.)).max(px(1.)).into();
+            let avail_h = (viewport.height - px(76.)).max(px(1.)).into();
+            let natural = render.size(0);
+            let natural = (
+                u32::from(natural.width) as f32,
+                u32::from(natural.height) as f32,
+            );
+            let fit = ql_fit_scale(natural, (avail_w, avail_h));
+            let zoom = self
+                .quicklook
+                .as_ref()
+                .map(|ql| ql.zoom.clamp(1.0, QL_ZOOM_MAX))
+                .unwrap_or(1.0);
+            let display = (natural.0 * fit * zoom, natural.1 * fit * zoom);
+            let pan = self
+                .quicklook
+                .as_ref()
+                .map(|ql| ql.pan)
+                .unwrap_or((0.0, 0.0));
+            let (pan_x, pan_y) = ql_clamp_pan(pan, display, (avail_w, avail_h));
+            // symmetric opposed margins: in a centered flex the net
+            // shift is (ml - mr) / 2, so this is the pan, plain
+            // flexbox, no positioning semantics
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+                .m_3()
+                .child(
+                    img(ImageSource::Render(render))
+                        .w(px(display.0))
+                        .h(px(display.1))
+                        .ml(px(pan_x))
+                        .mr(px(-pan_x))
+                        .mt(px(pan_y))
+                        .mb(px(-pan_y)),
+                )
+        } else if !entry.is_dir && self.preview_key.as_ref() == Some(&entry.key)
+            && self.text_preview.is_some()
+        {
+            let text = self.text_preview.as_ref().unwrap();
+            let mono = div()
+                .w_full()
+                .text_size(px(13.))
+                .text_color(theme::text())
+                .font_family("monospace");
+            let lines: Div = match text.kind {
+                TextKind::Csv => mono.children(csv_lines(&text.lines).iter().map(|line| {
+                    preview_line(line.clone()).text_color(theme::text())
+                })),
+                TextKind::Code => mono.children(
+                    text.lines
+                        .iter()
+                        .map(|line| code_line(line).into_any_element()),
+                ),
+                TextKind::Markdown => div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .text_size(px(13.))
+                    .text_color(theme::text())
+                    .children(md_blocks(text)),
+                TextKind::Plain => mono.children(
+                    text.lines
+                        .iter()
+                        .map(|line| preview_line(line.clone()).text_color(theme::text())),
+                ),
+            };
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .m_3()
+                .child(
+                    div()
+                        .id("quicklook-text")
+                        .overflow_y_scroll()
+                        .track_scroll(&self.ql_scroll)
+                        .w_full()
+                        .child(lines),
+                )
+        } else {
+            // dirs, undecoded/failed page files, unknown types: the
+            // card. Enter still hands the file to the system.
+            let kind = if entry.is_dir {
+                "Folder".to_string()
+            } else {
+                let ext = Path::new(&entry.name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_uppercase())
+                    .unwrap_or_else(|| "file".into());
+                let size = entry
+                    .size
+                    .map(|size| format!(" · {}", human_size(size)))
+                    .unwrap_or_default();
+                format!("{ext} file{size}")
+            };
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .m_3()
+                .child(self.entry_icon(&entry, px(96.)))
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(theme::text())
+                        .child(entry.name.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_dim())
+                        .child(kind),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_dim())
+                        .child("Enter opens with the system"),
+                )
+        };
+
+        // the image pane's mouse: wheel zooms, a press+move pans (the
+        // clamps live in ql_clamp_pan at render), release drops the
+        // drag. On non-image panes the handlers idle.
+        let drag_pane = pane
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                let Some(entry) = this
+                    .tab()
+                    .cursor
+                    .and_then(|ix| this.tab().entries.get(ix))
+                    .filter(|entry| entry.item.is_none())
+                    .cloned()
+                else {
+                    return;
+                };
+                if entry.is_dir || !icons::is_thumbable(&entry.name) || this.ql_render.is_none() {
+                    return;
+                }
+                let Some(ql) = this.quicklook.as_mut() else {
+                    return;
+                };
+                // one wheel notch (3 lines) is about 1/1.2, same as
+                // the +/- keys; trackpads land in between smoothly
+                let dy: f32 = event.delta.pixel_delta(px(20.)).y.into();
+                ql.zoom = (ql.zoom * (-dy * 0.003f32).exp()).clamp(1.0, QL_ZOOM_MAX);
+                if ql.zoom <= 1.0 {
+                    ql.pan = (0.0, 0.0);
+                }
+                cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, _| {
+                // any press arms a pan; at fit the clamps hold the
+                // pan at zero, so only a zoomed image moves
+                if let Some(ql) = this.quicklook.as_mut() {
+                    ql.drag_from = Some((event.position, ql.pan));
+                }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                let Some(ql) = this.quicklook.as_mut() else {
+                    return;
+                };
+                let Some((from, from_pan)) = ql.drag_from else {
+                    return;
+                };
+                if event.pressed_button != Some(MouseButton::Left) {
+                    ql.drag_from = None;
+                    cx.notify();
+                    return;
+                }
+                let dx: f32 = (event.position.x - from.x).into();
+                let dy: f32 = (event.position.y - from.y).into();
+                ql.pan = (from_pan.0 + dx, from_pan.1 + dy);
+                cx.notify();
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if let Some(ql) = this.quicklook.as_mut()
+                    && ql.drag_from.take().is_some()
+                {
+                    cx.notify();
+                }
+            }));
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .flex_col()
+                .bg(theme::sidebar())
+                .child(header)
+                .child(drag_pane),
+        )
+    }
+
     /// The Connect to Server dialog. Before the pump runs: the URI
     /// field. At a prompt: the gio prompt text and a masked (or plain)
     /// answer field. Between prompts: the status line alone.
-    fn connect_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let dialog = self.connect.as_ref()?;
+    fn connect_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {        let dialog = self.connect.as_ref()?;
         let at_prompt = dialog.session.is_some();
         let asking = dialog.prompt.is_some();
         // the protocol picker and its field rows, before the pump
@@ -6694,6 +7234,14 @@ impl Render for Browser {
                     self.text_preview = None;
                 }
             }
+        }
+
+        // Quick Look owns the preview while open: it follows the
+        // cursor entry (flips land here, and so do watcher
+        // reshuffles). The rail's feed below keeps running on the
+        // same keys and guards, so nothing double-fetches.
+        if self.quicklook.is_some() {
+            self.sync_quicklook(cx);
         }
 
         // the titlebar follows the active folder
@@ -7544,6 +8092,7 @@ impl Render for Browser {
             .children(self.conflict_overlay(cx))
             .children(self.compress_overlay(cx))
             .children(self.connect_overlay(cx))
+            .children(self.quicklook_overlay(window, cx))
             .children(self.accent_overlay(cx))
             .children(self.menu_overlay(window, cx))
     }
@@ -8366,6 +8915,17 @@ struct TextPreview {
     blocks: Option<Vec<MdBlock>>,
 }
 
+/// Quick Look's own state: which entry it shows (follows the cursor),
+/// the image zoom and pan, and an active drag's anchor (the pointer
+/// position the press started at, plus the pan it started from).
+#[derive(Clone, Debug, PartialEq)]
+struct QuickLook {
+    path: PathBuf,
+    zoom: f32,
+    pan: (f32, f32),
+    drag_from: Option<(Point<Pixels>, (f32, f32))>,
+}
+
 fn text_kind(path: &Path) -> TextKind {
     let ext = path
         .extension()
@@ -8762,6 +9322,7 @@ const KEY_HINTS: &[(&str, &str)] = &[
     ("Del", "trash"),
     ("Shift+Del", "delete"),
     ("Alt+Enter", "info"),
+    ("Space", "quick look"),
     ("Right-click", "menu"),
     ("Shift+F10", "menu (keyboard)"),
     ("Ctrl+C/X/V/Z", "clipboard"),
@@ -9665,6 +10226,173 @@ mod browser_ux_keys {
         assert_eq!(
             fs::read_to_string(lab.dir.join("c (copy).txt")).unwrap(),
             "new-c"
+        );
+    }
+
+    #[test]
+    fn space_opens_quick_look_over_the_cursor_and_toggles_shut() {
+        let lab = Lab::new("quicklook-toggle");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // dirs sort first: sub, a.txt, b.txt, c.txt
+            browser.jump_cursor(1, cx);
+            browser.route_key(&key("space"), cx);
+            assert!(browser
+                .quicklook
+                .as_ref()
+                .is_some_and(|ql| ql.path == lab.dir.join("a.txt")));
+            // the text pipeline fed for the entry under the overlay
+            assert_eq!(browser.preview_key.as_ref(), Some(&lab.dir.join("a.txt")));
+            // space again closes and keeps the cursor
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_none());
+            assert_eq!(browser.tab().cursor, Some(1));
+            // escape closes too
+            browser.route_key(&key("space"), cx);
+            browser.route_key(&key("escape"), cx);
+            assert!(browser.quicklook.is_none());
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_flip_follows_the_listing_and_resets_the_image() {
+        let lab = Lab::new("quicklook-flip");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.jump_cursor(1, cx); // a.txt
+            browser.route_key(&key("space"), cx);
+            if let Some(ql) = browser.quicklook.as_mut() {
+                ql.zoom = 4.0;
+                ql.pan = (100.0, -50.0);
+            }
+            // down: to b.txt, and the image state resets
+            browser.route_key(&key("down"), cx);
+            assert!(browser
+                .quicklook
+                .as_ref()
+                .is_some_and(|ql| ql.path == lab.dir.join("b.txt")));
+            assert_eq!(browser.quicklook.as_ref().unwrap().zoom, 1.0);
+            assert_eq!(browser.quicklook.as_ref().unwrap().pan, (0.0, 0.0));
+            // up onto the dir card, where a further up clamps
+            browser.route_key(&key("up"), cx);
+            browser.route_key(&key("up"), cx);
+            assert!(browser
+                .quicklook
+                .as_ref()
+                .is_some_and(|ql| ql.path == lab.dir.join("sub")));
+            // the listing's cursor followed, so a later close leaves
+            // the browser parked on the same entry
+            browser.route_key(&key("space"), cx);
+            assert_eq!(browser.tab().cursor, Some(0));
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_flip_respects_the_filter() {
+        let lab = Lab::new("quicklook-filter");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // set directly: the flip path reads visible_indices, no
+            // deep search involved
+            browser.filter = "b.txt".into();
+            browser.snap_cursor_visible();
+            browser.route_key(&key("space"), cx);
+            assert!(browser
+                .quicklook
+                .as_ref()
+                .is_some_and(|ql| ql.path == lab.dir.join("b.txt")));
+            // the only visible entry: flipping clamps in place
+            browser.route_key(&key("down"), cx);
+            browser.route_key(&key("down"), cx);
+            assert!(browser
+                .quicklook
+                .as_ref()
+                .is_some_and(|ql| ql.path == lab.dir.join("b.txt")));
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_enter_hands_off_or_navigates() {
+        let lab = Lab::new("quicklook-enter");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // enter on a folder card navigates (and closes first)
+            browser.jump_cursor(0, cx); // sub
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_some());
+            browser.route_key(&key("enter"), cx);
+            assert!(browser.quicklook.is_none());
+            assert_eq!(
+                browser.tab().current_dir().map(Path::to_path_buf),
+                Some(lab.dir.join("sub"))
+            );
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_image_decode_lands_and_flips_drop_it() {
+        let lab = Lab::new("quicklook-image");
+        // a tiny real png, written before the browser loads so the
+        // listing sees it; dirs first, so pic sorts last
+        let pic = lab.dir.join("pic.png");
+        image::DynamicImage::new_rgb8(8, 8)
+            .save_with_format(&pic, image::ImageFormat::Png)
+            .unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.jump_cursor(4, cx); // pic.png
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_some());
+        });
+        app.run_until_parked(); // the background decode lands
+        window.update(|browser, _, cx| {
+            assert!(browser.ql_render.as_ref().is_some_and(|(p, _)| *p == pic));
+            // flip to a text file: the held tile drops (ADR-0016)
+            browser.route_key(&key("up"), cx);
+            assert!(browser.ql_render.is_none());
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_zoom_and_pan_clamp() {
+        // contain: the tighter ratio wins
+        assert_eq!(ql_fit_scale((2000.0, 1000.0), (100.0, 100.0)), 0.05);
+        // degenerate sizes read as fit instead of dividing by zero
+        assert_eq!(ql_fit_scale((0.0, 1000.0), (100.0, 100.0)), 1.0);
+        assert_eq!(ql_fit_scale((100.0, 100.0), (0.0, 0.0)), 1.0);
+        // pan clamps to half the overflow each way, zero at fit
+        assert_eq!(
+            ql_clamp_pan((5000.0, 0.0), (2000.0, 1000.0), (1000.0, 1000.0)),
+            (500.0, 0.0)
+        );
+        assert_eq!(
+            ql_clamp_pan((5000.0, 0.0), (1000.0, 1000.0), (1000.0, 1000.0)),
+            (0.0, 0.0)
         );
     }
 
