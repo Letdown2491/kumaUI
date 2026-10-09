@@ -196,11 +196,11 @@ pub struct SelectSpan {
 }
 
 /// A frame's worth of terminal state, plain data for the renderer.
+/// Input-mode flags (alt screen, bracketed paste) are read on demand
+/// through their accessors: no consumer needs them per frame.
 pub struct Snapshot {
     pub rows: Vec<Row>,
     pub cursor: Option<CursorSpot>,
-    pub alt_screen: bool,
-    pub bracketed_paste: bool,
     /// how far the viewport is scrolled back into history (0 = live)
     pub display_offset: usize,
     /// the active selection, projected into viewport row spans
@@ -671,6 +671,32 @@ impl Engine {
         self.term.lock().mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// Whether the alternate screen buffer is active: full-screen
+    /// programs own the viewport, so the wheel becomes arrows.
+    pub fn alt_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Whether the program wants pastes wrapped in the bracket markers.
+    pub fn bracketed_paste(&self) -> bool {
+        self.term
+            .lock()
+            .mode()
+            .contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// One visible row's cells, the same decode a snapshot row gets,
+    /// without materializing the rest of the frame.
+    pub fn row_cells(&self, row: usize) -> Option<Vec<RenderCell>> {
+        let term = self.term.lock();
+        let content = term.renderable_content();
+        let mut rows: Vec<Row> = (0..term.screen_lines())
+            .map(|_| Row { cells: Vec::new() })
+            .collect();
+        fill_rows(&self.theme, content, &mut rows, Some(row));
+        rows.into_iter().nth(row).map(|row| row.cells)
+    }
+
     /// Take a snapshot of the visible grid for the renderer.
     /// A frame's worth of terminal state, plain data for the renderer.
     /// `cursor_visible` says whether a blinking style is in its lit
@@ -682,7 +708,6 @@ impl Engine {
         let offset = content.display_offset;
         let screen_lines = term.screen_lines();
         let columns = term.columns();
-        let mode = content.mode;
 
         let mut rows: Vec<Row> = Vec::with_capacity(screen_lines);
         for _ in 0..screen_lines {
@@ -715,53 +740,7 @@ impl Engine {
             None
         };
 
-        for indexed in content.display_iter {
-            let viewport_row = indexed.point.line.0 + offset as i32;
-            if viewport_row < 0 || viewport_row as usize >= screen_lines {
-                continue;
-            }
-            let row = &mut rows[viewport_row as usize];
-            let cell = indexed.cell;
-            let flags = cell.flags;
-
-            if flags.contains(Flags::WIDE_CHAR_SPACER) {
-                row.cells.push(RenderCell {
-                    c: ' ',
-                    fg: self.theme.foreground,
-                    bg: self.theme.background,
-                    bold: false,
-                    italic: false,
-                    underline: false,
-                    strikeout: false,
-                    spacer: true,
-                });
-                continue;
-            }
-
-            let mut fg = palette::resolve(cell.fg, content.colors, &self.theme);
-            let mut bg = palette::resolve(cell.bg, content.colors, &self.theme);
-            if flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if flags.contains(Flags::HIDDEN) {
-                fg = bg;
-            }
-            if flags.contains(Flags::DIM) {
-                fg = fg.scale(2.0 / 3.0);
-            }
-
-            row.cells.push(RenderCell {
-                c: if flags.contains(Flags::HIDDEN) { ' ' } else { cell.c },
-                fg,
-                bg,
-                bold: flags.contains(Flags::BOLD),
-                italic: flags.contains(Flags::ITALIC),
-                underline: flags.contains(Flags::UNDERLINE),
-                strikeout: flags.contains(Flags::STRIKEOUT),
-                spacer: false,
-            });
-        }
-
+        fill_rows(&self.theme, content, &mut rows, None);
         // the block's bake lands on the filled cells
         if let Some(spot) = &cursor {
             if cursor_visible && spot.shape == CursorShape::Block {
@@ -791,11 +770,75 @@ impl Engine {
         Snapshot {
             rows,
             cursor,
-            alt_screen: mode.contains(TermMode::ALT_SCREEN),
-            bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
             display_offset: offset,
             selection,
         }
+    }
+}
+
+/// The visible-grid cell walk behind `snapshot` and `row_cells`: decodes
+/// each grid cell into a viewport `RenderCell` (INVERSE swaps, HIDDEN
+/// blanks, DIM dims, wide-char spacers as blank two-wide slots).
+/// `only_row` decodes just that viewport row's cells and leaves the other
+/// rows empty: the URL hover reads one row per mouse move and has no
+/// business materializing the whole frame.
+fn fill_rows(
+    theme: &Theme,
+    content: RenderableContent,
+    rows: &mut [Row],
+    only_row: Option<usize>,
+) {
+    let offset = content.display_offset;
+    for indexed in content.display_iter {
+        let viewport_row = indexed.point.line.0 + offset as i32;
+        if viewport_row < 0 || viewport_row as usize >= rows.len() {
+            continue;
+        }
+        if let Some(only_row) = only_row
+            && viewport_row != only_row as i32
+        {
+            continue;
+        }
+        let row = &mut rows[viewport_row as usize];
+        let cell = indexed.cell;
+        let flags = cell.flags;
+
+        if flags.contains(Flags::WIDE_CHAR_SPACER) {
+            row.cells.push(RenderCell {
+                c: ' ',
+                fg: theme.foreground,
+                bg: theme.background,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikeout: false,
+                spacer: true,
+            });
+            continue;
+        }
+
+        let mut fg = palette::resolve(cell.fg, content.colors, theme);
+        let mut bg = palette::resolve(cell.bg, content.colors, theme);
+        if flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if flags.contains(Flags::HIDDEN) {
+            fg = bg;
+        }
+        if flags.contains(Flags::DIM) {
+            fg = fg.scale(2.0 / 3.0);
+        }
+
+        row.cells.push(RenderCell {
+            c: if flags.contains(Flags::HIDDEN) { ' ' } else { cell.c },
+            fg,
+            bg,
+            bold: flags.contains(Flags::BOLD),
+            italic: flags.contains(Flags::ITALIC),
+            underline: flags.contains(Flags::UNDERLINE),
+            strikeout: flags.contains(Flags::STRIKEOUT),
+            spacer: false,
+        });
     }
 }
 
@@ -926,6 +969,35 @@ mod tests {
         assert!(cursor_spot(&term, &term.renderable_content()).is_some());
         feed(&mut term, b"\x1b[?25l"); // DECTCEM: hide the cursor
         assert!(cursor_spot(&term, &term.renderable_content()).is_none());
+    }
+
+    #[test]
+    fn row_walk_can_target_a_single_row() {
+        let mut term = test_term(10, 3);
+        feed(&mut term, b"\x1b[2;1Hrow one");
+        let theme = crate::theme::Theme::builtin();
+
+        // only the targeted viewport row decodes; the others stay empty
+        let content = term.renderable_content();
+        let mut rows: Vec<Row> = (0..3).map(|_| Row { cells: Vec::new() }).collect();
+        fill_rows(&theme, content, &mut rows, Some(1));
+        assert!(rows[0].cells.is_empty());
+        assert!(rows[1].cells.iter().any(|c| c.c == 'r'));
+        assert!(rows[2].cells.is_empty());
+
+        // the unfiltered walk (snapshot's path) fills every row
+        let content = term.renderable_content();
+        let mut rows: Vec<Row> = (0..3).map(|_| Row { cells: Vec::new() }).collect();
+        fill_rows(&theme, content, &mut rows, None);
+        assert!(!rows[0].cells.iter().any(|c| c.c == 'r'));
+        assert!(rows[1].cells.iter().any(|c| c.c == 'r'));
+
+        // a row past the screen is None territory for row_cells' caller:
+        // the walk never indexes it
+        let content = term.renderable_content();
+        let mut rows: Vec<Row> = (0..3).map(|_| Row { cells: Vec::new() }).collect();
+        fill_rows(&theme, content, &mut rows, Some(5));
+        assert!(rows.iter().all(|row| row.cells.is_empty()));
     }
 
     #[test]

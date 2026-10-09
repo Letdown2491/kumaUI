@@ -25,7 +25,8 @@ use crate::font;
 use crate::glyphs;
 use crate::palette::Rgb8;
 use crate::term::{
-    CellEdge, CursorShape, Engine, GridPoint, Row, SearchMatch, SelectMode, SelectSpan, UiEvent,
+    CellEdge, CursorShape, Engine, GridPoint, RenderCell, Row, SearchMatch, SelectMode, SelectSpan,
+    UiEvent,
 };
 use crate::theme::Theme;
 
@@ -308,12 +309,13 @@ impl TerminalView {
 
     /// Paste from the clipboard, bracketed when the shell asked for it.
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = cx.read_from_clipboard() else { return };        let Some(text) = item.text() else { return };
+        let Some(item) = cx.read_from_clipboard() else { return };
+        let Some(text) = item.text() else { return };
         // newlines become carriage returns: that is what the shell's line
         // discipline expects from a paste
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
         let mut bytes = Vec::with_capacity(text.len() + 16);
-        if self.engine.snapshot(false).bracketed_paste {
+        if self.engine.bracketed_paste() {
             bytes.extend_from_slice(b"\x1b[200~");
             bytes.extend_from_slice(text.as_bytes());
             bytes.extend_from_slice(b"\x1b[201~");
@@ -574,13 +576,14 @@ impl TerminalView {
     /// The URL under a viewport cell, if any: the span that covers it,
     /// rebuilt from the row's cells. Bare www. hosts get the scheme.
     fn url_at(&self, row: usize, col: usize) -> Option<String> {
-        let snapshot = self.engine.snapshot(false);
-        let grid_row = snapshot.rows.get(row)?;
-        let spans = url_spans(grid_row, grid_row.cells.len());
+        // one row of cells, not a whole-grid snapshot: this runs per
+        // mouse move while a link is hovered
+        let cells = self.engine.row_cells(row)?;
+        let spans = url_spans(&cells, cells.len());
         let &(start, len) = spans
             .iter()
             .find(|(s, len)| col >= *s && col < s + len)?;
-        let mut url = span_cells_text(grid_row, start, len);
+        let mut url = span_cells_text(&cells, start, len);
         if url.starts_with("www.") {
             url.insert_str(0, "http://");
         }
@@ -678,8 +681,7 @@ impl TerminalView {
             return;
         }
 
-        let snapshot = self.engine.snapshot(false);
-        if snapshot.alt_screen {
+        if self.engine.alt_screen() {
             // full-screen programs own the viewport: wheel becomes arrows,
             // which is what they expect
             let key = if lines < 0 { "\x1b[A" } else { "\x1b[B" };
@@ -1024,7 +1026,7 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
         match (bg_open.as_ref().map(|&(_, _, c)| c), bg_color) {
             (Some(c), Some(color)) if c == color => {
                 let open = bg_open.as_mut().unwrap();
-                open.1 = col_of[i] + cell_width(row, i) - open.0;
+                open.1 = col_of[i] + cell_width(&row.cells, i) - open.0;
             }
             (Some(_), Some(color)) => {
                 if let Some((col, len, c)) = bg_open.take() {
@@ -1032,7 +1034,7 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
                         bg_quads.push((col, len, c));
                     }
                 }
-                bg_open = Some((col_of[i], cell_width(row, i), color));
+                bg_open = Some((col_of[i], cell_width(&row.cells, i), color));
             }
             (Some(_), None) => {
                 if let Some((col, len, c)) = bg_open.take() {
@@ -1042,7 +1044,7 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
                 }
             }
             (None, Some(color)) => {
-                bg_open = Some((col_of[i], cell_width(row, i), color));
+                bg_open = Some((col_of[i], cell_width(&row.cells, i), color));
             }
             (None, None) => {}
         }
@@ -1060,7 +1062,7 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
         cells.push(CellSpan {
             byte: text.len() - drawn.len_utf8(),
             col: col_of[i],
-            span: cell_width(row, i),
+            span: cell_width(&row.cells, i),
         });
 
         let key = (cell.bold, cell.italic, cell.underline, cell.strikeout, cell.fg);
@@ -1095,7 +1097,7 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
     }
     flush_bg_at_end(&mut bg_quads, bg_open.take());
 
-    RowRender { key: 0, text, runs, bg_quads, glyphs, url_spans: url_spans(row, end), cells }
+    RowRender { key: 0, text, runs, bg_quads, glyphs, url_spans: url_spans(&row.cells, end), cells }
 }
 
 /// True when `c` may appear inside a URL run. Everything RFC 3986 allows
@@ -1119,9 +1121,9 @@ fn is_url_trailing(c: char) -> bool {
 }
 
 /// The URL text of one span, read back from the row's cells.
-fn span_cells_text(row: &Row, start: usize, len: usize) -> String {
+fn span_cells_text(cells: &[RenderCell], start: usize, len: usize) -> String {
     let mut out = String::new();
-    for cell in &row.cells[start..start + len] {
+    for cell in &cells[start..start + len] {
         if !cell.spacer {
             out.push(cell.c);
         }
@@ -1133,18 +1135,18 @@ fn span_cells_text(row: &Row, start: usize, len: usize) -> String {
 /// `end`. A run starts at a scheme or a bare www. and extends over
 /// URL-safe characters; runs are ASCII only, so length in characters is
 /// length in columns.
-fn url_spans(row: &Row, end: usize) -> Vec<(usize, usize)> {
+fn url_spans(cells: &[RenderCell], end: usize) -> Vec<(usize, usize)> {
     const SCHEMES: [&str; 4] = ["https://", "http://", "file://", "mailto:"];
 
     // visible characters with their grid columns
     let mut chars: Vec<(char, usize)> = Vec::with_capacity(end);
     let mut col = 0usize;
     for i in 0..end {
-        if row.cells[i].spacer {
+        if cells[i].spacer {
             continue;
         }
-        chars.push((row.cells[i].c, col));
-        col += cell_width(row, i);
+        chars.push((cells[i].c, col));
+        col += cell_width(cells, i);
     }
 
     let starts = |at: usize, pattern: &str| {
@@ -1186,10 +1188,10 @@ fn flush_bg_at_end(quads: &mut Vec<(usize, usize, Rgb8)>, open: Option<(usize, u
 }
 
 /// The grid width this cell contributes, mirroring the col_of pass.
-fn cell_width(row: &Row, i: usize) -> usize {
-    if row.cells[i].spacer {
+fn cell_width(cells: &[RenderCell], i: usize) -> usize {
+    if cells[i].spacer {
         0
-    } else if i + 1 < row.cells.len() && row.cells[i + 1].spacer {
+    } else if i + 1 < cells.len() && cells[i + 1].spacer {
         2
     } else {
         1
@@ -1597,7 +1599,6 @@ impl GridPaint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::term::RenderCell;
     use crate::theme::Theme;
 
     fn theme() -> Theme {
@@ -1627,8 +1628,8 @@ mod tests {
     }
 
     fn spans_of(s: &str) -> Vec<(usize, usize)> {
-        let row = row_of(s);
-        url_spans(&row, row.cells.len())
+        let cells = row_of(s).cells;
+        url_spans(&cells, cells.len())
     }
 
     fn span_text(s: &str, span: (usize, usize)) -> String {
@@ -1675,13 +1676,12 @@ mod tests {
         cells[1].spacer = true;
         cells[4].spacer = true;
         cells.extend("https://x.io".chars().map(cell));
-        let row = Row { cells };
-        let spans = url_spans(&row, row.cells.len());
+        let spans = url_spans(&cells, cells.len());
         // 字(2 cols) spacer(0) space(1) 文(2) spacer(0): the URL starts
         // at column 5, and ASCII length is column length
         assert_eq!(spans, vec![(5, 12)]);
         let mut url = String::new();
-        for cell in &row.cells[5..5 + 12] {
+        for cell in &cells[5..5 + 12] {
             if !cell.spacer {
                 url.push(cell.c);
             }
@@ -1696,8 +1696,7 @@ mod tests {
         cells.push(wide);
         cells.push(cell(' '));
         cells.push(RenderCell { spacer: true, ..cell(' ') });
-        let row = Row { cells };
-        let spans = url_spans(&row, row.cells.len());
+        let spans = url_spans(&cells, cells.len());
         assert_eq!(spans, vec![(0, 13)]);
     }
 
@@ -1708,14 +1707,14 @@ mod tests {
         // returned a truncated URL and a click right of the span start
         // near the row end panicked the UI thread (closing the window)
         let text = "see https://x.io/edge";
-        let row = row_of(text);
-        let spans = url_spans(&row, row.cells.len());
+        let cells = row_of(text).cells;
+        let spans = url_spans(&cells, cells.len());
         assert_eq!(spans, vec![(4, 17)]);
         // the span reaches the row's last cell
-        assert_eq!(spans[0].0 + spans[0].1, row.cells.len());
-        for _clicked in 4..row.cells.len() {
+        assert_eq!(spans[0].0 + spans[0].1, cells.len());
+        for _clicked in 4..cells.len() {
             let (start, len) = spans[0];
-            assert_eq!(span_cells_text(&row, start, len), "https://x.io/edge");
+            assert_eq!(span_cells_text(&cells, start, len), "https://x.io/edge");
         }
     }
 
@@ -1728,9 +1727,9 @@ mod tests {
             "prefix https://x.io/long/path?q=1 suffix",
             "https://very.long.url/that/fills/the/whole/row/exactly/end",
         ] {
-            let row = row_of(text);
-            for (start, len) in url_spans(&row, row.cells.len()) {
-                assert!(start + len <= row.cells.len(), "{text}: {start}+{len}");
+            let cells = row_of(text).cells;
+            for (start, len) in url_spans(&cells, cells.len()) {
+                assert!(start + len <= cells.len(), "{text}: {start}+{len}");
             }
         }
     }
