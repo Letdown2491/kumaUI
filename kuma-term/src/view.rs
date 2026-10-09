@@ -70,8 +70,31 @@ struct SearchState {
     stale: bool,
 }
 
-pub struct TerminalView {
+/// One terminal session: its own engine, PTY pump, and per-session UI
+/// state. Everything the grid owns lives here; window-level state
+/// (font, cell metrics, pointer gestures, blink) stays on the view.
+struct Tab {
     engine: Engine,
+    /// the shell's OSC 0/2 title, if it set one; the tab bar's label
+    title: Option<String>,
+    /// scrollback search; None means the bar is closed
+    search: Option<SearchState>,
+    /// the debounced rescan task; dropping it cancels the pending scan
+    _search_task: Task<()>,
+    /// bumped on every schedule, so a stale scan's late result is dropped
+    search_generation: u64,
+    /// this session's PTY reader; aborts if dropped
+    _pump: Task<()>,
+}
+
+/// Height of the tab bar, shown only while more than one tab is open.
+const TAB_BAR_H: f32 = 22.0;
+
+pub struct TerminalView {
+    /// one session per tab; at least one always exists
+    tabs: Vec<Tab>,
+    /// the focused tab
+    active: usize,
     theme: Theme,
     focus: FocusHandle,
     font: gpui::Font,
@@ -79,7 +102,6 @@ pub struct TerminalView {
     cell_h: f32,
     cols: u16,
     lines: u16,
-    title: Option<String>,
     /// a left-drag is actively stretching the selection
     selecting: bool,
     /// the cell the pointer is over, viewport coordinates: drives the URL
@@ -90,14 +112,9 @@ pub struct TerminalView {
     down_cell: Option<(usize, usize, CellEdge)>,
     /// shaped rows keyed on the row's cell-content hash: a row the grid
     /// did not change skips the cell walk, the string build, and (through
-    /// gpui's hash-keyed layout cache) the shaper itself
+    /// gpui's hash-keyed layout cache) the shaper itself. Content-keyed,
+    /// so tabs share it soundly
     row_shapes: FxHashMap<u64, Arc<RowRender>>,
-    /// scrollback search; None means the bar is closed
-    search: Option<SearchState>,
-    /// the debounced rescan task; dropping it cancels the pending scan
-    _search_task: Task<()>,
-    /// bumped on every schedule, so a stale scan's late result is dropped
-    search_generation: u64,
     /// the blink phase for a blinking DECSCUSR style; typing forces it
     /// lit for one period, the blink task toggles it afterwards
     blink_visible: bool,
@@ -109,8 +126,6 @@ pub struct TerminalView {
     /// mirrored from the window each render; the blink task stays quiet
     /// while the window cannot see the cursor
     window_active: bool,
-    // the pump task aborts if dropped, so it stays owned by the view
-    _pump: Task<()>,
     _palette_tick: Task<()>,
     _blink: Task<()>,
 }
@@ -142,26 +157,11 @@ impl TerminalView {
             cell_width: cell_w as u16,
             cell_height: cell_h as u16,
         };
-        let (tx, rx) = futures::channel::mpsc::unbounded::<UiEvent>();
-        let engine = match Engine::new(window_size, theme.clone(), tx) {
-            Ok(engine) => engine,
-            Err(err) => {
+        let tab = Self::start_session(&theme, 0, window_size, cx)
+            .unwrap_or_else(|err| {
                 // without a shell there is no terminal
-                panic!("kuma-term: cannot spawn the shell: {err}");
-            }
-        };
-
-        let pump = cx.spawn(async move |this, cx| {
-            let mut rx = rx;
-            while let Some(event) = rx.next().await {
-                if this
-                    .update_in(cx, |this, window, cx| this.handle_event(event, window, cx))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+                panic!("kuma-term: cannot spawn the shell: {err}")
+            });
 
         // the wallpaper republishes the shell palette; swap the chrome
         // live so the terminal follows the session like kuma-files does
@@ -209,7 +209,8 @@ impl TerminalView {
         });
 
         Self {
-            engine,
+            tabs: vec![tab],
+            active: 0,
             theme,
             focus,
             font,
@@ -217,63 +218,185 @@ impl TerminalView {
             cell_h,
             cols: 80,
             lines: 24,
-            title: None,
             selecting: false,
             hover: None,
             down_cell: None,
             row_shapes: FxHashMap::default(),
-            search: None,
-            _search_task: Task::ready(()),
-            search_generation: 0,
             blink_visible: true,
             last_input: Instant::now(),
             cursor_blinking: false,
             window_active: false,
-            _pump: pump,
             _palette_tick: palette_tick,
             _blink: blink,
         }
     }
 
-    fn handle_event(&mut self, event: UiEvent, window: &mut Window, cx: &mut Context<Self>) {
+    /// Spawn a session (engine + its PTY pump task) sized for the
+    /// window; the caller places it in `tabs`. `index` is where it will
+    /// land: the pump tags every event with it.
+    fn start_session(
+        theme: &Theme,
+        index: usize,
+        window_size: alacritty_terminal::event::WindowSize,
+        cx: &mut Context<Self>,
+    ) -> std::io::Result<Tab> {
+        let (tx, rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+        let engine = Engine::new(window_size, theme.clone(), tx)?;
+        let pump = cx.spawn(async move |this, cx| {
+            let mut rx = rx;
+            while let Some(event) = rx.next().await {
+                if this
+                    .update_in(cx, |this, window, cx| this.handle_event(index, event, window, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(Tab {
+            engine,
+            title: None,
+            search: None,
+            _search_task: Task::ready(()),
+            search_generation: 0,
+            _pump: pump,
+        })
+    }
+
+    /// The focused session.
+    fn active(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    fn active_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+
+    /// Open a new session after the focused one, and focus it. Spawns
+    /// in the process's cwd; a spawn-in-this-tab's-cwd needs the OSC 7
+    /// tap, which is not wired yet.
+    fn spawn_tab(&mut self, cx: &mut Context<Self>) {
+        let window_size = alacritty_terminal::event::WindowSize {
+            num_cols: self.cols,
+            num_lines: self.lines,
+            cell_width: self.cell_w as u16,
+            cell_height: self.cell_h as u16,
+        };
+        let tab = match Self::start_session(&self.theme, self.tabs.len(), window_size, cx) {
+            Ok(tab) => tab,
+            Err(err) => {
+                log::warn!("kuma-term: cannot spawn a tab: {err}");
+                return;
+            }
+        };
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        cx.notify();
+    }
+
+    /// Close a session; the last one closes the window (a terminal with
+    /// no shell is nothing).
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() == 1 {
+            window.remove_window();
+            return;
+        }
+        let was_active = index == self.active;
+        self.tabs.remove(index);
+        if was_active {
+            // the next tab slid into this index and takes focus; the
+            // last tab falls back to its neighbor
+            if self.active >= self.tabs.len() {
+                self.active = self.tabs.len() - 1;
+            }
+        } else if index < self.active {
+            // keep pointing at the same tab, which shifted down
+            self.active -= 1;
+        }
+        cx.notify();
+    }
+
+    /// Focus a tab by index; a stale search resyncs on the way in.
+    fn switch_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() || index == self.active {
+            return;
+        }
+        self.active = index;
+        // a mid-drag tab switch must not stretch the new tab's
+        // selection; the old tab keeps its own
+        self.selecting = false;
+        self.down_cell = None;
+        self.hover = None;
+        // a search left stale by background output resyncs on the way in
+        let needs_rescan = self.tabs[index]
+            .search
+            .as_ref()
+            .is_some_and(|search| !search.query.is_empty() && search.stale);
+        if needs_rescan {
+            self.schedule_search(false, cx);
+        }
+        cx.notify();
+    }
+
+    /// Step the focused tab by delta (wrapping).
+    fn cycle_tab(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let count = self.tabs.len() as i32;
+        let next = ((self.active as i32 + delta).rem_euclid(count)) as usize;
+        self.switch_tab(next, cx);
+    }
+
+    fn handle_event(
+        &mut self,
+        tab: usize,
+        event: UiEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             UiEvent::Wakeup => {
+                // a background tab's output waits for its turn: the
+                // snapshot picks the grid up whenever it is focused
+                if tab != self.active {
+                    return;
+                }
                 // while the search bar is open, output shifts the buffer:
                 // rescan (debounced) so the count and highlights follow
-                if self
+                let needs_rescan = self
+                    .tabs[tab]
                     .search
                     .as_ref()
-                    .is_some_and(|search| !search.query.is_empty() && !search.stale)
-                {
-                    if let Some(search) = self.search.as_mut() {
+                    .is_some_and(|search| !search.query.is_empty() && !search.stale);
+                if needs_rescan {
+                    if let Some(search) = self.tabs[tab].search.as_mut() {
                         search.stale = true;
                     }
                     self.schedule_search(false, cx);
                 }
                 cx.notify();
             }
-            UiEvent::Title(title) => {
-                self.title = Some(title);
-                // dynamic window titles are a later concern (needs the
-                // window API surface for it)
-            }
-            UiEvent::ResetTitle => self.title = None,
+            UiEvent::Title(title) => self.tabs[tab].title = Some(title),
+            UiEvent::ResetTitle => self.tabs[tab].title = None,
             UiEvent::Bell => log::info!("bell"),
             UiEvent::Exit => {
-                log::info!("child exited, closing");
-                window.remove_window();
+                // one session's shell exiting closes that tab; the last
+                // one closes the window
+                self.close_tab(tab, window, cx);
             }
             UiEvent::ColorRequest(index, format) => {
-                let color = self.engine.resolve_index(index);
-                self.engine.input(format(color));
+                let color = self.tabs[tab].engine.resolve_index(index);
+                self.tabs[tab].engine.input(format(color));
             }
             UiEvent::TextAreaSizeRequest(format) => {
-                self.engine.input(format(self.engine.window_size()));
+                let size = self.tabs[tab].engine.window_size();
+                self.tabs[tab].engine.input(format(size));
             }
             UiEvent::ClipboardStore(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
-            UiEvent::PtyWrite(bytes) => self.engine.input(bytes),
+            UiEvent::PtyWrite(bytes) => self.tabs[tab].engine.input(bytes),
         }
     }
 
@@ -282,7 +405,9 @@ impl TerminalView {
     fn apply_shell_palette(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = Theme::shell_palette_text() {
             crate::theme::apply_shell_palette(&mut self.theme, &text);
-            self.engine.set_theme(self.theme.clone());
+            for tab in &mut self.tabs {
+                tab.engine.set_theme(self.theme.clone());
+            }
             cx.notify();
         }
     }
@@ -316,30 +441,31 @@ impl TerminalView {
         // discipline expects from a paste
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
         let mut bytes = Vec::with_capacity(text.len() + 16);
-        if self.engine.bracketed_paste() {
+        if self.active().engine.bracketed_paste() {
             bytes.extend_from_slice(b"\x1b[200~");
             bytes.extend_from_slice(text.as_bytes());
             bytes.extend_from_slice(b"\x1b[201~");
         } else {
             bytes.extend_from_slice(text.as_bytes());
         }
-        self.engine.input(bytes);
+        self.active().engine.input(bytes);
     }
 
     /// Open the search bar, prefilled from the selection when it is a
     /// single line; closing clears the highlights. No grid row is
     /// reserved either way: the bar floats over the bottom row.
     fn toggle_search(&mut self, cx: &mut Context<Self>) {
-        if self.search.take().is_some() {
+        if self.active_mut().search.take().is_some() {
             cx.notify();
             return;
         }
         let query = self
+            .active()
             .engine
             .selection_text()
             .filter(|text| text.len() <= 200 && !text.contains(['\n', '\r']))
             .unwrap_or_default();
-        self.search = Some(SearchState {
+        self.active_mut().search = Some(SearchState {
             query,
             regex: false,
             matches: Vec::new(),
@@ -356,25 +482,26 @@ impl TerminalView {
     /// search handle (the term lock is fair, so the pump and renderer
     /// interleave with the scan).
     fn schedule_search(&mut self, fresh: bool, cx: &mut Context<Self>) {
-        self.search_generation += 1;
-        let generation = self.search_generation;
-        let Some(search) = self.search.as_ref() else { return };
+        let tab = self.active;
+        self.tabs[tab].search_generation += 1;
+        let generation = self.tabs[tab].search_generation;
+        let Some(search) = self.tabs[tab].search.as_ref() else { return };
         if search.query.is_empty() {
             cx.notify();
             return;
         }
         let query = search.query.clone();
         let regex = search.regex;
-        let handle = self.engine.search_handle();
-        self._search_task = cx.spawn(async move |this, cx| {
+        let handle = self.tabs[tab].engine.search_handle();
+        self.tabs[tab]._search_task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(150)).await;
             let scan =
                 cx.background_executor().spawn(async move { handle.search(&query, regex) }).await;
             let _ = this.update(cx, |this, cx| {
-                if this.search_generation != generation {
+                if this.tabs[tab].search_generation != generation {
                     return; // a newer scan owns the result
                 }
-                let Some(search) = this.search.as_mut() else { return };
+                let Some(search) = this.tabs[tab].search.as_mut() else { return };
                 // a rescan keeps the cycled match when it still exists
                 // (new output shifts buffer lines); a fresh query starts
                 // at the oldest match
@@ -394,7 +521,7 @@ impl TerminalView {
                 // off-screen, so typing jumps straight to the first hit
                 let jump = fresh.then(|| search.matches.first().copied()).flatten();
                 if let Some(hit) = jump {
-                    this.reveal_match(hit);
+                    this.reveal_match(tab, hit);
                 }
                 cx.notify();
             });
@@ -403,12 +530,12 @@ impl TerminalView {
 
     /// The query changed: drop the stale highlights and rescan.
     fn query_edited(&mut self, cx: &mut Context<Self>) {
-        let Some(search) = self.search.as_mut() else { return };
+        let Some(search) = self.active_mut().search.as_mut() else { return };
         search.matches.clear();
         search.current = 0;
         if search.query.is_empty() {
             search.stale = false;
-            self.search_generation += 1; // any in-flight scan is moot
+            self.active_mut().search_generation += 1; // any in-flight scan is moot
             cx.notify();
             return;
         }
@@ -425,7 +552,7 @@ impl TerminalView {
     fn search_key(&mut self, k: &Keystroke, cx: &mut Context<Self>) {
         let edit = match k.key.as_str() {
             "escape" => {
-                self.search = None;
+                self.active_mut().search = None;
                 cx.notify();
                 return;
             }
@@ -438,7 +565,7 @@ impl TerminalView {
             // regex, kitty's convention. A stale pattern never lingers:
             // the flip rescans
             "enter" if k.modifiers.control => {
-                let Some(search) = self.search.as_mut() else { return };
+                let Some(search) = self.active_mut().search.as_mut() else { return };
                 search.regex = !search.regex;
                 true
             }
@@ -453,13 +580,13 @@ impl TerminalView {
                 return;
             }
             "backspace" => {
-                let Some(search) = self.search.as_mut() else { return };
+                let Some(search) = self.active_mut().search.as_mut() else { return };
                 search.query.pop();
                 true
             }
             // ctrl+u clears the line, shell habit
             "u" if k.modifiers.control => {
-                let Some(search) = self.search.as_mut() else { return };
+                let Some(search) = self.active_mut().search.as_mut() else { return };
                 search.query.clear();
                 true
             }
@@ -469,7 +596,7 @@ impl TerminalView {
                     && !k.modifiers.platform
                     && k.key_char.is_some();
                 if printable {
-                    let Some(search) = self.search.as_mut() else { return };
+                    let Some(search) = self.active_mut().search.as_mut() else { return };
                     search.query.push_str(k.key_char.as_deref().unwrap_or_default());
                     true
                 } else {
@@ -486,22 +613,23 @@ impl TerminalView {
 
     /// Step the current match by `delta` (-1 or 1, wrapping) and reveal it.
     fn cycle_search(&mut self, delta: i32) {
-        let Some(search) = self.search.as_mut() else { return };
+        let Some(search) = self.active_mut().search.as_mut() else { return };
         if search.matches.is_empty() {
             return;
         }
         let count = search.matches.len() as i32;
         search.current = ((search.current as i32 + delta).rem_euclid(count)) as usize;
         let hit = search.matches[search.current];
-        self.reveal_match(hit);
+        let tab = self.active;
+        self.reveal_match(tab, hit);
     }
 
     /// Scroll the viewport so a match's first row is visible, with the
     /// minimal movement: a match above the viewport lands on the top
     /// row, one below on the last row. No-op when already visible.
-    fn reveal_match(&mut self, hit: SearchMatch) {
+    fn reveal_match(&mut self, tab: usize, hit: SearchMatch) {
         let lines = self.lines as i32;
-        let offset = self.engine.display_offset() as i32;
+        let offset = self.tabs[tab].engine.display_offset() as i32;
         let top = hit.from.line + offset;
         let target = if top < 0 {
             -hit.from.line
@@ -510,17 +638,41 @@ impl TerminalView {
         } else {
             return;
         };
-        self.engine.scroll_to_offset(target.max(0) as usize);
+        self.tabs[tab].engine.scroll_to_offset(target.max(0) as usize);
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k: &Keystroke = &event.keystroke;
+
+        // tab management, kitty's chords: the shell never sees these
+        if k.modifiers.control && k.modifiers.shift {
+            match k.key.as_str() {
+                "t" => {
+                    self.spawn_tab(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "w" => {
+                    let tab = self.active;
+                    self.close_tab(tab, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // ctrl+tab / ctrl+shift+tab cycle, kitty's convention
+        if k.modifiers.control && k.key == "tab" {
+            self.cycle_tab(if k.modifiers.shift { -1 } else { 1 }, cx);
+            cx.stop_propagation();
+            return;
+        }
 
         // clipboard chords first; the shell never sees these
         if k.modifiers.control && k.modifiers.shift {
             match k.key.as_str() {
                 "c" => {
-                    if let Some(text) = self.engine.selection_text() {
+                    if let Some(text) = self.active().engine.selection_text() {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
                     cx.stop_propagation();
@@ -543,22 +695,22 @@ impl TerminalView {
 
         // while the search bar is open it eats the keyboard: typing goes
         // to the query, not to the shell
-        if self.search.is_some() {
+        if self.active().search.is_some() {
             self.search_key(k, cx);
             cx.stop_propagation();
             return;
         }
 
-        let app_cursor = self.engine.app_cursor();
+        let app_cursor = self.active().engine.app_cursor();
         if let Some(bytes) = encoder::encode(k, app_cursor) {
             // landing input collapses any active selection, like every
             // terminal; bare modifier presses do not
-            self.engine.clear_selection();
+            self.active_mut().engine.clear_selection();
             // typing holds the cursor lit through the next blink period
             self.blink_visible = true;
             self.last_input = Instant::now();
             cx.stop_propagation();
-            self.engine.input(bytes);
+            self.active().engine.input(bytes);
         }
     }
 
@@ -579,7 +731,7 @@ impl TerminalView {
     fn url_at(&self, row: usize, col: usize) -> Option<String> {
         // one row of cells, not a whole-grid snapshot: this runs per
         // mouse move while a link is hovered
-        let cells = self.engine.row_cells(row)?;
+        let cells = self.active().engine.row_cells(row)?;
         let spans = url_spans(&cells, cells.len());
         let &(start, len) = spans
             .iter()
@@ -599,11 +751,11 @@ impl TerminalView {
     ) {
         // while the program owns the pointer, clicks are its input
         // (shift keeps local selection, the xterm convention)
-        if self.engine.mouse_tracking() != MouseTracking::Off && !event.modifiers.shift {
+        if self.active().engine.mouse_tracking() != MouseTracking::Off && !event.modifiers.shift {
             if let Some(button) = mouse_button_code(event.button) {
                 let (row, col, _) =
                     self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
-                self.engine.report_mouse(button, col, row, false);
+                self.active().engine.report_mouse(button, col, row, false);
             }
             return;
         }
@@ -618,8 +770,8 @@ impl TerminalView {
             3.. => SelectMode::Line,
             _ => SelectMode::Char,
         };
-        let offset = self.engine.display_offset();
-        self.engine.begin_selection(
+        let offset = self.active().engine.display_offset();
+        self.active_mut().engine.begin_selection(
             GridPoint { line: row as i32 - offset as i32, column: col },
             edge,
             mode,
@@ -636,7 +788,7 @@ impl TerminalView {
     ) {
         // while the program owns the pointer, motion is its input:
         // 1002 reports drags, 1003 reports every move
-        let tracking = self.engine.mouse_tracking();
+        let tracking = self.active().engine.mouse_tracking();
         if tracking != MouseTracking::Off && !event.modifiers.shift {
             let forward = match tracking {
                 MouseTracking::Motion => true,
@@ -647,14 +799,14 @@ impl TerminalView {
                 let (row, col, _) =
                     self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
                 let base = event.pressed_button.and_then(mouse_button_code).unwrap_or(MOUSE_NONE);
-                self.engine.report_mouse(base + MOUSE_MOTION_FLAG, col, row, false);
+                self.active().engine.report_mouse(base + MOUSE_MOTION_FLAG, col, row, false);
             }
             // a mode landing mid-drag must not leave a stretched local
             // selection behind
             if self.selecting {
                 self.selecting = false;
                 self.down_cell = None;
-                self.engine.clear_selection();
+                self.active_mut().engine.clear_selection();
                 cx.notify();
             }
             return;
@@ -667,8 +819,8 @@ impl TerminalView {
             cx.notify();
         }
         if self.selecting {
-            let offset = self.engine.display_offset();
-            self.engine
+            let offset = self.active().engine.display_offset();
+            self.active_mut().engine
                 .update_selection(GridPoint { line: row as i32 - offset as i32, column: col }, edge);
             cx.notify();
         }
@@ -681,11 +833,11 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         // while the program owns the pointer, releases are its input
-        if self.engine.mouse_tracking() != MouseTracking::Off && !event.modifiers.shift {
+        if self.active().engine.mouse_tracking() != MouseTracking::Off && !event.modifiers.shift {
             if let Some(button) = mouse_button_code(event.button) {
                 let (row, col, _) =
                     self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
-                self.engine.report_mouse(button, col, row, true);
+                self.active().engine.report_mouse(button, col, row, true);
             }
             return;
         }
@@ -702,7 +854,7 @@ impl TerminalView {
             }
         }
         self.down_cell = None;
-        self.engine.finish_selection();
+        self.active_mut().engine.finish_selection();
         cx.notify();
     }
 
@@ -714,10 +866,10 @@ impl TerminalView {
         // while the program owns the pointer, the wheel is its input:
         // this is how an AI harness scrolls its own transcript (shift
         // keeps the local scrollback, the xterm convention)
-        if self.engine.mouse_tracking() != MouseTracking::Off && !event.modifiers.shift {
+        if self.active().engine.mouse_tracking() != MouseTracking::Off && !event.modifiers.shift {
             let (row, col, _) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
             let button = if lines < 0.0 { MOUSE_WHEEL_UP } else { MOUSE_WHEEL_DOWN };
-            self.engine.report_mouse(button, col, row, false);
+            self.active().engine.report_mouse(button, col, row, false);
             return;
         }
         // a notch below one line still moves one line
@@ -735,15 +887,15 @@ impl TerminalView {
             return;
         }
 
-        if self.engine.alt_screen() {
+        if self.active().engine.alt_screen() {
             // full-screen programs own the viewport: wheel becomes arrows,
             // which is what they expect
             let key = if lines < 0 { "\x1b[A" } else { "\x1b[B" };
             let bytes = key.repeat(lines.unsigned_abs() as usize).into_bytes();
-            self.engine.input(bytes);
+            self.active().engine.input(bytes);
         } else {
             // wheel up shows older output
-            self.engine.scroll(-lines);
+            self.active().engine.scroll(-lines);
         }
         cx.notify();
     }
@@ -781,17 +933,27 @@ fn open_url(url: &str) {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // the tab bar exists only while more than one session is open;
+        // its height comes out of the grid's viewport, so opening the
+        // first tab reflows the grid like a window resize would
+        let tab_bar_h = (self.tabs.len() > 1).then_some(TAB_BAR_H);
         // fit the grid to the viewport: rounded-down cell counts, so the
         // last row and column never clip
         let viewport = window.viewport_size();
+        let bar_total = tab_bar_h.map(|h| h + 2.0).unwrap_or(0.0);
         let usable_w = (viewport.width - px(PADDING * 2.0)).as_f32().max(1.0);
-        let usable_h = (viewport.height - px(PADDING * 2.0)).as_f32().max(1.0);
+        let usable_h = (viewport.height - px(PADDING * 2.0 + bar_total)).as_f32().max(1.0);
         let want_cols = ((usable_w / self.cell_w).floor() as u16).max(2);
         let want_lines = ((usable_h / self.cell_h).floor() as u16).max(2);
         if want_cols != self.cols || want_lines != self.lines {
             self.cols = want_cols;
             self.lines = want_lines;
-            self.engine.resize(want_cols, want_lines);
+            // tabs share the window's geometry, background ones
+            // included: their programs get the SIGWINCH now and are the
+            // right size on reveal
+            for tab in &mut self.tabs {
+                tab.engine.resize(want_cols, want_lines);
+            }
             cx.notify();
         }
 
@@ -801,7 +963,7 @@ impl Render for TerminalView {
         // facts so the block only restyles its cell when it would paint.
         let focused = window.is_window_active();
         let cursor_visible = focused && (!self.cursor_blinking || self.blink_visible);
-        let snapshot = self.engine.snapshot(cursor_visible);
+        let snapshot = self.active().engine.snapshot(cursor_visible);
 
         // a fresh blinking style starts lit, not mid-off
         let blinking_now = snapshot.cursor.as_ref().is_some_and(|spot| spot.blinking);
@@ -843,7 +1005,7 @@ impl Render for TerminalView {
 
         // scrollback search: project the buffer matches into viewport row
         // spans for this frame's paint
-        let (search_spans, search_current) = match &self.search {
+        let (search_spans, search_current) = match &self.active().search {
             Some(search) => search_view_spans(
                 &search.matches,
                 search.current,
@@ -896,8 +1058,67 @@ impl Render for TerminalView {
         let mut bg = hsla_of(self.theme.background);
         bg.a *= opacity;
 
-        let bar = self.search.as_ref().map(|search| {
+        let bar = self.active().search.as_ref().map(|search| {
             search_bar(search, &self.theme, &self.font.family)
+        });
+
+        // the tab bar: one label per session, the focused one lit.
+        // Left-click focuses, middle-click closes.
+        let tab_bar = tab_bar_h.map(|h| {
+            let theme = self.theme.clone();
+            let focused = self.active;
+            div()
+                .flex()
+                .h(px(h))
+                .mb(px(2.0))
+                .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
+                    let label =
+                        tab.title.clone().unwrap_or_else(|| "shell".to_string());
+                    let is_active = ix == focused;
+                    let mut bg = hsla_of(theme.foreground);
+                    bg.a *= if is_active { 0.14 } else { 0.0 };
+                    div()
+                        .id(gpui::ElementId::NamedInteger("tab".into(), ix as u64))
+                        .px_2()
+                        .mr(px(2.0))
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
+                        .bg(bg)
+                        .text_size(px(11.0))
+                        .font_family(self.font.family.clone())
+                        .text_color(hsla_of(theme.foreground))
+                        .max_w(px(160.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .when(!is_active, |tab| {
+                            tab.hover(|style| {
+                                let mut hover = hsla_of(theme.foreground);
+                                hover.a *= 0.07;
+                                style.bg(hover)
+                            })
+                        })
+                        .child(label)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
+                                // the grid's own handlers must not see
+                                // this press: no phantom selection, no
+                                // click reported into a running program
+                                cx.stop_propagation();
+                                this.switch_tab(ix, cx)
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(
+                                move |this, _: &gpui::MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_tab(ix, window, cx)
+                                },
+                            ),
+                        )
+                }))
         });
 
         div()
@@ -929,6 +1150,7 @@ impl Render for TerminalView {
             .on_click(cx.listener(|this, _event: &gpui::ClickEvent, window, cx| {
                 window.focus(&this.focus, cx);
             }))
+            .children(tab_bar)
             .child(
                 canvas(|_, _, _| (), move |bounds, _, window, cx| grid.paint(bounds, window, cx))
                     .w(px(grid_w))
@@ -2094,7 +2316,7 @@ mod tests {
         let mut landed = false;
         for _ in 0..100 {
             landed = window.update(|view, _, _| {
-                view.engine.snapshot(false).rows.iter().any(|r| {
+                view.active().engine.snapshot(false).rows.iter().any(|r| {
                     let text: String = r.cells.iter().map(|c| c.c).collect();
                     text.contains("a.b") && text.contains("axb")
                 })
@@ -2119,7 +2341,7 @@ mod tests {
         app.advance_clock(Duration::from_millis(200));
         app.run_until_parked();
         window.update(|view, _, _| {
-            let search = view.search.as_ref().expect("bar never opened");
+            let search = view.active().search.as_ref().expect("bar never opened");
             assert_eq!(search.query, "a.b");
             assert!(!search.regex, "literal by default");
             // the echoed line holds `a.b` once and `axb` once: literal
@@ -2134,9 +2356,55 @@ mod tests {
         app.advance_clock(Duration::from_millis(200));
         app.run_until_parked();
         window.update(|view, _, _| {
-            let search = view.search.as_ref().expect("bar closed by the toggle?");
+            let search = view.active().search.as_ref().expect("bar closed by the toggle?");
             assert!(search.regex, "the toggle flipped the mode");
             assert_eq!(search.matches.len(), 2, "regex mode matches the dot too");
+        });
+    }
+
+    /// A full-window view test: the tab chords. A second session opens
+    /// on ctrl+shift+t, ctrl+tab and ctrl+shift+tab cycle between the
+    /// two, and closing the focused one falls back to its neighbor.
+    /// Real engines, so real PTYs: two sleeps.
+    #[test]
+    fn tab_chords_spawn_cycle_and_close() {
+        if std::env::var("KUMA_TERM_SKIP_PTY_TEST").is_ok() {
+            return;
+        }
+        let _env = crate::PTY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var("KUMA_TERM_COMMAND", "sleep 300") };
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| TerminalView::new(window, cx));
+        drop(_env);
+        app.run_until_parked();
+
+        let chord = |s: &str| KeyDownEvent {
+            keystroke: Keystroke::parse(s).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+
+        window.update(|view, window, cx| {
+            assert_eq!(view.tabs.len(), 1, "one session at birth");
+
+            // ctrl+shift+t opens a second and focuses it
+            view.on_key(&chord("ctrl-shift-t"), window, cx);
+            assert_eq!(view.tabs.len(), 2, "ctrl+shift+t spawned a session");
+            assert_eq!(view.active, 1, "the new session takes focus");
+
+            // ctrl+shift+tab cycles back, ctrl+tab cycles forward
+            view.on_key(&chord("ctrl-shift-tab"), window, cx);
+            assert_eq!(view.active, 0, "ctrl+shift+tab cycles backward");
+            view.on_key(&chord("ctrl-tab"), window, cx);
+            assert_eq!(view.active, 1, "ctrl+tab cycles forward");
+
+            // closing the focused one falls back to the neighbor
+            view.on_key(&chord("ctrl-shift-w"), window, cx);
+            assert_eq!(view.tabs.len(), 1, "ctrl+shift+w closed the session");
+            assert_eq!(view.active, 0, "the neighbor takes focus");
         });
     }
 }
