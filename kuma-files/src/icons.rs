@@ -100,10 +100,12 @@ pub(crate) fn is_image(name: &str) -> bool {
     )
 }
 
-/// Files that get a page-style thumbnail: plain images always, PDFs
-/// when pdftocairo (poppler-utils) is available.
+/// Thumbable grid entries: images always, PDFs when pdftocairo
+/// (poppler-utils) is available, and now videos (a video's grid
+/// thumb is its poster frame; playback stays with the default
+/// handler). Decodes run through the bounded thumb pool.
 pub(crate) fn is_thumbable(name: &str) -> bool {
-    is_image(name) || is_pdf(name)
+    is_image(name) || is_pdf(name) || is_video(name)
 }
 
 /// EPUB ebooks: the Quick Look book glance (cover plus metadata).
@@ -121,8 +123,9 @@ pub(crate) fn is_pdf(name: &str) -> bool {    Path::new(name)
         .unwrap_or(false)
 }
 
-/// Video files: a poster frame for the Quick Look pane. Playback
-/// stays with the system default handler (gpui has no decoder).
+/// Video files: a poster frame for the Quick Look pane and the grid
+/// thumbs (through the bounded pool). Playback itself stays with the
+/// system default handler (gpui has no decoder).
 pub(crate) fn is_video(name: &str) -> bool {
     let ext = Path::new(name)
         .extension()
@@ -137,11 +140,23 @@ pub(crate) fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> 
     Some(decode_to_render(image, max_width, max_height))
 }
 
+/// An image file decoded into a plain `DynamicImage`, uncapped and
+/// unswapped: the grid thumb job's intermediate, so the disk cache
+/// can encode PNGs of the pre-swap pixels.
+pub(crate) fn decode_thumbnail_dynamic(path: &Path) -> Option<image::DynamicImage> {
+    image::ImageReader::open(path).ok()?.decode().ok()
+}
+
 /// An epub's cover bytes into the BGRA `RenderImage`, same contract
 /// as the other decoders.
 pub(crate) fn decode_cover(bytes: &[u8], max: u32) -> Option<gpui::RenderImage> {
     let image = image::load_from_memory(bytes).ok()?;
     Some(decode_to_render(image, max, max))
+}
+
+/// The epub cover's dynamic twin, same split as images.
+pub(crate) fn decode_cover_dynamic(bytes: &[u8]) -> Option<image::DynamicImage> {
+    image::load_from_memory(bytes).ok()
 }
 
 /// Render one PDF page to a thumbnail by shelling out to pdftocairo
@@ -152,6 +167,16 @@ pub(crate) fn decode_pdf_thumbnail(
     page: usize,
     max: u32,
 ) -> Option<gpui::RenderImage> {
+    decode_pdf_dynamic(path, page, max).map(|image| decode_to_render(image, max, max))
+}
+
+/// The pdf thumb's dynamic twin: raw pdftocairo PNG bytes decoded,
+/// pre-swap, for the grid thumb job's disk cache.
+pub(crate) fn decode_pdf_dynamic(
+    path: &Path,
+    page: usize,
+    max: u32,
+) -> Option<image::DynamicImage> {
     let page = page.to_string();
     let out = std::process::Command::new("pdftocairo")
         .args(["-png", "-f", &page, "-l", &page, "-singlefile", "-scale-to"])
@@ -163,8 +188,7 @@ pub(crate) fn decode_pdf_thumbnail(
     if !out.status.success() || out.stdout.is_empty() {
         return None;
     }
-    let image = image::load_from_memory(&out.stdout).ok()?;
-    Some(decode_to_render(image, max, max))
+    image::load_from_memory(&out.stdout).ok()
 }
 
 /// Convert a decoded image into the BGRA `RenderImage` gpui expects.
@@ -193,14 +217,15 @@ mod tests {
 
     #[test]
     fn thumbable_gates() {
-        // videos are pane posters, not grid thumbs: playback stays
-        // with the default handler
+        // videos are grid thumbs now (their poster frame, through
+        // the bounded pool); playback itself stays with the default
+        // handler
         assert!(is_video("clip.mp4"));
         assert!(is_video("CLIP.MKV"));
         assert!(is_video("clip.webm"));
         assert!(!is_video("clip.txt"));
         assert!(!is_video("song.mp3"));
-        assert!(!is_thumbable("clip.mp4"));
+        assert!(is_thumbable("clip.mp4"));
         assert!(is_thumbable("scan.pdf"));
         assert!(is_thumbable("SCAN.PDF"));
         assert!(!is_thumbable("notes.pdf.txt"));

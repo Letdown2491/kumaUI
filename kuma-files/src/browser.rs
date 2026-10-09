@@ -31,6 +31,16 @@ use crate::input;
 /// most memory the cache can hold (about 75 MiB worst case).
 const THUMB_CACHE_MAX: usize = 300;
 
+/// The grid thumb decode pool: at most this many decodes in flight
+/// (the kumaOS ffmpeg contract's 2 to 4 worker pool), whatever the
+/// kind: libav posters, pdftocairo pages, raw image files.
+const THUMB_POOL: usize = 3;
+
+/// Disk cache entries older than this get swept on startup; the key
+/// carries (path, mtime, size), so stale entries can never be read
+/// again anyway and are pure disk weight.
+const THUMB_CACHE_SWEEP_SECS: u64 = 30 * 24 * 3600;
+
 /// Insertion-order trim for the thumb cache: evicts down to the cap,
 /// oldest first (dropping the oldest keeps the visible window's thumbs
 /// warm, where a wholesale clear re-decoded everything at once), and
@@ -53,6 +63,106 @@ fn trim_thumbs(
         }
     }
     droplets
+}
+
+/// One grid thumb job: the disk cache first (a PNG of the fitted
+/// pixels, keyed (path, mtime, size)), the source decode second,
+/// with the result written back before it lands. Returns the BGRA
+/// `RenderImage` ready for the thumbs map. Runs off the UI thread,
+/// inside the caller's catch_unwind.
+fn thumb_job(path: &Path, cache_path: &Path) -> Option<gpui::RenderImage> {
+    if let Ok(bytes) = fs::read(cache_path)
+        && let Some(image) = image::load_from_memory(&bytes).ok()
+    {
+        return Some(icons::decode_to_render(image, 256, 256));
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let dynamic = if icons::is_pdf(&name) {
+        icons::decode_pdf_dynamic(path, 1, 256)
+    } else if icons::is_epub(&name) {
+        // a pathological cover stays sane: cap the bytes handed to
+        // the decoder
+        crate::epub::read_epub_meta(path).and_then(|meta| {
+            let bytes = meta.cover?;
+            (bytes.len() <= 16 * 1024 * 1024)
+                .then_some(bytes)
+                .and_then(|bytes| icons::decode_cover_dynamic(&bytes))
+        })
+    } else if icons::is_video(&name) {
+        crate::video::poster_dynamic(path, 256)
+    } else {
+        icons::decode_thumbnail_dynamic(path)
+    }?;
+    // the cache stores the fitted pixels, not the raw decode: a
+    // 12 MP photo would balloon the cache dir. Pdfs, epub covers,
+    // and video posters arrive fitted already; fitting a fitted
+    // image is a no-op (never enlarged).
+    let fitted = if dynamic.width() > 256 || dynamic.height() > 256 {
+        dynamic.thumbnail(256, 256)
+    } else {
+        dynamic
+    };
+    // best effort: the cache is a durability win, not a dependency
+    let _ = write_thumb_cache(cache_path, &fitted);
+    Some(icons::decode_to_render(fitted, 256, 256))
+}
+
+/// PNG the fitted pixels into the cache root, creating it as needed.
+fn write_thumb_cache(cache_path: &Path, image: &image::DynamicImage) -> std::io::Result<()> {
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    fs::write(cache_path, bytes)
+}
+
+/// The disk cache filename for a thumbable path: a hash over the
+/// (path, mtime seconds, byte size) triple, so a changed file never
+/// reads a stale PNG. std's hasher is only stable within a build: a
+/// toolchain change re-decodes once and repopulates, which is
+/// harmless.
+fn thumb_cache_key(path: &Path, mtime: u64, size: u64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.as_os_str().hash(&mut hasher);
+    mtime.hash(&mut hasher);
+    size.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Startup sweep: disk cache entries older than the age bound are
+/// unreachable by their keys' nature only when their files change,
+/// which resets the key anyway; anything this old is pure disk
+/// weight. Best effort.
+fn sweep_thumb_cache(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().saturating_sub(THUMB_CACHE_SWEEP_SECS))
+        .unwrap_or(0);
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| {
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            })
+            .map(|modified| modified.as_secs() < cutoff)
+            .unwrap_or(false);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Undo memory bound: individual file operations, not steps, so a
@@ -1361,6 +1471,16 @@ pub(crate) struct Browser {
     /// Decoded thumbnails keyed by path; cleared wholesale when large.
     thumbs: HashMap<PathBuf, Arc<RenderImage>>,
     thumbs_inflight: HashSet<PathBuf>,
+    /// Pending thumb kicks, FIFO: the pool pops from here as slots
+    /// free, and pops die for paths the last paint stopped asking
+    /// about (off-screen work dies).
+    thumbs_queue: VecDeque<PathBuf>,
+    /// The paths the current paint asked thumbnails for: refreshed
+    /// every render, consulted when the pool pops the queue.
+    thumb_wanted: HashSet<PathBuf>,
+    /// The grid thumb disk cache root, keyed (path, mtime, size),
+    /// PNGs of the fitted pixels. Survives restarts.
+    thumb_cache: PathBuf,
     /// Insertion order into `thumbs`, so trimming drops the oldest
     /// entries instead of clearing the whole cache.
     thumb_order: VecDeque<PathBuf>,
@@ -1466,6 +1586,11 @@ impl Browser {
             show_hidden: false,
             thumbs: HashMap::new(),
             thumbs_inflight: HashSet::new(),
+            thumbs_queue: VecDeque::new(),
+            thumb_wanted: HashSet::new(),
+            thumb_cache: dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("kuma/files"),
             thumb_order: VecDeque::new(),
             path_editing: false,
             path_field: Default::default(),
@@ -1547,6 +1672,14 @@ impl Browser {
                     return;
                 }
             }
+        })
+        .detach();
+        // stale disk cache entries are pure disk weight: sweep them
+        // once per process start, in the background
+        let cache_root = browser.thumb_cache.clone();
+        cx.spawn(async move |_this, cx| {
+            cx.background_spawn(async move { sweep_thumb_cache(&cache_root) })
+                .await;
         })
         .detach();
         browser
@@ -1783,70 +1916,103 @@ impl Browser {
         cx.notify();
     }
 
-    /// Kick off a background decode for an image file; the cached result
-    /// arrives with a notify. Safe to call every render: inflight and
-    /// cached paths are no-ops.
+    /// Kick off a background decode for a thumbable file; the result
+    /// arrives with a notify. Safe to call every render: cached,
+    /// inflight, and queued paths are no-ops. The kick marks the path
+    /// wanted (this paint is asking) and queues it; the pool pops the
+    /// queue up to THUMB_POOL concurrent decodes, and a queued path
+    /// the paints stopped asking about dies at pop time instead of
+    /// spending a decode. Results go through the disk cache keyed
+    /// (path, mtime, size), so a restart or a re-scroll past an
+    /// evicted entry reads the PNG instead of the source.
     fn request_thumb(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.thumbs.contains_key(&path) || self.thumbs_inflight.contains(&path) {
+        if self.thumbs.contains_key(&path)
+            || self.thumbs_inflight.contains(&path)
+            || self.thumbs_queue.contains(&path)
+        {
             return;
         }
+        self.thumb_wanted.insert(path.clone());
         let Ok(meta) = fs::symlink_metadata(&path) else {
             return;
         };
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let is_pdf = icons::is_pdf(&name);
-        let is_epub = icons::is_epub(&name);
         // decoding cost is in the file read, not the resize; cap it.
         // epubs read selectively (zip directory, manifest, cover
-        // bytes), so the file-size cap does not apply to them
-        if !is_epub && meta.len() > 32 * 1024 * 1024 {
+        // bytes) and videos stream through libav's seek, so the
+        // file-size cap does not apply to them
+        if !icons::is_epub(&name) && !icons::is_video(&name) && meta.len() > 32 * 1024 * 1024 {
             return;
         }
-        self.thumbs_inflight.insert(path.clone());
-        cx.spawn(async move |this, cx| {
-            let bg_path = path.clone();
-            let render = cx
-                .background_spawn(async move {
-                    std::panic::catch_unwind(|| {
-                        if is_pdf {
-                            icons::decode_pdf_thumbnail(&bg_path, 1, 256)
-                        } else if is_epub {
-                            // a pathological cover stays sane: cap the
-                            // bytes handed to the decoder
-                            crate::epub::read_epub_meta(&bg_path).and_then(|meta| {
-                                let bytes = meta.cover?;
-                                (bytes.len() <= 16 * 1024 * 1024)
-                                    .then_some(bytes)
-                                    .and_then(|bytes| icons::decode_cover(&bytes, 256))
-                            })
-                        } else {
-                            icons::decode_thumbnail(&bg_path, 256, 256)
-                        }
-                    })
-                    .unwrap_or(None)
-                })
-                .await;
-            let update = this.update(cx, |this, cx| {
-                this.thumbs_inflight.remove(&path);
-                if let Some(render) = render {
-                    // evicted thumbs release their atlas tiles: the img
-                    // element never drops the tile it paints, so a
-                    // heap-only eviction would leave every thumbnail
-                    // ever scrolled past painted until the window
-                    // closed (ADR-0016)
-                    for image in trim_thumbs(&mut this.thumbs, &mut this.thumb_order) {
-                        cx.drop_image(image, None);
-                    }
-                    this.thumb_order.push_back(path.clone());
-                    this.thumbs.insert(path, Arc::new(render));
-                    cx.notify();
-                }
-            });
-            if let Err(err) = update {
-                log::error!("thumbnail update failed: {err:#}");
+        self.thumbs_queue.push_back(path);
+        self.pump_thumbs(cx);
+    }
+
+    /// Start queued thumb decodes while the pool has room. Called
+    /// from kicks and from landings, whichever comes first.
+    fn pump_thumbs(&mut self, cx: &mut Context<Self>) {
+        while self.thumbs_inflight.len() < THUMB_POOL {
+            let Some(path) = self.thumbs_queue.pop_front() else {
+                return;
+            };
+            if !self.thumb_wanted.contains(&path) {
+                continue; // off-screen since it was queued: dies here
             }
-        })
-        .detach();
+            let cache_path = self.cache_path_for(&path);
+            self.thumbs_inflight.insert(path.clone());
+            cx.spawn(async move |this, cx| {
+                let bg_path = path.clone();
+                let render = cx
+                    .background_spawn(async move {
+                        std::panic::catch_unwind(|| {
+                            thumb_job(&bg_path, &cache_path)
+                        })
+                        .unwrap_or(None)
+                    })
+                    .await;
+                let update = this.update(cx, |this, cx| {
+                    this.thumbs_inflight.remove(&path);
+                    if let Some(render) = render {
+                        // evicted thumbs release their atlas tiles: the img
+                        // element never drops the tile it paints, so a
+                        // heap-only eviction would leave every thumbnail
+                        // ever scrolled past painted until the window
+                        // closed (ADR-0016)
+                        for image in trim_thumbs(&mut this.thumbs, &mut this.thumb_order) {
+                            cx.drop_image(image, None);
+                        }
+                        this.thumb_order.push_back(path.clone());
+                        this.thumbs.insert(path, Arc::new(render));
+                        cx.notify();
+                    }
+                    this.pump_thumbs(cx);
+                });
+                if let Err(err) = update {
+                    log::error!("thumbnail update failed: {err:#}");
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// The disk cache entry for a thumbable path, keyed by the
+    /// (path, mtime, size) triple. The metadata is read fresh here:
+    /// the kick already stat'ed the file, but this stays correct for
+    /// any path handed in later.
+    fn cache_path_for(&self, path: &Path) -> PathBuf {
+        let key = match fs::symlink_metadata(path) {
+            Ok(meta) => {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                thumb_cache_key(path, mtime, meta.len())
+            }
+            Err(_) => thumb_cache_key(path, 0, 0),
+        };
+        self.thumb_cache.join(format!("{key}.png"))
     }
 
     /// New folder in the current directory, named to not collide.
@@ -4189,12 +4355,13 @@ impl Browser {
             if icons::is_pdf(&entry.name) || icons::is_epub(&entry.name) {
                 self.request_page_count(entry.path.clone(), cx);
             }
-        } else if icons::is_video(&entry.name) {
-            // a poster frame rides the image arm, so zoom and pan
-            // come free; playback itself stays with the default
-            // handler (gpui has no decoder)
-            self.request_quicklook_render(entry.path.clone(), 1, cx);
-            self.request_video_duration(entry.path.clone(), cx);
+            // a video's poster rides the image arm, so zoom and pan
+            // come free; its header facts land once into the shared
+            // label slot (playback itself stays with the default
+            // handler; gpui has no decoder)
+            if icons::is_video(&entry.name) {
+                self.request_video_duration(entry.path.clone(), cx);
+            }
         } else {
             let key = entry.key.clone();
             if self.preview_key.as_ref() != Some(&key) {
@@ -8068,6 +8235,9 @@ impl Render for Browser {
         self.arm_watcher();
         self.auto_dock(window);
         self.sync_sel_video(cx);
+        // this paint's thumb kicks define the wanted set; the pool
+        // consults it at pop time, so off-screen queue entries die
+        self.thumb_wanted.clear();
         let inspector_docked_bottom = self.inspector_bottom;
 
         // the info rail follows the cursor entry; keep its preview fed
@@ -11969,6 +12139,150 @@ mod browser_ux_keys {
             assert_eq!(browser.video_len_label(&entry).as_deref(), Some("3:25"));
             let other = browser.tab().entries[1].clone();
             assert_eq!(browser.video_len_label(&other), None);
+        });
+    }
+
+    #[test]
+    fn thumb_pool_bounds_and_cancels_queued() {
+        let lab = Lab::new("thumb-pool");
+        // eight decodable pngs; more kicks than pool slots
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let mut paths = Vec::new();
+        for i in 0..8 {
+            let path = lab.dir.join(format!("img{i}.png"));
+            fs::write(&path, &png).unwrap();
+            paths.push(path);
+        }
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            for path in &paths {
+                browser.request_thumb(path.clone(), cx);
+            }
+            // the pool bounds concurrency no matter how many kicks,
+            // whatever landed or started before these
+            assert!(browser.thumbs_inflight.len() <= 3);
+            assert_eq!(
+                browser.thumbs.len()
+                    + browser.thumbs_inflight.len()
+                    + browser.thumbs_queue.len(),
+                8
+            );
+            // every path scrolled away from: the queue dies at pop
+            // time instead of spending decodes
+            browser.thumb_wanted.clear();
+            browser.thumbs_inflight.clear();
+            browser.pump_thumbs(cx);
+            assert!(browser.thumbs_queue.is_empty());
+            assert!(browser.thumbs_inflight.is_empty());
+            // wanted again: fresh kicks re-enqueue, and the pump
+            // starts at most three
+            for path in &paths {
+                browser.request_thumb(path.clone(), cx);
+            }
+            assert_eq!(browser.thumbs_inflight.len(), 3);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            // started jobs always land, whatever the repaints did to
+            // wanted; in list mode nothing re-kicks, so the queue's
+            // unstarted entries died exactly as designed
+            assert!(browser.thumbs.len() >= 3);
+            for path in browser.thumbs.keys() {
+                assert!(paths.contains(path));
+            }
+        });
+    }
+
+    #[test]
+    fn thumb_disk_cache_survives_and_shields_the_source() {
+        let lab = Lab::new("thumb-cache");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let path = lab.dir.join("photo.png");
+        fs::write(&path, &png).unwrap();
+        let cache = std::env::temp_dir().join(format!("kuma-thumb-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cache);
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.thumb_cache = cache.clone();
+            browser.request_thumb(path.clone(), cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            assert!(browser.thumbs.contains_key(&path));
+        });
+        // the cache root now holds exactly one PNG
+        let mut entries = fs::read_dir(&cache).unwrap();
+        let cached = entries.next().unwrap().unwrap().path();
+        assert!(entries.next().is_none());
+        assert_eq!(cached.extension().unwrap(), "png");
+
+        // poison the source but restore its (mtime, size): the key
+        // must not move, and the cache read must shield the decode
+        // from the corrupt file
+        let meta = fs::metadata(&path).unwrap();
+        let mtime = meta.modified().unwrap();
+        fs::write(&path, vec![0u8; png.len()]).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(mtime),
+        )
+        .unwrap();
+        drop(file);
+
+        // a fresh browser is the restart case: empty memory, warm
+        // disk
+        let mut window2 = open_browser(&mut app, &lab.dir);
+        window2.update(|browser, _, cx| {
+            browser.thumb_cache = cache.clone();
+            browser.request_thumb(path.clone(), cx);
+        });
+        app.run_until_parked();
+        window2.update(|browser, _, _| {
+            assert!(browser.thumbs.contains_key(&path));
+            let bytes = browser.thumbs[&path].as_bytes(0).unwrap().to_vec();
+            assert!(bytes.iter().any(|b| *b != 0));
+        });
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn video_posters_decode_through_the_grid_pipeline() {
+        let lab = Lab::new("thumb-video");
+        // the committed fixture decodes in-process: no CLI, no GPU
+        fs::copy("tests/fixtures/sample.mp4", lab.dir.join("a.mp4")).unwrap();
+        fs::copy("tests/fixtures/sample.mp4", lab.dir.join("b.mp4")).unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.request_thumb(lab.dir.join("a.mp4"), cx);
+            browser.request_thumb(lab.dir.join("b.mp4"), cx);
+            assert!(icons::is_thumbable("a.mp4"));
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            assert!(browser.thumbs.contains_key(&lab.dir.join("a.mp4")));
+            assert!(browser.thumbs.contains_key(&lab.dir.join("b.mp4")));
+            let bytes = browser.thumbs[&lab.dir.join("a.mp4")]
+                .as_bytes(0)
+                .unwrap();
+            assert!(bytes.iter().any(|b| *b != 0));
         });
     }
 
