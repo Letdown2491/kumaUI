@@ -1302,6 +1302,12 @@ pub(crate) struct Browser {
     /// The open epub's metadata (title, author, cover flag), landed
     /// by the same background decode; reset on file flips.
     ql_book: Option<epub::BookMeta>,
+    /// The open video's duration label, when ffprobe answered.
+    ql_video_len: Option<(PathBuf, String)>,
+    /// ffprobe has been asked for the current video's duration (one
+    /// ask per open path; reset on file flips). Absent tools and
+    /// failed reads just leave the label out.
+    video_meta_asked: bool,
     /// The open epub's reading pane: spine chapters decoded in order
     /// by one background chain, blocks appending as each lands.
     /// Plain data, no tile.
@@ -1419,6 +1425,8 @@ impl Browser {
             ql_failed: None,
             ql_counting: false,
             ql_book: None,
+            ql_video_len: None,
+            video_meta_asked: false,
             ql_text_blocks: Arc::new(Vec::new()),
             ql_text_starts: Vec::new(),
             ql_text_for: None,
@@ -4117,6 +4125,8 @@ impl Browser {
                 cx.drop_image(image, None);
             }
             self.ql_book = None;
+            self.ql_video_len = None;
+            self.video_meta_asked = false;
             self.ql_scroll.set_offset(point(px(0.), px(0.)));
         }
         self.feed_quicklook(&entry, cx);
@@ -4161,6 +4171,12 @@ impl Browser {
             if icons::is_pdf(&entry.name) || icons::is_epub(&entry.name) {
                 self.request_page_count(entry.path.clone(), cx);
             }
+        } else if icons::is_video(&entry.name) {
+            // a poster frame rides the image arm, so zoom and pan
+            // come free; playback itself stays with the default
+            // handler (gpui has no decoder)
+            self.request_quicklook_render(entry.path.clone(), 1, cx);
+            self.request_video_duration(entry.path.clone(), cx);
         } else {
             let key = entry.key.clone();
             if self.preview_key.as_ref() != Some(&key) {
@@ -4304,6 +4320,35 @@ impl Browser {
         .detach();
     }
 
+    /// ffprobe's duration for the video under Quick Look, one ask
+    /// per open path: the label rides the header like an epub's book
+    /// label. A missing tool or a failed read just leaves the label
+    /// out; the pane still shows its poster or its card.
+    fn request_video_duration(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.video_meta_asked {
+            return;
+        }
+        self.video_meta_asked = true;
+        cx.spawn(async move |this, cx| {
+            let bg_path = path.clone();
+            let label = cx
+                .background_spawn(async move { icons::video_duration(&bg_path) })
+                .await;
+            let update = this.update(cx, |this, cx| {
+                if let Some(label) = label
+                    && this.quicklook.as_ref().is_some_and(|ql| ql.path == path)
+                {
+                    this.ql_video_len = Some((path, label));
+                    cx.notify();
+                }
+            });
+            if let Err(err) = update {
+                log::error!("video duration failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
     /// Kick the background decode for Quick Look's own render (the
     /// listing's thumbs are 256px; a pane wants more). Keyed by path
     /// and page; a newer request supersedes an older one in flight,
@@ -4333,17 +4378,21 @@ impl Browser {
             self.ql_failed = Some(path);
             return;
         };
-        // decoding cost is in the file read, not the resize; cap it
-        if meta.len() > 32 * 1024 * 1024 {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let is_epub = icons::is_epub(&name);
+        let is_video = icons::is_video(&name);
+        // decoding cost is in the file read, not the resize; cap it.
+        // epubs read selectively (zip directory, manifest, cover
+        // bytes) and videos stream through ffmpeg's seek, so the
+        // file-size cap does not apply to them
+        if !is_epub && !is_video && meta.len() > 32 * 1024 * 1024 {
             self.ql_failed = Some(path);
             return;
         }
         self.ql_inflight = Some((path.clone(), page));
         // a fresh attempt supersedes an old failure's knowledge
         self.ql_failed = None;
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
         let is_pdf = icons::is_pdf(&name);
-        let is_epub = icons::is_epub(&name);
         cx.spawn(async move |this, cx| {
             let bg_path = path.clone();
             let (render, book) = cx
@@ -4364,6 +4413,11 @@ impl Browser {
                                 ),
                                 None => (None, None),
                             }
+                        } else if is_video {
+                            (
+                                icons::decode_video_poster(&bg_path, QL_DECODE_MAX),
+                                None,
+                            )
                         } else {
                             (
                                 icons::decode_thumbnail(&bg_path, QL_DECODE_MAX, QL_DECODE_MAX),
@@ -6783,6 +6837,28 @@ impl Browser {
             }
             if label.is_empty() { None } else { Some(label) }
         });
+        // a video's glance: duration plus the poster's own
+        // resolution ("3:25 · 1920×1080")
+        let video_label = self.ql_video_len.as_ref().and_then(|(p, len)| {
+            if *p != entry.path || entry.is_dir || !icons::is_video(&entry.name) {
+                return None;
+            }
+            match self
+                .ql_render
+                .as_ref()
+                .filter(|(rp, _, _)| *rp == entry.path)
+            {
+                Some((_, _, render)) => {
+                    let size = render.size(0);
+                    Some(format!(
+                        "{len} · {}\u{d7}{}",
+                        u32::from(size.width),
+                        u32::from(size.height)
+                    ))
+                }
+                None => Some(len.clone()),
+            }
+        });
 
         // the top row: name, position in the listing, the close road
         let header = div()
@@ -6800,7 +6876,7 @@ impl Browser {
                     .truncate()
                     .child(entry.name.clone()),
             )
-            .children(book_label.map(|label| {
+            .children(book_label.or(video_label).map(|label| {
                 div()
                     .text_size(px(12.))
                     .text_color(theme::text_dim())
@@ -11606,6 +11682,35 @@ mod browser_ux_keys {
             assert_eq!(browser.quicklook.as_ref().unwrap().pages, Some(3));
         });
     }
+    #[test]
+    fn quick_look_video_fails_soft_into_the_card() {
+        let lab = Lab::new("quicklook-video");
+        // the container has no ffmpeg: the poster decode fails soft,
+        // the card stands in, and the duration ask is spent quietly
+        fs::write(lab.dir.join("clip.mp4"), b"not a video").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // dirs first: sub, a.txt, b.txt, c.txt, clip.mp4
+            browser.jump_cursor(4, cx);
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_some());
+        });
+        app.run_until_parked(); // the failed decode lands
+        window.update(|browser, _, _| {
+            assert_eq!(
+                browser.ql_failed.as_deref(),
+                Some(lab.dir.join("clip.mp4").as_path())
+            );
+            // one ask, no label: nothing respawns per frame
+            assert!(browser.video_meta_asked);
+            assert!(browser.ql_video_len.is_none());
+        });
+    }
+
     #[test]
     fn quick_look_corrupt_epub_fails_into_the_card() {
         let lab = Lab::new("quicklook-epub-bad");

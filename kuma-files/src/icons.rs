@@ -121,6 +121,16 @@ pub(crate) fn is_pdf(name: &str) -> bool {    Path::new(name)
         .unwrap_or(false)
 }
 
+/// Video files: a poster frame for the Quick Look pane. Playback
+/// stays with the system default handler (gpui has no decoder).
+pub(crate) fn is_video(name: &str) -> bool {
+    let ext = Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(), "mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v")
+}
+
 /// Decode a file into a BGRA `RenderImage` no larger than the bounds, the
 /// byte order gpui expects. Same contract as kuma-shell's imaging module.
 pub(crate) fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<gpui::RenderImage> {    let image = image::ImageReader::open(path).ok()?.decode().ok()?;
@@ -166,6 +176,87 @@ fn decode_to_render(image: image::DynamicImage, max_width: u32, max_height: u32)
     gpui::RenderImage::new(SmallVec::from_buf([image::Frame::new(thumb)]))
 }
 
+/// A poster frame for the Quick Look pane by shelling out to ffmpeg:
+/// a real frame from a second in (first frames are black on plenty
+/// of recordings), scaled to the max bound, PNG on stdout so no
+/// temp file exists. None when the tool is missing or the file is
+/// not a readable video. A clip shorter than the seek retries from
+/// zero rather than give up.
+pub(crate) fn decode_video_poster(path: &Path, max: u32) -> Option<gpui::RenderImage> {
+    let bound = max.to_string();
+    let mut seek_from = Some("1");
+    let stdout = loop {
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args(["-v", "error", "-nostdin"]);
+        if let Some(from) = seek_from {
+            cmd.args(["-ss", from]);
+        }
+        let out = cmd
+            .arg("-i")
+            .arg(path)
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                &format!("scale={bound}:{bound}:force_original_aspect_ratio=decrease"),
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "png",
+                "pipe:1",
+            ])
+            .output()
+            .ok()?;
+        if out.status.success() && !out.stdout.is_empty() {
+            break out.stdout;
+        }
+        match seek_from.take() {
+            Some(_) => continue, // retry from the first frame
+            None => return None,
+        }
+    };
+    let image = image::load_from_memory(&stdout).ok()?;
+    Some(decode_to_render(image, max, max))
+}
+
+/// ffprobe's duration for a video as a wall-clock label ("3:25",
+/// "1:02:03"). None when the tool is missing or the read failed.
+pub(crate) fn video_duration(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    video_duration_label(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pure twin of the ffprobe parse: seconds ("3.42") into a
+/// wall-clock label ("0:03"). N/A and junk parse as None.
+pub(crate) fn video_duration_label(raw: &str) -> Option<String> {
+    let seconds: f64 = raw.trim().parse().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let total = seconds.round() as u64;
+    let (h, rem) = (total / 3600, total % 3600);
+    let (m, s) = (rem / 60, rem % 60);
+    if h > 0 {
+        Some(format!("{h}:{m:02}:{s:02}"))
+    } else {
+        Some(format!("{m}:{s:02}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +270,14 @@ mod tests {
 
     #[test]
     fn thumbable_gates() {
+        // videos are pane posters, not grid thumbs: playback stays
+        // with the default handler
+        assert!(is_video("clip.mp4"));
+        assert!(is_video("CLIP.MKV"));
+        assert!(is_video("clip.webm"));
+        assert!(!is_video("clip.txt"));
+        assert!(!is_video("song.mp3"));
+        assert!(!is_thumbable("clip.mp4"));
         assert!(is_thumbable("scan.pdf"));
         assert!(is_thumbable("SCAN.PDF"));
         assert!(!is_thumbable("notes.pdf.txt"));
