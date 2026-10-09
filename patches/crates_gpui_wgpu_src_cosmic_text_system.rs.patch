@@ -1,0 +1,44 @@
+--- a/vendor/zed/crates/gpui_wgpu/src/cosmic_text_system.rs
++++ b/vendor/zed/crates/gpui_wgpu/src/cosmic_text_system.rs
+@@ -421,8 +421,39 @@
+             if font.as_swash().charmap().map('m') == 0
+                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
+             {
+-                self.font_system.db_mut().remove_face(font.id());
+-                continue;
++                // KUMA PATCH: a letter-less face survives only when swash
++                // can actually pull a color bitmap out of it. Color emoji
++                // faces carry no letters; the CBDT builds (what Debian and
++                // Arch ship, and what kumaOS vendors into its image, since
++                // Fedora's noto-emoji packaging switched to COLRv1 in
++                // April 2025 and no longer packages a bitmap build) render
++                // through Source::ColorBitmap, but the COLRv1 build (Fedora's
++                // google-noto-color-emoji-fonts, the only color face Fedora
++                // ships now) cannot rasterize here at all: COLRv1 is beyond
++                // swash, the base outlines are empty, and every render comes
++                // back blank. Evicting the COLRv1 face keeps it from
++                // shadowing a usable face of the same family in the fallback
++                // chain; with only the COLRv1 build installed, emoji fall
++                // through to the next face instead of painting nothing.
++                let font_ref = font.as_swash();
++                let gid = font_ref.charmap().map('\u{1f389}');
++                let mut delivers_color = false;
++                if gid != 0 {
++                    let mut scaler = self
++                        .swash_scale_context
++                        .builder(font_ref)
++                        .size(32.0)
++                        .build();
++                    delivers_color = swash::scale::Render::new(&[swash::scale::Source::ColorBitmap(
++                        swash::scale::StrikeWith::BestFit,
++                    )])
++                    .render(&mut scaler, gid)
++                    .is_some();
++                }
++                if !delivers_color {
++                    self.font_system.db_mut().remove_face(font.id());
++                    continue;
++                }
+             };
+ 
+             let font_id = FontId(self.loaded_fonts.len());

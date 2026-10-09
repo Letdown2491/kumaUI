@@ -1,0 +1,19 @@
+--- a/vendor/zed/crates/gpui/src/app.rs
++++ b/vendor/zed/crates/gpui/src/app.rs
+@@ -2023,7 +2023,7 @@
+                 drop(result.take());
+             }
+         });
+-        result.context("window not found")
++        result.context(format!("window not found: {:?}", id))
+     }
+ 
+     /// Creates an `AsyncApp`, which can be cloned and has a static lifetime
+@@ -2961,6 +2961,7 @@
+                 cx.window_update_stack.pop();
+ 
+                 if window.removed {
++                    log::info!("kuma-debug: slab REMOVE window {:?}", window_id);
+                     cx.end_platform_drag(window_id);
+                     cx.window_handles.remove(&window_id);
+                     cx.windows.remove(window_id);

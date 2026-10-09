@@ -19,6 +19,13 @@ bite us.
 
 Pinned commit: `40180d9c40e2d20eb63d388bff920818f2910b53` (zed main, 2026-09-30)
 
+The local patches live as files under `patches/` (one per recorded change
+below) and the script applies them after the untar. A fresh clone that
+runs the script assembles the same vendor tree as this checkout, which is
+what the kumaOS build action and the committed `Cargo.lock` both count on.
+A new patch is a file under `patches/` plus an entry here, in the same
+commit as the code that needs it.
+
 Note: `vendor/zed/AGENTS.md` belongs to the zed repo; its rules apply to upstream
 PRs, not to kumaUI development. Treat the vendored tree as read-only except for
 local patches, which should be recorded here.

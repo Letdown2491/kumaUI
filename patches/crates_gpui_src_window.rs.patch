@@ -1,0 +1,24 @@
+--- a/vendor/zed/crates/gpui/src/window.rs
++++ b/vendor/zed/crates/gpui/src/window.rs
+@@ -2812,6 +2812,13 @@
+         self.active.get()
+     }
+ 
++    /// Debug helper for tests: the painted bounds of the element that
++    /// registered `selector` via `debug_selector`, if any.
++    #[cfg(any(test, feature = "test-support"))]
++    pub fn debug_element_bounds(&self, selector: &str) -> Option<Bounds<Pixels>> {
++        self.rendered_frame.debug_bounds.get(selector).copied()
++    }
++
+     /// Returns whether this window is considered to be the window
+     /// that currently owns the mouse cursor.
+     /// On mac, this is equivalent to `is_window_active`.
+@@ -5751,7 +5758,6 @@
+             self.mouse_hit_test = hit_test;
+             self.reset_cursor_style(cx);
+         }
+-
+         #[cfg(any(feature = "inspector", debug_assertions))]
+         if self.is_inspector_picking(cx) {
+             self.handle_inspector_mouse_event(event, cx);

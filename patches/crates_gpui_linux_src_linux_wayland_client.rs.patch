@@ -1,0 +1,327 @@
+--- a/vendor/zed/crates/gpui_linux/src/linux/wayland/client.rs
++++ b/vendor/zed/crates/gpui_linux/src/linux/wayland/client.rs
+@@ -336,6 +336,10 @@
+     outputs: HashMap<ObjectId, Output>,
+     in_progress_outputs: HashMap<ObjectId, InProgressOutput>,
+     wl_outputs: HashMap<ObjectId, wl_output::WlOutput>,
++    // Registry name of each bound wl_output, for GlobalRemove: a removed
++    // global's wl_output goes inert with no event of its own, and without
++    // this the display map keeps reporting outputs that are gone
++    output_global_names: HashMap<u32, ObjectId>,
+     keyboard_layout: LinuxKeyboardLayout,
+     keymap_state: Option<xkb::State>,
+     compose_state: Option<xkb::compose::State>,
+@@ -470,9 +474,216 @@
+ pub(crate) struct ExternalDrag {
+     source: wl_data_source::WlDataSource,
+     bytes: Vec<u8>,
++    /// The drag icon surface: a small SHM-backed pill that follows the
++    /// cursor. Without it the compositor shows nothing for the drag.
++    /// Never read, only held: Drop destroys the wayland objects when the
++    /// drag ends.
++    #[allow(dead_code)]
++    icon: Option<DragIcon>,
+     window: WaylandWindowStatePtr,
+ }
+ 
++const DRAG_ICON_WIDTH: i32 = 128;
++const DRAG_ICON_HEIGHT: i32 = 32;
++
++/// A CPU-rendered drag icon: one SHM pool, one buffer, one surface. The
++/// pixels are a rounded accent pill; the ghost view inside the window
++/// already shows the file name, this just makes the drag visible outside.
++struct DragIcon {
++    _file: std::fs::File,
++    surface: wl_surface::WlSurface,
++    pool: wl_shm_pool::WlShmPool,
++    buffer: wl_buffer::WlBuffer,
++}
++
++impl Drop for DragIcon {
++    fn drop(&mut self) {
++        self.buffer.destroy();
++        self.pool.destroy();
++        self.surface.destroy();
++    }
++}
++
++fn create_drag_icon(globals: &Globals, label: Option<String>) -> Option<DragIcon> {
++    use std::io::{Seek, SeekFrom, Write};
++    use std::os::fd::{AsFd, FromRawFd};
++
++    let width = DRAG_ICON_WIDTH;
++    let height = DRAG_ICON_HEIGHT;
++    let stride = width * 4;
++    let size = (stride * height) as usize;
++
++    let fd = unsafe {
++        libc::memfd_create(b"kuma-drag-icon\0".as_ptr() as *const libc::c_char, libc::MFD_CLOEXEC)
++    };
++    if fd < 0 {
++        log::error!("drag icon: memfd_create failed");
++        return None;
++    }
++    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
++    file.set_len(size as u64).ok()?;
++
++    // Argb8888 is little-endian in memory: b, g, r, a.
++    let mut pixels = vec![0u8; size];
++    let radius = 8.0f32;
++    let half_w = width as f32 / 2.0;
++    let half_h = height as f32 / 2.0;
++    for y in 0..height {
++        for x in 0..width {
++            let dx = ((x as f32 + 0.5) - half_w).abs() - (half_w - radius);
++            let dy = ((y as f32 + 0.5) - half_h).abs() - (half_h - radius);
++            let outside_corner = dx > 0.0 && dy > 0.0 && dx * dx + dy * dy > radius * radius;
++            if outside_corner {
++                continue;
++            }
++            let i = (y * stride + x * 4) as usize;
++            pixels[i] = 0xc9; // blue
++            pixels[i + 1] = 0x8c; // green
++            pixels[i + 2] = 0x4f; // red
++            pixels[i + 3] = 0xd9; // alpha
++        }
++    }
++    if let Some(label) = label {
++        draw_drag_label(&mut pixels, width, height, stride, &label);
++    }
++    file.write_all(&pixels).ok()?;
++    file.seek(SeekFrom::Start(0)).ok()?;
++
++    let pool = globals
++        .shm
++        .create_pool(file.as_fd(), size as i32, &globals.qh, ());
++    let buffer = pool.create_buffer(
++        0,
++        width,
++        height,
++        stride,
++        wl_shm::Format::Argb8888,
++        &globals.qh,
++        (),
++    );
++
++    let surface = globals.compositor.create_surface(&globals.qh, ());
++    surface.attach(Some(&buffer), 0, 0);
++    surface.damage(0, 0, width, height);
++    surface.commit();
++
++    Some(DragIcon {
++        _file: file,
++        surface,
++        pool,
++        buffer,
++    })
++}
++
++/// Composites a white label into the pill: one A8 canvas per glyph,
++/// rasterized by font-kit's freetype loader, blitted by alpha. The glyph
++/// origin is the baseline's left end; the canvas position comes from
++/// `raster_bounds` of the very same transform, so no font metrics math
++/// beyond the baseline offset is needed.
++fn draw_drag_label(pixels: &mut [u8], width: i32, height: i32, stride: i32, label: &str) {
++    use font_kit::canvas::{Canvas, Format as CanvasFormat, RasterizationOptions};
++    use font_kit::hinting::HintingOptions;
++    use font_kit::family_name::FamilyName;
++    use font_kit::properties::Properties;
++    use font_kit::source::SystemSource;
++    use pathfinder_geometry::transform2d::Transform2F;
++    use pathfinder_geometry::vector::Vector2F;
++
++    let size = 13.0f32;
++    let pad = 12.0f32;
++    let font = match SystemSource::new()
++        .select_best_match(&[FamilyName::SansSerif], &Properties::new())
++    {
++        Ok(handle) => match handle.load() {
++            Ok(font) => font,
++            Err(err) => {
++                log::info!("drag icon: font failed to load: {err}");
++                return;
++            }
++        },
++        Err(err) => {
++            log::info!("drag icon: no font for the label: {err}");
++            return;
++        }
++    };
++    let metrics = font.metrics();
++    let scale = size / metrics.units_per_em as f32;
++    // center the (ascent, descent) band vertically; descent is negative
++    let baseline_y = height as f32 / 2.0 + (metrics.ascent + metrics.descent) * scale / 2.0;
++
++    // Measure with the transform baked in, truncating to the pill's width.
++    let max_width = width as f32 - 2.0 * pad;
++    let mut placed: Vec<(u32, pathfinder_geometry::rect::RectI, Transform2F)> = Vec::new();
++    let mut pen_x = pad;
++    for ch in label.chars() {
++        let Some(glyph) = font.glyph_for_char(ch) else {
++            continue;
++        };
++        let transform = Transform2F::from_translation(Vector2F::new(pen_x, baseline_y));
++        let Ok(rect) = font.raster_bounds(
++            glyph,
++            size,
++            transform,
++            HintingOptions::None,
++            RasterizationOptions::GrayscaleAa,
++        ) else {
++            continue;
++        };
++        pen_x += rect.width() as f32 + 1.0;
++        if pen_x > pad + max_width {
++            break;
++        }
++        placed.push((glyph, rect, transform));
++    }
++    if placed.is_empty() {
++        return;
++    }
++
++    for (glyph, rect, transform) in placed {
++        let mut canvas = Canvas::new(rect.size(), CanvasFormat::A8);
++        if font
++            .rasterize_glyph(
++                &mut canvas,
++                glyph,
++                size,
++                Transform2F::from_translation(-rect.origin().to_f32()) * transform,
++                HintingOptions::None,
++                RasterizationOptions::GrayscaleAa,
++            )
++            .is_err()
++        {
++            continue;
++        }
++        let ox = rect.origin_x();
++        let oy = rect.origin_y();
++        for row in 0..canvas.size.y() {
++            let py = oy + row;
++            if py < 0 || py >= height {
++                continue;
++            }
++            for col in 0..canvas.size.x() {
++                let px = ox + col;
++                if px < 0 || px >= width {
++                    continue;
++                }
++                let a = canvas.pixels[row as usize * canvas.stride + col as usize];
++                if a == 0 {
++                    continue;
++                }
++                let i = (py * stride + px * 4) as usize;
++                let t = a as f32 / 255.0;
++                let p = pixels[i + 3] as f32 / 255.0;
++                let mix = |c: u8| (c as f32 * (1.0 - t) + 255.0 * t) as u8;
++                pixels[i] = mix(pixels[i]);
++                pixels[i + 1] = mix(pixels[i + 1]);
++                pixels[i + 2] = mix(pixels[i + 2]);
++                pixels[i + 3] = ((t + p * (1.0 - t)) * 255.0) as u8;
++            }
++        }
++    }
++}
++
++
+ fn file_uri_list(paths: &FileDragPaths) -> String {
+     paths
+         .entries()
+@@ -604,12 +815,45 @@
+         let source =
+             data_device_manager.create_data_source(&state.globals.qh, DataSourceKind::Drag);
+         source.offer(FILE_LIST_MIME_TYPE.to_string());
+-        source.set_actions(DndAction::Copy | DndAction::Move);
+-        data_device.start_drag(Some(&source), surface, None, serial.as_raw());
++        // kumaUI local patch: Copy only. Upstream advertises Copy | Move, and
++        // real targets (Nautilus) choose Move, so a dragged file silently
++        // leaves its folder on drop. A file manager's outbound drags must
++        // default to the non-destructive action.
++        source.set_actions(DndAction::Copy);
++
++        // kumaUI local patch: attach a drag icon. Upstream passes None, so
++        // outbound drags show no surface at all: the cursor gives no
++        // feedback that a drag is live. A small SHM-backed pill follows the
++        // cursor instead. (The icon object rides on ExternalDrag and is
++        // destroyed when the drag finishes or cancels.)
++        let entries = paths.entries();
++        let label = if entries.len() == 1 {
++            entries
++                .iter()
++                .next()
++                .map(|(path, _)| {
++                    path.file_name().map_or_else(
++                        || path.display().to_string(),
++                        |name| name.to_string_lossy().into_owned(),
++                    )
++                })
++                .or_else(|| Some("1 item".into()))
++        } else {
++            Some(format!("{} items", entries.len()))
++        };
++        let icon = create_drag_icon(&state.globals, label);
++        let icon_surface = icon.as_ref().map(|icon| icon.surface.clone());
++        data_device.start_drag(
++            Some(&source),
++            surface,
++            icon_surface.as_ref(),
++            serial.as_raw(),
++        );
+ 
+         state.external_drag = Some(ExternalDrag {
+             source,
+             bytes: uri_list.into_bytes(),
++            icon,
+             window,
+         });
+         true
+@@ -846,6 +1090,8 @@
+         let mut in_progress_outputs = HashMap::default();
+         #[allow(clippy::mutable_key_type)]
+         let mut wl_outputs: HashMap<ObjectId, wl_output::WlOutput> = HashMap::default();
++        #[allow(clippy::mutable_key_type)]
++        let mut output_global_names: HashMap<u32, ObjectId> = HashMap::default();
+         globals.contents().with_list(|list| {
+             for global in list {
+                 match &global.interface[..] {
+@@ -865,6 +1111,7 @@
+                             (),
+                         );
+                         in_progress_outputs.insert(output.id(), InProgressOutput::default());
++                        output_global_names.insert(global.name, output.id());
+                         wl_outputs.insert(output.id(), output);
+                     }
+                     _ => {}
+@@ -1005,6 +1252,7 @@
+             outputs: HashMap::default(),
+             in_progress_outputs,
+             wl_outputs,
++            output_global_names,
+             windows: HashMap::default(),
+             common,
+             keyboard_layout: LinuxKeyboardLayout::new(UNKNOWN_KEYBOARD_LAYOUT_NAME),
+@@ -1495,12 +1743,21 @@
+                     state
+                         .in_progress_outputs
+                         .insert(output.id(), InProgressOutput::default());
++                    state.output_global_names.insert(name, output.id());
+                     state.wl_outputs.insert(output.id(), output);
+                 }
+                 _ => {}
+             },
+-            wl_registry::Event::GlobalRemove { name: _ } => {
+-                // TODO: handle global removal
++            wl_registry::Event::GlobalRemove { name } => {
++                // An output's global removal (unplug, disable) leaves the
++                // bound wl_output inert: no event arrives on the object
++                // itself, so retire it here or the display map reports
++                // outputs that are gone for the rest of the session
++                if let Some(object_id) = state.output_global_names.remove(&name) {
++                    state.outputs.remove(&object_id);
++                    state.in_progress_outputs.remove(&object_id);
++                    state.wl_outputs.remove(&object_id);
++                }
+             }
+             _ => {}
+         }

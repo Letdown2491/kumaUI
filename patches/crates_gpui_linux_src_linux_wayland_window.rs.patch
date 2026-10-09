@@ -1,0 +1,105 @@
+--- a/vendor/zed/crates/gpui_linux/src/linux/wayland/window.rs
++++ b/vendor/zed/crates/gpui_linux/src/linux/wayland/window.rs
+@@ -543,6 +543,14 @@
+     callbacks: Rc<RefCell<Callbacks>>,
+     frame_loop: Rc<Cell<FrameLoop>>,
+     frame_ping: Ping,
++    /// Set the moment the `WaylandWindow` begins dropping, on the main
++    /// thread. Clones of this pointer outlive that drop — the client's
++    /// window map unregisters asynchronously, and the input dispatch
++    /// retains a clone as the focused window — and the compositor can
++    /// still deliver events (a pointer leave for a surface that closed
++    /// under the cursor, say) to a window gpui has already removed.
++    /// Forwarding those is where `window not found` noise came from.
++    closed: Rc<Cell<bool>>,
+ }
+ 
+ impl WaylandWindowState {
+@@ -756,6 +764,7 @@
+ 
+ impl Drop for WaylandWindow {
+     fn drop(&mut self) {
++        self.0.closed.set(true);
+         self.0.frame_loop.set(FrameLoop::Parked);
+ 
+         let mut state = self.0.state.borrow_mut();
+@@ -864,6 +873,7 @@
+             callbacks: Rc::new(RefCell::new(Callbacks::default())),
+             frame_loop: Rc::new(Cell::new(FrameLoop::Unconfigured)),
+             frame_ping,
++            closed: Rc::new(Cell::new(false)),
+         });
+ 
+         // Kick things off
+@@ -1496,6 +1506,12 @@
+         {
+             let state = self.state.borrow();
+             if let Some(viewport) = &state.viewport {
++                // layer surfaces start at zero size and are sized by
++                // the layer configure; a scale event can land first,
++                // and the viewporter protocol forbids zero destinations
++                if size.width <= px(0.) || size.height <= px(0.) {
++                    return;
++                }
+                 viewport
+                     .set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
+             }
+@@ -1532,7 +1548,7 @@
+     }
+ 
+     pub fn handle_input(&self, input: PlatformInput) {
+-        if self.is_blocked() {
++        if self.closed.get() || self.is_blocked() {
+             return;
+         }
+         let callback = self.callbacks.borrow_mut().input.take();
+@@ -1557,6 +1573,9 @@
+     }
+ 
+     pub fn set_focused(&self, focus: bool) {
++        if self.closed.get() {
++            return;
++        }
+         self.state.borrow_mut().active = focus;
+         let callback = self.callbacks.borrow_mut().active_status_change.take();
+         if let Some(mut fun) = callback {
+@@ -1569,6 +1588,9 @@
+     }
+ 
+     pub fn set_hovered(&self, focus: bool) {
++        if self.closed.get() {
++            return;
++        }
+         let callback = self.callbacks.borrow_mut().hover_status_change.take();
+         if let Some(mut fun) = callback {
+             fun(focus);
+@@ -1577,6 +1599,9 @@
+     }
+ 
+     fn report_visibility(&self, visibility: WindowVisibility) {
++        if self.closed.get() {
++            return;
++        }
+         let callback = self.callbacks.borrow_mut().visibility_change.take();
+         if let Some(mut callback) = callback {
+             callback(visibility);
+@@ -1585,6 +1610,9 @@
+     }
+ 
+     pub fn set_appearance(&mut self, appearance: WindowAppearance) {
++        if self.closed.get() {
++            return;
++        }
+         self.state.borrow_mut().appearance = appearance;
+ 
+         let callback = self.callbacks.borrow_mut().appearance_changed.take();
+@@ -1595,6 +1623,9 @@
+     }
+ 
+     pub fn set_button_layout(&self) {
++        if self.closed.get() {
++            return;
++        }
+         let callback = self.callbacks.borrow_mut().button_layout_changed.take();
+         if let Some(mut fun) = callback {
+             fun();
