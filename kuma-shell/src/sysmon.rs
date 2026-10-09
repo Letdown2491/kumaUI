@@ -1061,7 +1061,7 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
                     sysmon.power_profile = snapshot.power_profile;
                     sysmon.media = snapshot.media.clone();
                     sysmon.recording = snapshot.recording.clone();
-                    log::info!("sysmon snapshot: {snapshot:?}");
+                    log::debug!("sysmon snapshot: {snapshot:?}");
                     // the trio rides the same confirm gate as the
                     // fast pass: the full pass doesn't get to
                     // bypass it

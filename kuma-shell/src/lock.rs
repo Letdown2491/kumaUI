@@ -190,6 +190,11 @@ impl LockState {
         self.password.clear();
         self.busy = false;
         self.message = None;
+        // hold nothing while unlocked: the decoded wallpaper is an 8-33 MB
+        // Arc nobody looks at between lock cycles; the next lock re-decodes
+        // off-thread (its atlas tiles died with the lock surfaces anyway)
+        self.wallpaper = None;
+        self.wallpaper_path = None;
         cx.notify();
         let surfaces = std::mem::take(&mut self.surfaces);
         for handle in surfaces {

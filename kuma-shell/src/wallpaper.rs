@@ -77,7 +77,8 @@ impl Render for WallpaperView {
         );
         if self.shown.as_ref() != Some(&wanted) {
             self.shown = Some(wanted.clone());
-            self.image = None;
+            // the old image keeps painting until the new decode lands (no
+            // blank flash); the swap then releases its atlas tile (ADR-0016)
             cx.spawn(async move |this, cx| {
                 let image = cx
                     .background_spawn(async move {
@@ -88,7 +89,9 @@ impl Render for WallpaperView {
                     })
                     .await;
                 let _ = this.update(cx, |this, cx| {
-                    this.image = image;
+                    if let Some(old) = std::mem::replace(&mut this.image, image) {
+                        crate::imaging::release(&old, cx);
+                    }
                     cx.notify();
                 });
             })
