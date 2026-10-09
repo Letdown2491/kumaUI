@@ -86,7 +86,7 @@ fn ql_clamp_pan(pan: (f32, f32), display: (f32, f32), avail: (f32, f32)) -> (f32
     (pan.0.clamp(-max_x, max_x), pan.1.clamp(-max_y, max_y))
 }
 
-use crate::{icons, theme};
+use crate::{epub, icons, theme};
 
 /// One drag origin. The external payload resolver needs the path plus
 /// whether it is a directory, so the platform drag advertises both.
@@ -1278,6 +1278,9 @@ pub(crate) struct Browser {
     /// pdfinfo has been asked for the current PDF's page count (one
     /// ask per open path; reset on file flips).
     ql_counting: bool,
+    /// The open epub's metadata (title, author, cover flag), landed
+    /// by the same background decode; reset on file flips.
+    ql_book: Option<epub::BookMeta>,
     /// The overlay's text column scrolls through the snippet.
     ql_scroll: gpui::ScrollHandle,
     /// Hand-rolled right-click menu: position plus a flat item list.
@@ -1374,6 +1377,7 @@ impl Browser {
             ql_inflight: None,
             ql_failed: None,
             ql_counting: false,
+            ql_book: None,
             ql_scroll: gpui::ScrollHandle::new(),
             menu: None,
             grid_row_len: Arc::new(AtomicUsize::new(0)),
@@ -4016,6 +4020,7 @@ impl Browser {
             if let Some((_, _, image)) = self.ql_render.take() {
                 cx.drop_image(image, None);
             }
+            self.ql_book = None;
             self.ql_scroll.set_offset(point(px(0.), px(0.)));
         }
         self.feed_quicklook(&entry, cx);
@@ -4051,7 +4056,7 @@ impl Browser {
         if entry.is_dir {
             return;
         }
-        if icons::is_thumbable(&entry.name) {
+        if icons::is_thumbable(&entry.name) || icons::is_epub(&entry.name) {
             self.request_quicklook_render(entry.path.clone(), 1, cx);
             // a multi-page PDF wants its count so paging and the
             // indicator can wake up (one ask per open path)
@@ -4174,12 +4179,17 @@ impl Browser {
     fn request_quicklook_render(&mut self, path: PathBuf, page: usize, cx: &mut Context<Self>) {
         let nothing_held_failed = self.ql_render.as_ref().is_none_or(|(p, _, _)| *p != path)
             && self.ql_failed.as_ref() == Some(&path);
+        // an epub whose meta already landed is read: a retry would
+        // not find a cover that was not there
+        let already_read = self.ql_book.is_some()
+            && self.quicklook.as_ref().is_some_and(|ql| ql.path == path);
         if self
             .ql_render
             .as_ref()
             .is_some_and(|(p, pg, _)| *p == path && *pg == page)
             || self.ql_inflight.as_ref() == Some(&(path.clone(), page))
             || nothing_held_failed
+            || already_read
         {
             return;
         }
@@ -4195,28 +4205,59 @@ impl Browser {
         self.ql_inflight = Some((path.clone(), page));
         // a fresh attempt supersedes an old failure's knowledge
         self.ql_failed = None;
-        let is_pdf = icons::is_pdf(&path.file_name().unwrap_or_default().to_string_lossy());
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let is_pdf = icons::is_pdf(&name);
+        let is_epub = icons::is_epub(&name);
         cx.spawn(async move |this, cx| {
             let bg_path = path.clone();
-            let render = cx
+            let (render, book) = cx
                 .background_spawn(async move {
                     std::panic::catch_unwind(|| {
                         if is_pdf {
-                            icons::decode_pdf_thumbnail(&bg_path, page, QL_DECODE_MAX)
+                            (
+                                icons::decode_pdf_thumbnail(&bg_path, page, QL_DECODE_MAX),
+                                None,
+                            )
+                        } else if is_epub {
+                            match crate::epub::read_epub_meta(&bg_path) {
+                                Some(meta) => (
+                                    meta.cover
+                                        .as_deref()
+                                        .and_then(|bytes| icons::decode_cover(bytes, QL_DECODE_MAX)),
+                                    Some(meta),
+                                ),
+                                None => (None, None),
+                            }
                         } else {
-                            icons::decode_thumbnail(&bg_path, QL_DECODE_MAX, QL_DECODE_MAX)
+                            (
+                                icons::decode_thumbnail(&bg_path, QL_DECODE_MAX, QL_DECODE_MAX),
+                                None,
+                            )
                         }
                     })
-                    .unwrap_or(None)
+                    .unwrap_or((None, None))
                 })
                 .await;
             let update = this.update(cx, |this, cx| {
                 if this.ql_inflight.as_ref() == Some(&(path.clone(), page)) {
                     this.ql_inflight = None;
                 }
+                // the book's words land regardless of the tile: an
+                // epub without a cover still names itself
+                if let Some(book) = &book
+                    && this.quicklook.as_ref().is_some_and(|ql| ql.path == path)
+                {
+                    this.ql_book = Some(book.clone());
+                    cx.notify();
+                }
                 // landed empty (corrupt file, missing pdftocairo, a
-                // page beyond the end): keep the screen honest
+                // page beyond the end): keep the screen honest. An
+                // epub with meta but no cover is a success, not a
+                // failure: the enriched card stands in
                 let Some(render) = render else {
+                    if book.is_some() {
+                        return;
+                    }
                     match this.ql_render.as_ref() {
                         // paging: the held tile stays up, the counter
                         // reverts to the page it shows; the guard
@@ -6379,6 +6420,21 @@ impl Browser {
             .and_then(|ql| ql.pages.map(|pages| (ql.page, pages)))
             .map(|(page, pages)| format!("page {page} / {pages}"));
 
+        // the book glance: dc title and author when the epub told us
+        let book_label = self.ql_book.as_ref().and_then(|book| {
+            if entry.is_dir || !icons::is_epub(&entry.name) {
+                return None;
+            }
+            let mut label = book.title.clone().unwrap_or_default();
+            if let Some(author) = &book.author {
+                if !label.is_empty() {
+                    label.push_str(" · ");
+                }
+                label.push_str(author);
+            }
+            if label.is_empty() { None } else { Some(label) }
+        });
+
         // the top row: name, position in the listing, the close road
         let header = div()
             .flex()
@@ -6395,6 +6451,13 @@ impl Browser {
                     .truncate()
                     .child(entry.name.clone()),
             )
+            .children(book_label.map(|label| {
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme::text_dim())
+                    .truncate()
+                    .child(label)
+            }))
             .children(page_label.clone().map(|label| {
                 div()
                     .flex()
@@ -10693,6 +10756,82 @@ mod browser_ux_keys {
             browser.quicklook.as_mut().unwrap().pages = None;
             browser.route_key(&shift_down, cx);
             assert_eq!(browser.quicklook.as_ref().unwrap().page, 1);
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_epub_lands_cover_and_metadata() {
+        let lab = Lab::new("quicklook-epub");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let opf = br#"<?xml version="1.0"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>Neuromancer</dc:title>
+                <dc:creator>William Gibson</dc:creator>
+              </metadata>
+              <manifest>
+                <item id="cover" href="cover.png" properties="cover-image"/>
+              </manifest>
+              <spine/>
+            </package>"#;
+        let container = br#"<?xml version="1.0"?>
+            <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+              <rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles>
+            </container>"#;
+        let bytes = crate::epub::tests::write_epub(&[
+            ("META-INF/container.xml", container),
+            ("OEBPS/content.opf", opf),
+            ("OEBPS/cover.png", &png),
+        ]);
+        fs::write(lab.dir.join("zz.epub"), bytes).unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // dirs first: sub, a.txt, b.txt, c.txt, zz.epub
+            browser.jump_cursor(4, cx);
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_some());
+        });
+        app.run_until_parked(); // the background container read lands
+        window.update(|browser, _, _| {
+            let book = browser.ql_book.as_ref().unwrap();
+            assert_eq!(book.title.as_deref(), Some("Neuromancer"));
+            assert_eq!(book.author.as_deref(), Some("William Gibson"));
+            assert!(browser
+                .ql_render
+                .as_ref()
+                .is_some_and(|(p, pg, _)| *p == lab.dir.join("zz.epub") && *pg == 1));
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_corrupt_epub_fails_into_the_card() {
+        let lab = Lab::new("quicklook-epub-bad");
+        fs::write(lab.dir.join("zz.epub"), b"not a zip").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.jump_cursor(4, cx); // zz.epub
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_some());
+        });
+        app.run_until_parked(); // the failed decode lands
+        window.update(|browser, _, _| {
+            assert_eq!(browser.ql_failed.as_ref(), Some(&lab.dir.join("zz.epub")));
+            assert!(browser.ql_render.is_none());
+            // still open, showing the card
+            assert!(browser.quicklook.is_some());
         });
         app.run_until_parked();
     }

@@ -106,9 +106,16 @@ pub(crate) fn is_thumbable(name: &str) -> bool {
     is_image(name) || is_pdf(name)
 }
 
-/// PDF files: a page rendered by pdftocairo, falling back to the icon.
-pub(crate) fn is_pdf(name: &str) -> bool {
+/// EPUB ebooks: the Quick Look book glance (cover plus metadata).
+pub(crate) fn is_epub(name: &str) -> bool {
     Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase() == "epub")
+        .unwrap_or(false)
+}
+
+/// PDF files: a page rendered by pdftocairo, falling back to the icon.
+pub(crate) fn is_pdf(name: &str) -> bool {    Path::new(name)
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase() == "pdf")
         .unwrap_or(false)
@@ -116,9 +123,15 @@ pub(crate) fn is_pdf(name: &str) -> bool {
 
 /// Decode a file into a BGRA `RenderImage` no larger than the bounds, the
 /// byte order gpui expects. Same contract as kuma-shell's imaging module.
-pub(crate) fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<gpui::RenderImage> {
-    let image = image::ImageReader::open(path).ok()?.decode().ok()?;
+pub(crate) fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<gpui::RenderImage> {    let image = image::ImageReader::open(path).ok()?.decode().ok()?;
     Some(decode_to_render(image, max_width, max_height))
+}
+
+/// An epub's cover bytes into the BGRA `RenderImage`, same contract
+/// as the other decoders.
+pub(crate) fn decode_cover(bytes: &[u8], max: u32) -> Option<gpui::RenderImage> {
+    let image = image::load_from_memory(bytes).ok()?;
+    Some(decode_to_render(image, max, max))
 }
 
 /// Render one PDF page to a thumbnail by shelling out to pdftocairo
