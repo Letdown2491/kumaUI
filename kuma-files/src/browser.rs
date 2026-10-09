@@ -13,11 +13,11 @@ use std::io::{BufRead as _, Write as _};
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent,
-    ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, Font, HighlightStyle,
-    ImageSource, KeyDownEvent, MouseDownEvent, MouseMoveEvent, MouseButton, MouseUpEvent,
-    ObjectFit, Pixels, Point, Render, RenderImage, Rgba, ScrollWheelEvent, Stateful, StyledText,
-    TextRun, UnderlineStyle, Window, div, img, point, prelude::*, px, relative, rgba, rgb, svg,
-    FontStyle, FontWeight, SharedString,
+    ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, Font,
+    HighlightStyle, ImageSource, KeyDownEvent, MouseDownEvent, MouseMoveEvent, MouseButton,
+    MouseUpEvent, ObjectFit, Pixels, Point, Render, RenderImage, Rgba, ScrollWheelEvent, Stateful,
+    StyledText, TextRun, UnderlineStyle, Window, div, img, list, point, prelude::*, px, relative,
+    rgba, rgb, svg, uniform_list, FontStyle, FontWeight, SharedString,
 };
 use trash::{os_limited, TrashItem};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,6 +68,14 @@ const QL_DECODE_MAX: u32 = 2048;
 /// Quick Look's zoom bounds around the fit: 1.0 is fit, 6x is as deep
 /// as a glance needs.
 const QL_ZOOM_MAX: f32 = 6.0;
+
+/// The whole-file read for the text reading pane caps here; past it
+/// the file shows its head and a tail marker says so honestly.
+const TEXT_READ_MAX: usize = 2 * 1024 * 1024;
+
+/// One line of the reading pane caps here: a single enormous line
+/// must not become one enormous layout.
+const TEXT_LINE_MAX: usize = 4096;
 
 /// Contain-scale for the Quick Look pane: the image fills the smaller
 /// ratio, never crops. Degenerate sizes read as "already fit".
@@ -1260,6 +1268,19 @@ pub(crate) struct Browser {
     text_preview: Option<TextPreview>,
     preview_key: Option<PathBuf>,
     preview_inflight: HashSet<PathBuf>,
+    /// Quick Look's whole-file read for text-ish entries (capped;
+    /// the rail keeps its 48-line snippet). Keyed by path; None
+    /// while loading. Plain data, no tile.
+    ql_text: Option<(PathBuf, TextPreview)>,
+    /// The whole-file read in flight, if any.
+    ql_text_inflight: Option<PathBuf>,
+    /// The path whose whole-file read failed or smelled binary: the
+    /// card stands in and the failed slot stops the respawn loop.
+    ql_text_failed: Option<PathBuf>,
+    /// The reading pane's scroll for the uniform line rows.
+    ql_text_scroll: gpui::UniformListScrollHandle,
+    /// The markdown reading pane's list state (item counts ride it).
+    ql_md_state: gpui::ListState,
     /// Quick Look: the full-pane preview overlay. `None` when closed;
     /// while open it owns the keyboard (route_key's rung) and follows
     /// the cursor entry. `zoom` is 1.0 = fit; pan only matters zoomed.
@@ -1378,6 +1399,11 @@ impl Browser {
             text_preview: None,
             preview_key: None,
             preview_inflight: HashSet::new(),
+            ql_text: None,
+            ql_text_inflight: None,
+            ql_text_failed: None,
+            ql_text_scroll: gpui::UniformListScrollHandle::new(),
+            ql_md_state: gpui::ListState::new(0, gpui::ListAlignment::Top, px(256.)),
             quicklook: None,
             ql_render: None,
             ql_inflight: None,
@@ -4040,6 +4066,15 @@ impl Browser {
                 self.ql_counting = false;
                 self.ql_chapter = None;
                 self.ql_chapter_inflight = None;
+                self.ql_text = None;
+                self.ql_text_inflight = None;
+                self.ql_text_failed = None;
+                self.ql_md_state.reset(0);
+                self.ql_text_scroll
+                    .0
+                    .borrow_mut()
+                    .base_handle
+                    .set_offset(point(px(0.), px(0.)));
             }
             if let Some((_, _, image)) = self.ql_render.take() {
                 cx.drop_image(image, None);
@@ -4096,6 +4131,9 @@ impl Browser {
                 self.text_preview = None;
                 self.request_text_preview(entry.path.clone(), cx);
             }
+            // and the whole-file read for the reading pane; the
+            // snippet above stays the loading state until it lands
+            self.request_text_read(entry.path.clone(), cx);
         }
     }
 
@@ -4468,13 +4506,13 @@ impl Browser {
                 if this.preview_key.as_ref() == Some(&path) {
                     this.text_preview = lines.clone().map(|loaded| {
                         let blocks = if kind == TextKind::Markdown {
-                            Some(parse_markdown(&loaded.join("\n")))
+                            Some(Arc::new(parse_markdown(&loaded.join("\n"))))
                         } else {
                             None
                         };
                         TextPreview {
                             kind,
-                            lines: loaded,
+                            lines: Arc::new(loaded),
                             blocks,
                         }
                     });
@@ -4483,6 +4521,111 @@ impl Browser {
             });
             if let Err(err) = update {
                 log::error!("preview update failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// Read a text-ish file whole (capped at TEXT_READ_MAX) for the
+    /// reading pane: the rail's snippet stays the loading state until
+    /// this lands over it. A binary smell (a NUL in the head) or an
+    /// unreadable file lands in the failed slot, the card stands in,
+    /// and the respawn loop stays dead. Lines cap individually: one
+    /// enormous line must not become one enormous layout. Csv rows
+    /// align at decode so the pane renders, not computes.
+    fn request_text_read(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.ql_text.as_ref().is_some_and(|(p, _)| *p == path)
+            || self.ql_text_inflight.as_ref() == Some(&path)
+            || self.ql_text_failed.as_ref() == Some(&path)
+        {
+            return;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            self.ql_text_failed = Some(path);
+            return;
+        };
+        self.ql_text_inflight = Some(path.clone());
+        let kind = text_kind(&path);
+        let total = meta.len();
+        cx.spawn(async move |this, cx| {
+            let bg_path = path.clone();
+            let read = cx
+                .background_spawn(async move {
+                    let mut file = fs::File::open(&bg_path).ok()?;
+                    // the head doubles as the binary smell test
+                    let mut head = vec![0u8; 4096];
+                    let mut filled = io::Read::read(&mut file, &mut head).unwrap_or(0);
+                    if head[..filled].contains(&0) {
+                        return None;
+                    }
+                    let capped = total > TEXT_READ_MAX as u64;
+                    let mut buf = vec![0u8; TEXT_READ_MAX];
+                    buf[..filled].copy_from_slice(&head[..filled]);
+                    while filled < buf.len() {
+                        let n = io::Read::read(&mut file, &mut buf[filled..]).ok()?;
+                        if n == 0 {
+                            break;
+                        }
+                        filled += n;
+                    }
+                    // the read may cut mid-char; lossy conversion
+                    // plus a boundary trim keeps the tail clean
+                    let mut text = String::from_utf8_lossy(&buf[..filled]).into_owned();
+                    while !text.is_char_boundary(text.len()) {
+                        text.pop();
+                    }
+                    let lines: Vec<String> = text
+                        .lines()
+                        .map(|line| match line.char_indices().nth(TEXT_LINE_MAX) {
+                            Some((cut, _)) => format!("{}\u{2026}", &line[..cut]),
+                            None => line.to_string(),
+                        })
+                        .collect();
+                    Some((lines, capped, total))
+                })
+                .await;
+            let update = this.update(cx, |this, cx| {
+                if this.ql_text_inflight.as_ref() == Some(&path) {
+                    this.ql_text_inflight = None;
+                }
+                let Some((mut lines, capped, total)) = read else {
+                    if this.quicklook.as_ref().is_some_and(|ql| ql.path == path) {
+                        this.ql_text_failed = Some(path);
+                        cx.notify();
+                    }
+                    return;
+                };
+                // the overlay may have flipped files mid-read: a stale
+                // landing drops (the fresh file's read owns the slot)
+                if !this.quicklook.as_ref().is_some_and(|ql| ql.path == path) {
+                    return;
+                }
+                if kind == TextKind::Csv {
+                    lines = csv_lines(&lines);
+                }
+                if capped {
+                    lines.push(format!("… the file continues ({})", human_size(total)));
+                }
+                let blocks = if kind == TextKind::Markdown {
+                    let parsed = Arc::new(parse_markdown(&lines.join("\n")));
+                    this.ql_md_state.reset(parsed.len());
+                    Some(parsed)
+                } else {
+                    None
+                };
+                this.ql_text_failed = None;
+                this.ql_text = Some((
+                    path,
+                    TextPreview {
+                        kind,
+                        lines: Arc::new(lines),
+                        blocks,
+                    },
+                ));
+                cx.notify();
+            });
+            if let Err(err) = update {
+                log::error!("text read update failed: {err:#}");
             }
         })
         .detach();
@@ -6663,6 +6806,10 @@ impl Browser {
             (path == &entry.path && !entry.is_dir && (!is_epub || ql_page == 0))
                 .then(|| render.clone())
         });
+        // the whole-file read lands over the snippet once here
+        let full_text = self.ql_text.as_ref().and_then(|(p, preview)| {
+            (p == &entry.path && !entry.is_dir).then(|| preview.clone())
+        });
         let pane: Div = if let Some(blocks) = chapter {
             // tag-carried typography only: paragraphs wrap, headings
             // size, quotes indent; no CSS is honored here
@@ -6729,6 +6876,22 @@ impl Browser {
                         .mt(px(pan_y))
                         .mb(px(-pan_y)),
                 )
+        } else if let Some(preview) = full_text {
+            // the whole-file reading pane: deferred rows (uniform
+            // list for lines, list for markdown blocks) so a 2 MB
+            // file renders only what is on screen
+            match preview.kind {
+                TextKind::Markdown => match preview.blocks.filter(|b| !b.is_empty()) {
+                    Some(blocks) => div().flex_1().overflow_hidden().m_3().child(list(
+                        self.ql_md_state.clone(),
+                        move |ix, _, _| md_block_view(&blocks[ix]),
+                    )),
+                    None => line_list_pane(preview.lines.clone(), &self.ql_text_scroll),
+                },
+                TextKind::Csv | TextKind::Code | TextKind::Plain => {
+                    line_list_pane(preview.lines.clone(), &self.ql_text_scroll)
+                }
+            }
         } else if !entry.is_dir && self.preview_key.as_ref() == Some(&entry.key)
             && self.text_preview.is_some()
         {
@@ -9342,10 +9505,13 @@ enum TextKind {
 #[derive(Clone)]
 struct TextPreview {
     kind: TextKind,
-    lines: Vec<String>,
+    /// Arc so the reading pane's deferred list closures can capture
+    /// it: a whole-file read is up to tens of thousands of lines and
+    /// the pane repaints per frame.
+    lines: Arc<Vec<String>>,
     /// Parsed markdown, when kind is Markdown; None or empty falls
     /// back to plain lines.
-    blocks: Option<Vec<MdBlock>>,
+    blocks: Option<Arc<Vec<MdBlock>>>,
 }
 
 /// Quick Look's own state: which entry it shows (follows the cursor),
@@ -9381,6 +9547,31 @@ fn text_kind(path: &Path) -> TextKind {
 /// One styled line for the preview box.
 fn preview_line(line: String) -> Div {
     div().w_full().truncate().child(line)
+}
+
+/// The line-rows reading pane: a uniform list of truncated mono
+/// rows, deferred so only the visible window lays out (a 2 MB read
+/// is tens of thousands of lines).
+fn line_list_pane(lines: Arc<Vec<String>>, scroll: &gpui::UniformListScrollHandle) -> Div {
+    let count = lines.len();
+    div().flex_1().overflow_hidden().m_3().child(
+        uniform_list("quicklook-text-list", count, move |range, _, _| {
+            lines[range.clone()]
+                .iter()
+                .map(|line| {
+                    div()
+                        .h(px(20.))
+                        .w_full()
+                        .truncate()
+                        .text_size(px(13.))
+                        .font_family("monospace")
+                        .text_color(theme::text())
+                        .child(line.clone())
+                })
+                .collect()
+        })
+        .track_scroll(scroll),
+    )
 }
 
 /// One chapter block for the glance pane: tag-carried typography
@@ -9575,84 +9766,87 @@ fn md_blocks(preview: &TextPreview) -> Vec<AnyElement> {
                 .collect();
         }
     };
-    blocks
-        .iter()
-        .map(|block| match block {
-            MdBlock::Heading { level, spans } => div()
-                .font_weight(FontWeight::BOLD)
-                .text_size(px(match level {
-                    1 => 16.,
-                    2 => 15.,
-                    _ => 13.,
-                }))
-                .text_color(if *level <= 2 {
-                    theme::accent()
-                } else {
-                    theme::text()
-                })
-                .child(md_spans(spans))
-                .into_any_element(),
-            MdBlock::Para(spans) => div()
-                .w_full()
-                .text_color(theme::text())
-                .child(md_spans(spans))
-                .into_any_element(),
-            MdBlock::Quote(spans) => div()
-                .border_l_1()
-                .border_color(theme::accent())
-                .pl_2()
-                .italic()
-                .text_color(theme::text_dim())
-                .child(md_spans(spans))
-                .into_any_element(),
-            MdBlock::Item(spans) => div()
-                .w_full()
-                .flex()
-                .gap_1()
-                .child(div().text_color(theme::accent()).child("·"))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_color(theme::text())
-                        .child(md_spans(spans)),
-                )
-                .into_any_element(),
-            MdBlock::Code(lines) => div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_px()
-                .rounded_sm()
-                .border_1()
-                .border_color(theme::border())
-                .p_1()
-                .text_size(px(11.))
-                .font_family("monospace")
-                .text_color(theme::text())
-                .children(lines.iter().map(|l| preview_line(l.clone())))
-                .into_any_element(),
-            MdBlock::Table(lines) => div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_px()
-                .text_size(px(11.))
-                .font_family("monospace")
-                .children(
-                    lines
-                        .iter()
-                        .map(|l| preview_line(l.clone()).text_color(theme::text_dim())),
-                )
-                .into_any_element(),
-            MdBlock::Rule => div()
-                .w_full()
-                .h(px(1.))
-                .flex_none()
-                .bg(theme::border())
-                .into_any_element(),
-        })
-        .collect()
+    blocks.iter().map(md_block_view).collect()
+}
+
+/// One markdown block as an element; the reading pane's deferred
+/// list renders it per visible index, so this is the shared shape.
+fn md_block_view(block: &MdBlock) -> AnyElement {
+    match block {
+        MdBlock::Heading { level, spans } => div()
+            .font_weight(FontWeight::BOLD)
+            .text_size(px(match level {
+                1 => 16.,
+                2 => 15.,
+                _ => 13.,
+            }))
+            .text_color(if *level <= 2 {
+                theme::accent()
+            } else {
+                theme::text()
+            })
+            .child(md_spans(spans))
+            .into_any_element(),
+        MdBlock::Para(spans) => div()
+            .w_full()
+            .text_color(theme::text())
+            .child(md_spans(spans))
+            .into_any_element(),
+        MdBlock::Quote(spans) => div()
+            .border_l_1()
+            .border_color(theme::accent())
+            .pl_2()
+            .italic()
+            .text_color(theme::text_dim())
+            .child(md_spans(spans))
+            .into_any_element(),
+        MdBlock::Item(spans) => div()
+            .w_full()
+            .flex()
+            .gap_1()
+            .child(div().text_color(theme::accent()).child("·"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_color(theme::text())
+                    .child(md_spans(spans)),
+            )
+            .into_any_element(),
+        MdBlock::Code(lines) => div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_px()
+            .rounded_sm()
+            .border_1()
+            .border_color(theme::border())
+            .p_1()
+            .text_size(px(11.))
+            .font_family("monospace")
+            .text_color(theme::text())
+            .children(lines.iter().map(|l| preview_line(l.clone())))
+            .into_any_element(),
+        MdBlock::Table(lines) => div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_px()
+            .text_size(px(11.))
+            .font_family("monospace")
+            .children(
+                lines
+                    .iter()
+                    .map(|l| preview_line(l.clone()).text_color(theme::text_dim())),
+            )
+            .into_any_element(),
+        MdBlock::Rule => div()
+            .w_full()
+            .h(px(1.))
+            .flex_none()
+            .bg(theme::border())
+            .into_any_element(),
+    }
 }
 
 /// One styled run of inline markdown text.
@@ -11073,6 +11267,106 @@ mod browser_ux_keys {
                 .is_some_and(|(p, pg, _)| *p == lab.dir.join("zz.epub") && *pg == 0));
         });
         app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_text_reads_the_whole_file() {
+        let lab = Lab::new("quicklook-fulltext");
+        // dirs first: sub, then a.txt, big.txt, blob.bin, c.txt, note.md
+        let body: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        fs::write(lab.dir.join("big.txt"), &body).unwrap();
+        fs::write(lab.dir.join("blob.bin"), [0u8; 4096]).unwrap();
+        fs::write(lab.dir.join("note.md"), "# Title\n\nhello world\n".repeat(10)).unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // entries: sub, a.txt, b.txt, big.txt, blob.bin, c.txt, note.md
+            browser.jump_cursor(4, cx); // blob.bin
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_some());
+        });
+        app.run_until_parked(); // the binary read fails into the slot
+        window.update(|browser, _, cx| {
+            assert!(browser.ql_text.is_none());
+            assert_eq!(
+                browser.ql_text_failed.as_deref(),
+                Some(lab.dir.join("blob.bin").as_path())
+            );
+            // flip to c.txt: a plain one-line read
+            browser.quicklook_flip(1, cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, cx| {
+            let (p, preview) = browser.ql_text.as_ref().unwrap();
+            assert_eq!(*p, lab.dir.join("c.txt"));
+            assert_eq!(preview.lines.last().unwrap(), "old-c");
+            // flip on to note.md: blocks parse
+            browser.quicklook_flip(2, cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            let (p, preview) = browser.ql_text.as_ref().unwrap();
+            assert_eq!(*p, lab.dir.join("note.md"));
+            let blocks = preview.blocks.as_ref().unwrap();
+            assert!(blocks.len() >= 10, "markdown blocks unparsed");
+        });
+        // the whole-file read of big.txt checked apart
+        window.update(|browser, _, cx| {
+            browser.close_quicklook(cx);
+            browser.jump_cursor(3, cx); // big.txt
+            browser.route_key(&key("space"), cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            let (p, preview) = browser.ql_text.as_ref().unwrap();
+            assert_eq!(*p, lab.dir.join("big.txt"));
+            assert_eq!(preview.lines.len(), 20_000);
+            assert_eq!(preview.lines.first().unwrap(), "line 0");
+            assert_eq!(preview.lines.last().unwrap(), "line 19999");
+        });
+    }
+
+    #[test]
+    fn quick_look_text_caps_the_read_and_each_line() {
+        let lab = Lab::new("quicklook-fulltext-cap");
+        // past the read cap: head plus a tail marker ("abc\n" is 4
+        // bytes, so the cap cuts on a whole line)
+        let body = "abc\n".repeat(900_000); // 3.6 MB
+        fs::write(lab.dir.join("huge.txt"), &body).unwrap();
+        // one enormous line caps per line instead of one huge layout
+        let wide = format!("w{}x\n", "o".repeat(TEXT_LINE_MAX * 2));
+        fs::write(lab.dir.join("a.txt"), &wide).unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.jump_cursor(1, cx); // a.txt: dirs first, then a.txt
+            browser.route_key(&key("space"), cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, cx| {
+            let (_, preview) = browser.ql_text.as_ref().unwrap();
+            // one line, capped at TEXT_LINE_MAX chars plus the mark
+            assert_eq!(preview.lines.len(), 1);
+            assert_eq!(preview.lines[0].len(), TEXT_LINE_MAX + "\u{2026}".len());
+            // over b.txt and c.txt to the huge file
+            browser.quicklook_flip(3, cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            let (_, preview) = browser.ql_text.as_ref().unwrap();
+            assert_eq!(
+                preview.lines.len(),
+                TEXT_READ_MAX / 4 + 1,
+                "head of the file plus the tail marker"
+            );
+            assert!(preview.lines.last().unwrap().contains("continues"));
+        });
     }
 
     #[test]
