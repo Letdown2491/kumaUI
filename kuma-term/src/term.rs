@@ -470,6 +470,78 @@ fn pump_thread(
     }
 }
 
+/// The mouse reporting mode a program asked for (DECSET 1000/1002/1003).
+/// While any is active the pointer belongs to the program: wheel and
+/// clicks are reported to it instead of scrolling the local scrollback.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MouseTracking {
+    /// No reporting: the terminal owns the pointer (selection, wheel
+    /// scrolling, URL hover).
+    #[default]
+    Off,
+    /// 1000: clicks only.
+    Click,
+    /// 1002: clicks and motion while a button is held.
+    Drag,
+    /// 1003: clicks and every motion.
+    Motion,
+}
+
+/// The xterm protocol's button codes: three buttons, the wheel as
+/// buttons 64/65, motion flagged by adding 32.
+pub(crate) const MOUSE_LEFT: u8 = 0;
+pub(crate) const MOUSE_MIDDLE: u8 = 1;
+pub(crate) const MOUSE_RIGHT: u8 = 2;
+pub(crate) const MOUSE_WHEEL_UP: u8 = 64;
+pub(crate) const MOUSE_WHEEL_DOWN: u8 = 65;
+pub(crate) const MOUSE_MOTION_FLAG: u8 = 32;
+/// X10's "no button held" code, used in release events and motion
+/// without a button.
+pub(crate) const MOUSE_NONE: u8 = 3;
+
+/// Which reporting mode the mode bits ask for.
+fn tracking_of(mode: &TermMode) -> MouseTracking {
+    if mode.contains(TermMode::MOUSE_MOTION) {
+        MouseTracking::Motion
+    } else if mode.contains(TermMode::MOUSE_DRAG) {
+        MouseTracking::Drag
+    } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+        MouseTracking::Click
+    } else {
+        MouseTracking::Off
+    }
+}
+
+/// The bytes for one mouse event: SGR 1006 when the program asked for
+/// that encoding, X10's three-byte form otherwise. The protocol is
+/// 1-based; X10's position bytes top out at 223 or they leave the
+/// printable range.
+pub(crate) fn encode_mouse(
+    sgr: bool,
+    button: u8,
+    col: usize,
+    row: usize,
+    release: bool,
+) -> Vec<u8> {
+    if sgr {
+        format!(
+            "\x1b[<{};{};{}{}",
+            button,
+            col + 1,
+            row + 1,
+            if release { 'm' } else { 'M' }
+        )
+        .into_bytes()
+    } else {
+        // X10 releases report "no button" (3); the wheel is press-only
+        // and the caller knows that
+        let code = if release { MOUSE_NONE } else { button };
+        let x = ((col + 1).min(223) as u8) + 32;
+        let y = ((row + 1).min(223) as u8) + 32;
+        vec![0x1b, b'[', b'M', code + 32, x, y]
+    }
+}
+
 pub struct Engine {
     term: Arc<FairMutex<Term<UiProxy>>>,
     /// alacritty's Pty handle, kept for its Drop: it sends SIGHUP to the
@@ -683,6 +755,20 @@ impl Engine {
             .lock()
             .mode()
             .contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// The program's mouse reporting mode, if it asked for the pointer.
+    pub fn mouse_tracking(&self) -> MouseTracking {
+        tracking_of(self.term.lock().mode())
+    }
+
+    /// Hand the program one mouse event: SGR 1006 when it asked for
+    /// that encoding, X10 bytes otherwise. Wheel events are presses
+    /// only; clicks get a press from the down handler and a release
+    /// from the up handler.
+    pub fn report_mouse(&self, button: u8, col: usize, row: usize, release: bool) {
+        let sgr = self.term.lock().mode().contains(TermMode::SGR_MOUSE);
+        self.input(encode_mouse(sgr, button, col, row, release));
     }
 
     /// One visible row's cells, the same decode a snapshot row gets,
@@ -1048,6 +1134,60 @@ mod tests {
         assert!(term.mode().contains(TermMode::APP_CURSOR));
         feed(&mut term, b"\x1b[?2004h");
         assert!(term.mode().contains(TermMode::BRACKETED_PASTE));
+    }
+
+    #[test]
+    fn mouse_modes_cross_the_seam() {
+        let mut term = test_term(10, 3);
+        assert_eq!(tracking_of(term.mode()), MouseTracking::Off);
+        feed(&mut term, b"\x1b[?1000h");
+        assert_eq!(tracking_of(term.mode()), MouseTracking::Click);
+        feed(&mut term, b"\x1b[?1002h");
+        assert_eq!(tracking_of(term.mode()), MouseTracking::Drag);
+        feed(&mut term, b"\x1b[?1003h");
+        assert_eq!(tracking_of(term.mode()), MouseTracking::Motion);
+        // SGR encoding rides 1006
+        feed(&mut term, b"\x1b[?1006h");
+        assert!(term.mode().contains(TermMode::SGR_MOUSE));
+        // and every reset returns the pointer to the terminal
+        feed(&mut term, b"\x1b[?1003l\x1b[?1006l");
+        assert_eq!(tracking_of(term.mode()), MouseTracking::Off);
+        assert!(!term.mode().contains(TermMode::SGR_MOUSE));
+    }
+
+    #[test]
+    fn sgr_mouse_encoding_is_one_based_and_marked_releases() {
+        assert_eq!(encode_mouse(true, MOUSE_LEFT, 0, 0, false), b"\x1b[<0;1;1M".to_vec());
+        assert_eq!(encode_mouse(true, MOUSE_RIGHT, 3, 7, false), b"\x1b[<2;4;8M".to_vec());
+        assert_eq!(encode_mouse(true, MOUSE_LEFT, 3, 7, true), b"\x1b[<0;4;8m".to_vec());
+        // the wheel is press-only and keeps its high button numbers
+        assert_eq!(
+            encode_mouse(true, MOUSE_WHEEL_UP, 9, 2, false),
+            b"\x1b[<64;10;3M".to_vec()
+        );
+        assert_eq!(
+            encode_mouse(true, MOUSE_WHEEL_DOWN, 9, 2, false),
+            b"\x1b[<65;10;3M".to_vec()
+        );
+    }
+
+    #[test]
+    fn x10_mouse_encoding_caps_and_marks_releases() {
+        // X10 packs each field into one byte, offset by 32
+        assert_eq!(
+            encode_mouse(false, MOUSE_LEFT, 0, 0, false),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        // a release reports "no button" (3)
+        assert_eq!(
+            encode_mouse(false, MOUSE_LEFT, 5, 5, true),
+            vec![0x1b, b'[', b'M', 35, 38, 38]
+        );
+        // positions cap at 223 so the bytes stay printable
+        assert_eq!(
+            encode_mouse(false, MOUSE_RIGHT, 500, 900, false),
+            vec![0x1b, b'[', b'M', 34, 223 + 32, 223 + 32]
+        );
     }
 
     #[test]

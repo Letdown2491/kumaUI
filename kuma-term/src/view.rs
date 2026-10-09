@@ -25,8 +25,9 @@ use crate::font;
 use crate::glyphs;
 use crate::palette::Rgb8;
 use crate::term::{
-    CellEdge, CursorShape, Engine, GridPoint, RenderCell, Row, SearchMatch, SelectMode, SelectSpan,
-    UiEvent,
+    CellEdge, CursorShape, Engine, GridPoint, MouseTracking, RenderCell, Row, SearchMatch,
+    SelectMode, SelectSpan, UiEvent, MOUSE_LEFT, MOUSE_MIDDLE, MOUSE_MOTION_FLAG, MOUSE_NONE,
+    MOUSE_RIGHT, MOUSE_WHEEL_DOWN, MOUSE_WHEEL_UP,
 };
 use crate::theme::Theme;
 
@@ -596,6 +597,16 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // while the program owns the pointer, clicks are its input
+        // (shift keeps local selection, the xterm convention)
+        if self.engine.mouse_tracking() != MouseTracking::Off && !event.modifiers.shift {
+            if let Some(button) = mouse_button_code(event.button) {
+                let (row, col, _) =
+                    self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
+                self.engine.report_mouse(button, col, row, false);
+            }
+            return;
+        }
         if event.button != MouseButton::Left {
             return;
         }
@@ -623,6 +634,31 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // while the program owns the pointer, motion is its input:
+        // 1002 reports drags, 1003 reports every move
+        let tracking = self.engine.mouse_tracking();
+        if tracking != MouseTracking::Off && !event.modifiers.shift {
+            let forward = match tracking {
+                MouseTracking::Motion => true,
+                MouseTracking::Drag => event.pressed_button.is_some(),
+                _ => false,
+            };
+            if forward {
+                let (row, col, _) =
+                    self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
+                let base = event.pressed_button.and_then(mouse_button_code).unwrap_or(MOUSE_NONE);
+                self.engine.report_mouse(base + MOUSE_MOTION_FLAG, col, row, false);
+            }
+            // a mode landing mid-drag must not leave a stretched local
+            // selection behind
+            if self.selecting {
+                self.selecting = false;
+                self.down_cell = None;
+                self.engine.clear_selection();
+                cx.notify();
+            }
+            return;
+        }
         let (row, col, edge) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
         // only repaint on cell changes: the underline appears when the
         // pointer crosses onto a URL, not per pixel
@@ -644,6 +680,15 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // while the program owns the pointer, releases are its input
+        if self.engine.mouse_tracking() != MouseTracking::Off && !event.modifiers.shift {
+            if let Some(button) = mouse_button_code(event.button) {
+                let (row, col, _) =
+                    self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
+                self.engine.report_mouse(button, col, row, true);
+            }
+            return;
+        }
         if event.button != MouseButton::Left || !self.selecting {
             return;
         }
@@ -666,6 +711,15 @@ impl TerminalView {
             ScrollDelta::Lines(point) => point.y,
             ScrollDelta::Pixels(point) => point.y.as_f32() / self.cell_h,
         };
+        // while the program owns the pointer, the wheel is its input:
+        // this is how an AI harness scrolls its own transcript (shift
+        // keeps the local scrollback, the xterm convention)
+        if self.engine.mouse_tracking() != MouseTracking::Off && !event.modifiers.shift {
+            let (row, col, _) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
+            let button = if lines < 0.0 { MOUSE_WHEEL_UP } else { MOUSE_WHEEL_DOWN };
+            self.engine.report_mouse(button, col, row, false);
+            return;
+        }
         // a notch below one line still moves one line
         let lines = if lines.abs() < 1.0 {
             if lines < 0.0 {
@@ -692,6 +746,17 @@ impl TerminalView {
             self.engine.scroll(-lines);
         }
         cx.notify();
+    }
+}
+
+/// The xterm button code for a gpui button; the wheel is not a
+/// button here, it rides the wheel event.
+fn mouse_button_code(button: MouseButton) -> Option<u8> {
+    match button {
+        MouseButton::Left => Some(MOUSE_LEFT),
+        MouseButton::Middle => Some(MOUSE_MIDDLE),
+        MouseButton::Right => Some(MOUSE_RIGHT),
+        _ => None,
     }
 }
 
@@ -846,9 +911,15 @@ impl Render for TerminalView {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
+            // all three buttons: local selection only ever uses the
+            // left, but a reporting program wants the others too
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 // leaving the window must not leave a stale underline
                 if !hovered && this.hover.take().is_some() {
