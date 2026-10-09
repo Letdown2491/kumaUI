@@ -348,6 +348,12 @@ impl TerminalView {
         self.switch_tab(next, cx);
     }
 
+    /// Focus the nth tab (0-based); out of range is a no-op.
+    fn jump_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        self.switch_tab(index, cx);
+    }
+
     fn handle_event(
         &mut self,
         tab: usize,
@@ -658,6 +664,18 @@ impl TerminalView {
                     cx.stop_propagation();
                     return;
                 }
+                // jump to a tab by index, kitty's convention. Wayland
+                // delivers shift+digit as its glyph (!@#.. for 1..9);
+                // the keypad keeps the digit name
+                "1" | "!" => self.jump_tab(0, cx),
+                "2" | "@" => self.jump_tab(1, cx),
+                "3" | "#" => self.jump_tab(2, cx),
+                "4" | "$" => self.jump_tab(3, cx),
+                "5" | "%" => self.jump_tab(4, cx),
+                "6" | "^" => self.jump_tab(5, cx),
+                "7" | "&" => self.jump_tab(6, cx),
+                "8" | "*" => self.jump_tab(7, cx),
+                "9" | "(" => self.jump_tab(8, cx),
                 _ => {}
             }
         }
@@ -2400,6 +2418,16 @@ mod tests {
             assert_eq!(view.active, 0, "ctrl+shift+tab cycles backward");
             view.on_key(&chord("ctrl-tab"), window, cx);
             assert_eq!(view.active, 1, "ctrl+tab cycles forward");
+
+            // ctrl+shift+# jumps straight to a tab; wayland names the
+            // shifted key by its glyph, so both forms must match, and
+            // an out of range index is a no-op
+            view.on_key(&chord("ctrl-shift-!"), window, cx);
+            assert_eq!(view.active, 0, "ctrl+shift+! jumps to the first tab");
+            view.on_key(&chord("ctrl-shift-9"), window, cx);
+            assert_eq!(view.active, 0, "an out of range jump is a no-op");
+            view.on_key(&chord("ctrl-shift-2"), window, cx);
+            assert_eq!(view.active, 1, "ctrl+shift+@ jumps to the second tab");
 
             // closing the focused one falls back to the neighbor
             view.on_key(&chord("ctrl-shift-w"), window, cx);
