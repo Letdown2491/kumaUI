@@ -1264,16 +1264,20 @@ pub(crate) struct Browser {
     /// while open it owns the keyboard (route_key's rung) and follows
     /// the cursor entry. `zoom` is 1.0 = fit; pan only matters zoomed.
     quicklook: Option<QuickLook>,
-    /// The one held Quick Look decode, keyed by the path it belongs
-    /// to. Dropped via `cx.drop_image` on close and flip: the img
-    /// element never drops its own atlas tile (ADR-0016).
-    ql_render: Option<(PathBuf, Arc<RenderImage>)>,
+    /// The one held Quick Look decode, keyed by the path and (for
+    /// PDFs) the page it belongs to. Dropped via `cx.drop_image` on
+    /// close and flip: the img element never drops its own atlas
+    /// tile (ADR-0016).
+    ql_render: Option<(PathBuf, usize, Arc<RenderImage>)>,
     /// The decode in flight, if any.
-    ql_inflight: Option<PathBuf>,
-    /// The path whose decode landed empty (corrupt file, missing
-    /// pdftocairo): stands in as the card so sync does not re-spawn
-    /// the decode every frame.
+    ql_inflight: Option<(PathBuf, usize)>,
+    /// The path whose opening decode landed empty (corrupt file,
+    /// missing pdftocairo): stands in as the card so sync does not
+    /// re-spawn the decode every frame.
     ql_failed: Option<PathBuf>,
+    /// pdfinfo has been asked for the current PDF's page count (one
+    /// ask per open path; reset on file flips).
+    ql_counting: bool,
     /// The overlay's text column scrolls through the snippet.
     ql_scroll: gpui::ScrollHandle,
     /// Hand-rolled right-click menu: position plus a flat item list.
@@ -1369,6 +1373,7 @@ impl Browser {
             ql_render: None,
             ql_inflight: None,
             ql_failed: None,
+            ql_counting: false,
             ql_scroll: gpui::ScrollHandle::new(),
             menu: None,
             grid_row_len: Arc::new(AtomicUsize::new(0)),
@@ -1704,7 +1709,7 @@ impl Browser {
                 .background_spawn(async move {
                     std::panic::catch_unwind(|| {
                         if is_pdf {
-                            icons::decode_pdf_thumbnail(&bg_path, 256)
+                            icons::decode_pdf_thumbnail(&bg_path, 1, 256)
                         } else {
                             icons::decode_thumbnail(&bg_path, 256, 256)
                         }
@@ -3958,6 +3963,8 @@ impl Browser {
                 zoom: 1.0,
                 pan: (0.0, 0.0),
                 drag_from: None,
+                page: 1,
+                pages: None,
             });
             self.sync_quicklook(cx);
             // open must paint even when the preview is already
@@ -3967,7 +3974,7 @@ impl Browser {
     }
 
     fn close_quicklook(&mut self, cx: &mut Context<Self>) {
-        if let Some((_, image)) = self.ql_render.take() {
+        if let Some((_, _, image)) = self.ql_render.take() {
             cx.drop_image(image, None);
         }
         self.ql_inflight = None;
@@ -4000,8 +4007,13 @@ impl Browser {
                 ql.zoom = 1.0;
                 ql.pan = (0.0, 0.0);
                 ql.drag_from = None;
+                // a different file pages from its own start, and its
+                // count (if any) gets asked fresh
+                ql.page = 1;
+                ql.pages = None;
+                self.ql_counting = false;
             }
-            if let Some((_, image)) = self.ql_render.take() {
+            if let Some((_, _, image)) = self.ql_render.take() {
                 cx.drop_image(image, None);
             }
             self.ql_scroll.set_offset(point(px(0.), px(0.)));
@@ -4040,7 +4052,12 @@ impl Browser {
             return;
         }
         if icons::is_thumbable(&entry.name) {
-            self.request_quicklook_render(entry.path.clone(), cx);
+            self.request_quicklook_render(entry.path.clone(), 1, cx);
+            // a multi-page PDF wants its count so paging and the
+            // indicator can wake up (one ask per open path)
+            if icons::is_pdf(&entry.name) {
+                self.request_pdf_pages(entry.path.clone(), cx);
+            }
         } else {
             let key = entry.key.clone();
             if self.preview_key.as_ref() != Some(&key) {
@@ -4051,15 +4068,80 @@ impl Browser {
         }
     }
 
+    /// PageUp/PageDown/Home/End: turn pages of the PDF under view.
+    /// No-ops while the count is unknown. Zoom and pan reset with the
+    /// page, same as a file flip: a page is a new picture.
+    fn quicklook_page(&mut self, target: usize, cx: &mut Context<Self>) {
+        let Some(ql) = self.quicklook.as_mut() else {
+            return;
+        };
+        let Some(pages) = ql.pages else {
+            return;
+        };
+        let next = target.clamp(1, pages);
+        if next == ql.page {
+            return;
+        }
+        ql.page = next;
+        ql.zoom = 1.0;
+        ql.pan = (0.0, 0.0);
+        ql.drag_from = None;
+        cx.notify();
+        let path = ql.path.clone();
+        self.request_quicklook_render(path, next, cx);
+    }
+
+    /// Ask pdfinfo (poppler ships it beside pdftocairo) how many
+    /// pages the PDF has. One ask per open path; a missing tool or a
+    /// failed call lands as None and paging stays dormant.
+    fn request_pdf_pages(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.ql_counting {
+            return;
+        }
+        self.ql_counting = true;
+        cx.spawn(async move |this, cx| {
+            let bg_path = path.clone();
+            let pages = cx
+                .background_spawn(async move {
+                    let out = std::process::Command::new("pdfinfo")
+                        .arg(&bg_path)
+                        .output()
+                        .ok()?;
+                    parse_pdf_pages(&String::from_utf8_lossy(&out.stdout))
+                })
+                .await;
+            let update = this.update(cx, |this, cx| {
+                if let Some(ql) = this.quicklook.as_mut()
+                    && ql.path == path
+                {
+                    ql.pages = pages;
+                    cx.notify();
+                }
+            });
+            if let Err(err) = update {
+                log::error!("quick look page count failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
     /// Kick the background decode for Quick Look's own render (the
-    /// listing's thumbs are 256px; a pane wants more). One decode in
-    /// flight; the result lands only if Quick Look is still open on
-    /// that path. Failures mark the path so sync does not re-spawn
-    /// the decode every frame.
-    fn request_quicklook_render(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.ql_render.as_ref().is_some_and(|(p, _)| *p == path)
-            || self.ql_inflight.as_ref() == Some(&path)
-            || self.ql_failed.as_ref() == Some(&path)
+    /// listing's thumbs are 256px; a pane wants more). Keyed by path
+    /// and page; a newer request supersedes an older one in flight,
+    /// and a stale landing drops quietly (its pixels were never
+    /// uploaded, so the Arc release is enough). Failures keep the
+    /// screen honest: a held tile for the file reverts the counter
+    /// to the page it shows; nothing held stands the card in via the
+    /// failed slot so sync does not re-spawn every frame.
+    fn request_quicklook_render(&mut self, path: PathBuf, page: usize, cx: &mut Context<Self>) {
+        let nothing_held_failed = self.ql_render.as_ref().is_none_or(|(p, _, _)| *p != path)
+            && self.ql_failed.as_ref() == Some(&path);
+        if self
+            .ql_render
+            .as_ref()
+            .is_some_and(|(p, pg, _)| *p == path && *pg == page)
+            || self.ql_inflight.as_ref() == Some(&(path.clone(), page))
+            || nothing_held_failed
         {
             return;
         }
@@ -4072,7 +4154,9 @@ impl Browser {
             self.ql_failed = Some(path);
             return;
         }
-        self.ql_inflight = Some(path.clone());
+        self.ql_inflight = Some((path.clone(), page));
+        // a fresh attempt supersedes an old failure's knowledge
+        self.ql_failed = None;
         let is_pdf = icons::is_pdf(&path.file_name().unwrap_or_default().to_string_lossy());
         cx.spawn(async move |this, cx| {
             let bg_path = path.clone();
@@ -4080,7 +4164,7 @@ impl Browser {
                 .background_spawn(async move {
                     std::panic::catch_unwind(|| {
                         if is_pdf {
-                            icons::decode_pdf_thumbnail(&bg_path, QL_DECODE_MAX)
+                            icons::decode_pdf_thumbnail(&bg_path, page, QL_DECODE_MAX)
                         } else {
                             icons::decode_thumbnail(&bg_path, QL_DECODE_MAX, QL_DECODE_MAX)
                         }
@@ -4089,29 +4173,48 @@ impl Browser {
                 })
                 .await;
             let update = this.update(cx, |this, cx| {
-                this.ql_inflight = None;
-                // landed empty (corrupt file, missing pdftocairo):
-                // remember it so the overlay shows the card and the
-                // decode does not re-spawn
+                if this.ql_inflight.as_ref() == Some(&(path.clone(), page)) {
+                    this.ql_inflight = None;
+                }
+                // landed empty (corrupt file, missing pdftocairo, a
+                // page beyond the end): keep the screen honest
                 let Some(render) = render else {
-                    if this.quicklook.as_ref().is_some_and(|ql| ql.path == path) {
-                        this.ql_failed = Some(path);
-                        cx.notify();
+                    match this.ql_render.as_ref() {
+                        // paging: the held tile stays up, the counter
+                        // reverts to the page it shows; the guard
+                        // matches again, so no respawn loop
+                        Some((p, pg, _)) if *p == path => {
+                            if let Some(ql) = this.quicklook.as_mut()
+                                && ql.path == path
+                            {
+                                ql.page = *pg;
+                                cx.notify();
+                            }
+                        }
+                        // nothing held (the opening decode failed):
+                        // the card stands in and the failed slot
+                        // stops the respawn loop
+                        _ => {
+                            this.ql_failed = Some(path);
+                            cx.notify();
+                        }
                     }
                     return;
                 };
-                // the overlay may have closed or flipped mid-decode
+                // the overlay may have closed, flipped files, or
+                // turned pages mid-decode: a stale landing drops
+                // quietly (never uploaded, the Arc release suffices)
                 if this
                     .quicklook
                     .as_ref()
-                    .is_some_and(|ql| ql.path == path)
+                    .is_some_and(|ql| ql.path == path && ql.page == page)
                 {
                     // the previous tile goes the moment the new one
                     // lands (ADR-0016)
-                    if let Some((_, old)) = this.ql_render.take() {
+                    if let Some((_, _, old)) = this.ql_render.take() {
                         cx.drop_image(old, None);
                     }
-                    this.ql_render = Some((path, Arc::new(render)));
+                    this.ql_render = Some((path, page, Arc::new(render)));
                     cx.notify();
                 }
             });
@@ -4548,6 +4651,32 @@ impl Browser {
                 }
                 "=" | "+" => self.quicklook_zoom_step(1.2, cx),
                 "-" | "_" => self.quicklook_zoom_step(1.0 / 1.2, cx),
+                // PDF paging: no-ops while the count is unknown
+                "pageup" => {
+                    let page = self
+                        .quicklook
+                        .as_ref()
+                        .map(|ql| ql.page.saturating_sub(1))
+                        .unwrap_or(1);
+                    self.quicklook_page(page, cx);
+                }
+                "pagedown" => {
+                    let page = self
+                        .quicklook
+                        .as_ref()
+                        .map(|ql| ql.page + 1)
+                        .unwrap_or(1);
+                    self.quicklook_page(page, cx);
+                }
+                "home" => self.quicklook_page(1, cx),
+                "end" => {
+                    let last = self
+                        .quicklook
+                        .as_ref()
+                        .and_then(|ql| ql.pages)
+                        .unwrap_or(1);
+                    self.quicklook_page(last, cx);
+                }
                 "0" => {
                     if let Some(ql) = self.quicklook.as_mut() {
                         ql.zoom = 1.0;
@@ -6210,6 +6339,14 @@ impl Browser {
         let visible = self.visible_indices();
         let pos = cursor.and_then(|ix| visible.iter().position(|&v| v == ix));
 
+        // the page indicator, only when the count is known
+        let page_label = self
+            .quicklook
+            .as_ref()
+            .filter(|_| !entry.is_dir && icons::is_pdf(&entry.name))
+            .and_then(|ql| ql.pages.map(|pages| (ql.page, pages)))
+            .map(|(page, pages)| format!("page {page} / {pages}"));
+
         // the top row: name, position in the listing, the close road
         let header = div()
             .flex()
@@ -6226,6 +6363,12 @@ impl Browser {
                     .truncate()
                     .child(entry.name.clone()),
             )
+            .children(page_label.clone().map(|label| {
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme::text_dim())
+                    .child(label)
+            }))
             .child(
                 div()
                     .text_size(px(12.))
@@ -6240,7 +6383,11 @@ impl Browser {
                 div()
                     .text_size(px(11.))
                     .text_color(theme::text_dim())
-                    .child("Esc closes"),
+                    .child(if page_label.is_some() {
+                        "PgUp/PgDn pages · Esc closes"
+                    } else {
+                        "Esc closes"
+                    }),
             )
             .child(
                 div()
@@ -6256,7 +6403,10 @@ impl Browser {
             );
 
         // the pane: what renders depends on what the entry is
-        let image = self.ql_render.as_ref().and_then(|(path, render)| {
+        // a held tile for this file stays up while the next page
+        // decodes (same document, close content); file flips drop
+        // the tile in sync, so a foreign file never shows here
+        let image = self.ql_render.as_ref().and_then(|(path, _, render)| {
             (path == &entry.path && !entry.is_dir).then(|| render.clone())
         });
         let pane: Div = if let Some(render) = image {
@@ -8919,14 +9069,18 @@ struct TextPreview {
 }
 
 /// Quick Look's own state: which entry it shows (follows the cursor),
-/// the image zoom and pan, and an active drag's anchor (the pointer
-/// position the press started at, plus the pan it started from).
+/// the image zoom and pan, an active drag's anchor (the pointer
+/// position the press started at, plus the pan it started from), and
+/// the PDF page under view (`pages` is the count from pdfinfo, `None`
+/// while unknown: paging hides itself).
 #[derive(Clone, Debug, PartialEq)]
 struct QuickLook {
     path: PathBuf,
     zoom: f32,
     pan: (f32, f32),
     drag_from: Option<(Point<Pixels>, (f32, f32))>,
+    page: usize,
+    pages: Option<usize>,
 }
 
 fn text_kind(path: &Path) -> TextKind {
@@ -8947,6 +9101,15 @@ fn text_kind(path: &Path) -> TextKind {
 /// One styled line for the preview box.
 fn preview_line(line: String) -> Div {
     div().w_full().truncate().child(line)
+}
+
+/// Page count out of pdfinfo's stdout: the "Pages:" line. None when
+/// the tool said nothing usable (or said zero).
+fn parse_pdf_pages(info: &str) -> Option<usize> {
+    info.lines()
+        .find_map(|line| line.strip_prefix("Pages:"))
+        .and_then(|rest| rest.trim().parse::<usize>().ok())
+        .filter(|pages| *pages > 0)
 }
 
 /// A code-ish line: keys accented, comments dimmed.
@@ -10373,7 +10536,10 @@ mod browser_ux_keys {
         });
         app.run_until_parked(); // the background decode lands
         window.update(|browser, _, cx| {
-            assert!(browser.ql_render.as_ref().is_some_and(|(p, _)| *p == pic));
+            assert!(browser
+                .ql_render
+                .as_ref()
+                .is_some_and(|(p, _, _)| *p == pic));
             // flip to a text file: the held tile drops (ADR-0016)
             browser.route_key(&key("up"), cx);
             assert!(browser.ql_render.is_none());
@@ -10397,6 +10563,82 @@ mod browser_ux_keys {
             ql_clamp_pan((5000.0, 0.0), (1000.0, 1000.0), (1000.0, 1000.0)),
             (0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn pdf_pages_parse_from_pdfinfo_output() {
+        assert_eq!(parse_pdf_pages("Pages:          12\n"), Some(12));
+        assert_eq!(
+            parse_pdf_pages("Title: report\nCreator: x\nPages: 3\n"),
+            Some(3)
+        );
+        // nothing usable: no line, zero, or garbage
+        assert_eq!(parse_pdf_pages("Title: report\n"), None);
+        assert_eq!(parse_pdf_pages("Pages: 0\n"), None);
+        assert_eq!(parse_pdf_pages("Pages: many\n"), None);
+    }
+
+    #[test]
+    fn quick_look_page_keys_clamp_and_noop_without_a_count() {
+        let lab = Lab::new("quicklook-pages");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.jump_cursor(1, cx); // a.txt
+            browser.route_key(&key("space"), cx);
+            // count unknown: paging hides itself entirely
+            browser.route_key(&key("pagedown"), cx);
+            assert_eq!(browser.quicklook.as_ref().unwrap().page, 1);
+            // simulate pdfinfo landing
+            browser.quicklook.as_mut().unwrap().pages = Some(3);
+            browser.route_key(&key("pagedown"), cx);
+            browser.route_key(&key("pagedown"), cx);
+            assert_eq!(browser.quicklook.as_ref().unwrap().page, 3);
+            browser.route_key(&key("pagedown"), cx);
+            assert_eq!(browser.quicklook.as_ref().unwrap().page, 3);
+            browser.route_key(&key("pageup"), cx);
+            assert_eq!(browser.quicklook.as_ref().unwrap().page, 2);
+            browser.route_key(&key("home"), cx);
+            assert_eq!(browser.quicklook.as_ref().unwrap().page, 1);
+            browser.route_key(&key("end"), cx);
+            assert_eq!(browser.quicklook.as_ref().unwrap().page, 3);
+            // a page is a new picture: zoom and pan reset with it
+            if let Some(ql) = browser.quicklook.as_mut() {
+                ql.zoom = 4.0;
+                ql.pan = (100.0, 100.0);
+            }
+            browser.route_key(&key("pageup"), cx);
+            let ql = browser.quicklook.as_ref().unwrap();
+            assert_eq!(ql.page, 2);
+            assert_eq!(ql.zoom, 1.0);
+            assert_eq!(ql.pan, (0.0, 0.0));
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_file_flip_resets_pages() {
+        let lab = Lab::new("quicklook-page-flip");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.jump_cursor(1, cx); // a.txt
+            browser.route_key(&key("space"), cx);
+            browser.quicklook.as_mut().unwrap().page = 2;
+            browser.quicklook.as_mut().unwrap().pages = Some(5);
+            browser.route_key(&key("down"), cx); // b.txt
+            let ql = browser.quicklook.as_ref().unwrap();
+            assert_eq!(ql.path, lab.dir.join("b.txt"));
+            assert_eq!(ql.page, 1);
+            assert_eq!(ql.pages, None);
+        });
+        app.run_until_parked();
     }
 
     #[test]
