@@ -1,7 +1,7 @@
 //! In-process video decode: kumaOS ships the full libav as
-//! ffmpeg-libs and no CLI (the kumaOS ffmpeg contract), so posters
-//! and durations come from linking libavcodec, libavformat and
-//! libswscale. Videos are hostile input: every step is fallible and
+//! ffmpeg-libs and no CLI (the kumaOS ffmpeg contract), so posters,
+//! preview loops and durations come from linking libavcodec,
+//! libavformat and libswscale. Videos are hostile input: every step is fallible and
 //! degrades, so callers fall back to the type icon or the card. No
 //! function here may run on the UI thread; callers wrap the decode
 //! in catch_unwind like every other thumbnail decode.
@@ -10,6 +10,11 @@
 //! The decode path lives behind the `video` feature (default on);
 //! without it this module is the stub below and video is a degraded
 //! feature: the type icon and the plain card stand in.
+//!
+//! A base image update that moves libav (even within one soname)
+//! leaves the bindgen'd struct offsets stale in target/: decode
+//! then corrupts instead of failing (fields land at old offsets).
+//! `cargo clean -p ffmpeg-sys-next` after any libav bump.
 
 /// Why a video has no poster frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,9 +44,31 @@ pub(crate) fn duration_label(seconds: f64) -> Option<String> {
     }
 }
 
+/// A stream with degenerate timestamps (static, or none at all)
+/// must not spin the img element's frame clock at unbounded rate:
+/// every displayed frame gets at least this delay.
+pub(crate) const PREVIEW_MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// The presentation delay a frame implies, from PTS deltas in
+/// microseconds: the delta to the next frame, floored at the pace
+/// floor. An unknown timestamp or a backwards one carries the
+/// previous delay (the floor at the head).
+pub(crate) fn delay_from_pts(
+    prev_pts: Option<i64>,
+    pts: Option<i64>,
+    prev_delay: std::time::Duration,
+) -> std::time::Duration {
+    match (prev_pts, pts) {
+        (Some(prev), Some(pts)) if pts > prev => {
+            std::time::Duration::from_micros((pts - prev) as u64).max(PREVIEW_MIN_DELAY)
+        }
+        _ => prev_delay,
+    }
+}
+
 #[cfg(feature = "video")]
 mod imp {
-    use super::PosterFail;
+    use super::{PREVIEW_MIN_DELAY, PosterFail, delay_from_pts};
     use std::ffi::CString;
     use std::path::Path;
 
@@ -189,6 +216,45 @@ mod imp {
         poster_dynamic(path, max).map(|image| crate::icons::decode_to_render(image, max, max))
     }
 
+    /// The details pane's preview budget: at most this many frames
+    /// and at most this much source time per loop, whichever caps
+    /// first; a clip shorter than the budget loops whole. The caps
+    /// bound both the decode work (one background pass per settled
+    /// selection) and the memory (fitted frames only).
+    const PREVIEW_MAX_FRAMES: usize = 96;
+    const PREVIEW_MAX_SECS: f64 = 8.0;
+    /// The preview's memory ceiling on top of the frame cap: the
+    /// frame count alone does not bound a caller that passes a large
+    /// `max`.
+    const PREVIEW_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    /// The clip's head as a BGRA multi-frame `RenderImage`: a bounded
+    /// loop of fitted frames whose per-frame delays are the stream's
+    /// own PTS deltas, for the img element to cycle (it honors
+    /// reduce_motion and parks when the window is inactive). Falls
+    /// back to the single-frame poster when the head could not be
+    /// turned into a loop (one decodable frame, a decode that came
+    /// up empty); `Err(CodecMissing)` and `Err(Empty)` exactly where
+    /// decode_poster errs. Never runs on the UI thread.
+    pub(crate) fn decode_preview(path: &Path, max: u32) -> Result<gpui::RenderImage, PosterFail> {
+        let cpath = cpath(path).ok_or(PosterFail::Empty)?;
+        let start = std::time::Instant::now();
+        match preview(&cpath, max) {
+            Ok(frames) if frames.len() >= 2 => {
+                let bytes: usize = frames.iter().map(|f| f.buffer().as_raw().len()).sum();
+                log::info!(
+                    "video preview: {} frames, {:.1} MB, decoded in {} ms",
+                    frames.len(),
+                    bytes as f64 / (1024.0 * 1024.0),
+                    start.elapsed().as_millis()
+                );
+                Ok(gpui::RenderImage::new(smallvec::SmallVec::from_vec(frames)))
+            }
+            // the poster stands in: the loop is not worth showing
+            _ => decode_poster(path, max),
+        }
+    }
+
     /// The poster's dynamic twin: the fitted RGBA pixels as a plain
     /// `DynamicImage`, pre-swap, for the grid thumb job's disk cache.
     pub(crate) fn poster_dynamic(
@@ -204,6 +270,148 @@ mod imp {
         max: u32,
         from_head: bool,
     ) -> Result<image::DynamicImage, PosterFail> {
+        unsafe {
+            let (input, video_index, mut cctx) = open_video_decoder(path)?;
+            if !from_head {
+                // the seek's timestamp runs in the container time
+                // base, microseconds; ten percent in, one second as
+                // the ceiling
+                let raw = (*input.0).duration;
+                let tenth = (raw > 0)
+                    .then(|| (raw as f64 * 0.1) as i64)
+                    .unwrap_or(1_000_000);
+                if sys::avformat_seek_file(
+                    input.0,
+                    -1,
+                    i64::MIN,
+                    tenth.min(1_000_000),
+                    i64::MAX,
+                    0,
+                ) < 0
+                {
+                    return Err(PosterFail::Empty);
+                }
+            }
+            decode_first_frame(input.0, &mut cctx, video_index, max)
+        }
+    }
+
+    /// The clip's head as fitted RGBA frames: at most the preview
+    /// budget's frames, span and bytes, per-frame delays from PTS
+    /// deltas. Starts at the head because playback is honest:
+    /// recordings that start black play past it. `Err(CodecMissing)`
+    /// propagates from the decoder check; a stream that yields
+    /// nothing decodable is `Err(Empty)` (the caller falls back to
+    /// the poster).
+    fn preview(path: &CString, max: u32) -> Result<Vec<image::Frame>, PosterFail> {
+        unsafe {
+            let (input, video_index, cctx) = open_video_decoder(path)?;
+            let pkt = Packet::alloc().ok_or(PosterFail::Empty)?;
+            let frame = Frame::alloc().ok_or(PosterFail::Empty)?;
+            // the container's own time base for the stream: the
+            // decoder copies packet pts through unchanged, so this
+            // is what the frames' timestamps actually run in when
+            // libav does not stamp a frame time base
+            let streams = *std::ptr::addr_of!((*input.0).streams);
+            let stream = *streams.add(video_index);
+            let stream_tb = (*stream).time_base;
+            let mut scaler: Option<Scaler> = None;
+            let mut collected: Vec<(image::RgbaImage, Option<i64>)> = Vec::new();
+            let mut bytes_total = 0usize;
+            let mut first_pts: Option<i64> = None;
+            'collect: loop {
+                if sys::av_read_frame(input.0, pkt.0) < 0 {
+                    break; // eof or read error: the loop is what it is
+                }
+                if (*pkt.0).stream_index != video_index as i32 {
+                    sys::av_packet_unref(pkt.0);
+                    continue;
+                }
+                if sys::avcodec_send_packet(cctx.0, pkt.0) < 0 {
+                    sys::av_packet_unref(pkt.0);
+                    break;
+                }
+                loop {
+                    let got = sys::avcodec_receive_frame(cctx.0, frame.0);
+                    if got < 0 {
+                        break; // EAGAIN or error: next packet
+                    }
+                    let (dw, dh, buf) = scale_frame(frame.0, &mut scaler, max)?;
+                    // frame pts: libav stamps the frame's own time
+                    // base when it has one; the container's stream
+                    // time base is what the copied-through packet
+                    // timestamps run in otherwise
+                    let tb = if (*frame.0).time_base.num > 0 {
+                        (*frame.0).time_base
+                    } else if stream_tb.num > 0 {
+                        stream_tb
+                    } else {
+                        (*cctx.0).time_base
+                    };
+                    let pts = ((*frame.0).pts >= 0 && tb.num > 0).then(|| {
+                        sys::av_rescale_q(
+                            (*frame.0).pts,
+                            tb,
+                            sys::AVRational {
+                                num: 1,
+                                den: 1_000_000,
+                            },
+                        )
+                    });
+                    bytes_total += buf.len();
+                    collected.push((
+                        image::RgbaImage::from_raw(dw, dh, buf).ok_or(PosterFail::Empty)?,
+                        pts,
+                    ));
+                    sys::av_frame_unref(frame.0);
+                    let spanned = pts
+                        .zip(first_pts)
+                        .is_some_and(|(p, first)| p - first > (PREVIEW_MAX_SECS * 1e6) as i64);
+                    first_pts = first_pts.or(pts);
+                    if collected.len() >= PREVIEW_MAX_FRAMES
+                        || bytes_total >= PREVIEW_MAX_BYTES
+                        || spanned
+                    {
+                        break 'collect;
+                    }
+                }
+            }
+            // frame i displays for the gap to the next frame's
+            // arrival; the last frame wraps on the previous gap
+            let n = collected.len();
+            let mut delays = vec![PREVIEW_MIN_DELAY; n];
+            for ix in 0..n.saturating_sub(1) {
+                delays[ix] = delay_from_pts(collected[ix].1, collected[ix + 1].1, PREVIEW_MIN_DELAY);
+            }
+            if n > 1 {
+                delays[n - 1] =
+                    delay_from_pts(collected[n - 2].1, collected[n - 1].1, PREVIEW_MIN_DELAY);
+            }
+            Ok(collected
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (mut buffer, _))| {
+                    // gpui's atlas wants BGRA
+                    for pixel in buffer.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                    }
+                    image::Frame::from_parts(
+                        buffer,
+                        0,
+                        0,
+                        image::Delay::from_saturating_duration(std::mem::take(&mut delays[ix])),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    /// Open the container, find the best video stream, open its
+    /// decoder. `Err(CodecMissing)` when libav parses the container
+    /// but has no decoder for the codec (the named state's trigger).
+    unsafe fn open_video_decoder(
+        path: &CString,
+    ) -> Result<(FormatInput, usize, CodecCtx), PosterFail> {
         unsafe {
             let mut ic: *mut sys::AVFormatContext = std::ptr::null_mut();
             if sys::avformat_open_input(
@@ -226,28 +434,8 @@ mod imp {
                 return Err(PosterFail::CodecMissing);
             }
             let codec = sys::avcodec_find_decoder((*par).codec_id);
-            let mut cctx = avcodec_open(codec, par)?;
-            if !from_head {
-                // the seek's timestamp runs in the container time
-                // base, microseconds; ten percent in, one second as
-                // the ceiling
-                let raw = (*input.0).duration;
-                let tenth = (raw > 0)
-                    .then(|| (raw as f64 * 0.1) as i64)
-                    .unwrap_or(1_000_000);
-                if sys::avformat_seek_file(
-                    input.0,
-                    -1,
-                    i64::MIN,
-                    tenth.min(1_000_000),
-                    i64::MAX,
-                    0,
-                ) < 0
-                {
-                    return Err(PosterFail::Empty);
-                }
-            }
-            decode_first_frame(input.0, &mut cctx, video_index, max)
+            let cctx = avcodec_open(codec, par)?;
+            Ok((input, video_index, cctx))
         }
     }
 
@@ -298,59 +486,7 @@ mod imp {
                     if got < 0 {
                         break; // EAGAIN or error: next packet
                     }
-                    if scaler.is_none() {
-                        let (dw, dh) = fit(
-                            (*frame.0).width as u32,
-                            (*frame.0).height as u32,
-                            max,
-                        );
-                        let sc = sys::sws_getContext(
-                            (*frame.0).width,
-                            (*frame.0).height,
-                            // the format came from libav itself, its
-                            // enum value is valid by construction
-                            std::mem::transmute::<i32, sys::AVPixelFormat>((*frame.0).format),
-                            dw as i32,
-                            dh as i32,
-                            sys::AVPixelFormat::AV_PIX_FMT_RGBA,
-                            sys::SWS_BILINEAR,
-                            std::ptr::null_mut(),
-                            std::ptr::null_mut(),
-                            std::ptr::null(),
-                        );
-                        if sc.is_null() {
-                            return Err(PosterFail::Empty);
-                        }
-                        scaler = Some(Scaler(sc));
-                    }
-                    let sc = scaler.as_ref().unwrap().0;
-                    let (dw, dh) = fit(
-                        (*frame.0).width as u32,
-                        (*frame.0).height as u32,
-                        max,
-                    );
-                    let mut buf = vec![0u8; dw as usize * dh as usize * 4];
-                    let src_data = (*frame.0).data.as_ptr() as *const *const u8;
-                    let src_stride = (*frame.0).linesize.as_ptr();
-                    let mut dst_data = [
-                        buf.as_mut_ptr(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    ];
-                    let dst_stride = [(dw as usize * 4) as i32, 0, 0, 0];
-                    if sys::sws_scale(
-                        sc,
-                        src_data,
-                        src_stride,
-                        0,
-                        (*frame.0).height,
-                        dst_data.as_mut_ptr() as *const *mut u8,
-                        dst_stride.as_ptr(),
-                    ) < 0
-                    {
-                        return Err(PosterFail::Empty);
-                    }
+                    let (dw, dh, buf) = scale_frame(frame.0, &mut scaler, max)?;
                     sys::av_frame_unref(frame.0);
                     let image =
                         image::RgbaImage::from_raw(dw, dh, buf).ok_or(PosterFail::Empty)?;
@@ -358,6 +494,65 @@ mod imp {
                 }
                 sys::av_packet_unref(pkt.0);
             }
+        }
+    }
+
+    /// One decoded AVFrame into fitted RGBA bytes: the scaler is
+    /// created on the first frame (its format pins the source pixel
+    /// format), the downscale happens in the scaler so no full-size
+    /// RGBA intermediate exists.
+    unsafe fn scale_frame(
+        frame: *mut sys::AVFrame,
+        scaler: &mut Option<Scaler>,
+        max: u32,
+    ) -> Result<(u32, u32, Vec<u8>), PosterFail> {
+        unsafe {
+            if scaler.is_none() {
+                let (dw, dh) = fit((*frame).width as u32, (*frame).height as u32, max);
+                let sc = sys::sws_getContext(
+                    (*frame).width,
+                    (*frame).height,
+                    // the format came from libav itself, its
+                    // enum value is valid by construction
+                    std::mem::transmute::<i32, sys::AVPixelFormat>((*frame).format),
+                    dw as i32,
+                    dh as i32,
+                    sys::AVPixelFormat::AV_PIX_FMT_RGBA,
+                    sys::SwsFlags::SWS_BILINEAR as i32,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                );
+                if sc.is_null() {
+                    return Err(PosterFail::Empty);
+                }
+                *scaler = Some(Scaler(sc));
+            }
+            let sc = scaler.as_ref().unwrap().0;
+            let (dw, dh) = fit((*frame).width as u32, (*frame).height as u32, max);
+            let mut buf = vec![0u8; dw as usize * dh as usize * 4];
+            let src_data = (*frame).data.as_ptr() as *const *const u8;
+            let src_stride = (*frame).linesize.as_ptr();
+            let mut dst_data = [
+                buf.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ];
+            let dst_stride = [(dw as usize * 4) as i32, 0, 0, 0];
+            if sys::sws_scale(
+                sc,
+                src_data,
+                src_stride,
+                0,
+                (*frame).height,
+                dst_data.as_mut_ptr() as *const *mut u8,
+                dst_stride.as_ptr(),
+            ) < 0
+            {
+                return Err(PosterFail::Empty);
+            }
+            Ok((dw, dh, buf))
         }
     }
 
@@ -374,7 +569,7 @@ mod imp {
 }
 
 #[cfg(feature = "video")]
-pub(crate) use imp::{decode_poster, poster_dynamic, probe};
+pub(crate) use imp::{decode_poster, decode_preview, poster_dynamic, probe};
 
 #[cfg(not(feature = "video"))]
 mod imp {
@@ -396,6 +591,13 @@ mod imp {
         Err(PosterFail::Empty)
     }
 
+    pub(crate) fn decode_preview(
+        _path: &Path,
+        _max: u32,
+    ) -> Result<gpui::RenderImage, PosterFail> {
+        Err(PosterFail::Empty)
+    }
+
     pub(crate) fn poster_dynamic(
         _path: &Path,
         _max: u32,
@@ -405,7 +607,7 @@ mod imp {
 }
 
 #[cfg(not(feature = "video"))]
-pub(crate) use imp::{decode_poster, poster_dynamic, probe};
+pub(crate) use imp::{decode_poster, decode_preview, poster_dynamic, probe};
 
 /// Test helper (the `video` feature on, test builds only): a raw
 /// H.264 elementary stream whose container parses but whose codec
@@ -427,23 +629,34 @@ pub(crate) fn write_codec_missing_stream(path: &std::path::Path) {
 
 #[cfg(all(test, feature = "video"))]
 mod tests {
-    use super::imp::{decode_poster, poster_dynamic, probe};
-    use super::duration_label;
+    use super::imp::{decode_poster, decode_preview, poster_dynamic, probe};
+    use super::{delay_from_pts, duration_label};
     use super::PosterFail;
     use super::write_codec_missing_stream;
     use ffmpeg_sys_next as sys;
     use std::ffi::CString;
     use std::fs;
     use std::path::Path;
+    use std::time::Duration;
 
     /// One-time fixture generator: a one-second 64x64 mpeg4 with
     /// moving luma bars, committed as tests/fixtures/sample.mp4 so
     /// the decode tests run headless with no GPU and no encoder at
-    /// test time. Run with `--ignored` to regenerate.
+    /// test time; its ten-second twin pins the preview budget. Run
+    /// with `--ignored` to regenerate.
     #[test]
     #[ignore]
     fn generate_fixture() {
-        let path = Path::new("tests/fixtures/sample.mp4");
+        encode_fixture(Path::new("tests/fixtures/sample.mp4"), 25);
+    }
+
+    #[test]
+    #[ignore]
+    fn generate_long_fixture() {
+        encode_fixture(Path::new("tests/fixtures/sample-long.mp4"), 250);
+    }
+
+    fn encode_fixture(path: &Path, frames: i64) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let cpath = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         unsafe {
@@ -508,7 +721,7 @@ mod tests {
                     assert_eq!(sys::av_interleaved_write_frame(octx, pkt), 0);
                 }
             };
-            for i in 0i64..25 {
+            for i in 0i64..frames {
                 // moving luma bars: the poster test asserts real content
                 let stride = (*frame).linesize[0] as usize;
                 let y = (*frame).data[0] as *mut u8;
@@ -550,6 +763,74 @@ mod tests {
         let bytes = render.as_bytes(0).expect("frame bytes");
         assert!(bytes.iter().any(|b| *b != 0));
         assert!(bytes.iter().any(|b| *b != bytes[0]));
+    }
+
+    #[test]
+    fn preview_decodes_a_bounded_loop() {
+        let path = Path::new("tests/fixtures/sample.mp4");
+        let render = decode_preview(path, 256).expect("preview");
+        // the fixture is one second of 25fps: the whole clip loops,
+        // under every cap
+        let count = render.frame_count();
+        assert!((2..=25).contains(&count), "frames {count}");
+        let first = render.size(0);
+        let mut total = std::time::Duration::ZERO;
+        for ix in 0..count {
+            let size = render.size(ix);
+            assert_eq!((size.width, size.height), (first.width, first.height));
+            assert!(u32::from(size.width) <= 256 && u32::from(size.height) <= 256);
+            // paced from the stream's own timestamps
+            assert!(Duration::from(render.delay(ix)) >= Duration::from_millis(16));
+            total += Duration::from(render.delay(ix));
+        }
+        assert!(total >= Duration::from_millis(500), "loop {total:?}");
+        // real content on frame 0: the luma bars made it through
+        let bytes = render.as_bytes(0).expect("frame bytes");
+        assert!(bytes.iter().any(|b| *b != 0));
+        assert!(bytes.iter().any(|b| *b != bytes[0]));
+    }
+
+    #[test]
+    fn preview_caps_long_clips() {
+        let path = Path::new("tests/fixtures/sample-long.mp4");
+        let render = decode_preview(path, 256).expect("preview");
+        // ten seconds of 25fps source: the frame cap lands first
+        assert_eq!(render.frame_count(), 96);
+        let total: Duration = (0..render.frame_count())
+            .map(|ix| Duration::from(render.delay(ix)))
+            .sum();
+        assert!(total <= Duration::from_secs(9), "loop {total:?}");
+    }
+
+    #[test]
+    fn preview_fails_soft_on_junk() {
+        // a text file has no video stream; raw h264 garbage must
+        // not panic either: same contract as the poster
+        assert!(matches!(
+            decode_preview(Path::new("Cargo.toml"), 256),
+            Err(PosterFail::Empty)
+        ));
+        let dir = std::env::temp_dir().join(format!("kuma-video-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clip.h264");
+        write_codec_missing_stream(&path);
+        assert!(matches!(decode_preview(&path, 256), Err(_)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_pace_survives_degenerate_timestamps() {
+        let floor = std::time::Duration::from_millis(16);
+        let carried = std::time::Duration::from_millis(40);
+        // the head: no previous frame to delta against
+        assert_eq!(delay_from_pts(None, Some(0), floor), floor);
+        // a real delta
+        assert_eq!(delay_from_pts(Some(0), Some(40_000), floor), carried);
+        // a sub-floor delta clamps to the pace floor
+        assert_eq!(delay_from_pts(Some(0), Some(1_000), floor), floor);
+        // unknown and backwards timestamps carry the last pace
+        assert_eq!(delay_from_pts(Some(40_000), None, carried), carried);
+        assert_eq!(delay_from_pts(Some(40_000), Some(20_000), carried), carried);
     }
 
     #[test]
