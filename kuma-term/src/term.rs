@@ -559,19 +559,36 @@ pub struct Engine {
 impl Engine {
     /// Spawn the shell, wire the PTY reader thread. `window_size` carries
     /// the initial cell geometry (measured from the real font by the view).
-    pub fn new(window_size: WindowSize, theme: Theme, tx: UnboundedSender<UiEvent>) -> io::Result<Self> {
+    /// `command` is `-e`'s argv, run directly (no shell between), which
+    /// wins over the env hook when both are present.
+    pub fn new(
+        window_size: WindowSize,
+        theme: Theme,
+        tx: UnboundedSender<UiEvent>,
+        command: Option<Vec<String>>,
+    ) -> io::Result<Self> {
         // TERM and COLORTERM for the child; alacritty's own helper picks
         // alacritty terminfo when installed, xterm-256color otherwise
         tty::setup_env();
 
-        // spike hook: KUMA_TERM_COMMAND replaces the login shell, so the
-        // headless smoke and visual tests can drive exact content
-        let options = match std::env::var("KUMA_TERM_COMMAND") {
-            Ok(command) => tty::Options {
-                shell: Some(tty::Shell::new("/bin/sh".to_string(), vec!["-c".to_string(), command])),
+        // `-e` first, then the spike hook: KUMA_TERM_COMMAND replaces
+        // the login shell so the headless smoke and visual tests can
+        // drive exact content (the hook is env, so it persists into
+        // child processes: exactly why `-e` never rides it)
+        let argv = command.or_else(|| {
+            std::env::var("KUMA_TERM_COMMAND")
+                .ok()
+                .map(|hook| vec!["/bin/sh".to_string(), "-c".to_string(), hook])
+        });
+        let options = match argv {
+            Some(argv) => tty::Options {
+                shell: Some(tty::Shell::new(
+                    argv[0].clone(),
+                    argv[1..].iter().cloned().collect(),
+                )),
                 ..Default::default()
             },
-            Err(_) => tty::Options::default(),
+            None => tty::Options::default(),
         };
         let mut pty = tty::new(&options, window_size, 0)?;
 
@@ -1455,8 +1472,8 @@ mod tests {
         let _env = crate::PTY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         unsafe { std::env::set_var("KUMA_TERM_COMMAND", "echo kuma") };
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<UiEvent>();
-        let mut engine = Engine::new(window_size, crate::theme::Theme::builtin(), tx)
-            .expect("engine with a live pty");
+        let mut engine =
+            Engine::new(window_size, crate::theme::Theme::builtin(), tx, None).expect("engine with a live pty");
 
         // pump the event channel until the child exits, with a wall clock
         // bound so a broken pump fails instead of hanging the suite
@@ -1484,6 +1501,59 @@ mod tests {
         unsafe { std::env::remove_var("KUMA_TERM_COMMAND") };
 
         assert!(saw_text, "grid never received the visible text");
+        assert!(saw_exit, "pump never reported the child exit");
+        engine.resize(19, 4);
+    }
+
+    #[test]
+    fn engine_command_beats_the_env_hook() {
+        if std::env::var("KUMA_TERM_SKIP_PTY_TEST").is_ok() {
+            return;
+        }
+        let window_size = WindowSize {
+            num_cols: 20,
+            num_lines: 5,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        // `-e` is a stateless argv contract: even with the env hook
+        // set (as a kuma-launch'd kuma-term inside a kuma-launch'd
+        // kuma-term would see), the explicit command runs and the
+        // hook's script does not
+        let _env = crate::PTY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var("KUMA_TERM_COMMAND", "echo envhook-mistake") };
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+        let mut engine = Engine::new(
+            window_size,
+            crate::theme::Theme::builtin(),
+            tx,
+            Some(vec!["echo".to_string(), "direct-wins".to_string()]),
+        )
+        .expect("engine with a live pty");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_direct = false;
+        let mut saw_hook = false;
+        let mut saw_exit = false;
+        while std::time::Instant::now() < deadline && !saw_exit {
+            let event = futures::executor::block_on(rx.next());
+            match event {
+                Some(UiEvent::Wakeup) => {
+                    for row in engine.snapshot(true).rows {
+                        let line: String = row.cells.iter().map(|c| c.c).collect();
+                        saw_direct |= line.contains("direct-wins");
+                        saw_hook |= line.contains("envhook");
+                    }
+                },
+                Some(UiEvent::Exit) => saw_exit = true,
+                Some(_) => {},
+                None => break,
+            }
+        }
+        unsafe { std::env::remove_var("KUMA_TERM_COMMAND") };
+
+        assert!(saw_direct, "the -e command never reached the grid");
+        assert!(!saw_hook, "the env hook leaked past an explicit -e");
         assert!(saw_exit, "pump never reported the child exit");
         engine.resize(19, 4);
     }

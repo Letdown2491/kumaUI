@@ -40,7 +40,7 @@ if [ "${1:-}" = "build" ]; then
   mv -f ~/.local/bin/kuma-term.new ~/.local/bin/kuma-term
   mkdir -p ~/.local/share/applications \
     ~/.local/share/icons/hicolor/256x256/apps
-  sed "s|@HOME@|$HOME|" kuma-term/packaging/kuma-term.desktop.in \
+  sed "s|@BIN@|$HOME/.local/bin|" kuma-term/packaging/kuma-term.desktop.in \
     > ~/.local/share/applications/kuma-term.desktop
   # png, not svg: same reason as Koguma's, the shell tints svgs
   cp kuma-term/packaging/kuma-term.png \

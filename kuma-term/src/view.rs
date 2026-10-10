@@ -131,7 +131,10 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// `command` seeds the initial tab: `-e` from the argv, so a
+    /// kuma-launch'd term runs the verb script instead of a shell.
+    /// Tabs opened after that are plain shells.
+    pub fn new(command: Option<Vec<String>>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let theme = Theme::load();
         // the window surface must opt into alpha before anything paints,
         // and subpixel AA is wrong over a translucent background
@@ -157,7 +160,7 @@ impl TerminalView {
             cell_width: cell_w as u16,
             cell_height: cell_h as u16,
         };
-        let tab = Self::start_session(&theme, 0, window_size, cx)
+        let tab = Self::start_session(&theme, 0, window_size, cx, command)
             .unwrap_or_else(|err| {
                 // without a shell there is no terminal
                 panic!("kuma-term: cannot spawn the shell: {err}")
@@ -239,9 +242,10 @@ impl TerminalView {
         index: usize,
         window_size: alacritty_terminal::event::WindowSize,
         cx: &mut Context<Self>,
+        command: Option<Vec<String>>,
     ) -> std::io::Result<Tab> {
         let (tx, rx) = futures::channel::mpsc::unbounded::<UiEvent>();
-        let engine = Engine::new(window_size, theme.clone(), tx)?;
+        let engine = Engine::new(window_size, theme.clone(), tx, command)?;
         let pump = cx.spawn(async move |this, cx| {
             let mut rx = rx;
             while let Some(event) = rx.next().await {
@@ -282,7 +286,8 @@ impl TerminalView {
             cell_width: self.cell_w as u16,
             cell_height: self.cell_h as u16,
         };
-        let tab = match Self::start_session(&self.theme, self.tabs.len(), window_size, cx) {
+        // a new tab is a fresh shell: `-e` seeds the initial tab only
+        let tab = match Self::start_session(&self.theme, self.tabs.len(), window_size, cx, None) {
             Ok(tab) => tab,
             Err(err) => {
                 log::warn!("kuma-term: cannot spawn a tab: {err}");
@@ -2324,7 +2329,7 @@ mod tests {
             Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
             Arc::new(()),
         );
-        let mut window = app.open_window(|window, cx| TerminalView::new(window, cx));
+        let mut window = app.open_window(|window, cx| TerminalView::new(None, window, cx));
         drop(_env);
         app.run_until_parked();
 
@@ -2419,7 +2424,7 @@ mod tests {
             Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
             Arc::new(()),
         );
-        let mut window = app.open_window(|window, cx| TerminalView::new(window, cx));
+        let mut window = app.open_window(|window, cx| TerminalView::new(None, window, cx));
         drop(_env);
         app.run_until_parked();
 
