@@ -85,9 +85,10 @@ volumes, so builds are incremental.
 
 ## Release
 
-Releases are cut from the changelog. Write bullets under `## Unreleased`
-in `CHANGELOG.md`, grouped under `### Added`, `### Changed`, or
-`### Fixed`, then run:
+A reader-facing change lands with its changelog bullet in the same
+commit: a bullet under `## Unreleased` in `CHANGELOG.md`, grouped under
+`### Added`, `### Changed`, or `### Fixed` (test-only and docs-only
+work earns no bullet). Cut a release when the owner asks for one:
 
     ./scripts/release.sh
 
