@@ -1389,8 +1389,8 @@ pub(crate) struct Browser {
     palette_mtime: Option<std::time::SystemTime>,
     theme_refresh: Instant,
     accent_picker: bool,
-    /// Keybinding cheatsheet expanded in the places sidebar.
-    keys_open: bool,
+    /// The keybindings modal (the sidebar button opens it).
+    keys_modal: bool,
     /// Text snippet for the rail, when the focused entry is textual.
     text_preview: Option<TextPreview>,
     preview_key: Option<PathBuf>,
@@ -1562,7 +1562,7 @@ impl Browser {
             palette_mtime: None,
             theme_refresh: Instant::now(),
             accent_picker: false,
-            keys_open: false,
+            keys_modal: false,
             text_preview: None,
             preview_key: None,
             preview_inflight: HashSet::new(),
@@ -3909,8 +3909,9 @@ impl Browser {
                 ("inspector-lock", "right") => self.inspector_lock = Some(false),
                 ("accent", "auto") => self.accent = None,
                 ("accent", _) => self.accent = parse_hex_color(value),
-                ("keys", "true") => self.keys_open = true,
-                ("keys", "false") => self.keys_open = false,
+                // "keys" (once an open flag for a sidebar cheatsheet)
+                // is a modal now: the line parses as unknown and dies
+                // in the _ arm
                 ("active", _) => saved_active = value.parse().ok(),
                 ("scale", _) => {
                     if let Ok(parsed) = value.parse::<f32>() {
@@ -3979,7 +3980,7 @@ impl Browser {
             SortKey::Modified => "modified",
         };
         let text = format!(
-            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\ninspector-lock={}\naccent={}\nkeys={}\nscale={}\n",
+            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\ninspector-lock={}\naccent={}\nscale={}\n",
             if tab.view_mode == ViewMode::Icons {
                 "icons"
             } else {
@@ -3999,7 +4000,6 @@ impl Browser {
                 Some(hex) => format!("#{hex:06x}"),
                 None => "auto".into(),
             },
-            self.keys_open,
             self.scale,
         );
         let mut text = text;
@@ -4148,18 +4148,10 @@ impl Browser {
         cx.notify();
     }
 
-    /// Show or hide the keybinding cheatsheet in the sidebar.
-    fn toggle_keys(&mut self, cx: &mut Context<Self>) {
-        self.keys_open = !self.keys_open;
-        self.save_state();
-        cx.notify();
-    }
-
-    /// The collapsible keybinding cheatsheet, pinned to the bottom of
-    /// the places sidebar.
+    /// The sidebar's tail: the Keybindings button (opens the modal).
     fn keys_section(&self, cx: &mut Context<Self>) -> Div {
-        let connect_row = div()
-            .id("connect-server")
+        let keybindings_row = div()
+            .id("keys-button")
             .px_3()
             .py_1()
             .rounded_sm()
@@ -4167,56 +4159,12 @@ impl Browser {
             .text_size(px(13.))
             .text_color(theme::text_dim())
             .hover(|this| this.bg(theme::row_hover()))
-            .on_click(cx.listener(|this, _, _, cx| this.open_connect_dialog(cx)))
-            .child("Connect to Server");
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .gap_px()
-            .child(connect_row)
-            .child(
-                div()
-                    .id("keys-toggle")
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .py_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_size(px(13.))
-                    .text_color(theme::text_dim())
-                    .hover(|this| this.bg(theme::row_hover()))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_keys(cx)))
-                    .child("Keys")
-                    .child(
-                        svg()
-                            .path(if self.keys_open {
-                                "icons/chevron_up.svg"
-                            } else {
-                                "icons/chevron_down.svg"
-                            })
-                            .size(px(12.))
-                            .text_color(theme::text_dim()),
-                    ),
-            );
-
-        if self.keys_open {
-            for (key, action) in KEY_HINTS {
-                section = section.child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .px_3()
-                        .pl_4()
-                        .py_px()
-                        .text_size(px(12.))
-                        .child(div().text_color(theme::text()).child(*key))
-                        .child(div().text_color(theme::text_dim()).child(*action)),
-                );
-            }
-        }
-        section
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.keys_modal = true;
+                cx.notify();
+            }))
+            .child("Keybindings");
+        div().flex().flex_col().gap_px().child(keybindings_row)
     }
 
     /// Alt+Enter: show or hide the info rail.
@@ -5347,6 +5295,16 @@ impl Browser {
                     cx.notify();
                 }
                 _ => {}
+            }
+            return;
+        }
+
+        if self.keys_modal {
+            // the modal takes the rung: escape closes, everything
+            // else is ignored while it is up
+            if keystroke.key == "escape" {
+                self.keys_modal = false;
+                cx.notify();
             }
             return;
         }
@@ -6931,6 +6889,101 @@ impl Browser {
         }
     }
 
+    /// The keybindings modal: the audited cheat sheet in two columns.
+    /// Escape (route_key) or a click outside the card closes it.
+    fn keys_overlay(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.keys_modal {
+            return None;
+        }
+        let (left, right) = key_columns();
+        let column = |tag: &str, rows: &'static [(&'static str, &'static str)]| {
+            div().flex_1().flex().flex_col().gap_0p5().children(
+                rows.iter().enumerate().map(|(ix, (key, action))| {
+                    div()
+                        .id(format!("keys-{tag}-{ix}"))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .py_px()
+                        .text_size(px(12.))
+                        .child(div().flex_none().text_color(theme::text()).child(*key))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_right()
+                                .text_color(theme::text_dim())
+                                .child(*action),
+                        )
+                }),
+            )
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000066))
+                // a click outside the card closes it
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.keys_modal = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .w(px(640.))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .rounded_md()
+                        .bg(theme::sidebar())
+                        .border_1()
+                        .border_color(theme::border())
+                        // clicks inside the card must not fall through
+                        // to the catcher above
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::text())
+                                        .child("Keybindings"),
+                                )
+                                .child(
+                                    div()
+                                        .id("keys-close")
+                                        .px_2()
+                                        .cursor_pointer()
+                                        .text_size(px(13.))
+                                        .text_color(theme::text_dim())
+                                        .hover(|this| this.text_color(theme::text()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.keys_modal = false;
+                                            cx.notify();
+                                        }))
+                                        .child("×"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_5()
+                                .child(column("l", left))
+                                .child(column("r", right)),
+                        ),
+                ),
+        )
+    }
+
     /// The right-click menu: a backdrop that eats the next click (and
     /// closes) plus the panel itself, siblings so the backdrop never
     /// swallows an item's click through parent-first bubbling.
@@ -8412,9 +8465,11 @@ impl Render for Browser {
 
         // the sidebar groups into sections: Home with Recent and
         // Trash at the top, then Places (XDG dirs and bookmarks),
-        // Network (network mounts and stale network bookmarks), and
-        // Removable (USB drives and local devices). A header renders
-        // only when its section is non-empty.
+        // Network (network mounts, stale network bookmarks, and the
+        // always-present Connect to Server row), and Removable (USB
+        // drives and local devices). A header renders only when its
+        // section is non-empty, except Network: it always shows.
+        // Section rows sit slightly indented under their header.
         let mut top_items: Vec<AnyElement> = Vec::new();
         let mut place_items: Vec<AnyElement> = Vec::new();
         let mut network_items: Vec<AnyElement> = Vec::new();
@@ -8510,20 +8565,54 @@ impl Render for Browser {
                 .child(label)
                 .into_any_element()
         };
+        let connect_row = div()
+            .id("connect-server")
+            .px_3()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(13.))
+            .text_color(theme::text_dim())
+            .hover(|this| this.bg(theme::row_hover()))
+            .on_click(cx.listener(|this, _, _, cx| this.open_connect_dialog(cx)))
+            .child(
+                svg()
+                    .path("icons/plus.svg")
+                    .size(px(14.))
+                    .flex_none()
+                    .text_color(theme::text_dim()),
+            )
+            .child("Connect Server");
+        // the slight indent under a header: rows belong to their
+        // section, headers do not
+        let indent = |items: Vec<AnyElement>| {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .pl(px(6.))
+                .children(items)
+                .into_any_element()
+        };
         let mut sidebar: Vec<AnyElement> = top_items;
         sidebar.push(recent_row.into_any_element());
         sidebar.push(trash_row.into_any_element());
         if !place_items.is_empty() {
             sidebar.push(section_header("Places"));
-            sidebar.extend(place_items);
+            sidebar.push(indent(place_items));
         }
-        if !network_items.is_empty() {
-            sidebar.push(section_header("Network"));
-            sidebar.extend(network_items);
-        }
+        // the Network section always shows: its tail row is the
+        // affordance that gives it something to list, and mounts
+        // collect above it
+        sidebar.push(section_header("Network"));
+        network_items.push(connect_row.into_any_element());
+        sidebar.push(indent(network_items));
         if !removable_items.is_empty() {
             sidebar.push(section_header("Removable"));
-            sidebar.extend(removable_items);
+            sidebar.push(indent(removable_items));
         }
 
         let mut tabs: Vec<Stateful<Div>> = Vec::new();
@@ -9244,6 +9333,7 @@ impl Render for Browser {
             .children(self.connect_overlay(cx))
             .children(self.quicklook_overlay(window, cx))
             .children(self.accent_overlay(cx))
+            .children(self.keys_overlay(cx))
             .children(self.menu_overlay(window, cx))
     }
 }
@@ -10610,30 +10700,45 @@ fn parse_markdown(text: &str) -> Vec<MdBlock> {
 }
 
 /// The sidebar cheatsheet's lines: key, what it does.
+/// The cheat sheet, kept in step with route_key: every row was
+/// checked against the dispatcher (the window-level on_key_down owns
+/// Shift+F10 and Ctrl+Q, the match below owns the rest).
 const KEY_HINTS: &[(&str, &str)] = &[
+    ("Arrows", "move the cursor"),
+    ("Home / End", "first / last entry"),
     ("Enter", "open"),
+    ("Alt+Enter", "info rail"),
+    ("Space", "quick look"),
+    ("Backspace", "up folder; pops the filter first"),
+    ("Escape", "clear filter, else selection"),
     ("F2", "rename"),
     ("Del", "trash"),
     ("Shift+Del", "delete"),
-    ("Alt+Enter", "info"),
-    ("Space", "quick look"),
-    ("Right-click", "menu"),
-    ("Shift+F10", "menu (keyboard)"),
-    ("Ctrl+C/X/V/Z", "clipboard"),
-    ("Ctrl+Shift+C", "copy path"),
-    ("Ctrl+Left/Right", "back/fwd"),
-    ("Ctrl+Up", "up folder"),
-    ("Ctrl+L/F6", "edit path"),
-    ("Ctrl+Tab", "switch tab"),
+    ("Ctrl+A", "select all"),
+    ("Ctrl+C X V Z", "copy, cut, paste, undo"),
+    ("Ctrl+Shift+C", "copy path(s)"),
+    ("Ctrl+Left/Right", "back / forward (Alt too)"),
+    ("Ctrl+Up", "up folder (Alt too)"),
     ("Alt+Home", "home"),
+    ("Ctrl+L / F6", "edit path"),
+    ("Ctrl+Tab", "next tab (Shift: previous)"),
+    ("Ctrl+T / W", "new / close tab"),
+    ("Ctrl+Shift+N", "new folder"),
+    ("Ctrl+Alt+N", "new file"),
     ("F5", "refresh"),
-    ("Ctrl+H", "hidden"),
-    ("Ctrl+1/2", "views"),
-    ("Ctrl+=/-/0", "zoom"),
-    ("Ctrl+T/W", "tabs"),
+    ("Ctrl+H", "hidden files"),
+    ("Ctrl+1 / 2", "list / icons view"),
+    ("Ctrl+= - 0", "zoom in, out, reset"),
+    ("Right-click / Shift+F10", "context menu"),
     ("Ctrl+Q", "close window"),
     ("Type", "filter; also searches subfolders"),
 ];
+
+/// The modal's two columns: the hint list split down the middle.
+fn key_columns() -> (&'static [(&'static str, &'static str)], &'static [(&'static str, &'static str)]) {
+    let half = KEY_HINTS.len().div_ceil(2);
+    (&KEY_HINTS[..half], &KEY_HINTS[half..])
+}
 
 fn sort_entries(entries: &mut [Entry], key: SortKey, asc: bool) {
     entries.sort_by(|a, b| {
@@ -10967,6 +11072,19 @@ mod tests {
         let lines = csv_lines(&["a".repeat(30), "short".to_string()]);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with(&"a".repeat(23)) && lines[0].contains('…'));
+    }
+
+    #[test]
+    fn key_columns_cover_every_hint() {
+        let (left, right) = key_columns();
+        assert!(!left.is_empty() && !right.is_empty());
+        assert_eq!(left.len() + right.len(), KEY_HINTS.len());
+        // no row leaks between columns
+        assert!(left.iter().all(|row| !right.contains(row)));
+        // every row is populated
+        assert!(KEY_HINTS
+            .iter()
+            .all(|(key, action)| !key.is_empty() && !action.is_empty()));
     }
 
     #[test]
