@@ -25,8 +25,20 @@ libc = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 roxmltree = "0.20"
 # video: in-process libav decode (kumaOS ships ffmpeg-libs, no CLI;
-# headers are the free build's, same sonames as the runtime libs)
-ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
+# headers are the free build's, same sonames as the runtime libs).
+# The sys crate, not ffmpeg-next: the safe wrapper's 9.0.0 release
+# calls avcodec_close, removed in FFmpeg 8, behind an undeclared
+# feature, so it cannot link against the 8.1 libs the image ships.
+# Optional by the portability rule: libav is a capability, not a
+# requirement; a system without a matching libav builds with
+# --no-default-features and video degrades to the type icon
+ffmpeg-sys-next = { version = "9", optional = true, default-features = false, features = ["avcodec", "avformat", "swscale"] }
+
+[features]
+# video: in-process libav decode, default on. Off, the app builds
+# and runs anywhere; videos show the type icon and the plain card
+default = ["video"]
+video = ["dep:ffmpeg-sys-next"]
 
 [dev-dependencies]
 # only test builds pull this in; the release binary stays lean

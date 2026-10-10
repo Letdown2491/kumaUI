@@ -89,7 +89,7 @@ fn thumb_job(path: &Path, cache_path: &Path) -> Option<gpui::RenderImage> {
                 .and_then(|bytes| icons::decode_cover_dynamic(&bytes))
         })
     } else if icons::is_video(&name) {
-        crate::video::poster_dynamic(path, 256)
+        crate::video::poster_dynamic(path, 256).ok()
     } else {
         icons::decode_thumbnail_dynamic(path)
     }?;
@@ -163,6 +163,15 @@ fn sweep_thumb_cache(root: &Path) {
             let _ = fs::remove_file(entry.path());
         }
     }
+}
+
+/// The details pane's video poster slot: the fitted frame, or the
+/// named codec-missing state (the portability rule: a missing codec
+/// is honest degradation, not a generic failure).
+#[derive(Clone)]
+enum VideoPoster {
+    Frame(Arc<gpui::RenderImage>),
+    CodecMissing,
 }
 
 /// Undo memory bound: individual file operations, not steps, so a
@@ -1403,9 +1412,10 @@ pub(crate) struct Browser {
     /// The decode in flight, if any.
     ql_inflight: Option<(PathBuf, usize)>,
     /// The path whose opening decode landed empty (corrupt file,
-    /// missing pdftocairo): stands in as the card so sync does not
+    /// missing pdftocairo), or whose codec this system's libav has
+    /// no decoder for: stands in as the card so sync does not
     /// re-spawn the decode every frame.
-    ql_failed: Option<PathBuf>,
+    ql_failed: Option<(PathBuf, crate::video::PosterFail)>,
     /// pdfinfo has been asked for the current PDF's page count (one
     /// ask per open path; reset on file flips).
     ql_counting: bool,
@@ -1419,10 +1429,10 @@ pub(crate) struct Browser {
     /// duration (one ask per open path; reset on file flips). A
     /// header that will not read just leaves the label out.
     video_meta_asked: bool,
-    /// The selected video's poster for the details pane, keyed by
-    /// entry key like the text snippet. Grid and search previews
+    /// The selected video's poster slot for the details pane, keyed
+    /// by entry key like the text snippet. Grid and search previews
     /// keep type icons; Quick Look has its own pane-scale poster.
-    sel_video: Option<(PathBuf, Arc<gpui::RenderImage>)>,
+    sel_video: Option<(PathBuf, VideoPoster)>,
     /// The selected video's duration label, same keying.
     sel_video_len: Option<(PathBuf, String)>,
     /// The armed settle kick (key, path): the decode spawns only
@@ -4551,7 +4561,10 @@ impl Browser {
     /// failed slot so sync does not re-spawn every frame.
     fn request_quicklook_render(&mut self, path: PathBuf, page: usize, cx: &mut Context<Self>) {
         let nothing_held_failed = self.ql_render.as_ref().is_none_or(|(p, _, _)| *p != path)
-            && self.ql_failed.as_ref() == Some(&path);
+            && self
+                .ql_failed
+                .as_ref()
+                .is_some_and(|(p, _)| *p == path);
         // an epub whose meta already landed is read: a retry would
         // not find a cover that was not there
         let already_read = self.ql_book.is_some()
@@ -4567,7 +4580,7 @@ impl Browser {
             return;
         }
         let Ok(meta) = fs::symlink_metadata(&path) else {
-            self.ql_failed = Some(path);
+            self.ql_failed = Some((path, crate::video::PosterFail::Empty));
             return;
         };
         let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -4578,7 +4591,7 @@ impl Browser {
         // bytes) and videos stream through libav's seek, so the
         // file-size cap does not apply to them
         if !is_epub && !is_video && meta.len() > 32 * 1024 * 1024 {
-            self.ql_failed = Some(path);
+            self.ql_failed = Some((path, crate::video::PosterFail::Empty));
             return;
         }
         self.ql_inflight = Some((path.clone(), page));
@@ -4587,12 +4600,13 @@ impl Browser {
         let is_pdf = icons::is_pdf(&name);
         cx.spawn(async move |this, cx| {
             let bg_path = path.clone();
-            let (render, book) = cx
+            let (render, book, video_fail) = cx
                 .background_spawn(async move {
                     std::panic::catch_unwind(|| {
                         if is_pdf {
                             (
                                 icons::decode_pdf_thumbnail(&bg_path, page, QL_DECODE_MAX),
+                                None,
                                 None,
                             )
                         } else if is_epub {
@@ -4602,22 +4616,24 @@ impl Browser {
                                         .as_deref()
                                         .and_then(|bytes| icons::decode_cover(bytes, QL_DECODE_MAX)),
                                     Some(meta),
+                                    None,
                                 ),
-                                None => (None, None),
+                                None => (None, None, None),
                             }
                         } else if is_video {
-                            (
-                                crate::video::decode_poster(&bg_path, QL_DECODE_MAX),
-                                None,
-                            )
+                            match crate::video::decode_poster(&bg_path, QL_DECODE_MAX) {
+                                Ok(render) => (Some(render), None, None),
+                                Err(fail) => (None, None, Some(fail)),
+                            }
                         } else {
                             (
                                 icons::decode_thumbnail(&bg_path, QL_DECODE_MAX, QL_DECODE_MAX),
                                 None,
+                                None,
                             )
                         }
                     })
-                    .unwrap_or((None, None))
+                    .unwrap_or((None, None, None))
                 })
                 .await;
             let update = this.update(cx, |this, cx| {
@@ -4654,9 +4670,11 @@ impl Browser {
                         }
                         // nothing held (the opening decode failed):
                         // the card stands in and the failed slot
-                        // stops the respawn loop
+                        // stops the respawn loop; a missing codec is
+                        // the named failure, the card says so
                         _ => {
-                            this.ql_failed = Some(path);
+                            let fail = video_fail.unwrap_or(crate::video::PosterFail::Empty);
+                            this.ql_failed = Some((path, fail));
                             cx.notify();
                         }
                     }
@@ -6518,7 +6536,9 @@ impl Browser {
                 // not a video under the cursor: nothing may paint
                 // from a stale slot, and a resting timer must learn
                 // it lost the race
-                if let Some((_, image)) = self.sel_video.take() {
+                if let Some((_, poster)) = self.sel_video.take()
+                    && let VideoPoster::Frame(image) = poster
+                {
                     cx.drop_image(image, None);
                 }
                 self.sel_video_len = None;
@@ -6555,7 +6575,7 @@ impl Browser {
             let poster = cx
                 .background_spawn(async move {
                     std::panic::catch_unwind(|| crate::video::decode_poster(&bg_path, 256))
-                        .unwrap_or(None)
+                        .unwrap_or(Err(crate::video::PosterFail::Empty))
                 })
                 .await;
             let bg_path = path.clone();
@@ -6570,11 +6590,22 @@ impl Browser {
                 if this.sel_video_gen != generation {
                     return; // the selection moved on; both lands are stale
                 }
-                if let Some(render) = poster {
-                    if let Some((_, old)) = this.sel_video.replace((key.clone(), Arc::new(render)))
-                    {
-                        cx.drop_image(old, None);
+                match poster {
+                    Ok(render) => {
+                        this.replace_sel_video(
+                            key.clone(),
+                            VideoPoster::Frame(Arc::new(render)),
+                            cx,
+                        );
                     }
+                    // the named state: libav parsed the container but
+                    // has no decoder for the codec
+                    Err(crate::video::PosterFail::CodecMissing) => {
+                        this.replace_sel_video(key.clone(), VideoPoster::CodecMissing, cx);
+                    }
+                    // fail-soft: the icon stands in, the kick stays
+                    // spent so the misses do not respawn
+                    Err(crate::video::PosterFail::Empty) => {}
                 }
                 if let Some(len) = len {
                     this.sel_video_len = Some((key.clone(), len));
@@ -6595,6 +6626,17 @@ impl Browser {
             .as_ref()
             .filter(|(k, _)| *k == entry.key)
             .map(|(_, len)| len.clone())
+    }
+
+    /// Swap the details pane's poster slot, releasing the old
+    /// frame's atlas tile when the slot held one (ADR-0016: the img
+    /// element never drops the tile it paints).
+    fn replace_sel_video(&mut self, key: PathBuf, poster: VideoPoster, cx: &mut Context<Self>) {
+        if let Some((_, old)) = self.sel_video.replace((key, poster))
+            && let VideoPoster::Frame(old) = old
+        {
+            cx.drop_image(old, None);
+        }
     }
 
     /// The info panel: preview plus metadata, following the cursor
@@ -6671,16 +6713,42 @@ impl Browser {
                 ),
             }
             .into_any_element()
-        } else if let Some(render) = entry.and_then(|e| {
+        } else if let Some(poster) = entry.and_then(|e| {
             self.sel_video
                 .as_ref()
                 .filter(|(k, _)| *k == e.key)
-                .map(|(_, r)| r.clone())
+                .map(|(_, p)| p.clone())
         }) {
-            img(ImageSource::Render(render))
-                .size_full()
-                .object_fit(ObjectFit::Contain)
-                .into_any_element()
+            match poster {
+                VideoPoster::Frame(render) => img(ImageSource::Render(render))
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element(),
+                // the named state: libav parsed the container but
+                // this system's libav has no decoder for the codec
+                // (Fedora's stripped libavcodec-free, say). Honest
+                // degradation, never a generic failure
+                VideoPoster::CodecMissing => div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        entry
+                            .map(|e| self.entry_icon(e, px(56.)))
+                            .unwrap_or_else(|| div().into_any_element()),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "codec-missing".into())
+                            .max_w(px(180.))
+                            .text_size(px(11.))
+                            .text_color(theme::text_dim())
+                            .child("codec unavailable in this system's libav"),
+                    )
+                    .into_any_element(),
+            }
         } else if let Some(entry) = entry {
             self.entry_icon(entry, px(56.))
         } else {
@@ -7413,6 +7481,24 @@ impl Browser {
                         .text_size(px(12.))
                         .text_color(theme::text_dim())
                         .child(kind),
+                )
+                // the named state: the container parses but this
+                // system's libav has no decoder for the codec (a
+                // stripped libavcodec-free, say). Honest, specific
+                .children(
+                    self.ql_failed
+                        .as_ref()
+                        .is_some_and(|(p, fail)| {
+                            *p == entry.path && *fail == crate::video::PosterFail::CodecMissing
+                        })
+                        .then(|| {
+                            div()
+                                .debug_selector(|| "ql-codec-missing".into())
+                                .max_w(px(320.))
+                                .text_size(px(12.))
+                                .text_color(theme::text_dim())
+                                .child("codec unavailable in this system's libav")
+                        }),
                 )
                 .child(
                     div()
@@ -12000,12 +12086,87 @@ mod browser_ux_keys {
         app.run_until_parked(); // the failed decode lands
         window.update(|browser, _, _| {
             assert_eq!(
-                browser.ql_failed.as_deref(),
+                browser
+                    .ql_failed
+                    .as_ref()
+                    .map(|(p, _)| p.as_path()),
                 Some(lab.dir.join("clip.mp4").as_path())
             );
             // one ask, no label: nothing respawns per frame
             assert!(browser.video_meta_asked);
             assert!(browser.ql_video_len.is_none());
+        });
+    }
+
+    #[test]
+    fn details_video_codec_missing_is_named() {
+        let lab = Lab::new("video-codec-missing");
+        // whether libav lacks a codec's decoder is a runtime fact
+        // of the system (the free build ships the common decoders,
+        // so no file in this container can trigger it end to end):
+        // inject the named state and assert the pane says so
+        fs::write(lab.dir.join("clip.mp4"), b"not a video").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, window, cx| {
+            // dirs first: sub, a.txt, b.txt, c.txt, clip.mp4
+            browser.jump_cursor(4, cx);
+            browser.sel_video = Some((lab.dir.join("clip.mp4"), VideoPoster::CodecMissing));
+            cx.notify();
+            window.refresh();
+        });
+        window.update(|browser, window, _| {
+            let bounds = window
+                .debug_element_bounds("codec-missing")
+                .expect("the codec-missing caption never painted");
+            assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
+            // the slot survives the pane's sync: the matching key
+            // is not cleared, not overwritten by the fail-soft
+            assert!(matches!(
+                browser.sel_video.as_ref().map(|(_, poster)| poster),
+                Some(VideoPoster::CodecMissing)
+            ));
+        });
+    }
+
+    #[test]
+    fn quick_look_video_codec_missing_says_so() {
+        let lab = Lab::new("quicklook-codec-missing");
+        fs::write(lab.dir.join("clip.mp4"), b"not a video").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // dirs first: sub, a.txt, b.txt, c.txt, clip.mp4
+            browser.jump_cursor(4, cx);
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_some());
+        });
+        app.run_until_parked(); // the junk mp4's decode fails fast
+        window.update(|browser, window, cx| {
+            // the generic card landed; now the named state (a
+            // runtime fact of the system's libav, injected here)
+            browser.ql_failed = Some((
+                lab.dir.join("clip.mp4"),
+                crate::video::PosterFail::CodecMissing,
+            ));
+            cx.notify();
+            window.refresh();
+        });
+        window.update(|browser, window, _| {
+            let bounds = window
+                .debug_element_bounds("ql-codec-missing")
+                .expect("the codec-missing line never painted");
+            assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
+            // the failed slot stops the respawn loop: the card
+            // stands in, nothing re-decodes
+            assert!(browser.ql_render.is_none());
+            assert!(browser.quicklook.is_some());
         });
     }
 
@@ -12025,7 +12186,10 @@ mod browser_ux_keys {
         });
         app.run_until_parked(); // the failed decode lands
         window.update(|browser, _, _| {
-            assert_eq!(browser.ql_failed.as_ref(), Some(&lab.dir.join("zz.epub")));
+            assert_eq!(
+                browser.ql_failed.as_ref().map(|(p, _)| p.as_path()),
+                Some(lab.dir.join("zz.epub").as_path())
+            );
             assert!(browser.ql_render.is_none());
             // still open, showing the card
             assert!(browser.quicklook.is_some());
@@ -12162,6 +12326,14 @@ mod browser_ux_keys {
         );
         let mut window = open_browser(&mut app, &lab.dir);
         window.update(|browser, _, cx| {
+            // the first draw's paint kicks may have queued, started,
+            // or even landed some of these against the default cache
+            // root: clear every slot so this update's own requests
+            // are the whole experiment
+            browser.thumbs.clear();
+            browser.thumbs_inflight.clear();
+            browser.thumbs_queue.clear();
+            browser.thumb_wanted.clear();
             for path in &paths {
                 browser.request_thumb(path.clone(), cx);
             }
@@ -12218,6 +12390,14 @@ mod browser_ux_keys {
         let mut window = open_browser(&mut app, &lab.dir);
         window.update(|browser, _, cx| {
             browser.thumb_cache = cache.clone();
+            // a first-draw paint kick may have started a job against
+            // the default cache root before this update ran: clear
+            // the slots so this request is the one that runs, and it
+            // runs against the test's own cache root
+            browser.thumbs.clear();
+            browser.thumbs_inflight.clear();
+            browser.thumbs_queue.clear();
+            browser.thumb_wanted.clear();
             browser.request_thumb(path.clone(), cx);
         });
         app.run_until_parked();
@@ -12248,6 +12428,13 @@ mod browser_ux_keys {
         let mut window2 = open_browser(&mut app, &lab.dir);
         window2.update(|browser, _, cx| {
             browser.thumb_cache = cache.clone();
+            // same clean slate as the first phase: the first draw's
+            // paint kick must not run this test's job against the
+            // default cache root (or the poisoned source)
+            browser.thumbs.clear();
+            browser.thumbs_inflight.clear();
+            browser.thumbs_queue.clear();
+            browser.thumb_wanted.clear();
             browser.request_thumb(path.clone(), cx);
         });
         app.run_until_parked();
@@ -12260,6 +12447,7 @@ mod browser_ux_keys {
     }
 
     #[test]
+    #[cfg(feature = "video")]
     fn video_posters_decode_through_the_grid_pipeline() {
         let lab = Lab::new("thumb-video");
         // the committed fixture decodes in-process: no CLI, no GPU
