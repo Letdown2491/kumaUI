@@ -50,7 +50,10 @@ if [ "${1:-}" = "build" ]; then
     mv -f ~/.local/bin/kuma-files.new ~/.local/bin/kuma-files
     mkdir -p ~/.local/share/applications \
       ~/.local/share/icons/hicolor/256x256/apps
-    sed "s|@HOME@|$HOME|" kuma-files/packaging/kuma-files.desktop.in \
+    # one template, two substitutions: @BIN@ is $HOME/.local/bin here,
+    # /usr/bin in the image (kumaOS's kuma-shell action substitutes
+    # that side)
+    sed "s|@BIN@|$HOME/.local/bin|" kuma-files/packaging/kuma-files.desktop.in \
       > ~/.local/share/applications/kuma-files.desktop
     # png, not svg: the shell tints svg icons with the theme text
     # color, which eats the bear; raster icons decode true-color
