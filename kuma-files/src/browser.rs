@@ -182,11 +182,11 @@ const UNDO_MAX_OPS: usize = 1000;
 /// scale (the listing's 256px thumbs are too small for a pane). Zoom
 /// past the decoded pixels goes soft; re-decode-on-zoom is out of
 /// scope (see #34).
-const QL_DECODE_MAX: u32 = 2048;
+pub(crate) const QL_DECODE_MAX: u32 = 2048;
 
 /// Quick Look's zoom bounds around the fit: 1.0 is fit, 6x is as deep
 /// as a glance needs.
-const QL_ZOOM_MAX: f32 = 6.0;
+pub(crate) const QL_ZOOM_MAX: f32 = 6.0;
 
 /// The whole-file read for the text reading pane caps here; past it
 /// the file shows its head and a tail marker says so honestly.
@@ -198,7 +198,7 @@ const TEXT_LINE_MAX: usize = 4096;
 
 /// Contain-scale for the Quick Look pane: the image fills the smaller
 /// ratio, never crops. Degenerate sizes read as "already fit".
-fn ql_fit_scale(natural: (f32, f32), avail: (f32, f32)) -> f32 {
+pub(crate) fn ql_fit_scale(natural: (f32, f32), avail: (f32, f32)) -> f32 {
     if natural.0 <= 0.0 || natural.1 <= 0.0 || avail.0 <= 0.0 || avail.1 <= 0.0 {
         return 1.0;
     }
@@ -207,7 +207,7 @@ fn ql_fit_scale(natural: (f32, f32), avail: (f32, f32)) -> f32 {
 
 /// Pan clamps so a zoomed image still covers the pane: at most half
 /// the overflow to each side, none when fit.
-fn ql_clamp_pan(pan: (f32, f32), display: (f32, f32), avail: (f32, f32)) -> (f32, f32) {
+pub(crate) fn ql_clamp_pan(pan: (f32, f32), display: (f32, f32), avail: (f32, f32)) -> (f32, f32) {
     let max_x = ((display.0 - avail.0) / 2.0).max(0.0);
     let max_y = ((display.1 - avail.1) / 2.0).max(0.0);
     (pan.0.clamp(-max_x, max_x), pan.1.clamp(-max_y, max_y))
@@ -2296,20 +2296,7 @@ impl Browser {
 
     /// Record an opened file in the xbel store, newest first, capped.
     fn note_recent(&mut self, path: &Path) {
-        let Some(store) = recent_xbel_path() else {
-            return;
-        };
-        let entries = Self::read_recents();
-        let entries = merge_recent(entries, path.to_path_buf(), now_secs(), 1000);
-        if let Some(parent) = store.parent()
-            && let Err(err) = fs::create_dir_all(parent)
-        {
-            log::error!("recent dir: {err}");
-            return;
-        }
-        if let Err(err) = fs::write(&store, xbel_text(&entries)) {
-            log::error!("recent write: {err}");
-        }
+        write_recent(path);
         // viewing the Recent list should reflect the open right away
         if self.tab().source == Source::Recent {
             let show_hidden = self.show_hidden;
@@ -5685,6 +5672,13 @@ impl Browser {
         }
         if entry.is_dir {
             self.load_source(Source::Dir(entry.path.clone()), cx);
+        } else if crate::viewer::is_openable(&entry.name) {
+            // the open surface: kuma-files claims these kinds as the
+            // system default, so Enter opens in-process instead of
+            // round-tripping xdg-open back to ourselves. The recency
+            // note is the viewer's job on this road.
+            crate::viewer::open_or_focus(entry.path.clone(), cx);
+            self.status = format!("opened {}", entry.name);
         } else {
             match Command::new("xdg-open").arg(&entry.path).spawn() {
                 Ok(mut child) => {
@@ -10172,9 +10166,29 @@ fn chapter_runs_view(
     StyledText::new(text.to_string()).with_runs(runs)
 }
 
+/// The freedesktop recency write: every open road notes here, the
+/// manager's Enter and the viewer's launches alike, so the Recent
+/// list and other apps' stores stay one truth.
+pub(crate) fn write_recent(path: &Path) {
+    let Some(store) = recent_xbel_path() else {
+        return;
+    };
+    let entries = Browser::read_recents();
+    let entries = merge_recent(entries, path.to_path_buf(), now_secs(), 1000);
+    if let Some(parent) = store.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        log::error!("recent dir: {err}");
+        return;
+    }
+    if let Err(err) = fs::write(&store, xbel_text(&entries)) {
+        log::error!("recent write: {err}");
+    }
+}
+
 /// Page count out of pdfinfo's stdout: the "Pages:" line. None when
 /// the tool said nothing usable (or said zero).
-fn parse_pdf_pages(info: &str) -> Option<usize> {
+pub(crate) fn parse_pdf_pages(info: &str) -> Option<usize> {
     info.lines()
         .find_map(|line| line.strip_prefix("Pages:"))
         .and_then(|rest| rest.trim().parse::<usize>().ok())
@@ -10667,7 +10681,7 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn human_size(size: u64) -> String {
+pub(crate) fn human_size(size: u64) -> String {
     const KIB: f64 = 1024.0;
     let bytes = size as f64;
     if bytes < KIB {
@@ -12370,6 +12384,129 @@ mod browser_ux_keys {
                 assert!(paths.contains(path));
             }
         });
+    }
+
+    #[test]
+    fn enter_on_a_claimed_type_opens_the_viewer() {
+        let lab = Lab::new("enter-viewer");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        fs::write(lab.dir.join("a.png"), &png).unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            let ix = browser
+                .tab()
+                .entries
+                .iter()
+                .position(|e| e.name == "a.png")
+                .expect("a.png in the listing");
+            browser.jump_cursor(ix, cx);
+            browser.route_key(&key("enter"), cx);
+            assert_eq!(browser.status, "opened a.png");
+        });
+        app.run_until_parked();
+        // the viewer window owns the file; the grid never shelled
+        // out to xdg-open on this road. The pane is probed through
+        // the viewer's own window, after a refresh so a frame drew.
+        app.update(|cx| {
+            let handle = cx
+                .try_global::<crate::viewer::Hosts>()
+                .expect("viewer host global")
+                .viewer
+                .as_ref()
+                .expect("no viewer window")
+                .clone();
+            let shown = handle
+                .update(cx, |_, window, _| {
+                    window.refresh();
+                    window.debug_element_bounds("viewer-pane").is_some()
+                })
+                .unwrap();
+            assert!(shown, "the viewer pane never painted");
+        });
+        app.update(|cx| {
+            let handle = cx
+                .try_global::<crate::viewer::Hosts>()
+                .expect("viewer host global")
+                .viewer
+                .as_ref()
+                .expect("no viewer window")
+                .clone();
+            handle
+                .update(cx, |viewer, _, _| {
+                    assert_eq!(viewer.path, lab.dir.join("a.png"));
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn enter_on_an_unclaimed_type_still_hands_off() {
+        let lab = Lab::new("enter-unclaimed");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // dirs first: sub, a.txt, b.txt, c.txt; a.txt is no kind
+            // the open surface claims
+            browser.jump_cursor(1, cx);
+            browser.route_key(&key("enter"), cx);
+            // the handoff road ran (its status wording depends on
+            // the env's xdg-open); the viewer stayed shut
+            assert_ne!(browser.status, "opened a.txt");
+        });
+        app.update(|cx| {
+            let hosts = cx.try_global::<crate::viewer::Hosts>();
+            assert!(hosts.map_or(true, |hosts| hosts.viewer.is_none()));
+        });
+    }
+
+    #[test]
+    fn desktop_file_claims_what_the_surface_renders() {
+        let text = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/kuma-files.desktop.in"),
+        )
+        .unwrap();
+        let exec = text
+            .lines()
+            .find(|line| line.starts_with("Exec="))
+            .expect("Exec line");
+        // glib passes the file only through a field code: without
+        // one the mimetype claims are inert
+        assert!(exec.ends_with(" %u"), "Exec lacks a %u field code: {exec}");
+        let mime_line = text
+            .lines()
+            .find(|line| line.starts_with("MimeType="))
+            .expect("MimeType line");
+        let claimed: Vec<&str> = mime_line
+            .strip_prefix("MimeType=")
+            .unwrap()
+            .split(';')
+            .filter(|t| !t.is_empty())
+            .collect();
+        for mime in [
+            "inode/directory",
+            "x-scheme-handler/file",
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            "image/tiff",
+            "application/pdf",
+        ] {
+            assert!(claimed.contains(&mime), "{mime} not claimed");
+        }
+        // the claim follows the surface: no decoder for these yet
+        assert!(!claimed.contains(&"image/avif"));
+        assert!(!claimed.contains(&"image/svg+xml"));
     }
 
     #[test]

@@ -10,8 +10,10 @@ mod icons;
 mod video;
 mod input;
 mod theme;
+mod viewer;
 
 use browser::Browser;
+use viewer::Hosts;
 
 /// The activation socket in the session runtime dir: the first
 /// instance listens here, later ones hand over their dir and exit.
@@ -22,7 +24,9 @@ fn socket_path() -> PathBuf {
     }
 }
 
-/// A dir request that arrived over the activation socket.
+/// A path that arrived over the activation socket: a file opens in
+/// the viewer, a dir lists in the manager, none (a bare poke) just
+/// brings the manager forward.
 struct Activation {
     dir: Option<PathBuf>,
 }
@@ -76,62 +80,74 @@ fn main() {
         std::process::exit(1);
     }
 
-    // an explicit CLI dir wins over the saved session; nothing passed
-    // means "reopen where I was last time" (falls back to home)
-    let dir = std::env::args().nth(1).map(PathBuf::from);
+    // an explicit CLI arg: a dir lists it, a file opens it in the
+    // viewer. Nothing passed means "reopen where I was last time"
+    // (falls back to home)
+    let mut dir = std::env::args().nth(1).map(PathBuf::from);
+    let file = dir.take_if(|path| path.is_file());
 
-    // second launch while one is already up: hand the dir over and
-    // exit before any GPU work happens
-    let listener = become_single_instance(dir.clone());
+    // second launch while one is already up: hand the request over
+    // and exit before any GPU work happens
+    let listener = become_single_instance(dir.clone().or(file.clone()));
 
     application()
         .with_assets(icons::Assets)
         .run(move |cx: &mut App| {
-            let bounds = gpui::Bounds::centered(None, size(px(960.), px(640.)), cx);
-            let handle = match cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    // the Wayland app_id: the dock matches it against
-                    // the desktop-file stem for icon and grouping
-                    app_id: Some("kuma-files".into()),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(SharedString::from("Koguma")),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    log::info!(
-                        "koguma window open, {}",
-                        dir.as_ref().map_or_else(
-                            || "restoring saved session".to_string(),
-                            |d| format!("listing {}", d.display()),
-                        )
-                    );
-                    cx.new(|cx| Browser::new(dir.clone(), window, cx))
-                },
-            ) {
-                Ok(handle) => handle,
-                Err(err) => {
-                    log::error!("open_window failed: {err:#}");
-                    return;
+            cx.set_global(Hosts::default());
+            match file.clone() {
+                // the standalone open surface: no manager behind it
+                Some(path) => {
+                    log::info!("koguma viewer open, {}", path.display());
+                    viewer::open_or_focus(path, cx);
                 }
-            };
+                None => {
+                    let bounds = gpui::Bounds::centered(None, size(px(960.), px(640.)), cx);
+                    let handle = match cx.open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(bounds)),
+                            // the Wayland app_id: the dock matches it against
+                            // the desktop-file stem for icon and grouping
+                            app_id: Some("kuma-files".into()),
+                            titlebar: Some(TitlebarOptions {
+                                title: Some(SharedString::from("Koguma")),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                        |window, cx| {
+                            log::info!(
+                                "koguma window open, {}",
+                                dir.as_ref().map_or_else(
+                                    || "restoring saved session".to_string(),
+                                    |d| format!("listing {}", d.display()),
+                                )
+                            );
+                            cx.new(|cx| Browser::new(dir.clone(), window, cx))
+                        },
+                    ) {
+                        Ok(handle) => handle,
+                        Err(err) => {
+                            log::error!("open_window failed: {err:#}");
+                            return;
+                        }
+                    };
+                    cx.global_mut::<Hosts>().browser = Some(handle);
+                }
+            }
             cx.activate(true);
 
             if let Some(listener) = listener {
-                pump_activations(listener, handle, cx);
+                pump_activations(listener, cx);
             }
         });
 }
 
 /// Accept loop on a plain thread (blocking is fine there), forwarded
-/// through an async channel so the UI only wakes per activation.
-fn pump_activations(
-    listener: std::os::unix::net::UnixListener,
-    handle: gpui::WindowHandle<Browser>,
-    cx: &mut App,
-) {
+/// through an async channel so the UI only wakes per activation. A
+/// file activation opens the viewer, a dir activation opens the
+/// manager (growing it lazily in a viewer-only process), a bare poke
+/// brings the manager forward.
+fn pump_activations(listener: std::os::unix::net::UnixListener, cx: &mut App) {
     let (tx, mut rx) = futures::channel::mpsc::unbounded::<Activation>();
     std::thread::Builder::new()
         .name("kuma-files-activate".into())
@@ -163,17 +179,30 @@ fn pump_activations(
     cx.spawn(async move |cx| {
         use futures::StreamExt;
         while let Some(activation) = rx.next().await {
-            let update = handle.update(cx, |browser, window, cx| {
-                // a dir request opens in a new tab; a bare poke just
-                // brings the window forward
-                if let Some(dir) = activation.dir {
-                    browser.open_dir_in_new_tab(dir, cx);
+            cx.update(|cx| {
+                match activation.dir {
+                    // a file lands in the viewer, replacing whatever
+                    // it showed
+                    Some(path) if path.is_file() => viewer::open_or_focus(path, cx),
+                    // a dir request opens in a new tab of the
+                    // manager (created here if this process is
+                    // viewer-only)
+                    Some(dir) => {
+                        if let Some(handle) = viewer::ensure_browser(cx) {
+                            let _ = handle.update(cx, |browser, window, cx| {
+                                browser.open_dir_in_new_tab(dir, cx);
+                                window.activate_window();
+                            });
+                        }
+                    }
+                    // a bare poke brings the manager forward
+                    None => {
+                        if let Some(handle) = viewer::ensure_browser(cx) {
+                            let _ = handle.update(cx, |_, window, _| window.activate_window());
+                        }
+                    }
                 }
-                window.activate_window();
             });
-            if update.is_err() {
-                return;
-            }
         }
     })
     .detach();
