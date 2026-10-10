@@ -165,9 +165,11 @@ fn sweep_thumb_cache(root: &Path) {
     }
 }
 
-/// The details pane's video poster slot: the fitted frame, or the
-/// named codec-missing state (the portability rule: a missing codec
-/// is honest degradation, not a generic failure).
+/// The details pane's video slot: a bounded preview loop of the
+/// clip's head (the poster stands in where the head could not be
+/// turned into a loop), or the named codec-missing state (the
+/// portability rule: a missing codec is honest degradation, not a
+/// generic failure).
 #[derive(Clone)]
 enum VideoPoster {
     Frame(Arc<gpui::RenderImage>),
@@ -183,6 +185,12 @@ const UNDO_MAX_OPS: usize = 1000;
 /// past the decoded pixels goes soft; re-decode-on-zoom is out of
 /// scope (see #34).
 pub(crate) const QL_DECODE_MAX: u32 = 2048;
+
+/// Quick Look's video loop scale: motion rides the same bounded head
+/// loop as the details pane, at glance scale (a 2048 loop would blow
+/// the byte budget in a handful of frames). The static poster keeps
+/// QL_DECODE_MAX where a loop cannot be built.
+pub(crate) const QL_PREVIEW_MAX: u32 = 720;
 
 /// Quick Look's zoom bounds around the fit: 1.0 is fit, 6x is as deep
 /// as a glance needs.
@@ -4608,7 +4616,7 @@ impl Browser {
                                 None => (None, None, None),
                             }
                         } else if is_video {
-                            match crate::video::decode_poster(&bg_path, QL_DECODE_MAX) {
+                            match crate::video::decode_preview(&bg_path, QL_PREVIEW_MAX) {
                                 Ok(render) => (Some(render), None, None),
                                 Err(fail) => (None, None, Some(fail)),
                             }
@@ -6505,14 +6513,14 @@ impl Browser {
 
     /// The modal overlay for unresolved paste conflicts. `None` (rendered
     /// as no child) when no paste is waiting on a decision.
-    /// Render-time sync for the details pane's video poster: while a
+    /// Render-time sync for the details pane's video slot: while a
     /// video sits selected with the pane open, arm a settle kick on
-    /// the first paint and spawn one poster decode (256, the same fn
-    /// the Quick Look pane uses) plus one header read once the
-    /// selection has rested out the delay. A fast arrow-through a
-    /// video folder therefore spends one or two in-process decodes,
-    /// not one per entry passed. The grid and the search preview
-    /// keep type icons, always.
+    /// the first paint and spawn one preview decode (the bounded
+    /// head loop at 256, poster fallback inside) plus one header
+    /// read once the selection has rested out the delay. A fast
+    /// arrow-through a video folder therefore spends one or two
+    /// in-process decodes, not one per entry passed. The grid and
+    /// the search preview keep type icons, always.
     fn sync_sel_video(&mut self, cx: &mut Context<Self>) {
         if !self.inspector || self.quicklook.is_some() {
             // nothing feeds while the pane is closed or Quick Look
@@ -6568,7 +6576,7 @@ impl Browser {
             let bg_path = path.clone();
             let poster = cx
                 .background_spawn(async move {
-                    std::panic::catch_unwind(|| crate::video::decode_poster(&bg_path, 256))
+                    std::panic::catch_unwind(|| crate::video::decode_preview(&bg_path, 256))
                         .unwrap_or(Err(crate::video::PosterFail::Empty))
                 })
                 .await;
@@ -6607,7 +6615,7 @@ impl Browser {
                 cx.notify();
             });
             if let Err(err) = update {
-                log::error!("details video poster failed: {err:#}");
+                log::error!("details video preview failed: {err:#}");
             }
         })
         .detach();
@@ -6660,10 +6668,53 @@ impl Browser {
             }
         });
 
-        // preview: image thumb, text snippet, or the type icon
-        let preview: AnyElement = if let Some(render) =
-            entry.and_then(|e| self.thumbs.get(&e.path).cloned())
-        {
+        // preview: the video slot (the animated loop, or its
+        // while-decoding static stand-ins), image thumb, text
+        // snippet, or the type icon. The video slot leads because
+        // videos also have grid thumbs: the static poster must only
+        // hold the pane until the loop lands.
+        let preview: AnyElement = if let Some(poster) = entry.and_then(|e| {
+            self.sel_video
+                .as_ref()
+                .filter(|(k, _)| *k == e.key)
+                .map(|(_, p)| p.clone())
+        }) {
+            match poster {
+                VideoPoster::Frame(render) => img(ImageSource::Render(render))
+                    // the element id is what keys the persistent
+                    // element state: without it the img element has
+                    // no frame clock and the loop paints its first
+                    // frame forever
+                    .id("video-preview")
+                    .size_full()
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element(),
+                // the named state: libav parsed the container but
+                // this system's libav has no decoder for the codec
+                // (Fedora's stripped libavcodec-free, say). Honest
+                // degradation, never a generic failure
+                VideoPoster::CodecMissing => div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        entry
+                            .map(|e| self.entry_icon(e, px(56.)))
+                            .unwrap_or_else(|| div().into_any_element()),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "codec-missing".into())
+                            .max_w(px(180.))
+                            .text_size(px(11.))
+                            .text_color(theme::text_dim())
+                            .child("codec unavailable in this system's libav"),
+                    )
+                    .into_any_element(),
+            }
+        } else if let Some(render) = entry.and_then(|e| self.thumbs.get(&e.path).cloned()) {
             img(ImageSource::Render(render))
                 .size_full()
                 .object_fit(ObjectFit::Contain)
@@ -6707,42 +6758,6 @@ impl Browser {
                 ),
             }
             .into_any_element()
-        } else if let Some(poster) = entry.and_then(|e| {
-            self.sel_video
-                .as_ref()
-                .filter(|(k, _)| *k == e.key)
-                .map(|(_, p)| p.clone())
-        }) {
-            match poster {
-                VideoPoster::Frame(render) => img(ImageSource::Render(render))
-                    .size_full()
-                    .object_fit(ObjectFit::Contain)
-                    .into_any_element(),
-                // the named state: libav parsed the container but
-                // this system's libav has no decoder for the codec
-                // (Fedora's stripped libavcodec-free, say). Honest
-                // degradation, never a generic failure
-                VideoPoster::CodecMissing => div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .child(
-                        entry
-                            .map(|e| self.entry_icon(e, px(56.)))
-                            .unwrap_or_else(|| div().into_any_element()),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "codec-missing".into())
-                            .max_w(px(180.))
-                            .text_size(px(11.))
-                            .text_color(theme::text_dim())
-                            .child("codec unavailable in this system's libav"),
-                    )
-                    .into_any_element(),
-            }
         } else if let Some(entry) = entry {
             self.entry_icon(entry, px(56.))
         } else {
@@ -7359,6 +7374,11 @@ impl Browser {
                 .m_3()
                 .child(
                     img(ImageSource::Render(render))
+                        // the element id keys the persistent element
+                        // state: without it the img element has no
+                        // frame clock and a video loop paints its
+                        // first frame forever
+                        .id("ql-image")
                         .w(px(display.0))
                         .h(px(display.1))
                         .ml(px(pan_x))
@@ -12147,6 +12167,74 @@ mod browser_ux_keys {
                 browser.sel_video.as_ref().map(|(_, poster)| poster),
                 Some(VideoPoster::CodecMissing)
             ));
+        });
+    }
+
+    #[test]
+    fn details_video_preview_lands_a_loop() {
+        let lab = Lab::new("video-preview");
+        // the committed fixture decodes in-process: no CLI, no GPU
+        fs::copy("tests/fixtures/sample.mp4", lab.dir.join("clip.mp4")).unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // dirs first: sub, a.txt, b.txt, c.txt, clip.mp4
+            browser.jump_cursor(4, cx);
+        });
+        app.advance_clock(std::time::Duration::from_millis(250)); // the settle kick
+        app.run_until_parked(); // the decode lands
+        window.update(|browser, _, _| {
+            let (_, poster) = browser
+                .sel_video
+                .as_ref()
+                .filter(|(k, _)| *k == lab.dir.join("clip.mp4"))
+                .expect("the preview never landed");
+            match poster {
+                VideoPoster::Frame(render) => {
+                    // the one-second fixture loops whole: more than
+                    // a poster
+                    assert!(render.frame_count() >= 2);
+                }
+                VideoPoster::CodecMissing => panic!("codec-missing on a healthy fixture"),
+            }
+        });
+    }
+
+    #[test]
+    fn details_video_preview_does_not_block_quick_look() {
+        let lab = Lab::new("video-preview-ql");
+        fs::copy("tests/fixtures/sample.mp4", lab.dir.join("clip.mp4")).unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // dirs first: sub, a.txt, b.txt, c.txt, clip.mp4
+            browser.jump_cursor(4, cx);
+        });
+        app.advance_clock(std::time::Duration::from_millis(250)); // the settle kick
+        app.run_until_parked(); // the decode lands
+        window.update(|browser, _, cx| {
+            assert!(browser.quicklook.is_none());
+            browser.route_key(&key("space"), cx);
+            assert!(
+                browser.quicklook.is_some(),
+                "quick look never opened on a video with the preview loop landed"
+            );
+        });
+        app.run_until_parked(); // the QL pane's own decode settles
+        window.update(|browser, _, _| {
+            assert!(browser.quicklook.is_some());
+            // the QL pane plays the same bounded loop, not a poster
+            let (_, _, render) = browser
+                .ql_render
+                .as_ref()
+                .expect("quick look's video loop never landed");
+            assert!(render.frame_count() >= 2);
         });
     }
 
