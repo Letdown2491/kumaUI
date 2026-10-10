@@ -83,6 +83,22 @@ volumes, so builds are incremental.
   The memory probe (`scripts/memory-probe.sh`) uses the same image and the
   same mount.
 
+## Release
+
+Releases are cut from the changelog. Write bullets under `## Unreleased`
+in `CHANGELOG.md`, grouped under `### Added`, `### Changed`, or
+`### Fixed`, then run:
+
+    ./scripts/release.sh
+
+The script infers the bump from the subsections (any Added or Removed:
+minor; only Changed and Fixed: patch), asks which apps move, bumps
+their Cargo.tomls, inserts the release heading and the three version
+lines, refreshes the lock and installs through the build, and commits
+(`--tag` also tags vN). A test in each crate fails when Cargo.toml and
+the changelog's newest version line disagree, so a version bump
+without changelog bullets will not go green.
+
 ## Writing
 
 No em dashes in documentation (README, CONTEXT.md, VENDORED.md, ADRs, and

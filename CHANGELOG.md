@@ -2,9 +2,12 @@
 
 Entries land with the change they describe; the next tag takes this
 section as its release notes. Say what changed and what a reader has to
-do differently. Why it changed belongs in the commit that made it. The
-three lines under a release heading name each binary's version in that
-release: an app whose line did not move rides unchanged.
+do differently. Why it changed belongs in the commit that made it.
+Bullets land under Added, Changed, or Fixed; `scripts/release.sh` reads
+those headings to infer the bump (any Added or Removed: minor; only
+Changed and Fixed: patch). The three lines under a release heading name
+each binary's version in that release: an app whose line did not move
+rides unchanged.
 
 ## Unreleased
 
