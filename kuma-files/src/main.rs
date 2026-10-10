@@ -1,4 +1,6 @@
+use std::ffi::OsStr;
 use std::io::Write as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 
 use gpui::{App, AppContext, WindowBounds, WindowOptions, TitlebarOptions, px, size, SharedString};
@@ -82,8 +84,11 @@ fn main() {
 
     // an explicit CLI arg: a dir lists it, a file opens it in the
     // viewer. Nothing passed means "reopen where I was last time"
-    // (falls back to home)
-    let mut dir = std::env::args().nth(1).map(PathBuf::from);
+    // (falls back to home). %u hands over either a plain path or a
+    // file:// URI, so both convert to a real path here, before the
+    // socket handoff: activation lines carry paths and the pump
+    // never parses URIs.
+    let mut dir = std::env::args().nth(1).map(|arg| arg_to_path(&arg));
     let file = dir.take_if(|path| path.is_file());
 
     // second launch while one is already up: hand the request over
@@ -206,4 +211,117 @@ fn pump_activations(listener: std::os::unix::net::UnixListener, cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// The argv contract: `%u` hands over a plain path or a `file://`
+/// URI (the x-scheme-handler/file claim invites the URI form), so
+/// both convert to a real path here. A file URI with an empty or
+/// localhost host percent-decodes into a path; anything else rides
+/// as-is into the dir branch, where a bad path fails with an honest
+/// status, exactly like a nonexistent directory argument.
+fn arg_to_path(arg: &str) -> PathBuf {
+    let Some(rest) = arg.strip_prefix("file://") else {
+        return PathBuf::from(arg);
+    };
+    // a file URI is host/path: only the local forms name a path
+    let Some((host, path)) = rest.split_once('/') else {
+        return PathBuf::from(arg);
+    };
+    if !host.is_empty() && host != "localhost" {
+        return PathBuf::from(arg);
+    }
+    // split_once consumed the path's own leading slash: put it back
+    let mut decoded = percent_decode(path);
+    decoded.insert(0, b'/');
+    PathBuf::from(OsStr::from_bytes(&decoded))
+}
+
+/// Percent-decode a URI path: `%XX` byte runs become raw bytes, so
+/// escaped UTF-8 and spaces survive. A lone `%` is not an escape and
+/// rides; `+` stays literal, that escape belongs to form encoding.
+fn percent_decode(path: &str) -> Vec<u8> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push(high * 16 + low);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arg_to_path_passes_plain_paths_through() {
+        assert_eq!(arg_to_path("/tmp/a.png"), PathBuf::from("/tmp/a.png"));
+        assert_eq!(arg_to_path("relative/dir"), PathBuf::from("relative/dir"));
+        assert_eq!(arg_to_path(""), PathBuf::from(""));
+    }
+
+    #[test]
+    fn arg_to_path_decodes_local_file_uris() {
+        // the gio form: empty host
+        assert_eq!(
+            arg_to_path("file:///home/m/My%20File.png"),
+            PathBuf::from("/home/m/My File.png")
+        );
+        // the RFC form: localhost
+        assert_eq!(
+            arg_to_path("file://localhost/home/m/x.jpg"),
+            PathBuf::from("/home/m/x.jpg")
+        );
+        // escaped multibyte UTF-8 survives the byte-level decode
+        assert_eq!(
+            arg_to_path("file:///home/m/caf%C3%A9.png"),
+            PathBuf::from("/home/m/café.png")
+        );
+        // a lone % is not an escape: it rides
+        assert_eq!(
+            arg_to_path("file:///tmp/100%.png"),
+            PathBuf::from("/tmp/100%.png")
+        );
+        // a truncated escape rides too
+        assert_eq!(
+            arg_to_path("file:///tmp/x%2.png"),
+            PathBuf::from("/tmp/x%2.png")
+        );
+    }
+
+    #[test]
+    fn arg_to_path_leaves_foreign_hosts_and_schemes_alone() {
+        // not a local file: rides as-is, the dir branch reports it
+        assert_eq!(
+            arg_to_path("file://nas/share/x.png"),
+            PathBuf::from("file://nas/share/x.png")
+        );
+        assert_eq!(
+            arg_to_path("https://example.com/x.png"),
+            PathBuf::from("https://example.com/x.png")
+        );
+        // a host with no path at all
+        assert_eq!(
+            arg_to_path("file://localhost"),
+            PathBuf::from("file://localhost")
+        );
+    }
 }

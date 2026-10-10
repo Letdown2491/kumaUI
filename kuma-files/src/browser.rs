@@ -12482,6 +12482,13 @@ mod browser_ux_keys {
         // glib passes the file only through a field code: without
         // one the mimetype claims are inert
         assert!(exec.ends_with(" %u"), "Exec lacks a %u field code: {exec}");
+        // one template, two substitutions: build.sh installs the
+        // user copy ($HOME/.local/bin), kumaOS's kuma-shell action
+        // stages the image copy (/usr/bin); both ride @BIN@
+        assert!(
+            exec.contains("@BIN@/kuma-files"),
+            "Exec must ride the @BIN@ substitution: {exec}"
+        );
         let mime_line = text
             .lines()
             .find(|line| line.starts_with("MimeType="))
