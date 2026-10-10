@@ -10259,10 +10259,17 @@ fn code_line(line: &str) -> Div {
 /// A csv preview: cells padded into an aligned mono table, first row
 /// as the header. Quote handling is out of scope for a glance.
 fn csv_lines(lines: &[String]) -> Vec<String> {
-    let rows: Vec<Vec<&str>> = lines
+    let rows: Vec<Vec<String>> = lines
         .iter()
-        .map(|line| line.split(',').collect::<Vec<_>>())
+        .map(|line| line.split(',').map(str::to_string).collect())
         .collect();
+    csv_rows(&rows)
+}
+
+/// Pad pre-split rows into the same aligned mono table lines. Splitting
+/// is the caller's job so a cell may contain commas: the markdown
+/// table path reuses this with its cells still separate.
+fn csv_rows(rows: &[Vec<String>]) -> Vec<String> {
     let columns = rows
         .iter()
         .map(|row| row.len())
@@ -10270,9 +10277,9 @@ fn csv_lines(lines: &[String]) -> Vec<String> {
         .unwrap_or(0)
         .min(12);
     let mut widths = vec![0usize; columns];
-    for row in &rows {
+    for row in rows {
         for (c, cell) in row.iter().enumerate().take(columns) {
-            widths[c] = widths[c].max(cell.len().min(24));
+            widths[c] = widths[c].max(cell.chars().count().min(24));
         }
     }
     rows.iter()
@@ -10282,8 +10289,11 @@ fn csv_lines(lines: &[String]) -> Vec<String> {
                 .take(columns)
                 .map(|(c, cell)| {
                     let mut cell = cell.to_string();
-                    if cell.len() > 24 {
-                        cell.truncate(23);
+                    // Count and cut in chars: a byte-indexed truncate lands
+                    // mid-character whenever a cell has multibyte text
+                    // straddling the cap, which is a panic.
+                    if cell.chars().count() > 24 {
+                        cell = cell.chars().take(23).collect();
                         cell.push('…');
                     }
                     format!("{cell:<width$}", width = widths[c])
@@ -10502,9 +10512,7 @@ fn parse_markdown(text: &str) -> Vec<MdBlock> {
             Event::End(TagEnd::Table) => {
                 in_table = false;
                 let rows = std::mem::take(&mut table_rows);
-                blocks.push(MdBlock::Table(csv_lines(
-                    &rows.iter().map(|row| row.join(",")).collect::<Vec<_>>(),
-                )));
+                blocks.push(MdBlock::Table(csv_rows(&rows)));
             }
             Event::Start(Tag::TableHead | Tag::TableRow) => table_rows.push(Vec::new()),
             Event::Start(Tag::TableCell) => {
@@ -10935,6 +10943,47 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "name  role   city");
         assert_eq!(lines[1], "ada   pilot  berlin");
+    }
+
+    #[test]
+    fn csv_truncation_is_char_safe() {
+        // 30 bytes but 28 chars: the old byte-indexed truncate(23) cut
+        // through the middle of the two-byte e-acute and panicked.
+        let cell = format!("{}{}{}", "a".repeat(22), "é", "b".repeat(5));
+        let lines = csv_lines(&[cell, "short".to_string()]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("é…"));
+        // all-ASCII truncation still works and pads to the width
+        let lines = csv_lines(&["a".repeat(30), "short".to_string()]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with(&"a".repeat(23)) && lines[0].contains('…'));
+    }
+
+    #[test]
+    fn markdown_table_with_multibyte_cells_does_not_panic() {
+        // regression: a markdown table like the one in a fitness PLAN.md
+        // crashed the preview when a cell's en dash straddled the cap
+        let blocks = parse_markdown(
+            "| Phase | Weeks |\n|---|---|\n\
+             | 4 — Half | Half marathon month 6–7, add running volume |",
+        );
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, MdBlock::Table(rows) if rows.len() == 2)));
+    }
+
+    #[test]
+    fn markdown_table_keeps_commas_inside_cells() {
+        // regression: cells went through a join(",")/split(",") round
+        // trip, so a cell with commas rendered as several fake columns
+        let blocks = parse_markdown(
+            "| food | note |\n|---|---|\n| beef | iron, zinc, creatine |\n",
+        );
+        let MdBlock::Table(lines) = &blocks[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("iron, zinc, creatine"));
     }
 
     #[test]
