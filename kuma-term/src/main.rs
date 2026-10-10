@@ -44,7 +44,18 @@ fn main() {
         std::process::exit(1);
     }
 
-    application().run(|cx: &mut App| {
+    // `-e` consumes the rest of argv as the command to run instead of
+    // the shell: the kitty/alacritty convention kuma-launch relies on
+    // (`kuma-term -e <held script>`). Stateless on purpose: the
+    // KUMA_TERM_COMMAND env hook (the tests') would persist into child
+    // processes, and a kuma-term opened inside a kuma-launch'd
+    // kuma-term would re-run the verb script instead of giving a shell.
+    let command = parse_args(&std::env::args().collect::<Vec<_>>()).unwrap_or_else(|err| {
+        eprintln!("kuma-term: {err}");
+        std::process::exit(1);
+    });
+
+    application().run(move |cx: &mut App| {
         let bounds = gpui::Bounds::centered(None, size(px(920.), px(620.)), cx);
         let _ = cx.open_window(
             WindowOptions {
@@ -56,8 +67,60 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| view::TerminalView::new(window, cx)),
+            |window, cx| cx.new(|cx| view::TerminalView::new(command, window, cx)),
         );
         cx.activate(true);
     });
+}
+
+/// The `-e` convention: everything after it is the command, and
+/// nothing after it is parsed as options. No `-e` means the login
+/// shell; `-e` with nothing after it is an error, not a silent shell.
+fn parse_args(args: &[String]) -> Result<Option<Vec<String>>, String> {
+    let Some(position) = args.iter().position(|arg| arg == "-e") else {
+        return Ok(None);
+    };
+    let command = &args[position + 1..];
+    if command.is_empty() {
+        return Err("-e needs a command after it".to_string());
+    }
+    Ok(Some(command.to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_args_takes_everything_after_e() {
+        // the kuma-launch shape: one script, maybe with arguments
+        assert_eq!(
+            parse_args(&argv(&["kuma-term", "-e", "/bin/verb"])).unwrap(),
+            Some(vec!["/bin/verb".to_string()])
+        );
+        assert_eq!(
+            parse_args(&argv(&["kuma-term", "-e", "nvim", "foo.txt"])).unwrap(),
+            Some(vec!["nvim".to_string(), "foo.txt".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_args_without_e_means_the_shell() {
+        assert_eq!(parse_args(&argv(&["kuma-term"])).unwrap(), None);
+        // the flag works at any position: argv[0] is just another
+        // string to scan
+        assert_eq!(
+            parse_args(&argv(&["kuma-term", "--something", "-e", "sh"])).unwrap(),
+            Some(vec!["sh".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_args_errors_on_a_bare_e() {
+        assert!(parse_args(&argv(&["kuma-term", "-e"])).is_err());
+    }
 }
