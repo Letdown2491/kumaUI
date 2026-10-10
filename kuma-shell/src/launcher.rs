@@ -27,6 +27,12 @@ pub struct AppEntry {
 }
 
 pub fn load_apps() -> Vec<AppEntry> {
+    // One read per scan: the desktop name never changes mid-session, and
+    // threading it in as a plain value keeps the filter testable without
+    // env mutation. Feeds the launcher, the dock's app menu, and the
+    // volume panel's per-app rows, so all three honor the show-in pair.
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok()
+        .filter(|name| !name.is_empty());
     let mut dirs: Vec<PathBuf> = Vec::new();
     let data_dirs = std::env::var("XDG_DATA_DIRS")
         .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
@@ -53,7 +59,7 @@ pub fn load_apps() -> Vec<AppEntry> {
             }
             if let Ok(text) = std::fs::read_to_string(&path) {
                 let desktop_path = path.to_string_lossy().to_string();
-                if let Some(mut app) = parse_desktop_entry(&text) {
+                if let Some(mut app) = parse_desktop_entry(&text, desktop.as_deref()) {
                     app.desktop_path = desktop_path.clone();
                     app.usage = usage.get(&desktop_path).copied().unwrap_or(0);
                     apps.push(app);
@@ -154,14 +160,52 @@ fn record_usage(desktop_path: &str) {
     save_usage(&usage);
 }
 
-fn parse_desktop_entry(text: &str) -> Option<AppEntry> {
+/// Semicolon-separated list value per the Desktop Entry spec: the trailing
+/// semicolon is part of the syntax, so empty segments drop out.
+fn show_in_list(value: &str) -> Vec<String> {
+    value
+        .trim()
+        .split(';')
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// glib's g_desktop_app_info_get_show_in, hand-rolled: walk the stacked
+/// desktop values in order, OnlyShowIn consulted before NotShowIn per value,
+/// and the tail hides whatever carries OnlyShowIn when nothing matched (an
+/// unset or empty desktop hides every gated entry). Plain case-sensitive
+/// equality, like the reference reader and the menu spec's registry
+/// ("these are case-sensitive").
+fn shows_in(only: Option<&[String]>, not: Option<&[String]>, desktop: Option<&str>) -> bool {
+    let Some(desktop) = desktop else {
+        return only.is_none();
+    };
+    for env in desktop.split(':').filter(|env| !env.is_empty()) {
+        if let Some(only) = only
+            && only.iter().any(|name| name.as_str() == env)
+        {
+            return true;
+        }
+        if let Some(not) = not
+            && not.iter().any(|name| name.as_str() == env)
+        {
+            return false;
+        }
+    }
+    only.is_none()
+}
+
+fn parse_desktop_entry(text: &str, desktop: Option<&str>) -> Option<AppEntry> {
     let mut name = None;
     let mut generic = None;
     let mut keywords = None;
     let mut exec = None;
     let mut icon = None;
     let mut terminal = false;
-    let mut no_display = false;
+    let mut hidden = false;
+    let mut only_show_in: Option<Vec<String>> = None;
+    let mut not_show_in: Option<Vec<String>> = None;
     for line in text.lines() {
         if line.starts_with('[') && !line.starts_with("[Desktop Entry]") {
             break;
@@ -174,12 +218,17 @@ fn parse_desktop_entry(text: &str) -> Option<AppEntry> {
                 "Exec" => exec = Some(value.trim().to_string()),
                 "Icon" => icon = Some(value.trim().to_string()),
                 "Terminal" => terminal = value.trim() == "true",
-                "NoDisplay" => no_display = value.trim() == "true",
+                "NoDisplay" | "Hidden" => hidden = value.trim() == "true",
+                "OnlyShowIn" => only_show_in = Some(show_in_list(value)),
+                "NotShowIn" => not_show_in = Some(show_in_list(value)),
                 _ => {}
             }
         }
     }
-    if no_display {
+    if hidden {
+        return None;
+    }
+    if !shows_in(only_show_in.as_deref(), not_show_in.as_deref(), desktop) {
         return None;
     }
     let exec = exec?;
@@ -1166,6 +1215,7 @@ mod tests {
     fn desktop_entry_parses() {
         let entry = parse_desktop_entry(
             "[Desktop Entry]\nName=GNU Image\nExec=gimp-3.0 %U\nIcon=gimp\nTerminal=false\nType=Application\n",
+            None,
         )
         .unwrap();
         assert_eq!(entry.name, "GNU Image");
@@ -1177,13 +1227,98 @@ mod tests {
     #[test]
     fn desktop_entry_hides_no_display() {
         let text = "[Desktop Entry]\nName=X\nExec=x\nNoDisplay=true\n";
-        assert!(parse_desktop_entry(text).is_none());
+        assert!(parse_desktop_entry(text, None).is_none());
+    }
+
+    #[test]
+    fn desktop_entry_hides_other_desktops() {
+        // the live find: blueman-adapters gates itself to XFCE;MATE
+        let text = "[Desktop Entry]\nName=X\nExec=x\nOnlyShowIn=XFCE;MATE;\n";
+        assert!(parse_desktop_entry(text, Some("niri")).is_none());
+        assert!(parse_desktop_entry(
+            "[Desktop Entry]\nName=X\nExec=x\nOnlyShowIn=niri\n",
+            Some("niri"),
+        )
+        .is_some());
+        // no gating keys at all: the common case, shown on any desktop
+        assert!(parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\n", Some("niri")).is_some());
+        // case-sensitive, like g_str_equal: no folding
+        assert!(parse_desktop_entry(
+            "[Desktop Entry]\nName=X\nExec=x\nOnlyShowIn=NIRI\n",
+            Some("niri"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn desktop_entry_not_show_in_hides() {
+        assert!(parse_desktop_entry(
+            "[Desktop Entry]\nName=X\nExec=x\nNotShowIn=niri\n",
+            Some("niri"),
+        )
+        .is_none());
+        assert!(parse_desktop_entry(
+            "[Desktop Entry]\nName=X\nExec=x\nNotShowIn=GNOME\n",
+            Some("niri"),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn desktop_entry_show_in_precedence_matches_glib() {
+        // glib consults OnlyShowIn before NotShowIn per stacked value, so a
+        // value both keys share shows the entry; pinned because we claim
+        // exact glib behavior
+        assert!(parse_desktop_entry(
+            "[Desktop Entry]\nName=X\nExec=x\nOnlyShowIn=niri\nNotShowIn=niri\n",
+            Some("niri"),
+        )
+        .is_some());
+        // stacked values: any OnlyShowIn match shows, any NotShowIn match hides
+        assert!(parse_desktop_entry(
+            "[Desktop Entry]\nName=X\nExec=x\nOnlyShowIn=niri\n",
+            Some("xfce:niri"),
+        )
+        .is_some());
+        assert!(parse_desktop_entry(
+            "[Desktop Entry]\nName=X\nExec=x\nNotShowIn=xfce\n",
+            Some("xfce:niri"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn desktop_entry_no_display_wins_over_show_in() {
+        assert!(parse_desktop_entry(
+            "[Desktop Entry]\nName=X\nExec=x\nNoDisplay=true\nOnlyShowIn=niri\n",
+            Some("niri"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn desktop_entry_hides_hidden() {
+        // Hidden=true means the user deleted the entry; same arm as NoDisplay
+        assert!(parse_desktop_entry(
+            "[Desktop Entry]\nName=X\nExec=x\nHidden=true\nOnlyShowIn=niri\n",
+            Some("niri"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn desktop_entry_gated_entry_hides_without_a_desktop() {
+        // glib's tail: only_show_in != NULL with no desktop means hidden
+        assert!(parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\nOnlyShowIn=XFCE\n", None)
+            .is_none());
+        assert!(parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\n", None).is_some());
     }
 
     #[test]
     fn desktop_entry_captures_icon() {
         let entry = parse_desktop_entry(
             "[Desktop Entry]\nName=Files\nExec=nautilus %U\nIcon=org.gnome.Nautilus\n",
+            None,
         )
         .unwrap();
         assert_eq!(entry.icon, "org.gnome.nautilus");
@@ -1193,12 +1328,13 @@ mod tests {
     fn desktop_entry_captures_generic_and_keywords() {
         let entry = parse_desktop_entry(
             "[Desktop Entry]\nName=Koguma\nGenericName=File Manager\nKeywords=files;folders;\nExec=kuma-files\n",
+            None,
         )
         .unwrap();
         assert_eq!(entry.generic, "File Manager");
         assert_eq!(entry.keywords, "files;folders;");
         // entries without them just score empty, never panic
-        let bare = parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\n").unwrap();
+        let bare = parse_desktop_entry("[Desktop Entry]\nName=X\nExec=x\n", None).unwrap();
         assert_eq!(bare.generic, "");
         assert_eq!(bare.keywords, "");
     }
@@ -1209,7 +1345,7 @@ mod tests {
             name: "Koguma".into(),
             generic: "File Manager".into(),
             keywords: "files;folders;".into(),
-            ..parse_desktop_entry("[Desktop Entry]\nName=x\nExec=x\n").unwrap()
+            ..parse_desktop_entry("[Desktop Entry]\nName=x\nExec=x\n", None).unwrap()
         };
         let mut renamed = koguma.clone();
         renamed.name = "Archive Files".into();
@@ -1230,7 +1366,7 @@ mod tests {
     fn entry(name: &str, usage: u64) -> AppEntry {
         AppEntry {
             usage,
-            ..parse_desktop_entry(&format!("[Desktop Entry]\nName={name}\nExec={name}\n"))
+            ..parse_desktop_entry(&format!("[Desktop Entry]\nName={name}\nExec={name}\n"), None)
                 .unwrap()
         }
     }

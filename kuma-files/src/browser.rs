@@ -9565,6 +9565,10 @@ fn scan_desktop_apps() -> Vec<DesktopApp> {
                     _ => {}
                 }
             }
+            // Known gap: OnlyShowIn/NotShowIn are not consulted here, so an
+            // entry gated to another desktop can appear in open-with. The
+            // shell's launcher honors them (kuma-shell/src/launcher.rs
+            // shows_in); the shared fix rides the platform crate (#33).
             if !is_app || hidden || nodisplay || exec.is_empty() {
                 continue;
             }
