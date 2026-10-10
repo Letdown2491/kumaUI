@@ -28,6 +28,9 @@ Koguma (`kuma-files`) is the workspace's second app: kuma's own file manager, re
 - **Theming**: reads the shell's palette opportunistically and recolors on wallpaper changes; built-ins everywhere else. Accent picker.
 - **Installed**: `build.sh` puts the binary in `~/.local/bin`, the menu entry and app icon in the user XDG dirs, and registers Koguma as the directory handler.
 
+**Open surface**: Koguma is also the desktop's default opener for images and PDFs. Enter or double-click opens such a file in a standalone viewer window: the Quick Look peek's renderer underneath, with the real viewer behaviors added (zoom, pan, rotate for images; page navigation for PDFs), and the arrow keys walk the containing directory's files of the same kind. `xdg-open` from anywhere (a browser download, a terminal) lands in the same window. The claim follows the surface: a type the viewer cannot render yet stays unclaimed, so video and audio keep handing off to the system's default (Celluloid on the appliance), and avif and svg stay unclaimed until a decoder exists.
+
+
 A fresh start opens at 125% zoom with the info rail docked at the bottom; the state file keeps whatever you change.
 
 ## Building
