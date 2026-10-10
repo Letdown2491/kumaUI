@@ -42,6 +42,10 @@ On a regular Linux box, a plain `cargo build --release` works too; you need a Ru
 
 Runtime requirements: a Wayland compositor with `wlr-layer-shell` and `ext-session-lock`, and PAM. niri is the primary target; sway works end to end (the bar's workspaces, window title, and dock ride a compositor-neutral session mirror, [ADR-0012](docs/adr/0012-compositor-neutral-session-state.md)). Hyprland speaks the same protocols but is untested. Koguma's requirements are lighter: any Wayland compositor or X11, no layer-shell.
 
+## Video previews and libav
+
+Koguma's video posters and Quick Look tiles use libav (the FFmpeg libraries) through the `ffmpeg-sys-next` bindings, enabled by the default `video` cargo feature. The libraries are linked, not dlopen'd: whatever soname generation your distro's libavcodec carries at build time is the one the binary wants, so a distro that moves to a different soname generation needs a rebuild (there is no vendoring and no shim). The image ships Fedora's libav: if a codec's decoder is missing from the system's libav, Koguma says so ("codec unavailable in this system's libav") instead of failing the listing. Building with `--no-default-features` drops libav entirely; the browser then shows a generic icon for videos and everything else works.
+
 ## kuma-term
 
 kuma-term works with any shell out of the box; no shell integration is required. It exports `KUMA_TERM=1` into the shell's environment so dotfiles can recognize it (the fish prompt and greeting in the kumaOS image key on it), and nothing else. Its theme is a line-based key value config at `$XDG_CONFIG_HOME/kuma-term/kuma-term.conf` with kitty-compatible key names, so a kitty theme's colors block pastes in unchanged, and it honors `kuma-shell`'s published wallpaper palette when the shell is present. The built-in theme, used when no conf exists, is the shipped pastel palette (the ANSI 16 and the chrome colors).
