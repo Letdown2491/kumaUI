@@ -12,7 +12,10 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 /// A decoded icon, either raster or vector; the launcher's app icons and
-/// the tray's status icons share this.
+/// the tray's status icons share this. Named icons decode to Raster even
+/// when the file is an SVG (gpui's `svg()` element is a single-color tint,
+/// not a color render); direct producers like the nostr panel hand over
+/// Svg bytes.
 #[derive(Clone, Debug)]
 pub enum IconImage {
     Raster(Arc<gpui::RenderImage>),
@@ -50,13 +53,32 @@ pub fn icon_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// Themed icon name → decoded icon, via the shared index.
+/// A full-color SVG rasterizer for named icons. gpui's `svg()` element paints
+/// only an alpha mask tinted with the text color (a glyph tint), which
+/// flattens multicolor artwork into a silhouette; app icons need resvg's
+/// color render instead. Fonts load lazily, so building this is cheap.
+fn svg_renderer() -> &'static gpui::SvgRenderer {
+    static RENDERER: std::sync::OnceLock<gpui::SvgRenderer> = std::sync::OnceLock::new();
+    RENDERER.get_or_init(|| gpui::SvgRenderer::new(std::sync::Arc::new(crate::icons::KumaAssets)))
+}
+
 /// Themed icon name or absolute path → decoded icon, downscaled to a
-/// paint size. Size 0 entries are size-independent (SVG bytes).
+/// paint size. SVGs rasterize in full color at the same size rasters
+/// decode at, so callers paint one shape of icon either way.
 fn decode_icon_sized(path: &Path, size: u32) -> Option<IconImage> {
     if path.extension().and_then(|ext| ext.to_str()) == Some("svg") {
         let bytes = std::fs::read(path).ok()?;
-        return Some(IconImage::Svg(bytes.into()));
+        let parsed = svg_renderer().parse_svg(&bytes).ok()?;
+        let image = svg_renderer()
+            .render_parsed(
+                &parsed,
+                gpui::SvgSize::Size(gpui::Size::new(
+                    gpui::DevicePixels(size as i32),
+                    gpui::DevicePixels(size as i32),
+                )),
+            )
+            .ok()?;
+        return Some(IconImage::Raster(image));
     }
     decode_thumbnail(path, size, size).map(Arc::new).map(IconImage::Raster)
 }
@@ -327,9 +349,15 @@ mod tests {
 
     #[test]
     fn resolve_returns_a_stable_arc() {
+        // named svgs decode to full-color rasters (gpui's svg() element is
+        // a tint, not a color render), keyed by size like raster files
         let a = resolve(&svg_key(), 32).expect("svg asset should decode");
-        let b = resolve(&svg_key(), 48).expect("svg asset should decode");
-        assert!(Arc::ptr_eq(&a, &b), "svg entries are size-independent");
+        assert!(
+            matches!(&*a, IconImage::Raster(_)),
+            "named svg icons decode full-color, not as tint bytes"
+        );
+        let b = resolve(&svg_key(), 32).expect("svg asset should decode");
+        assert!(Arc::ptr_eq(&a, &b), "same key+size resolves to one Arc");
 
         let a = resolve(&raster_key(), 32).expect("raster asset should decode");
         let b = resolve(&raster_key(), 32).expect("raster asset should decode");
