@@ -100,6 +100,14 @@ lines, refreshes the lock and installs through the build, and commits
 the changelog's newest version line disagree, so a version bump
 without changelog bullets will not go green.
 
+## kumaOS
+
+kumaOS (`~/Documents/kuma`, remote `Letdown2491/kumaOS`) is handled
+separately from kumaUI: never write code to, commit to, or push to
+that repo, locally or remotely, even when a fix belongs in the image.
+Discuss the change or write a handoff prompt for a kumaOS session; the
+owner lands it. (Set 2026-10-10.)
+
 ## Writing
 
 No em dashes in documentation (README, CONTEXT.md, VENDORED.md, ADRs, and
