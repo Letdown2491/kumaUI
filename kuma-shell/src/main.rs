@@ -73,6 +73,7 @@ fn main() {
             let lock = cx.new(|_| kuma_shell::lock::LockState::new(settings.clone()));
             kuma_shell::lock::connect(&lock, cx);
             kuma_shell::idle::run(&settings, &lock, cx);
+            kuma_shell::polkit::run(&lock, cx);
             cx.set_global(kuma_shell::panel::PanelHost::new(
                 settings.clone(),
                 sysmon.clone(),
