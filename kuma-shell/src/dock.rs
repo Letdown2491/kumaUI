@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, Bounds, Context, Div, Entity, ImageSource, Render, SharedString, Window,
@@ -33,6 +34,12 @@ const STRIP: f32 = CELL + 2. * PADDING;
 /// The always-first fixture: opens the launcher panel. Not a pin, not
 /// draggable: the dock's launch path.
 const LAUNCHER_KEY: &str = "__kuma-launcher__";
+
+/// How often a window matching no desktop entry may trigger a rescan of
+/// the desktop files: an app installed after the dock's startup scan
+/// leaves its windows unmatched until one lands. Installs are rare and
+/// the scan is a readdir pass, so this stays cheap.
+const APP_SCAN_EVERY: Duration = Duration::from_secs(5);
 
 /// The drag payload between dock cells: what's being carried, plus enough
 /// to render the ghost (the icon itself).
@@ -198,6 +205,20 @@ fn match_app<'a>(apps: &'a [AppEntry], app_id: &str) -> Option<&'a AppEntry> {
         })
 }
 
+/// Whether some window's app_id matches no desktop entry: the signature of
+/// an app installed after the dock's last scan (its raw entry shows the
+/// app_id as label, no icon, no menu). Missing app_ids (bare surfaces)
+/// never match anything and are no trigger.
+fn has_unmatched_app_id<'a>(
+    apps: &[AppEntry],
+    app_ids: impl Iterator<Item = Option<&'a str>>,
+) -> bool {
+    app_ids
+        .flatten()
+        .filter(|app_id| !app_id.is_empty())
+        .any(|app_id| match_app(apps, app_id).is_none())
+}
+
 /// The dock's window: always stretched along its screen edge (the bar's
 /// pattern: sized layer surfaces never learn their own screen position,
 /// but a stretched one's coordinates along the stretch axis ARE screen
@@ -344,9 +365,26 @@ pub struct DockView {
     settings: Entity<Settings>,
     apps: Vec<AppEntry>,
     icons: HashMap<String, Option<IconImage>>,
+    /// The last rescan attempt and whether one is in flight: rescans are
+    /// rate limited and single-filed (see [`has_unmatched_app_id`]).
+    last_app_scan: Option<Instant>,
+    scan_in_flight: bool,
     /// The card's last-known rect (offset along the stretch axis, length):
     /// gates the input region update.
     applied_card: Option<(f32, f32)>,
+}
+
+/// Resolve a batch of (desktop-path, icon-name) pairs through the image
+/// registry: stable Arcs, one atlas tile per icon, shared with every other
+/// resolver of the same name (ADR-0016).
+fn decode_icons(keys: Vec<(String, String)>) -> Vec<(String, Option<IconImage>)> {
+    keys.into_iter()
+        .map(|(desktop_path, icon)| {
+            let icon = crate::imaging::resolve(&icon, ICON_RESOLVE_SIZE)
+                .map(|shared| shared.clone_shared());
+            (desktop_path, icon)
+        })
+        .collect()
 }
 
 impl DockView {
@@ -364,23 +402,7 @@ impl DockView {
             .map(|app| (app.desktop_path.clone(), app.icon.clone()))
             .collect();
         cx.spawn(async move |this, cx| {
-            // the registry makes recreations instant and pins one atlas
-            // tile per icon: these Arcs are shared with every other
-            // resolver of the same name (ADR-0016)
-            let decoded: Vec<(String, Option<IconImage>)> = cx
-                .background_spawn(async move {
-                    icon_keys
-                        .into_iter()
-                        .map(|(desktop_path, icon)| {
-                            (
-                                desktop_path,
-                                crate::imaging::resolve(&icon, ICON_RESOLVE_SIZE)
-                                    .map(|shared| shared.clone_shared()),
-                            )
-                        })
-                        .collect()
-                })
-                .await;
+            let decoded = cx.background_spawn(async move { decode_icons(icon_keys) }).await;
             for (desktop_path, icon) in decoded {
                 let _ = this.update(cx, |this, cx| {
                     this.icons.insert(desktop_path, icon);
@@ -395,8 +417,49 @@ impl DockView {
             settings,
             apps,
             icons: HashMap::new(),
+            last_app_scan: None,
+            scan_in_flight: false,
             applied_card: None,
         }
+    }
+
+    /// A window matched no desktop entry: the app may have installed after
+    /// the dock's startup scan. Rescan (rate limited) and adopt the fresh
+    /// list; the registry's fast path makes re-resolving known icons a
+    /// map probe.
+    fn rescan_apps(&mut self, cx: &mut Context<Self>) {
+        if self.scan_in_flight
+            || self
+                .last_app_scan
+                .is_some_and(|at| at.elapsed() < APP_SCAN_EVERY)
+        {
+            return;
+        }
+        self.last_app_scan = Some(Instant::now());
+        self.scan_in_flight = true;
+        cx.spawn(async move |this, cx| {
+            let apps = cx.background_spawn(async move { load_apps() }).await;
+            let keys: Vec<(String, String)> = apps
+                .iter()
+                .map(|app| (app.desktop_path.clone(), app.icon.clone()))
+                .collect();
+            let decoded = cx.background_spawn(async move { decode_icons(keys) }).await;
+            let _ = this.update(cx, |this, cx| {
+                let live: std::collections::HashSet<&str> = apps
+                    .iter()
+                    .map(|app| app.desktop_path.as_str())
+                    .collect();
+                this.icons
+                    .retain(|key, _| live.contains(key.as_str()));
+                for (desktop_path, icon) in decoded {
+                    this.icons.insert(desktop_path, icon);
+                }
+                this.apps = apps;
+                this.scan_in_flight = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }
 
@@ -414,6 +477,14 @@ impl Render for DockView {
         let count = entries.len() + 1; // the launcher fixture leads, always
         let mut all_entries = vec![launcher_entry()];
         all_entries.extend(entries);
+
+        // a window matching no entry means an app may have installed after
+        // the startup scan: rescan so its entry grows icon, label, and menu
+        // (checked after the entries build: the rescan needs cx mutably,
+        // and the entries above are already owned)
+        if has_unmatched_app_id(&self.apps, windows.iter().map(|w| w.app_id.as_deref())) {
+            self.rescan_apps(cx);
+        }
 
         // the card is centered on the stretched strip; window coordinates
         // along the stretch axis are screen coordinates
@@ -851,5 +922,27 @@ mod tests {
         assert_eq!(cycle_target(&[], None), None);
         // focused window not in the list: fall back to first
         assert_eq!(cycle_target(&windows, Some(99)), Some(10));
+    }
+
+    #[test]
+    fn unmatched_app_ids_ask_for_a_rescan() {
+        let apps = vec![app("/usr/share/applications/foo.desktop", "Foo", "foo")];
+        let ids = |windows: Vec<SessionWindow>| -> Vec<Option<String>> {
+            windows.into_iter().map(|w| w.app_id).collect()
+        };
+        let none = ids(vec![]);
+        assert!(!has_unmatched_app_id(&apps, none.iter().map(|id| id.as_deref())));
+
+        // matched by stem, and by name case-insensitively
+        let matched = ids(vec![window(1, Some("foo"), false), window(2, Some("FOO"), false)]);
+        assert!(!has_unmatched_app_id(&apps, matched.iter().map(|id| id.as_deref())));
+
+        // an app_id matching nothing: the rescan trigger
+        let unmatched = ids(vec![window(3, Some("spotify"), false)]);
+        assert!(has_unmatched_app_id(&apps, unmatched.iter().map(|id| id.as_deref())));
+
+        // a missing app_id (a bare surface) never matches and never triggers
+        let nameless = ids(vec![window(4, None, false)]);
+        assert!(!has_unmatched_app_id(&apps, nameless.iter().map(|id| id.as_deref())));
     }
 }

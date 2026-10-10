@@ -11,6 +11,17 @@ rides unchanged.
 
 ## Unreleased
 
+### Fixed
+
+- **Apps installed mid-session get their icons without a shell restart.**
+  The shell's icon index walked the XDG icon roots once per process, so
+  an app installed while the shell ran (a flatpak, say) resolved no
+  icon in the dock and launcher, and the dock showed its window as a
+  raw entry with the app_id for a label. A named lookup that misses now
+  re-walks the trees when they changed underneath (rate limited to one
+  walk per 5 seconds), and the dock rescans the desktop files when a
+  window matches nothing.
+
 ## v0.2.0 (2026-10-10)
 
 kuma-shell 0.2.0
