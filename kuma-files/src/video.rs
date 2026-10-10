@@ -47,12 +47,14 @@ pub(crate) fn duration_label(seconds: f64) -> Option<String> {
 /// A stream with degenerate timestamps (static, or none at all)
 /// must not spin the img element's frame clock at unbounded rate:
 /// every displayed frame gets at least this delay.
+#[cfg(feature = "video")]
 pub(crate) const PREVIEW_MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// The presentation delay a frame implies, from PTS deltas in
 /// microseconds: the delta to the next frame, floored at the pace
 /// floor. An unknown timestamp or a backwards one carries the
 /// previous delay (the floor at the head).
+#[cfg(feature = "video")]
 pub(crate) fn delay_from_pts(
     prev_pts: Option<i64>,
     pts: Option<i64>,
@@ -569,7 +571,7 @@ mod imp {
 }
 
 #[cfg(feature = "video")]
-pub(crate) use imp::{decode_poster, decode_preview, poster_dynamic, probe};
+pub(crate) use imp::{decode_preview, poster_dynamic, probe};
 
 #[cfg(not(feature = "video"))]
 mod imp {
@@ -584,6 +586,9 @@ mod imp {
         None
     }
 
+    /// Test-only: the degraded path always errs, and the tests assert
+    /// exactly that. Nothing else has a reason to call it.
+    #[cfg(test)]
     pub(crate) fn decode_poster(
         _path: &Path,
         _max: u32,
@@ -607,7 +612,7 @@ mod imp {
 }
 
 #[cfg(not(feature = "video"))]
-pub(crate) use imp::{decode_poster, decode_preview, poster_dynamic, probe};
+pub(crate) use imp::{decode_preview, poster_dynamic, probe};
 
 /// Test helper (the `video` feature on, test builds only): a raw
 /// H.264 elementary stream whose container parses but whose codec
