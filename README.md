@@ -61,6 +61,7 @@ kuma-shell depends on gpui via a path dependency into `vendor/zed/` (gitignored,
 
 ## Repository notes
 
+- [`CHANGELOG.md`](CHANGELOG.md): the release history, kumaOS style, with each binary's version on three lines under the release heading.
 - [`CONTEXT.md`](CONTEXT.md): domain glossary (the names of the seams in the code, one line each) and the four-rule ethos that governs them.
 - [`docs/adr/`](docs/adr/): architecture decision records, including two about lock-screen failure modes that only ever show up as "PAM rejects the password the user typed correctly".
 - [`AGENTS.md`](AGENTS.md): how AI agents should build, run, and debug in this repo.
