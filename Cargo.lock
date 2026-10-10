@@ -3075,7 +3075,7 @@ dependencies = [
 
 [[package]]
 name = "kuma-files"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs 7.0.0",
@@ -3099,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "kuma-shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3125,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "kuma-term"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "env_logger",

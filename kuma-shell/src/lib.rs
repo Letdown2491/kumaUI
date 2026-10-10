@@ -37,3 +37,24 @@ pub mod wallpaper;
 pub mod weather;
 pub mod weather_panel;
 pub mod wifi_panel;
+
+/// The version line every surface carries: the crate version plus the
+/// commit build.sh stamped in (option_env! falls back when cargo runs
+/// without the stamp), so a running instance pins to an exact build.
+pub fn version_line() -> String {
+    format!(
+        "kuma-shell {} (g{})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KUMA_GIT_SHA").unwrap_or("unknown"),
+    )
+}
+
+/// The short tag for in-app surfaces: the version alone, the name is
+/// already on the page.
+pub fn version_tag() -> String {
+    format!(
+        "v{} (g{})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KUMA_GIT_SHA").unwrap_or("unknown"),
+    )
+}

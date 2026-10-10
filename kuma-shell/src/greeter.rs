@@ -237,7 +237,8 @@ mod tests {
     /// for assertions.
     struct FakeGreetd {
         requests: std::sync::mpsc::Receiver<serde_json::Value>,
-        stream: UnixStream,
+        /// held, not read: the client owns the pair's live end
+        _stream: UnixStream,
     }
 
     impl FakeGreetd {
@@ -272,7 +273,7 @@ mod tests {
                 }
             });
             let reader = BufReader::new(mine.try_clone().unwrap());
-            let fake = FakeGreetd { requests: rx, stream: mine.try_clone().unwrap() };
+            let fake = FakeGreetd { requests: rx, _stream: mine.try_clone().unwrap() };
             (GreetdClient { stream: mine, reader }, fake)
         }
 

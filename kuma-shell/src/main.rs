@@ -40,6 +40,7 @@ fn main() {
         std::process::exit(1);
     }
 
+    log::info!("boot: {}", kuma_shell::version_line());
     log::info!("boot: entering gpui, {}ms", started.elapsed().as_millis());
 
     application()
@@ -222,9 +223,15 @@ fn main() {
 }
 
 fn run_cli(args: &[String]) -> i32 {
-    // accepts both `kuma-shell volume-up` and noctalia-compatible `kuma-shell msg volume-up`
+    // version goes first: it must work with no session, no running
+    // instance and no IPC, straight off any tty
     let mut iter = args.iter().map(String::as_str);
     let mut action = iter.next().unwrap_or_default();
+    if action == "--version" || action == "-V" || action == "version" {
+        println!("{}", kuma_shell::version_line());
+        return 0;
+    }
+    // accepts both `kuma-shell volume-up` and noctalia-compatible `kuma-shell msg volume-up`
     if action == "msg" {
         action = iter.next().unwrap_or_default();
     }
@@ -329,4 +336,34 @@ fn cli_av(
         return Ok(());
     }
     standalone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_line_names_the_binary() {
+        let line = kuma_shell::version_line();
+        assert!(line.starts_with("kuma-shell "));
+        assert!(line.contains("(g"));
+    }
+
+    #[test]
+    fn version_tag_is_short() {
+        // the about page's tag: no name, the card title says it already
+        let tag = kuma_shell::version_tag();
+        assert!(tag.starts_with('v'));
+        assert!(!tag.contains("kuma-shell"));
+        assert!(tag.contains("(g"));
+    }
+
+    #[test]
+    fn run_cli_version_exits_clean_without_a_session() {
+        // no compositor, no running instance, no socket: the flag
+        // must print and return before any of that matters
+        assert_eq!(run_cli(&["--version".to_string()]), 0);
+        assert_eq!(run_cli(&["-V".to_string()]), 0);
+        assert_eq!(run_cli(&["version".to_string()]), 0);
+    }
 }

@@ -1398,9 +1398,10 @@ mod tests {
             "blue starved at 2700K: {}",
             warm[255][2]
         );
-        // below the slider floor the clamp holds, nothing saturates
+        // below the slider floor the clamp holds: the approximation's
+        // red stays pinned at full scale, nothing wraps or overflows
         let floor = kelvin_ramp(2500, 256);
-        assert!(floor[255].iter().all(|c| *c <= 65535));
+        assert_eq!(floor[255][0], 65535, "red full at the floor");
     }
 
     #[test]

@@ -8653,7 +8653,17 @@ impl Render for Browser {
                         // push the keys section to the bottom edge
                         div().flex_grow_1(),
                     )
-                    .child(self.keys_section(cx)),
+                    .child(self.keys_section(cx))
+                    .child(
+                        // the version tag: dim, static, the sidebar's
+                        // last word
+                        div()
+                            .px_3()
+                            .pt_1()
+                            .text_size(px(11.))
+                            .text_color(theme::text_dim())
+                            .child(crate::version_tag()),
+                    ),
             )
             .child(
                 div()

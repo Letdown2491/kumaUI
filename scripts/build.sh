@@ -18,6 +18,7 @@ podman run --rm \
   -v "$PWD":/work:Z -w /work \
   -v kumaui-cargo-home:/root/.cargo \
   -v kumaui-rustup-home:/root/.rustup \
+  --env KUMA_GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
   "$IMAGE" \
   bash -c '
     if [ ! -x /root/.cargo/bin/cargo ]; then

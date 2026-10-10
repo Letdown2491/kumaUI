@@ -63,6 +63,28 @@ fn become_single_instance(dir: Option<PathBuf>) -> Option<std::os::unix::net::Un
     }
 }
 
+/// The version line `--version` prints and the boot log carries: the
+/// crate version plus the commit build.sh stamped in (option_env!
+/// falls back when cargo runs without the stamp), so a running
+/// instance pins to an exact build.
+pub(crate) fn version_line() -> String {
+    format!(
+        "kuma-files {} (g{})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KUMA_GIT_SHA").unwrap_or("unknown"),
+    )
+}
+
+/// The sidebar's short tag: the version alone, the name is already
+/// in the title bar.
+pub(crate) fn version_tag() -> String {
+    format!(
+        "v{} (g{})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KUMA_GIT_SHA").unwrap_or("unknown"),
+    )
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default())
         .format(|buf, record| {
@@ -76,6 +98,18 @@ fn main() {
             )
         })
         .init();
+
+    // --version prints and exits: no session, no socket handoff, no
+    // window, works from any tty
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("{}", version_line());
+        return;
+    }
+
+    log::info!("koguma {}", version_line());
 
     if std::env::var("WAYLAND_DISPLAY").is_err() && std::env::var("DISPLAY").is_err() {
         eprintln!("kuma-files: no Wayland/X11 session detected");
@@ -270,6 +304,21 @@ fn hex_val(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_line_names_the_binary() {
+        let line = version_line();
+        assert!(line.starts_with("kuma-files "));
+        assert!(line.contains("(g"));
+    }
+
+    #[test]
+    fn version_tag_is_short() {
+        let tag = version_tag();
+        assert!(tag.starts_with('v'));
+        assert!(!tag.contains("kuma-files"));
+        assert!(tag.contains("(g"));
+    }
 
     #[test]
     fn arg_to_path_passes_plain_paths_through() {

@@ -143,6 +143,7 @@ enum Page {
     Backgrounds,
     Weather,
     NightLight,
+    About,
 }
 
 impl Page {
@@ -158,6 +159,7 @@ impl Page {
             Page::Backgrounds => "Backgrounds",
             Page::Weather => "Weather",
             Page::NightLight => "Night Light",
+            Page::About => "About",
         }
     }
 
@@ -173,10 +175,11 @@ impl Page {
             Page::Backgrounds => "icons/image.svg",
             Page::Weather => "icons/cloud.svg",
             Page::NightLight => "icons/moon.svg",
+            Page::About => "icons/info.svg",
         }
     }
 
-    const ALL: [Page; 10] = [
+    const ALL: [Page; 11] = [
         Page::Quick,
         Page::Bar,
         Page::Widgets,
@@ -187,11 +190,37 @@ impl Page {
         Page::Backgrounds,
         Page::Weather,
         Page::NightLight,
+        Page::About,
     ];
 }
 
 /// Where a widget drag would land: before the given index in a section.
 type DropTarget = (Section, usize);
+
+/// The project's home, opened by the about page's repo link.
+const REPO_URL: &str = "https://github.com/Letdown2491/kumaUI";
+
+/// The bug-report road, opened by the about page's issues link.
+const ISSUES_URL: &str = "https://github.com/Letdown2491/kumaUI/issues";
+
+/// The host distro's pretty name, read from os-release at render (a
+/// few hundred bytes, only while the page is open): the about page
+/// names where the shell actually runs instead of assuming any one
+/// distro. None hides the line.
+fn distro_name() -> Option<String> {
+    let content = std::fs::read_to_string("/etc/os-release").ok()?;
+    os_release_name(&content)
+}
+
+/// The PRETTY_NAME out of os-release content: quoted, possibly
+/// missing, possibly empty.
+fn os_release_name(content: &str) -> Option<String> {
+    let line = content
+        .lines()
+        .find(|line| line.starts_with("PRETTY_NAME="))?;
+    let name = line["PRETTY_NAME=".len()..].trim().trim_matches('"');
+    (!name.is_empty()).then(|| name.to_string())
+}
 
 /// The drag payload between widget chips: which widget moves, and
 /// where it came from.
@@ -1816,6 +1845,58 @@ impl SettingsView {
             )
     }
 
+    /// The about page: what is running and where it lives. Static on
+    /// purpose: nothing here reads state, so it renders the same on
+    /// any day.
+    fn about_page(&mut self, _cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        kit::card("about")
+            // the name rides larger than the version under it: the
+            // shared card title is 13px, the same as the tag, which
+            // read backwards
+            .child(kit::card_title("kuma-shell").text_size(px(16.)))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(rgb(crate::theme::current().text))
+                    .child(crate::version_tag()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(crate::theme::current().text))
+                    .child(
+                        "The desktop shell: bar, launcher, panels and lock screen, on gpui. \
+                         Part of kumaUI alongside Koguma (file manager) and Higuma (kuma-term).",
+                    ),
+            )
+            .children(distro_name().map(|name| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(crate::theme::current().text))
+                    .child(format!("Running on {name}."))
+            }))
+            .child(
+                div()
+                    .id("about-repo")
+                    .text_size(px(11.))
+                    .text_color(rgb(crate::theme::current().accent))
+                    .underline()
+                    .cursor_pointer()
+                    .on_click(|_, _, cx| cx.open_url(REPO_URL))
+                    .child(REPO_URL),
+            )
+            .child(
+                div()
+                    .id("about-issues")
+                    .text_size(px(11.))
+                    .text_color(rgb(crate::theme::current().accent))
+                    .underline()
+                    .cursor_pointer()
+                    .on_click(|_, _, cx| cx.open_url(ISSUES_URL))
+                    .child(ISSUES_URL),
+            )
+    }
+
     /// The weather page: the location query with its resolved match,
     /// and the unit. Enter on the field commits the query and runs
     /// the resolve; the coordinates cache into the settings so the
@@ -2804,7 +2885,8 @@ impl Render for SettingsView {
             })
             .when(self.page == Page::NightLight, |el| {
                 el.child(self.night_light_page(cx))
-            });
+            })
+            .when(self.page == Page::About, |el| el.child(self.about_page(cx)));
 
         crate::panel::chrome(
             self.geometry,
@@ -2845,5 +2927,21 @@ mod tests {
             percent_decode_path("file:///truncated%2"),
             PathBuf::from("/truncated%2")
         );
+    }
+
+    #[test]
+    fn os_release_pretty_name_parses() {
+        assert_eq!(
+            os_release_name("NAME=Fedora\nPRETTY_NAME=\"Fedora Linux 44\"\n"),
+            Some("Fedora Linux 44".to_string())
+        );
+        // unquoted and padded: trimmed, not stripped of inner spaces
+        assert_eq!(
+            os_release_name("PRETTY_NAME= Arch Linux \n"),
+            Some("Arch Linux".to_string())
+        );
+        // missing key or empty value: no line at all
+        assert_eq!(os_release_name("NAME=X\nID=x\n"), None);
+        assert_eq!(os_release_name("PRETTY_NAME=\"\"\n"), None);
     }
 }

@@ -20,6 +20,18 @@ use std::io::Write as _;
 use gpui::{App, AppContext, TitlebarOptions, WindowBounds, WindowOptions, px, size, SharedString};
 use gpui_platform::application;
 
+/// The version line `--version` prints: the crate version plus the
+/// commit build.sh stamped in (option_env! falls back when cargo
+/// runs without the stamp), so a running instance pins to an exact
+/// build.
+fn version_line() -> String {
+    format!(
+        "kuma-term {} (g{})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KUMA_GIT_SHA").unwrap_or("unknown"),
+    )
+}
+
 fn main() {
     // the PTY child inherits this process's environment, so anything set
     // here is how the shell recognizes kuma-term (prompt snippets key on
@@ -38,6 +50,15 @@ fn main() {
             )
         })
         .init();
+
+    // --version prints and exits: no session, no window, any tty
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("{}", version_line());
+        return;
+    }
 
     if std::env::var("WAYLAND_DISPLAY").is_err() && std::env::var("DISPLAY").is_err() {
         eprintln!("kuma-term: no Wayland/X11 session detected");
@@ -117,6 +138,13 @@ mod tests {
             parse_args(&argv(&["kuma-term", "--something", "-e", "sh"])).unwrap(),
             Some(vec!["sh".to_string()])
         );
+    }
+
+    #[test]
+    fn version_line_names_the_binary() {
+        let line = version_line();
+        assert!(line.starts_with("kuma-term "));
+        assert!(line.contains("(g"));
     }
 
     #[test]
