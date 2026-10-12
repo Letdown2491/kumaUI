@@ -7824,18 +7824,21 @@ impl Browser {
             .child(
                 // the keys modal's chip: the click road while the
                 // overlay hides the sidebar's button; F1 is the key.
-                // The two right-edge buttons share one square box so
-                // their pills and glyphs line up
+                // The two right-edge buttons share one square box and
+                // one text size so their glyphs line up; the ? hangs
+                // its ink from cap height while the × centers lower
+                // (math axis), so the ? carries a small optical nudge
                 div()
                     .id("quicklook-keys")
                     .cursor_pointer()
+                    .pt(px(2.))
                     .w(px(24.))
                     .h(px(24.))
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded_sm()
-                    .text_size(px(13.))
+                    .text_size(px(14.))
                     .text_color(theme::text_dim())
                     .hover(|this| this.text_color(theme::text()).bg(theme::row_hover()))
                     .on_click(cx.listener(|this, _, _, cx| {
