@@ -117,15 +117,18 @@ fn file_title(path: &Path) -> String {
 }
 
 /// Whether the open surface renders this file at all. The mimetype
-/// claims (the desktop file) are the honest subset: avif and svg
-/// have no decoder here and stay unclaimed, avif inside is_image's
-/// own list included, so the grid's Enter keeps handing those to
-/// whatever the system already opens them with.
+/// claims (the desktop file) are the honest subset: avif has no
+/// decoder here and stays unclaimed (it is in is_image's own list),
+/// so the grid's Enter keeps handing it to whatever the system
+/// already opens it with. SVGs claim through the in-process
+/// rasterizer.
 pub(crate) fn is_openable(name: &str) -> bool {
     let ext = Path::new(name)
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase());
-    icons::is_pdf(name) || (icons::is_image(name) && ext.as_deref() != Some("avif"))
+    icons::is_pdf(name)
+        || icons::is_svg(name)
+        || (icons::is_image(name) && ext.as_deref() != Some("avif"))
 }
 
 /// The viewer's decode budget: the peek's own cap, shared.
@@ -268,8 +271,9 @@ impl Viewer {
         let name = file_title(&self.path);
         let is_pdf = icons::is_pdf(&name);
         let is_image = icons::is_image(&name);
+        let is_svg = icons::is_svg(&name);
         let page = if is_pdf { self.page } else { 0 };
-        if !is_pdf && !is_image {
+        if !is_pdf && !is_image && !is_svg {
             // an unclaimed type landed here via a direct CLI call:
             // the failed card is the honest surface
             self.failed = true;
@@ -308,7 +312,12 @@ impl Viewer {
                         if is_pdf {
                             icons::decode_pdf_thumbnail(&bg_path, page, VIEWER_DECODE_MAX)
                         } else {
-                            icons::decode_thumbnail_dynamic(&bg_path)
+                            let dynamic = if is_svg {
+                                icons::decode_svg_dynamic(&bg_path, VIEWER_DECODE_MAX)
+                            } else {
+                                icons::decode_thumbnail_dynamic(&bg_path)
+                            };
+                            dynamic
                                 .map(|image| match rotation {
                                     1 => image.rotate90(),
                                     2 => image.rotate180(),
@@ -481,10 +490,12 @@ impl Viewer {
 }
 
 /// Whether two file names belong to the same nav kind: pdfs group
-/// with pdfs, images with images.
+/// with pdfs, images with images, svgs with svgs.
 fn same_kind(a: &str, b: &str) -> bool {
     if icons::is_pdf(b) {
         icons::is_pdf(a)
+    } else if icons::is_svg(b) {
+        icons::is_svg(a)
     } else if icons::is_image(b) {
         icons::is_image(a)
     } else {
@@ -766,6 +777,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn openable_claims() {
+        // svg joins the claimed kinds (rasterized in-process); avif
+        // stays the honest gap
+        assert!(is_openable("logo.svg"));
+        assert!(is_openable("LOGO.SVG"));
+        assert!(is_openable("photo.png"));
+        assert!(is_openable("scan.pdf"));
+        assert!(!is_openable("photo.avif"));
+        assert!(!is_openable("song.mp3"));
+        // svg siblings walk svg siblings, not the images beside them
+        assert!(same_kind("a.svg", "b.svg"));
+        assert!(!same_kind("a.svg", "b.png"));
     }
 
     #[test]

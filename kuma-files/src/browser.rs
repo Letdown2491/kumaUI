@@ -79,6 +79,11 @@ fn thumb_job(path: &Path, cache_path: &Path) -> Option<gpui::RenderImage> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let dynamic = if icons::is_pdf(&name) {
         icons::decode_pdf_dynamic(path, 1, 256)
+    } else if icons::is_svg(&name) {
+        // rasterized in-process at the fit size, then the common
+        // fit below: the disk cache stores the raster like any
+        // other kind's
+        icons::decode_svg_dynamic(path, 256)
     } else if icons::is_epub(&name) {
         // a pathological cover stays sane: cap the bytes handed to
         // the decoder
@@ -4528,6 +4533,7 @@ impl Browser {
         };
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let is_epub = icons::is_epub(&name);
+        let is_svg = icons::is_svg(&name);
         let is_video = icons::is_video(&name);
         // decoding cost is in the file read, not the resize; cap it.
         // epubs read selectively (zip directory, manifest, cover
@@ -4549,6 +4555,14 @@ impl Browser {
                         if is_pdf {
                             (
                                 icons::decode_pdf_thumbnail(&bg_path, page, QL_DECODE_MAX),
+                                None,
+                                None,
+                            )
+                        } else if is_svg {
+                            (
+                                icons::decode_svg_dynamic(&bg_path, QL_DECODE_MAX).map(|image| {
+                                    icons::decode_to_render(image, QL_DECODE_MAX, QL_DECODE_MAX)
+                                }),
                                 None,
                                 None,
                             )
@@ -12776,13 +12790,40 @@ mod browser_ux_keys {
             "image/webp",
             "image/gif",
             "image/tiff",
+            "image/svg+xml",
             "application/pdf",
         ] {
             assert!(claimed.contains(&mime), "{mime} not claimed");
         }
-        // the claim follows the surface: no decoder for these yet
+        // the claim follows the surface: no decoder for this yet
         assert!(!claimed.contains(&"image/avif"));
-        assert!(!claimed.contains(&"image/svg+xml"));
+    }
+
+    #[test]
+    fn thumb_job_rasterizes_svg() {
+        let dir =
+            std::env::temp_dir().join(format!("koguma-svg-thumb-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("logo.svg");
+        fs::write(
+            &path,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\" height=\"100\">\
+             <rect width=\"200\" height=\"100\" fill=\"#ff0000\"/></svg>",
+        )
+        .unwrap();
+        let cache = dir.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let render = thumb_job(&path, &cache.join("x.png")).expect("an svg thumb decodes");
+        assert_eq!(
+            render.size(0),
+            gpui::Size::new(gpui::DevicePixels(256), gpui::DevicePixels(128))
+        );
+        // the raster landed in the disk cache like any other kind's
+        let cached = fs::read(cache.join("x.png")).unwrap();
+        let image = image::load_from_memory(&cached).unwrap();
+        assert_eq!((image.width(), image.height()), (256, 128));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

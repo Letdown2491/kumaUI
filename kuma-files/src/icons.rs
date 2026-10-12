@@ -3,7 +3,9 @@
 //! alpha masks tinted by the element's text color.
 
 use std::borrow::Cow;
+use std::fs;
 use std::path::Path;
+use std::sync::{Arc, LazyLock};
 
 use gpui::{AssetSource, SharedString};
 use smallvec::SmallVec;
@@ -101,12 +103,23 @@ pub(crate) fn is_image(name: &str) -> bool {
     )
 }
 
+/// SVG files: rasterized in-process for the grid thumbs, the Quick
+/// Look pane, and the viewer. SVGs are resolution independent, so a
+/// small icon's thumb still renders crisp at the fit size.
+pub(crate) fn is_svg(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase() == "svg")
+        .unwrap_or(false)
+}
+
 /// Thumbable grid entries: images always, PDFs when pdftocairo
-/// (poppler-utils) is available, and now videos (a video's grid
-/// thumb is its poster frame; playback stays with the default
-/// handler). Decodes run through the bounded thumb pool.
+/// (poppler-utils) is available, SVGs through the in-process
+/// rasterizer, and videos (a video's grid thumb is its poster
+/// frame; playback stays with the default handler). Decodes run
+/// through the bounded thumb pool.
 pub(crate) fn is_thumbable(name: &str) -> bool {
-    is_image(name) || is_pdf(name) || is_video(name)
+    is_image(name) || is_pdf(name) || is_svg(name) || is_video(name)
 }
 
 /// EPUB ebooks: the Quick Look book glance (cover plus metadata).
@@ -192,6 +205,126 @@ pub(crate) fn decode_pdf_dynamic(
     image::load_from_memory(&out.stdout).ok()
 }
 
+/// The SVG preview's font database: system fonts scanned once per
+/// process (the scan is the costly part). fontdb's generic families
+/// default to Microsoft names kumaOS does not ship, so each generic
+/// that resolves to nothing points at a face that exists: the same
+/// repair gpui's svg_renderer makes for its bundled faces.
+static SVG_FONTDB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+    let mut db = usvg::fontdb::Database::new();
+    db.load_system_fonts();
+    let fallback = db
+        .faces()
+        .next()
+        .and_then(|face| face.families.first().map(|(name, _)| name.clone()));
+    if let Some(fallback) = fallback {
+        for family in [
+            usvg::fontdb::Family::SansSerif,
+            usvg::fontdb::Family::Serif,
+            usvg::fontdb::Family::Monospace,
+            usvg::fontdb::Family::Cursive,
+            usvg::fontdb::Family::Fantasy,
+        ] {
+            let query = usvg::fontdb::Query {
+                families: &[family],
+                ..Default::default()
+            };
+            if db.query(&query).is_none() {
+                match family {
+                    usvg::fontdb::Family::SansSerif => db.set_sans_serif_family(&fallback),
+                    usvg::fontdb::Family::Serif => db.set_serif_family(&fallback),
+                    usvg::fontdb::Family::Monospace => db.set_monospace_family(&fallback),
+                    usvg::fontdb::Family::Cursive => db.set_cursive_family(&fallback),
+                    usvg::fontdb::Family::Fantasy => db.set_fantasy_family(&fallback),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Arc::new(db)
+});
+
+/// usvg's parse options: the shared system fontdb under the default
+/// font matching, the same shape gpui's svg_renderer builds. A fresh
+/// options per decode (cheap boxed closures); the database is the
+/// process-wide part.
+fn svg_options() -> usvg::Options<'static> {
+    let default_font_selector = usvg::FontResolver::default_font_selector();
+    let default_fallback_selector = usvg::FontResolver::default_fallback_selector();
+    usvg::Options {
+        font_resolver: usvg::FontResolver {
+            select_font: Box::new(move |font, db| {
+                if db.is_empty() {
+                    *db = SVG_FONTDB.clone();
+                }
+                default_font_selector(font, db)
+            }),
+            select_fallback: Box::new(move |ch, fonts, db| {
+                default_fallback_selector(ch, fonts, db)
+            }),
+        },
+        ..Default::default()
+    }
+}
+
+/// Rasterize an SVG file into a straight-alpha RGBA `DynamicImage`
+/// fitted within `max x max`, the thumb pipeline's shared
+/// intermediate. resvg executes nothing and fetches nothing, so an
+/// untrusted file is on par with an untrusted raster here.
+pub(crate) fn decode_svg_dynamic(path: &Path, max: u32) -> Option<image::DynamicImage> {
+    let bytes = fs::read(path).ok()?;
+    decode_svg_bytes_dynamic(&bytes, max)
+}
+
+/// The svg decode from raw bytes, the test surface of the same
+/// contract.
+pub(crate) fn decode_svg_bytes_dynamic(bytes: &[u8], max: u32) -> Option<image::DynamicImage> {
+    // a pathological file stays sane: cap the bytes handed to the
+    // parser the way the epub cover is capped
+    (bytes.len() <= 16 * 1024 * 1024).then_some(bytes)?;
+    let tree = usvg::Tree::from_data(bytes, &svg_options()).ok()?;
+    let size = tree.size();
+    // fit within max on the long side, up or down: SVGs are
+    // resolution independent, so a small icon's thumb upscales crisp
+    let scale = max as f32 / size.width().max(size.height()).max(1.0);
+    let width = (size.width() * scale).round().max(1.0) as u32;
+    let height = (size.height() * scale).round().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(
+            width as f32 / size.width(),
+            height as f32 / size.height(),
+        ),
+        &mut pixmap.as_mut(),
+    );
+    demultiply(pixmap)
+}
+
+/// tiny-skia's pixmap is premultiplied RGBA; the image pipeline's
+/// DynamicImage wants straight alpha.
+fn demultiply(pixmap: resvg::tiny_skia::Pixmap) -> Option<image::DynamicImage> {
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let mut data = pixmap.take();
+    for pixel in data.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u32;
+        if alpha == 255 {
+            continue;
+        }
+        if alpha == 0 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+        } else {
+            for channel in &mut pixel[..3] {
+                *channel = ((*channel as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+    }
+    let buffer = image::ImageBuffer::from_raw(width, height, data)?;
+    Some(image::DynamicImage::ImageRgba8(buffer))
+}
+
 /// Convert a decoded image into the BGRA `RenderImage` gpui expects.
 pub(crate) fn decode_to_render(
     image: image::DynamicImage,
@@ -217,6 +350,26 @@ mod tests {
     }
 
     #[test]
+    fn svg_decode_renders_true_colors() {
+        use image::GenericImageView;
+        // a red rectangle on the left half, transparent right half:
+        // the tint-only svg element would discard the color, the
+        // rasterizer must keep it, and the alpha must come back
+        // straight (255 stays 255, zeros are zeros)
+        let svg: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="100" height="100" fill="#ff0000"/></svg>"##;
+        let image = decode_svg_bytes_dynamic(svg, 256).expect("a valid svg decodes");
+        assert_eq!((image.width(), image.height()), (256, 128));
+        assert_eq!(image.get_pixel(30, 30), image::Rgba([255, 0, 0, 255]));
+        assert_eq!(image.get_pixel(200, 64), image::Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn svg_decode_fails_soft() {
+        // garbage bytes: no panic, just None
+        assert!(decode_svg_bytes_dynamic(b"not an svg", 256).is_none());
+    }
+
+    #[test]
     fn thumbable_gates() {
         // videos are grid thumbs now (their poster frame, through
         // the bounded pool); playback itself stays with the default
@@ -232,5 +385,10 @@ mod tests {
         assert!(!is_thumbable("notes.pdf.txt"));
         assert!(is_thumbable("photo.png"));
         assert!(!is_thumbable("report.docx"));
+        // svgs rasterize in-process, no external tool involved
+        assert!(is_svg("logo.svg"));
+        assert!(is_svg("LOGO.SVG"));
+        assert!(!is_svg("logo.svg.txt"));
+        assert!(is_thumbable("logo.svg"));
     }
 }

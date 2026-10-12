@@ -24,6 +24,13 @@ libc = "0.2"
 # epub glances: container reads plus the two small XML docs
 zip = { version = "2", default-features = false, features = ["deflate"] }
 roxmltree = "0.20"
+# svg previews: in-process rasterization through the resvg gpui
+# already links (no new binary weight; same feature set as the
+# vendored gpui's, so the unified build adds no code either).
+# A DynamicImage out keeps the thumb pipeline, disk cache, and
+# viewer rotation uniform with the other decodable kinds.
+resvg = { version = "0.46.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
+usvg = { version = "0.46.0", default-features = false, features = ["text", "system-fonts"] }
 # video: in-process libav decode (kumaOS ships ffmpeg-libs, no CLI;
 # headers are the free build's, same sonames as the runtime libs).
 # The sys crate, not ffmpeg-next: the safe wrapper's 9.0.0 release

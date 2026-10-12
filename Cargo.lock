@@ -3091,9 +3091,11 @@ dependencies = [
  "notify",
  "nucleo",
  "pulldown-cmark",
+ "resvg",
  "roxmltree 0.20.0",
  "smallvec",
  "trash",
+ "usvg",
  "zip",
 ]
 

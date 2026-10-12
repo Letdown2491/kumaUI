@@ -8,5 +8,5 @@ Exec=@BIN@/kuma-files %u
 Icon=kuma-files
 Terminal=false
 Categories=System;FileManager;
-MimeType=inode/directory;x-scheme-handler/file;image/png;image/jpeg;image/webp;image/gif;image/tiff;application/pdf;
+MimeType=inode/directory;x-scheme-handler/file;image/png;image/jpeg;image/webp;image/gif;image/tiff;image/svg+xml;application/pdf;
 StartupNotify=true

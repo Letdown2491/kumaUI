@@ -11,6 +11,16 @@ rides unchanged.
 
 ## Unreleased
 
+### Added
+
+- **Koguma renders SVG files.** The grid shows a true-color thumbnail
+  (rasterized in-process at the fit size, so small icons stay crisp),
+  Quick Look glances them, and the standalone viewer opens one with
+  zoom and rotate, the arrows walking sibling SVGs. The desktop claim
+  `image/svg+xml` moves to Koguma, so Enter, double-click, and
+  `xdg-open` all land in it. avif stays unclaimed; it is the last
+  kind with no decoder here.
+
 ### Fixed
 
 - **Apps installed mid-session get their icons without a shell restart.**
