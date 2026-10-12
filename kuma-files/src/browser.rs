@@ -4627,14 +4627,15 @@ impl Browser {
             if let Some((old, _)) = vid.frame.replace((image, pts)) {
                 cx.drop_image(old, None);
             }
-            cx.notify();
         }
         if vid.eof && vid.ahead.is_none() {
             // the stream ran out and everything due is on screen:
-            // hold the last frame, park the loop
+            // hold the last frame, park the loop (one notify for the
+            // hint's state change)
             vid.playing = false;
             vid.ended = true;
             cx.notify();
+            return;
         }
     }
 
@@ -7572,18 +7573,14 @@ impl Browser {
         });
         // the player's presented frame wins over the poster the
         // moment one is due: the poster holds the pane only for the
-        // open beat (the Poster state). The playing flag rides along
-        // so the arm can keep the present loop armed.
+        // open beat (the Poster state). The loop itself arms in
+        // render, from the playing state alone.
         let ql_frame = self
             .ql_video
             .as_ref()
             .filter(|vid| vid.path == entry.path && !entry.is_dir)
-            .and_then(|vid| {
-                vid.frame
-                    .as_ref()
-                    .map(|(image, _)| (image.clone(), vid.playing))
-            })
-            .or_else(|| image.clone().map(|render| (render, false)));
+            .and_then(|vid| vid.frame.as_ref().map(|(image, _)| image.clone()))
+            .or_else(|| image.clone());
         // the whole-file read lands over the snippet once here
         let full_text = self.ql_text.as_ref().and_then(|(p, preview)| {
             (p == &entry.path && !entry.is_dir).then(|| preview.clone())
@@ -7607,17 +7604,7 @@ impl Browser {
                         .into_any_element()
                 })
                 .flex_1())
-        } else if let Some((render, playing)) = ql_frame {
-            // the present loop: one pump per compositor frame while
-            // a video plays; the poster and a parked player stay
-            // still. (The overlay's render holds &Window, so the
-            // entity handle routes the callback through the view.)
-            if playing {
-                let view = cx.entity();
-                window.on_next_frame(move |_, cx| {
-                    view.update(cx, |view, cx| view.pump_video(cx));
-                });
-            }
+        } else if let Some(render) = ql_frame {
             let viewport = window.viewport_size();
             // the pane's own budget: this overlay's top row and the
             // pane's margin, which the layout below owns
@@ -8614,6 +8601,21 @@ impl Render for Browser {
         self.arm_watcher();
         self.auto_dock(window);
         self.sync_sel_video(cx);
+        // the Quick Look video's present tick runs at the head of
+        // every draw pass: due frames land in the slot before this
+        // pass's tree reads it, and the compositor frame callback
+        // keeps the loop armed while a video plays (notify-only, so
+        // the pump never runs inside a held entity update)
+        if self.quicklook.is_some() {
+            self.pump_video(cx);
+            if self
+                .ql_video
+                .as_ref()
+                .is_some_and(|vid| vid.playing && !vid.ended)
+            {
+                window.request_animation_frame();
+            }
+        }
         // this paint's thumb kicks define the wanted set; the pool
         // consults it at pop time, so off-screen queue entries die
         self.thumb_wanted.clear();
@@ -12036,6 +12038,60 @@ mod browser_ux_keys {
                 .quicklook
                 .as_ref()
                 .is_some_and(|ql| ql.path == lab.dir.join("b.txt")));
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_video_presents_without_a_manual_pump() {
+        let lab = Lab::new("quicklook-video-loop");
+        // a real one-second clip, copied in before the browser loads
+        // so the listing sees it
+        let clip = lab.dir.join("clip.mp4");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.mp4"),
+            &clip,
+        )
+        .unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            let ix = browser
+                .tab()
+                .entries
+                .iter()
+                .position(|entry| entry.name == "clip.mp4")
+                .expect("clip listed");
+            browser.jump_cursor(ix, cx);
+            browser.route_key(&key("space"), cx);
+        });
+        app.run_until_parked(); // the poster and the player land
+        window.update(|browser, _, _| {
+            assert!(browser.ql_video.as_ref().expect("player landed").playing);
+        });
+        // the real app's metronome: each compositor frame's callback
+        // notifies the view, the draw pass pumps due frames in, and
+        // the render arms the next one from the playing state alone
+        let mut saw_callbacks = false;
+        for _ in 0..5 {
+            let callbacks = window.update(|_, window, cx| window.simulate_next_frame(cx));
+            app.run_until_parked();
+            saw_callbacks |= callbacks > 0;
+        }
+        window.update(|browser, _, _| {
+            assert!(saw_callbacks, "the present loop never armed");
+            assert!(
+                browser
+                    .ql_video
+                    .as_ref()
+                    .expect("player still up")
+                    .frame
+                    .is_some(),
+                "the present loop never presented a frame"
+            );
         });
         app.run_until_parked();
     }
