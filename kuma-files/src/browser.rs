@@ -7823,13 +7823,19 @@ impl Browser {
             .child(div().flex_1())
             .child(
                 // the keys modal's chip: the click road while the
-                // overlay hides the sidebar's button; F1 is the key
+                // overlay hides the sidebar's button; F1 is the key.
+                // The two right-edge buttons share one square box so
+                // their pills and glyphs line up
                 div()
                     .id("quicklook-keys")
                     .cursor_pointer()
-                    .px_2()
+                    .w(px(24.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded_sm()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme::text_dim())
                     .hover(|this| this.text_color(theme::text()).bg(theme::row_hover()))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -7842,9 +7848,13 @@ impl Browser {
                 div()
                     .id("quicklook-close")
                     .cursor_pointer()
-                    .px_2()
+                    .w(px(24.))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded_sm()
-                    .text_size(px(16.))
+                    .text_size(px(14.))
                     .text_color(theme::text_dim())
                     .hover(|this| this.text_color(theme::text()).bg(theme::row_hover()))
                     .on_click(cx.listener(|this, _, _, cx| this.close_quicklook(cx)))
