@@ -1,10 +1,12 @@
-//! In-process video decode: kumaOS ships the full libav as
-//! ffmpeg-libs and no CLI (the kumaOS ffmpeg contract), so posters,
-//! preview loops and durations come from linking libavcodec,
-//! libavformat and libswscale. Videos are hostile input: every step is fallible and
-//! degrades, so callers fall back to the type icon or the card. No
-//! function here may run on the UI thread; callers wrap the decode
-//! in catch_unwind like every other thumbnail decode.
+//! In-process video decode and playback: kumaOS ships the full libav
+//! as ffmpeg-libs and no CLI (the kumaOS ffmpeg contract), so
+//! posters, preview loops, durations and the Quick Look player come
+//! from linking libavcodec, libavformat and libswscale. Videos are
+//! hostile input: every step is fallible and degrades, so callers
+//! fall back to the type icon or the card. No function here may run
+//! libav on the UI thread; callers wrap the decode in catch_unwind
+//! like every other thumbnail decode, and the player's loop runs on
+//! its own thread (`Player::try_recv` only drains the ring).
 //!
 //! The portability rule: libav is a capability, not a requirement.
 //! The decode path lives behind the `video` feature (default on);
@@ -88,7 +90,14 @@ mod imp {
     }
 
     /// RAII for the demuxer: close frees the context and its streams.
+    ///
+    /// `Send` so the player can move an opened context into its
+    /// decode thread: the move transfers ownership, the open ran to
+    /// completion on the spawning thread, and libav's own rule is
+    /// only that no two threads touch one context at once.
     struct FormatInput(*mut sys::AVFormatContext);
+
+    unsafe impl Send for FormatInput {}
 
     impl Drop for FormatInput {
         fn drop(&mut self) {
@@ -96,8 +105,11 @@ mod imp {
         }
     }
 
-    /// RAII for the decoder context: free closes and frees.
+    /// RAII for the decoder context: free closes and frees. `Send`
+    /// for the player thread, same reasoning as `FormatInput`.
     struct CodecCtx(*mut sys::AVCodecContext);
+
+    unsafe impl Send for CodecCtx {}
 
     impl Drop for CodecCtx {
         fn drop(&mut self) {
@@ -254,6 +266,189 @@ mod imp {
             }
             // the poster stands in: the loop is not worth showing
             _ => decode_poster(path, max),
+        }
+    }
+
+    /// The playback decode cap on the long edge: the contract's bar
+    /// is 1080p software playback, so larger sources scale down in
+    /// the scaler (never up), a portrait clip caps its long edge
+    /// too, and the pane's own fit does the rest. One 1080p BGRA
+    /// frame is about 8 MB.
+    const PLAYER_MAX: u32 = 1080;
+    /// Frames in flight from the decode thread to the pane: a
+    /// handful is decode-ahead enough at 25fps (about 160ms) and
+    /// doubles as the pause buffer, because the thread blocks on a
+    /// full ring, which is exactly what a paused pane wants it to
+    /// do.
+    const PLAYER_RING: usize = 4;
+
+    /// What the decode thread ships the pane: a frame, or the
+    /// stream's end. `Eof` also covers a decode error mid-stream, so
+    /// the pane parks cleanly; a thread that dies without sending
+    /// (a panic) reads the same through the disconnected channel.
+    pub(crate) enum PlayerMsg {
+        /// A decoded frame, fitted, its media time in seconds.
+        Frame {
+            image: std::sync::Arc<gpui::RenderImage>,
+            pts: f64,
+        },
+        /// The stream is over; every frame is in the pane's hands.
+        Eof,
+    }
+
+    /// One playing video: the pane's handle on the decode thread.
+    /// The thread owns libav end to end, decodes ahead into the
+    /// bounded ring, and blocks when the ring is full: the
+    /// backpressure is the pause, the drain is the play. Dropping
+    /// the `Player` drops the receiver, which fails a thread's next
+    /// send and wakes a blocked one: no stop flag, no join.
+    pub(crate) struct Player {
+        rx: std::sync::mpsc::Receiver<PlayerMsg>,
+    }
+
+    impl Player {
+        /// Open the container and spawn the decode thread. The open
+        /// itself (header parse plus stream info) costs libav tens
+        /// of milliseconds: run it off the UI thread like every
+        /// other decode. `Err` names the failure exactly where the
+        /// poster path does. Decodes at `PLAYER_MAX`.
+        pub(crate) fn open(path: &Path) -> Result<Player, PosterFail> {
+            let cpath = cpath(path).ok_or(PosterFail::Empty)?;
+            let (input, video_index, cctx) = unsafe { open_video_decoder(&cpath)? };
+            let (tx, rx) = std::sync::mpsc::sync_channel(PLAYER_RING);
+            let spawned = std::thread::Builder::new()
+                .name("kuma-video-player".into())
+                .spawn(move || {
+                    // hostile input: a panic in libav-land ends the
+                    // thread, never the app; the pane reads the dead
+                    // channel as eof
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                        play_loop(input, video_index, cctx, tx, PLAYER_MAX);
+                    }));
+                });
+            spawned.map_err(|_| PosterFail::Empty)?;
+            Ok(Player { rx })
+        }
+
+        /// The next message if one is ready: a frame, the stream's
+        /// end, or nothing yet (the ring is empty and the thread
+        /// still runs). Never blocks, so it is safe on the UI
+        /// thread: the libav work stays on the thread that owns it.
+        pub(crate) fn try_recv(&self) -> Option<PlayerMsg> {
+            self.rx.try_recv().ok()
+        }
+    }
+
+    /// The player's decode loop, on the decode thread: read, decode,
+    /// fit, ship. Ends at eof, a decode error, or a gone pane (the
+    /// send fails once the receiver dropped; a send blocked on the
+    /// full ring wakes the same way). `tx` ships the terminal `Eof`
+    /// so the pane parks cleanly.
+    unsafe fn play_loop(
+        input: FormatInput,
+        video_index: usize,
+        cctx: CodecCtx,
+        tx: std::sync::mpsc::SyncSender<PlayerMsg>,
+        max: u32,
+    ) {
+        unsafe {
+            let Some(pkt) = Packet::alloc() else {
+                return;
+            };
+            let Some(frame) = Frame::alloc() else {
+                return;
+            };
+            let streams = *std::ptr::addr_of!((*input.0).streams);
+            let stream = *streams.add(video_index);
+            let stream_tb = (*stream).time_base;
+            // the synthetic clock for streams without usable
+            // timestamps: the stream's average frame rate, 25fps
+            // when unstated
+            let rate = (*cctx.0).framerate;
+            let frame_dur = if rate.num > 0 {
+                rate.den as f64 / rate.num as f64
+            } else {
+                1.0 / 25.0
+            };
+            let mut fallback: f64 = 0.0;
+            let mut scaler: Option<Scaler> = None;
+            'read: loop {
+                if sys::av_read_frame(input.0, pkt.0) < 0 {
+                    break; // eof or read error: the stream is what it is
+                }
+                if (*pkt.0).stream_index != video_index as i32 {
+                    sys::av_packet_unref(pkt.0);
+                    continue;
+                }
+                if sys::avcodec_send_packet(cctx.0, pkt.0) < 0 {
+                    sys::av_packet_unref(pkt.0);
+                    break;
+                }
+                loop {
+                    let got = sys::avcodec_receive_frame(cctx.0, frame.0);
+                    if got < 0 {
+                        break; // EAGAIN or error: next packet
+                    }
+                    let (dw, dh, mut buf) = match scale_frame(frame.0, &mut scaler, max) {
+                        Ok(ok) => ok,
+                        Err(_) => break 'read,
+                    };
+                    let pts = frame_pts_seconds(frame.0, stream_tb, &cctx).unwrap_or(fallback);
+                    fallback = pts + frame_dur;
+                    sys::av_frame_unref(frame.0);
+                    // gpui's atlas wants BGRA
+                    for pixel in buf.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                    }
+                    let Some(rgba) = image::RgbaImage::from_raw(dw, dh, buf) else {
+                        break 'read;
+                    };
+                    let image = gpui::RenderImage::new(smallvec::SmallVec::from_buf([
+                        image::Frame::new(rgba),
+                    ]));
+                    let ship = tx.send(PlayerMsg::Frame {
+                        image: std::sync::Arc::new(image),
+                        pts,
+                    });
+                    if ship.is_err() {
+                        return; // the pane moved on: the job is done
+                    }
+                }
+                sys::av_packet_unref(pkt.0);
+            }
+            let _ = tx.send(PlayerMsg::Eof);
+        }
+    }
+
+    /// The frame's presentation time in seconds. libav stamps the
+    /// frame's own time base when it has one; the container's stream
+    /// time base is what the copied-through packet timestamps run in
+    /// otherwise, and the codec context's is the last resort. None
+    /// when the timestamp is unknown (the caller synthesizes).
+    unsafe fn frame_pts_seconds(
+        frame: *mut sys::AVFrame,
+        stream_tb: sys::AVRational,
+        cctx: &CodecCtx,
+    ) -> Option<f64> {
+        unsafe {
+            let tb = if (*frame).time_base.num > 0 {
+                (*frame).time_base
+            } else if stream_tb.num > 0 {
+                stream_tb
+            } else {
+                (*cctx.0).time_base
+            };
+            ((*frame).pts >= 0 && tb.num > 0).then(|| {
+                sys::av_rescale_q(
+                    (*frame).pts,
+                    tb,
+                    sys::AVRational {
+                        num: 1,
+                        den: 1_000_000,
+                    },
+                ) as f64
+                    / 1_000_000.0
+            })
         }
     }
 
@@ -571,7 +766,7 @@ mod imp {
 }
 
 #[cfg(feature = "video")]
-pub(crate) use imp::{decode_preview, poster_dynamic, probe};
+pub(crate) use imp::{Player, PlayerMsg, decode_poster, decode_preview, poster_dynamic, probe};
 
 #[cfg(not(feature = "video"))]
 mod imp {
@@ -586,9 +781,9 @@ mod imp {
         None
     }
 
-    /// Test-only: the degraded path always errs, and the tests assert
-    /// exactly that. Nothing else has a reason to call it.
-    #[cfg(test)]
+    /// The degraded path always errs, and the panes stand in the
+    /// card: the QL pane's poster beat and the tests assert exactly
+    /// that.
     pub(crate) fn decode_poster(
         _path: &Path,
         _max: u32,
@@ -603,6 +798,31 @@ mod imp {
         Err(PosterFail::Empty)
     }
 
+    /// The playback engine's stub: opening a player always errs, so
+    /// the pane's named card stands in and no thread ever spawns.
+    pub(crate) struct Player;
+
+    impl Player {
+        pub(crate) fn open(_path: &Path) -> Result<Player, PosterFail> {
+            Err(PosterFail::Empty)
+        }
+
+        pub(crate) fn try_recv(&self) -> Option<PlayerMsg> {
+            None
+        }
+    }
+
+    /// The pane matches on these variants, the stub never builds
+    /// them (nothing decodes), hence the allow.
+    #[allow(dead_code)]
+    pub(crate) enum PlayerMsg {
+        Frame {
+            image: std::sync::Arc<gpui::RenderImage>,
+            pts: f64,
+        },
+        Eof,
+    }
+
     pub(crate) fn poster_dynamic(
         _path: &Path,
         _max: u32,
@@ -612,7 +832,7 @@ mod imp {
 }
 
 #[cfg(not(feature = "video"))]
-pub(crate) use imp::{decode_preview, poster_dynamic, probe};
+pub(crate) use imp::{Player, PlayerMsg, decode_poster, decode_preview, poster_dynamic, probe};
 
 /// Test helper (the `video` feature on, test builds only): a raw
 /// H.264 elementary stream whose container parses but whose codec
@@ -634,7 +854,7 @@ pub(crate) fn write_codec_missing_stream(path: &std::path::Path) {
 
 #[cfg(all(test, feature = "video"))]
 mod tests {
-    use super::imp::{decode_poster, decode_preview, poster_dynamic, probe};
+    use super::imp::{Player, PlayerMsg, decode_poster, decode_preview, poster_dynamic, probe};
     use super::{delay_from_pts, duration_label};
     use super::PosterFail;
     use super::write_codec_missing_stream;
@@ -836,6 +1056,57 @@ mod tests {
         // unknown and backwards timestamps carry the last pace
         assert_eq!(delay_from_pts(Some(40_000), None, carried), carried);
         assert_eq!(delay_from_pts(Some(40_000), Some(20_000), carried), carried);
+    }
+
+    #[test]
+    fn player_decodes_in_order_and_ends() {
+        let path = Path::new("tests/fixtures/sample.mp4");
+        let player = Player::open(path).expect("player opens");
+        let started = std::time::Instant::now();
+        let mut frames: Vec<(f64, u32, u32)> = Vec::new();
+        loop {
+            match player.try_recv() {
+                Some(PlayerMsg::Frame { image, pts }) => {
+                    let size = image.size(0);
+                    frames.push((pts, u32::from(size.width), u32::from(size.height)));
+                }
+                Some(PlayerMsg::Eof) => break,
+                None => {
+                    // the decode thread runs at its own pace: wait
+                    // for it, but never forever
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10),
+                        "player never ended"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+        // one second of 25fps at the fixture's native size (64x64 is
+        // far under the playback cap, so the scaler never touches it)
+        assert!(frames.len() >= 20, "frames {}", frames.len());
+        assert_eq!(frames[0].1, 64);
+        assert_eq!(frames[0].2, 64);
+        assert!(frames[0].0 < 0.1, "first pts {}", frames[0].0);
+        // timestamps run forward: the sync's most basic demand
+        for pair in frames.windows(2) {
+            assert!(
+                pair[1].0 > pair[0].0,
+                "pts {} then {}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    #[test]
+    fn player_fails_soft() {
+        // a text file has no video stream: the open errs, no thread
+        // lingers, no panic
+        assert!(matches!(
+            Player::open(Path::new("Cargo.toml")),
+            Err(PosterFail::Empty)
+        ));
     }
 
     #[test]

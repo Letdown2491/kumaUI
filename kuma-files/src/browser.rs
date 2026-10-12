@@ -1442,6 +1442,13 @@ pub(crate) struct Browser {
     /// duration (one ask per open path; reset on file flips). A
     /// header that will not read just leaves the label out.
     video_meta_asked: bool,
+    /// The Quick Look video player: the muted playback engine. The
+    /// wall clock stands in for the audio clock until the sink
+    /// lands; space toggles play/pause while a video is up.
+    ql_video: Option<VideoPlayer>,
+    /// The player has been asked for the current video (one ask per
+    /// open path; reset on file flips, close, and teardown).
+    video_player_asked: bool,
     /// The selected video's poster slot for the details pane, keyed
     /// by entry key like the text snippet. Grid and search previews
     /// keep type icons; Quick Look has its own pane-scale poster.
@@ -1584,6 +1591,8 @@ impl Browser {
             ql_book: None,
             ql_video_len: None,
             video_meta_asked: false,
+            ql_video: None,
+            video_player_asked: false,
             sel_video: None,
             sel_video_len: None,
             sel_video_kick: None,
@@ -4211,8 +4220,23 @@ impl Browser {
             cx.drop_image(image, None);
         }
         self.ql_inflight = None;
+        self.stop_video_player(cx);
         self.quicklook = None;
         cx.notify();
+    }
+
+    /// Tear the Quick Look player down: the held tile drops (the
+    /// registry owns tile lifetime, ADR-0016), the lookahead's
+    /// pixels were never uploaded (the Arc release is enough), and
+    /// the `Player` dropping wakes the decode thread. Also the
+    /// video_player_asked reset, so a reopen asks fresh.
+    fn stop_video_player(&mut self, cx: &mut Context<Self>) {
+        self.video_player_asked = false;
+        if let Some(mut vid) = self.ql_video.take() {
+            if let Some((image, _)) = vid.frame.take() {
+                cx.drop_image(image, None);
+            }
+        }
     }
 
     /// Re-point the open overlay at the cursor entry. Flips land
@@ -4269,6 +4293,7 @@ impl Browser {
             self.ql_book = None;
             self.ql_video_len = None;
             self.video_meta_asked = false;
+            self.stop_video_player(cx);
             self.ql_scroll.set_offset(point(px(0.), px(0.)));
         }
         self.feed_quicklook(&entry, cx);
@@ -4315,10 +4340,11 @@ impl Browser {
             }
             // a video's poster rides the image arm, so zoom and pan
             // come free; its header facts land once into the shared
-            // label slot (playback itself stays with the default
-            // handler; gpui has no decoder)
+            // label slot, and the player takes the pane over from
+            // the poster the moment its first frame is due
             if icons::is_video(&entry.name) {
                 self.request_video_duration(entry.path.clone(), cx);
+                self.request_video_player(entry.path.clone(), cx);
             }
         } else {
             let key = entry.key.clone();
@@ -4499,6 +4525,144 @@ impl Browser {
         .detach();
     }
 
+    /// Kick the Quick Look video player: open the container and
+    /// spawn the decode thread off the UI thread, one ask per open
+    /// path. The landing starts Playing at media time zero; the
+    /// pane's poster shows until the first frame is due. A failed
+    /// open lands in the named card slot exactly where the poster
+    /// path's failures land.
+    fn request_video_player(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.video_player_asked {
+            return;
+        }
+        self.video_player_asked = true;
+        cx.spawn(async move |this, cx| {
+            let bg_path = path.clone();
+            let opened = cx
+                .background_spawn(async move {
+                    std::panic::catch_unwind(|| crate::video::Player::open(&bg_path))
+                        .unwrap_or(Err(crate::video::PosterFail::Empty))
+                })
+                .await;
+            let update = this.update(cx, |this, cx| {
+                // the pane may have closed or flipped files while the
+                // open ran: a stale landing drops unheard
+                if !this
+                    .quicklook
+                    .as_ref()
+                    .is_some_and(|ql| ql.path == path)
+                {
+                    return;
+                }
+                match opened {
+                    Ok(player) => {
+                        this.ql_video = Some(VideoPlayer {
+                            path,
+                            player,
+                            frame: None,
+                            ahead: None,
+                            eof: false,
+                            clock_base: 0.0,
+                            wall: std::time::Instant::now(),
+                            playing: true,
+                            ended: false,
+                        });
+                        cx.notify();
+                    }
+                    Err(fail) => {
+                        this.ql_failed = Some((path, fail));
+                        cx.notify();
+                    }
+                }
+            });
+            if let Err(err) = update {
+                log::error!("video player open failed: {err:#}");
+            }
+        })
+        .detach();
+    }
+
+    /// The video pane's present tick, run once per compositor frame
+    /// while a video plays: drain the frames the clock has reached
+    /// (the newest due wins; frames it displaces are skipped without
+    /// display, the late-drop rule), hold the first not-yet-due frame
+    /// back, drop the displaced tile (ADR-0016), and park the loop at
+    /// the stream's end. The threshold is the sync floor; the clock
+    /// is wall time until the audio sink lands.
+    fn pump_video(&mut self, cx: &mut Context<Self>) {
+        const THRESHOLD: f64 = 0.04;
+        let Some(vid) = self.ql_video.as_mut() else {
+            return;
+        };
+        if !vid.playing || vid.ended {
+            return;
+        }
+        let clock = vid.media_now();
+        let mut pending = vid.ahead.take();
+        let mut due: Option<(Arc<RenderImage>, f64)> = None;
+        loop {
+            let next = match pending.take() {
+                Some(frame) => Some(frame),
+                None => match vid.player.try_recv() {
+                    Some(crate::video::PlayerMsg::Frame { image, pts }) => Some((image, pts)),
+                    Some(crate::video::PlayerMsg::Eof) => {
+                        vid.eof = true;
+                        None
+                    }
+                    None => None,
+                },
+            };
+            let Some(frame) = next else {
+                break;
+            };
+            if frame.1 <= clock + THRESHOLD {
+                due = Some(frame);
+            } else {
+                pending = Some(frame);
+                break;
+            }
+        }
+        vid.ahead = pending;
+        if let Some((image, pts)) = due {
+            if let Some((old, _)) = vid.frame.replace((image, pts)) {
+                cx.drop_image(old, None);
+            }
+            cx.notify();
+        }
+        if vid.eof && vid.ahead.is_none() {
+            // the stream ran out and everything due is on screen:
+            // hold the last frame, park the loop
+            vid.playing = false;
+            vid.ended = true;
+            cx.notify();
+        }
+    }
+
+    /// Space while a video is up: pause, resume, or (at the end)
+    /// replay from the head. Returns false when no player owns the
+    /// key, so the caller's space-to-close can have it.
+    fn quicklook_video_toggle(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(vid) = self.ql_video.as_mut() else {
+            return false;
+        };
+        if vid.ended {
+            // replay: a fresh player and the clock back to zero; the
+            // held tile drops with the teardown
+            let path = vid.path.clone();
+            self.stop_video_player(cx);
+            self.request_video_player(path, cx);
+            return true;
+        }
+        vid.playing = !vid.playing;
+        if vid.playing {
+            vid.wall = std::time::Instant::now();
+        } else {
+            vid.clock_base = vid.media_now();
+        }
+        cx.notify();
+        true
+    }
+
     /// Kick the background decode for Quick Look's own render (the
     /// listing's thumbs are 256px; a pane wants more). Keyed by path
     /// and page; a newer request supersedes an older one in flight,
@@ -4578,7 +4742,10 @@ impl Browser {
                                 None => (None, None, None),
                             }
                         } else if is_video {
-                            match crate::video::decode_preview(&bg_path, QL_PREVIEW_MAX) {
+                            // the still beat: one frame, the poster;
+                            // the player owns the pane from its own
+                            // first frame on
+                            match crate::video::decode_poster(&bg_path, QL_PREVIEW_MAX) {
                                 Ok(render) => (Some(render), None, None),
                                 Err(fail) => (None, None, Some(fail)),
                             }
@@ -5267,9 +5434,16 @@ impl Browser {
 
         if self.quicklook.is_some() {
             match keystroke.key.as_str() {
-                // space toggles shut, escape closes: both keep the
-                // cursor where it was
-                "space" | "escape" => self.close_quicklook(cx),
+                // space pauses a playing video, resumes a paused one,
+                // replays an ended one, and closes the overlay when
+                // no player owns the file; escape closes. Both keep
+                // the cursor where it was
+                "space" => {
+                    if !self.quicklook_video_toggle(cx) {
+                        self.close_quicklook(cx);
+                    }
+                }
+                "escape" => self.close_quicklook(cx),
                 // shift+arrows: same direction, bigger step, a page
                 // instead of a file
                 "up" | "left" if keystroke.modifiers.shift => {
@@ -7296,6 +7470,18 @@ impl Browser {
             (*p == entry.path && !entry.is_dir && icons::is_video(&entry.name))
                 .then(|| label.clone())
         });
+        // a landed player's space is pause, not close: the hint says
+        // so, and says the parked states' ways back too (until the
+        // player lands, space still closes, the default hint holds)
+        let video_hint = self
+            .ql_video
+            .as_ref()
+            .filter(|vid| vid.path == entry.path)
+            .map(|vid| match (vid.playing, vid.ended) {
+                (true, _) => "Space pauses · Esc closes",
+                (_, true) => "Space replays · Esc closes",
+                (false, _) => "Space plays · Esc closes",
+            });
 
         // the top row: name, position in the listing, the close road
         let header = div()
@@ -7348,7 +7534,9 @@ impl Browser {
                 div()
                     .text_size(px(11.))
                     .text_color(theme::text_dim())
-                    .child(if paging.is_some() {
+                    .child(if let Some(hint) = video_hint {
+                        hint.to_string()
+                    } else if paging.is_some() {
                         let word = if is_epub { "chapters" } else { "pages" };
                         format!("PgUp/PgDn or Shift+arrows {word} · Esc closes")
                     } else {
@@ -7382,6 +7570,20 @@ impl Browser {
             (path == &entry.path && !entry.is_dir && (!is_epub || ql_page == 0))
                 .then(|| render.clone())
         });
+        // the player's presented frame wins over the poster the
+        // moment one is due: the poster holds the pane only for the
+        // open beat (the Poster state). The playing flag rides along
+        // so the arm can keep the present loop armed.
+        let ql_frame = self
+            .ql_video
+            .as_ref()
+            .filter(|vid| vid.path == entry.path && !entry.is_dir)
+            .and_then(|vid| {
+                vid.frame
+                    .as_ref()
+                    .map(|(image, _)| (image.clone(), vid.playing))
+            })
+            .or_else(|| image.clone().map(|render| (render, false)));
         // the whole-file read lands over the snippet once here
         let full_text = self.ql_text.as_ref().and_then(|(p, preview)| {
             (p == &entry.path && !entry.is_dir).then(|| preview.clone())
@@ -7405,7 +7607,17 @@ impl Browser {
                         .into_any_element()
                 })
                 .flex_1())
-        } else if let Some(render) = image {
+        } else if let Some((render, playing)) = ql_frame {
+            // the present loop: one pump per compositor frame while
+            // a video plays; the poster and a parked player stay
+            // still. (The overlay's render holds &Window, so the
+            // entity handle routes the callback through the view.)
+            if playing {
+                let view = cx.entity();
+                window.on_next_frame(move |_, cx| {
+                    view.update(cx, |view, cx| view.pump_video(cx));
+                });
+            }
             let viewport = window.viewport_size();
             // the pane's own budget: this overlay's top row and the
             // pane's margin, which the layout below owns
@@ -10192,6 +10404,41 @@ struct QuickLook {
     pages: Option<usize>,
 }
 
+/// The Quick Look video pane's player state: the decoder handle plus
+/// what is on screen. The pane's machine is Poster (no player landed,
+/// or no frame due yet: the poster shows), Playing, Paused, and the
+/// ended rest (the stream ran out; the last frame holds). The audio
+/// sink slice replaces the wall clock; nothing here changes shape.
+struct VideoPlayer {
+    path: PathBuf,
+    player: crate::video::Player,
+    /// The frame on screen: its pixels and its media time.
+    frame: Option<(Arc<RenderImage>, f64)>,
+    /// One frame decoded ahead of the clock, not yet due: the ring
+    /// cannot be peeked, so the first not-due frame is held here.
+    ahead: Option<(Arc<RenderImage>, f64)>,
+    /// The stream said eof and the ring is drained.
+    eof: bool,
+    /// Media time the clock stood at on the last pause (or open).
+    clock_base: f64,
+    /// Wall anchor for the current run: media time is clock_base
+    /// plus wall time since this Instant.
+    wall: std::time::Instant,
+    playing: bool,
+    ended: bool,
+}
+
+impl VideoPlayer {
+    /// Media time now: the wall-clock stand-in for the audio clock
+    /// (the sink's samples-written clock replaces the body of this
+    /// in the sync slice). Paused time does not advance: the pump
+    /// only reads this while playing, and a pause stamps clock_base
+    /// first.
+    fn media_now(&self) -> f64 {
+        self.clock_base + self.wall.elapsed().as_secs_f64()
+    }
+}
+
 fn text_kind(path: &Path) -> TextKind {
     let ext = path
         .extension()
@@ -11794,6 +12041,68 @@ mod browser_ux_keys {
     }
 
     #[test]
+    fn quick_look_video_plays_pauses_and_closes() {
+        let lab = Lab::new("quicklook-video-player");
+        // a real one-second clip, copied in before the browser loads
+        // so the listing sees it
+        let clip = lab.dir.join("clip.mp4");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.mp4"),
+            &clip,
+        )
+        .unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            let ix = browser
+                .tab()
+                .entries
+                .iter()
+                .position(|entry| entry.name == "clip.mp4")
+                .expect("clip listed");
+            browser.jump_cursor(ix, cx);
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_some());
+        });
+        app.run_until_parked(); // the poster and the player land
+        window.update(|browser, _, cx| {
+            let vid = browser.ql_video.as_ref().expect("player landed");
+            assert!(vid.playing && vid.path == clip);
+            // the frame at media time zero is due on the first pump
+            browser.pump_video(cx);
+            assert!(browser.ql_video.as_ref().unwrap().frame.is_some());
+            // space pauses now (no longer closes) and holds the frame
+            browser.route_key(&key("space"), cx);
+            assert!(!browser.ql_video.as_ref().unwrap().playing);
+            let before = browser
+                .ql_video
+                .as_ref()
+                .unwrap()
+                .frame
+                .as_ref()
+                .map(|(_, pts)| *pts);
+            browser.pump_video(cx);
+            let after = browser
+                .ql_video
+                .as_ref()
+                .unwrap()
+                .frame
+                .as_ref()
+                .map(|(_, pts)| *pts);
+            assert_eq!(before, after, "paused time must not move");
+            // space resumes, escape closes and tears the player down
+            browser.route_key(&key("space"), cx);
+            assert!(browser.ql_video.as_ref().unwrap().playing);
+            browser.route_key(&key("escape"), cx);
+            assert!(browser.ql_video.is_none());
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
     fn quick_look_enter_hands_off_or_navigates() {
         let lab = Lab::new("quicklook-enter");
         let mut app = gpui::TestApp::with_text_system_and_assets(
@@ -12417,15 +12726,23 @@ mod browser_ux_keys {
                 "quick look never opened on a video with the preview loop landed"
             );
         });
-        app.run_until_parked(); // the QL pane's own decode settles
+        app.run_until_parked(); // the QL pane's poster and player land
         window.update(|browser, _, _| {
             assert!(browser.quicklook.is_some());
-            // the QL pane plays the same bounded loop, not a poster
+            // the QL pane holds the single-frame poster beat; the
+            // player owns motion from its first frame on
             let (_, _, render) = browser
                 .ql_render
                 .as_ref()
-                .expect("quick look's video loop never landed");
-            assert!(render.frame_count() >= 2);
+                .expect("quick look's poster never landed");
+            assert_eq!(render.frame_count(), 1);
+            assert!(
+                browser
+                    .ql_video
+                    .as_ref()
+                    .is_some_and(|vid| vid.path == lab.dir.join("clip.mp4")),
+                "the player never landed beside the poster"
+            );
         });
     }
 
