@@ -11,6 +11,12 @@ rides unchanged.
 
 ## Unreleased
 
+## v0.3.0 (2026-10-12)
+
+kuma-shell 0.3.0
+kuma-files 0.3.0
+kuma-term 0.2.0
+
 ### Added
 
 - **Koguma's Quick Look plays videos.** Opening a video now runs the
