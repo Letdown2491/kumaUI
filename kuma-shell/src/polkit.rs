@@ -636,11 +636,41 @@ async fn bring_up(events: &Sender<AgentEvent>) -> anyhow::Result<()> {
     }
     log::info!("polkit: agent registered for session {session_id} at {AGENT_PATH}");
 
-    // hold until the connection dies, then report to the retry loop
-    while !connection.is_closed() {
+    // The registration dies with polkitd, not with us: a restarted
+    // polkitd comes back with no agents at all and stays that way as
+    // long as our connection lives. Watch the authority's bus owner
+    // and fall out to the retry loop whenever it changes, so the
+    // shell re-registers after any polkitd restart.
+    let dbus = zbus::Proxy::new(
+        &connection,
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+    )
+    .await?;
+    let owner: String = dbus
+        .call_method("GetNameOwner", &(AUTHORITY_DEST))
+        .await?
+        .body()
+        .deserialize()?;
+
+    // hold until the connection dies or polkitd changes identity,
+    // then report to the retry loop
+    loop {
         smol::Timer::after(LIVENESS).await;
+        if connection.is_closed() {
+            anyhow::bail!("the system bus connection died");
+        }
+        let same = dbus
+            .call_method("GetNameOwner", &(AUTHORITY_DEST))
+            .await
+            .ok()
+            .and_then(|reply| reply.body().deserialize::<String>().ok())
+            .is_some_and(|name| name == owner);
+        if !same {
+            anyhow::bail!("polkitd restarted: the registration is gone");
+        }
     }
-    anyhow::bail!("the system bus connection died");
 }
 
 /// The D-Bus object polkitd calls into. The handlers only ferry events to
@@ -694,14 +724,18 @@ impl AgentService {
     }
 }
 
-/// The session subject's id: the inherited logind id, else the tail of
-/// the session object path GetSessionByPID returns (`.../session/_NN`).
+/// The session subject's id, mirroring how polkitd itself maps a
+/// process to a session: the direct per-pid lookups (logind
+/// GetSessionByPID, sd_pid_get_session) return nothing for the user
+/// manager's processes (they sit in no session scope), so polkitd
+/// falls through to uid -> the user's display session and resolves
+/// every such process there, the agent's caller included. Register
+/// for that same display session: anything else is refused with
+/// "Passed session and the session the caller is in differs". The
+/// inherited env var is the last resort (for user services it
+/// carries greetd's vestigial session id; it only agrees with the
+/// display session by accident).
 async fn resolve_session_id() -> Option<String> {
-    if let Ok(id) = std::env::var("XDG_SESSION_ID") {
-        if !id.is_empty() {
-            return Some(id);
-        }
-    }
     let connection = zbus::connection::Builder::system()
         .ok()?
         .build()
@@ -715,16 +749,32 @@ async fn resolve_session_id() -> Option<String> {
     )
     .await
     .ok()?;
-    let reply = manager
-        .call_method("GetSessionByPID", &(std::process::id() as u32))
-        .await
-        .ok()?;
-    let path: zbus::zvariant::OwnedObjectPath = reply.body().deserialize().ok()?;
-    path.as_str()
-        .rsplit('/')
-        .next()?
-        .strip_prefix('_')
-        .map(String::from)
+    let uid = unsafe { libc::getuid() };
+    if let Ok(reply) = manager.call_method("GetUser", &(uid as u32)).await {
+        if let Ok(user_path) = reply
+            .body()
+            .deserialize::<zbus::zvariant::OwnedObjectPath>()
+        {
+            let user = zbus::Proxy::new(
+                &connection,
+                "org.freedesktop.login1",
+                user_path,
+                "org.freedesktop.login1.User",
+            )
+            .await
+            .ok()?;
+            if let Ok(display) = user
+                .get_property::<(String, zbus::zvariant::OwnedObjectPath)>("Display")
+                .await
+            {
+                if !display.0.is_empty() {
+                    return Some(display.0);
+                }
+            }
+        }
+    }
+    let id = std::env::var("XDG_SESSION_ID").ok()?;
+    (!id.is_empty()).then_some(id)
 }
 
 /// The locale for polkitd's message localization: LANG without the

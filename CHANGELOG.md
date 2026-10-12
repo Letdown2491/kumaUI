@@ -11,6 +11,14 @@ rides unchanged.
 
 ## Unreleased
 
+### Fixed
+
+- kuma-shell: the polkit agent's auth prompt now survives polkitd restarts
+  and registers for the logind display session instead of trusting the
+  inherited `XDG_SESSION_ID`, which carries greetd's stale session id for
+  user services; before, one polkitd restart left the machine with no
+  working polkit prompt until the shell restarted.
+
 ## v0.3.0 (2026-10-12)
 
 kuma-shell 0.3.0
