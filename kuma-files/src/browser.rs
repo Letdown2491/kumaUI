@@ -4588,11 +4588,12 @@ impl Browser {
         .detach();
     }
 
-    /// The open video's header facts: duration and coded dimensions
-    /// from the container, no decode. One ask per open path; the
-    /// label rides the header like an epub's book label. A header
-    /// that will not read just leaves the label out; the pane still
-    /// shows its poster or its card.
+    /// The open video's header facts: the coded dimensions from the
+    /// container, no decode. One ask per open path; the label rides
+    /// the header's glance like an epub's book label. The duration
+    /// is not in it: the footer's transport owns that once the
+    /// player lands. A header that will not read just leaves the
+    /// label out; the pane still shows its poster or its card.
     fn request_video_duration(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.video_meta_asked {
             return;
@@ -4602,11 +4603,7 @@ impl Browser {
             let bg_path = path.clone();
             let label = cx
                 .background_spawn(async move {
-                    crate::video::probe(&bg_path).and_then(|(secs, w, h)| {
-                        crate::video::duration_label(secs).map(|len| {
-                            format!("{len} · {}\u{d7}{}", w, h)
-                        })
-                    })
+                    crate::video::probe(&bg_path).map(|(_, w, h)| format!("{}\u{d7}{}", w, h))
                 })
                 .await;
             let update = this.update(cx, |this, cx| {
@@ -5688,16 +5685,36 @@ impl Browser {
             return;
         }
 
+        // the keybindings modal takes the rung over everything under
+        // it, Quick Look included: it can open from the Quick Look
+        // header's chip, and its escape must close the modal, never
+        // the pane beneath
+        if self.keys_modal {
+            // the modal takes the rung: escape closes, everything
+            // else is ignored while it is up
+            if keystroke.key == "escape" {
+                self.keys_modal = false;
+                cx.notify();
+            }
+            return;
+        }
+
         if self.quicklook.is_some() {
             match keystroke.key.as_str() {
                 // space pauses a playing video, resumes a paused one,
                 // replays an ended one, and closes the overlay when
-                // no player owns the file; escape closes. Both keep
-                // the cursor where it was
+                // no player owns the file. It keeps the cursor where
+                // it was
                 "space" => {
                     if !self.quicklook_video_toggle(cx) {
                         self.close_quicklook(cx);
                     }
+                }
+                // F1 opens the keys modal (the header's ? chip is its
+                // click road); escape closes the pane
+                "f1" => {
+                    self.keys_modal = true;
+                    cx.notify();
                 }
                 "escape" => self.close_quicklook(cx),
                 // shift+arrows: same direction, bigger step, a page
@@ -5752,16 +5769,6 @@ impl Browser {
                     cx.notify();
                 }
                 _ => {}
-            }
-            return;
-        }
-
-        if self.keys_modal {
-            // the modal takes the rung: escape closes, everything
-            // else is ignored while it is up
-            if keystroke.key == "escape" {
-                self.keys_modal = false;
-                cx.notify();
             }
             return;
         }
@@ -5872,6 +5879,11 @@ impl Browser {
             }
             "delete" if keystroke.modifiers.shift => self.delete_selection(cx),
             "delete" => self.trash_selection(cx),
+            // the keys modal, from the listing too (F1, help's key)
+            "f1" => {
+                self.keys_modal = true;
+                cx.notify();
+            }
             "f2" => self.start_rename(cx),
             // path bar: type a location instead of clicking crumbs
             "l" if keystroke.modifiers.control => self.start_path_edit(cx),
@@ -7733,27 +7745,27 @@ impl Browser {
             }
             if label.is_empty() { None } else { Some(label) }
         });
-        // a video's glance: duration and dimensions straight from
-        // the container header ("3:25 · 1920×1080"), no decode
+        // a video's glance: the coded dimensions straight from the
+        // container header, no decode (the duration is the footer's)
         let video_label = self.ql_video_len.as_ref().and_then(|(p, label)| {
             (*p == entry.path && !entry.is_dir && icons::is_video(&entry.name))
                 .then(|| label.clone())
         });
-        // a landed player's space is pause, not close: the hint says
-        // so, and says the parked states' ways back too (until the
-        // player lands, space still closes, the default hint holds)
-        let video_hint = self
-            .ql_video
-            .as_ref()
-            .filter(|vid| vid.path == entry.path)
-            .map(|vid| match (vid.playing, vid.ended) {
-                (true, _) => "Space pauses · J/L seek · +/- volume · F11 full screen · Esc closes",
-                (_, true) => "Space replays · J/L seek · F11 full screen · Esc closes",
-                (false, _) => "Space plays · J/L seek · +/- volume · F11 full screen · Esc closes",
-            });
+        // one dim glance: where you are in the listing, then the
+        // file's own facts (a video's dims, an epub's title and
+        // author). The hint line is gone from here: the keys modal
+        // owns the rungs, the ? chip and F1 open it.
+        let glance = pos
+            .map(|pos| format!("{} of {}", pos + 1, visible.len()))
+            .into_iter()
+            .chain(book_label.or(video_label))
+            .collect::<Vec<_>>()
+            .join(" · ");
+
         // the video footer's two ends and fraction: the transport
-        // strip under the pane. The header's static duration·dims
-        // glance stands in until the player lands.
+        // strip under the pane. The header's glance carries the
+        // video's dims until the player lands; its duration is the
+        // footer's own.
         let vid = self
             .ql_video
             .as_ref()
@@ -7787,12 +7799,12 @@ impl Browser {
                     .truncate()
                     .child(entry.name.clone()),
             )
-            .children(book_label.or(video_label).map(|label| {
+            .children((!glance.is_empty()).then(|| {
                 div()
                     .text_size(px(12.))
                     .text_color(theme::text_dim())
                     .truncate()
-                    .child(label)
+                    .child(glance)
             }))
             .children(paging.is_some().then(|| {
                 div()
@@ -7808,28 +7820,23 @@ impl Browser {
                     }))
                     .child(self.quicklook_chevron("quicklook-page-fwd", "›", 1, cx))
             }))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(theme::text_dim())
-                    .child(match pos {
-                        Some(pos) => format!("{} of {}", pos + 1, visible.len()),
-                        None => String::new(),
-                    }),
-            )
             .child(div().flex_1())
             .child(
+                // the keys modal's chip: the click road while the
+                // overlay hides the sidebar's button; F1 is the key
                 div()
-                    .text_size(px(11.))
+                    .id("quicklook-keys")
+                    .cursor_pointer()
+                    .px_2()
+                    .rounded_sm()
+                    .text_size(px(12.))
                     .text_color(theme::text_dim())
-                    .child(if let Some(hint) = video_hint {
-                        hint.to_string()
-                    } else if paging.is_some() {
-                        let word = if is_epub { "chapters" } else { "pages" };
-                        format!("PgUp/PgDn or Shift+arrows {word} · Esc closes")
-                    } else {
-                        "Esc closes".to_string()
-                    }),
+                    .hover(|this| this.text_color(theme::text()).bg(theme::row_hover()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.keys_modal = true;
+                        cx.notify();
+                    }))
+                    .child("?"),
             )
             .child(
                 div()
@@ -11403,11 +11410,12 @@ const KEY_HINTS: &[(&str, &str)] = &[
     ("Home / End", "first / last entry"),
     ("Enter", "open"),
     ("Alt+Enter", "info rail"),
-    ("Space", "quick look"),
+    ("Space", "quick look; pauses or resumes a video"),
+    ("F1", "this cheat sheet (the ? chip)"),
     ("J/L · +/- · M", "video seek, volume, mute (Quick Look)"),
     ("F11", "full screen a video (Quick Look)"),
     ("Backspace", "up folder; pops the filter first"),
-    ("Escape", "clear filter, else selection"),
+    ("Escape", "close Quick Look, clear filter, else selection"),
     ("F2", "rename"),
     ("Del", "trash"),
     ("Shift+Del", "delete"),
@@ -12657,6 +12665,40 @@ mod browser_ux_keys {
             browser.quicklook_video_seek_to(999.0, cx);
             let vid = browser.ql_video.as_ref().unwrap();
             assert_eq!(vid.seeking, Some(vid.duration - 0.1));
+        });
+        app.run_until_parked();
+    }
+
+    /// The keys modal owns the rung over Quick Look: F1 opens it from
+    /// the pane (the header's ? chip is the click road), escape closes
+    /// the modal and the pane survives the beat.
+    #[test]
+    fn quick_look_keys_modal_takes_the_rung_over_the_pane() {
+        let lab = Lab::new("quicklook-keys-modal");
+        let note = lab.dir.join("note.txt");
+        fs::write(&note, "hello\n").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            let ix = browser
+                .tab()
+                .entries
+                .iter()
+                .position(|entry| entry.name == "note.txt")
+                .expect("note listed");
+            browser.jump_cursor(ix, cx);
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_some());
+            browser.route_key(&key("f1"), cx);
+            assert!(browser.keys_modal, "F1 opens the modal");
+            browser.route_key(&key("escape"), cx);
+            assert!(!browser.keys_modal, "escape closes the modal");
+            assert!(browser.quicklook.is_some(), "the pane outlives its modal");
+            browser.route_key(&key("escape"), cx);
+            assert!(browser.quicklook.is_none(), "the next escape closes the pane");
         });
         app.run_until_parked();
     }

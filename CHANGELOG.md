@@ -21,10 +21,14 @@ rides unchanged.
   video syncs to the audio clock. Space pauses and resumes a playing
   clip, and replays one that ran out. The transport lives in a footer
   strip under the video, the players' convention: elapsed time, a
-  full-width seek bar (click or drag), total time. The volume and
-  seek keys: J/L seek by ten seconds, +/- steps the volume, M mutes;
-  F11 fullscreens the window while a video is up and escape unwinds
-  it before closing the pane; the header hint follows the state.
+  full-width seek bar (click or drag), total time. The Quick Look
+  header slims down to the name, one dim glance (position in the
+  listing, then the file's own facts), the pager, and two buttons;
+  the key-hint line is gone. The keys modal opens with F1 or the
+  header's ? chip (it now also covers Quick Look's rungs), the
+  volume and seek keys stay: J/L seek by ten seconds, +/- steps the
+  volume, M mutes; F11 fullscreens the window while a video is up
+  and escape unwinds it before closing the pane.
   Decode attempts VAAPI hardware first and falls back to software
   wherever the driver is missing; `KOGUMA_NO_HWACCEL=1` forces
   software for A/B checks.
