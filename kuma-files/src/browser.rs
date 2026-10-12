@@ -1456,6 +1456,11 @@ pub(crate) struct Browser {
     /// The seek bar track's bounds, captured at paint by the track's
     /// canvas; the mouse handlers read them to map the pointer.
     ql_track: std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<Pixels>>>>,
+    /// The window went fullscreen for the video (F11). The window is
+    /// the real state; this flag is the pane's memory of the request,
+    /// so escape unwinds it before closing and a close path restores
+    /// the window even when no key handler is around.
+    ql_fullscreen: bool,
     /// The selected video's poster slot for the details pane, keyed
     /// by entry key like the text snippet. Grid and search previews
     /// keep type icons; Quick Look has its own pane-scale poster.
@@ -1602,6 +1607,7 @@ impl Browser {
             video_player_asked: false,
             ql_scrub: None,
             ql_track: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            ql_fullscreen: false,
             sel_video: None,
             sel_video_len: None,
             sel_video_kick: None,
@@ -4451,10 +4457,11 @@ impl Browser {
             .child(glyph)
     }
 
-    /// The video pane's seek bar: a fixed-width track with the played
-    /// fraction filled and a knob on its edge. A press jumps there
-    /// and arms the drag; the drag re-seeks at most every 150ms (the
-    /// move and release handlers ride the overlay root, so the
+    /// The video footer's seek bar: a full-width track (flex_1 in the
+    /// strip) with the played fraction filled and a knob on its edge,
+    /// both laid by relative lengths against the track. A press jumps
+    /// there and arms the drag; the drag re-seeks at most every 150ms
+    /// (the move and release handlers ride the overlay root, so the
     /// pointer may leave the track); the release lands the pointer's
     /// final fraction. The track's bounds come from a canvas capture
     /// at paint, since the handlers only see window coordinates.
@@ -4464,13 +4471,12 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let track = self.ql_track.clone();
-        let fill = (160.0 * fraction) as f32;
+        let fill = fraction as f32;
         div()
             .id("ql-video-seek")
             .relative()
-            .w(px(160.))
+            .flex_1()
             .h(px(16.))
-            .flex_none()
             .cursor_pointer()
             .child(
                 canvas(
@@ -4490,7 +4496,7 @@ impl Browser {
                     .absolute()
                     .left(px(0.))
                     .top(px(6.))
-                    .w(px(160.))
+                    .w_full()
                     .h(px(4.))
                     .rounded_sm()
                     .bg(theme::row_hover()),
@@ -4500,7 +4506,7 @@ impl Browser {
                     .absolute()
                     .left(px(0.))
                     .top(px(6.))
-                    .w(px(fill))
+                    .w(relative(fill))
                     .h(px(4.))
                     .rounded_sm()
                     .bg(theme::accent()),
@@ -4508,7 +4514,8 @@ impl Browser {
             .child(
                 div()
                     .absolute()
-                    .left(px((fill - 5.).clamp(0., 148.)))
+                    .left(relative(fill))
+                    .ml(px(-6.))
                     .top(px(2.))
                     .size(px(12.))
                     .rounded_full()
@@ -4898,6 +4905,17 @@ impl Browser {
         };
         vid.muted = !vid.muted;
         vid.player.set_volume(vid.gain());
+        cx.notify();
+    }
+
+    /// The video rung's fullscreen: the window itself goes (F11, the
+    /// viewers' convention). The flag is the pane's memory so escape
+    /// unwinds the fullscreen before it closes the pane, and a close
+    /// that runs without a key handler (the close button's road)
+    /// still puts the window back.
+    fn quicklook_video_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ql_fullscreen = !self.ql_fullscreen;
+        window.toggle_fullscreen();
         cx.notify();
     }
 
@@ -7729,34 +7747,29 @@ impl Browser {
             .as_ref()
             .filter(|vid| vid.path == entry.path)
             .map(|vid| match (vid.playing, vid.ended) {
-                (true, _) => "Space pauses · J/L seek · +/- volume · Esc closes",
-                (_, true) => "Space replays · J/L seek · Esc closes",
-                (false, _) => "Space plays · J/L seek · +/- volume · Esc closes",
+                (true, _) => "Space pauses · J/L seek · +/- volume · F11 full screen · Esc closes",
+                (_, true) => "Space replays · J/L seek · F11 full screen · Esc closes",
+                (false, _) => "Space plays · J/L seek · +/- volume · F11 full screen · Esc closes",
             });
-        // a landed player's glance goes live: elapsed over total,
-        // and the seek bar rides next to it. The static duration
-        // label stands in until the player lands.
+        // the video footer's two ends and fraction: the transport
+        // strip under the pane. The header's static duration·dims
+        // glance stands in until the player lands.
         let vid = self
             .ql_video
             .as_ref()
             .filter(|vid| vid.path == entry.path);
-        let video_time = vid.and_then(|vid| {
-            let total = if vid.duration > 0.0 {
-                crate::video::duration_label(vid.duration)
-            } else {
-                None
-            };
-            let now = crate::video::duration_label(vid.shown_at());
-            match (now, total) {
-                (Some(now), Some(total)) => Some(format!("{now} / {total}")),
-                _ => None,
-            }
+        // the footer's two ends, labeled apart: the strip owns the
+        // width now, the header only keeps the static glance
+        let video_now = vid.and_then(|vid| crate::video::duration_label(vid.shown_at()));
+        let video_total = vid.and_then(|vid| {
+            (vid.duration > 0.0)
+                .then(|| crate::video::duration_label(vid.duration))
+                .flatten()
         });
-        let video_fraction =
-            vid.and_then(|vid| {
-                (vid.duration > 0.0)
-                    .then(|| (vid.shown_at() / vid.duration).clamp(0.0, 1.0))
-            });
+        let video_fraction = vid.and_then(|vid| {
+            (vid.duration > 0.0)
+                .then(|| (vid.shown_at() / vid.duration).clamp(0.0, 1.0))
+        });
 
         // the top row: name, position in the listing, the close road
         let header = div()
@@ -7774,14 +7787,13 @@ impl Browser {
                     .truncate()
                     .child(entry.name.clone()),
             )
-            .children(book_label.or(video_time).or(video_label).map(|label| {
+            .children(book_label.or(video_label).map(|label| {
                 div()
                     .text_size(px(12.))
                     .text_color(theme::text_dim())
                     .truncate()
                     .child(label)
             }))
-            .children(video_fraction.map(|fraction| self.quicklook_seek_bar(fraction, cx)))
             .children(paging.is_some().then(|| {
                 div()
                     .flex()
@@ -8124,6 +8136,32 @@ impl Browser {
                 }
             }));
 
+        // the video footer: the transport strip under the pane, the
+        // players' convention. Elapsed, the full-width bar, total.
+        // It appears once the player has landed with a duration.
+        let footer = video_fraction.map(|fraction| {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .pb_2()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_dim())
+                        .child(video_now.clone().unwrap_or_default()),
+                )
+                .child(self.quicklook_seek_bar(fraction, cx).flex_1())
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_dim())
+                        .child(video_total.unwrap_or_default()),
+                )
+        });
+
         Some(
             div()
                 .absolute()
@@ -8134,6 +8172,7 @@ impl Browser {
                 .bg(theme::sidebar())
                 .child(header)
                 .child(drag_pane)
+                .children(footer)
                 // the seek bar's drag: the press armed it on the
                 // track; the move re-seeks at most every 150ms and
                 // the release lands the pointer's last fraction. On
@@ -8943,6 +8982,12 @@ impl Render for Browser {
             {
                 window.request_animation_frame();
             }
+        } else if self.ql_fullscreen {
+            // the overlay closed without a key handler around (the
+            // close button's road, a listing that moved out): the
+            // window comes back before the listing's first paint
+            self.ql_fullscreen = false;
+            window.toggle_fullscreen();
         }
         // this paint's thumb kicks define the wanted set; the pool
         // consults it at pop time, so off-screen queue entries die
@@ -9275,6 +9320,17 @@ impl Render for Browser {
                 // the keymap
                 if keystroke.key == "q" && keystroke.modifiers.control {
                     window.remove_window();
+                    return;
+                }
+                // F11 fullscreens the window for a video's Quick Look
+                // (the viewers' key); escape unwinds the fullscreen
+                // before it reaches the pane, which would close it
+                if keystroke.key == "f11" && this.ql_video.is_some() {
+                    this.quicklook_video_fullscreen(window, cx);
+                    return;
+                }
+                if keystroke.key == "escape" && this.ql_fullscreen {
+                    this.quicklook_video_fullscreen(window, cx);
                     return;
                 }
                 this.handle_key(event, cx);
@@ -11349,6 +11405,7 @@ const KEY_HINTS: &[(&str, &str)] = &[
     ("Alt+Enter", "info rail"),
     ("Space", "quick look"),
     ("J/L · +/- · M", "video seek, volume, mute (Quick Look)"),
+    ("F11", "full screen a video (Quick Look)"),
     ("Backspace", "up folder; pops the filter first"),
     ("Escape", "clear filter, else selection"),
     ("F2", "rename"),
@@ -12602,6 +12659,52 @@ mod browser_ux_keys {
             assert_eq!(vid.seeking, Some(vid.duration - 0.1));
         });
         app.run_until_parked();
+    }
+
+    /// F11 arms the pane's fullscreen and the pane's own close hands
+    /// the window back on the next paint (the × button's road: no key
+    /// handler is around to unwind). Escape's unwind-before-close is
+    /// the root listener's intercept, above route_key.
+    #[test]
+    fn quick_look_video_fullscreen_unwinds_before_the_close() {
+        let lab = Lab::new("quicklook-video-fullscreen");
+        let clip = lab.dir.join("clip.mp4");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.mp4"),
+            &clip,
+        )
+        .unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            let ix = browser
+                .tab()
+                .entries
+                .iter()
+                .position(|entry| entry.name == "clip.mp4")
+                .expect("clip listed");
+            browser.jump_cursor(ix, cx);
+            browser.route_key(&key("space"), cx);
+            assert!(browser.quicklook.is_some());
+        });
+        app.run_until_parked(); // the player lands
+        window.update(|browser, window, cx| {
+            browser.quicklook_video_fullscreen(window, cx);
+            assert!(browser.ql_fullscreen, "fullscreen armed");
+            assert!(browser.quicklook.is_some(), "fullscreen keeps the pane");
+        });
+        // the pane's close path (here via route_key; the × button is
+        // the other road) does not know the window: the flag rides
+        // until the next paint hands it back
+        window.update(|browser, _, cx| browser.route_key(&key("escape"), cx));
+        window.update(|_, window, cx| window.simulate_next_frame(cx));
+        window.update(|browser, _, cx| {
+            assert!(browser.quicklook.is_none());
+            assert!(!browser.ql_fullscreen, "the paint restored the window");
+        });
     }
 
     #[test]

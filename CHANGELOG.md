@@ -19,12 +19,15 @@ rides unchanged.
   Sound plays too, through the sound server (PipeWire's pulse-simple
   entry point, dlopen'd; systems without it play muted), and the
   video syncs to the audio clock. Space pauses and resumes a playing
-  clip, and replays one that ran out. The header gains a seek bar
-  (click or drag), live elapsed-over-total time, and the volume and
+  clip, and replays one that ran out. The transport lives in a footer
+  strip under the video, the players' convention: elapsed time, a
+  full-width seek bar (click or drag), total time. The volume and
   seek keys: J/L seek by ten seconds, +/- steps the volume, M mutes;
-  the header hint follows the state. Decode attempts VAAPI hardware
-  first and falls back to software wherever the driver is missing;
-  `KOGUMA_NO_HWACCEL=1` forces software for A/B checks.
+  F11 fullscreens the window while a video is up and escape unwinds
+  it before closing the pane; the header hint follows the state.
+  Decode attempts VAAPI hardware first and falls back to software
+  wherever the driver is missing; `KOGUMA_NO_HWACCEL=1` forces
+  software for A/B checks.
 
 - **Koguma renders SVG files.** The grid shows a true-color thumbnail
   (rasterized in-process at the fit size, so small icons stay crisp),
