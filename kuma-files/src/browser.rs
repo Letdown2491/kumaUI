@@ -16,8 +16,8 @@ use gpui::{
     ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, Font,
     HighlightStyle, ImageSource, KeyDownEvent, MouseDownEvent, MouseMoveEvent, MouseButton,
     MouseUpEvent, ObjectFit, Pixels, Point, Render, RenderImage, Rgba, ScrollWheelEvent, Stateful,
-    StyledText, TextRun, UnderlineStyle, Window, div, img, list, point, prelude::*, px, relative,
-    rgba, rgb, svg, uniform_list, FontStyle, FontWeight, SharedString,
+    StyledText, TextRun, UnderlineStyle, Window, canvas, div, img, list, point, prelude::*, px,
+    relative, rgba, rgb, svg, uniform_list, FontStyle, FontWeight, SharedString,
 };
 use trash::{os_limited, TrashItem};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1449,6 +1449,13 @@ pub(crate) struct Browser {
     /// The player has been asked for the current video (one ask per
     /// open path; reset on file flips, close, and teardown).
     video_player_asked: bool,
+    /// An armed seek-bar drag: the track's bounds (for pointer-to-
+    /// fraction), the last throttled seek's instant, and the pointer's
+    /// latest fraction for the release's final seek.
+    ql_scrub: Option<(gpui::Bounds<Pixels>, std::time::Instant, f64)>,
+    /// The seek bar track's bounds, captured at paint by the track's
+    /// canvas; the mouse handlers read them to map the pointer.
+    ql_track: std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<Pixels>>>>,
     /// The selected video's poster slot for the details pane, keyed
     /// by entry key like the text snippet. Grid and search previews
     /// keep type icons; Quick Look has its own pane-scale poster.
@@ -1593,6 +1600,8 @@ impl Browser {
             video_meta_asked: false,
             ql_video: None,
             video_player_asked: false,
+            ql_scrub: None,
+            ql_track: std::rc::Rc::new(std::cell::RefCell::new(None)),
             sel_video: None,
             sel_video_len: None,
             sel_video_kick: None,
@@ -4232,6 +4241,7 @@ impl Browser {
     /// video_player_asked reset, so a reopen asks fresh.
     fn stop_video_player(&mut self, cx: &mut Context<Self>) {
         self.video_player_asked = false;
+        self.ql_scrub = None;
         if let Some(mut vid) = self.ql_video.take() {
             if let Some((image, _)) = vid.frame.take() {
                 cx.drop_image(image, None);
@@ -4441,6 +4451,88 @@ impl Browser {
             .child(glyph)
     }
 
+    /// The video pane's seek bar: a fixed-width track with the played
+    /// fraction filled and a knob on its edge. A press jumps there
+    /// and arms the drag; the drag re-seeks at most every 150ms (the
+    /// move and release handlers ride the overlay root, so the
+    /// pointer may leave the track); the release lands the pointer's
+    /// final fraction. The track's bounds come from a canvas capture
+    /// at paint, since the handlers only see window coordinates.
+    fn quicklook_seek_bar(
+        &self,
+        fraction: f64,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let track = self.ql_track.clone();
+        let fill = (160.0 * fraction) as f32;
+        div()
+            .id("ql-video-seek")
+            .relative()
+            .w(px(160.))
+            .h(px(16.))
+            .flex_none()
+            .cursor_pointer()
+            .child(
+                canvas(
+                    {
+                        let track = track.clone();
+                        move |bounds, _, _| {
+                            *track.borrow_mut() = Some(bounds);
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(6.))
+                    .w(px(160.))
+                    .h(px(4.))
+                    .rounded_sm()
+                    .bg(theme::row_hover()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(6.))
+                    .w(px(fill))
+                    .h(px(4.))
+                    .rounded_sm()
+                    .bg(theme::accent()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px((fill - 5.).clamp(0., 148.)))
+                    .top(px(2.))
+                    .size(px(12.))
+                    .rounded_full()
+                    .bg(theme::accent()),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(
+                    |this, event: &MouseDownEvent, _, cx| {
+                        let Some(bounds) = this.ql_track.borrow().as_ref().copied() else {
+                            return;
+                        };
+                        let x: f32 = (event.position.x - bounds.left()).into();
+                        let width: f32 = bounds.size.width.into();
+                        let fraction = (x / width.max(1.)).clamp(0., 1.) as f64;
+                        this.ql_scrub = Some((bounds, std::time::Instant::now(), fraction));
+                        let target = fraction
+                            * this.ql_video.as_ref().map_or(0.0, |vid| vid.duration);
+                        this.quicklook_video_seek_to(target, cx);
+                    },
+                ),
+            )
+    }
+
     /// Ask how many pages the open document has: pdfinfo for PDFs,
     /// the spine for epubs. One ask per open path; a missing tool or
     /// a failed call lands as None and paging stays dormant.
@@ -4532,6 +4624,21 @@ impl Browser {
     /// open lands in the named card slot exactly where the poster
     /// path's failures land.
     fn request_video_player(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.request_video_player_at(path, None, true, cx);
+    }
+
+    /// The player request with the seek rung's extras: an optional
+    /// landing target (the ended pane's replay-into-seek) and
+    /// whether the landing plays or rests. A target lands paused at
+    /// that media time: the thread is told to seek before its first
+    /// packet, so nothing from the head ever shows.
+    fn request_video_player_at(
+        &mut self,
+        path: PathBuf,
+        target: Option<f64>,
+        start_playing: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.video_player_asked {
             return;
         }
@@ -4556,7 +4663,7 @@ impl Browser {
                 }
                 match opened {
                     Ok(player) => {
-                        this.ql_video = Some(VideoPlayer {
+                        let mut vid = VideoPlayer {
                             path,
                             player,
                             frame: None,
@@ -4564,9 +4671,24 @@ impl Browser {
                             eof: false,
                             clock_base: 0.0,
                             wall: std::time::Instant::now(),
-                            playing: true,
+                            frozen_at: 0.0,
+                            seeking: None,
+                            generation: None,
+                            duration: 0.0,
+                            volume: 256,
+                            muted: false,
+                            playing: start_playing,
                             ended: false,
-                        });
+                        };
+                        vid.duration = vid.player.duration_secs().unwrap_or(0.0);
+                        if let Some(target) = target {
+                            vid.seeking = Some(target);
+                            vid.generation = Some(vid.player.generation());
+                            vid.frozen_at = target;
+                            vid.clock_base = target;
+                            vid.player.request_seek(target);
+                        }
+                        this.ql_video = Some(vid);
                         cx.notify();
                     }
                     Err(fail) => {
@@ -4595,7 +4717,13 @@ impl Browser {
         let Some(vid) = self.ql_video.as_mut() else {
             return;
         };
-        if !vid.playing || vid.ended {
+        if vid.ended {
+            return;
+        }
+        // a scrub pumps while paused too: its landing frame must
+        // reach the screen without a resume
+        let scrubbing = vid.seeking.is_some();
+        if !vid.playing && !scrubbing {
             return;
         }
         let clock = vid.media_now();
@@ -4603,16 +4731,20 @@ impl Browser {
         // delta to the frame after it) when that one is decoded,
         // clamped to the sync band; the floor alone when it is not
         let threshold = match (&vid.ahead, &vid.frame) {
-            (Some((_, ahead_pts)), Some((_, pts))) => (ahead_pts - pts).clamp(0.04, 0.1),
+            (Some((_, ahead_pts, _)), Some((_, pts))) => (ahead_pts - pts).clamp(0.04, 0.1),
             _ => 0.04,
         };
         let mut pending = vid.ahead.take();
         let mut due: Option<(Arc<RenderImage>, f64)> = None;
         loop {
             let next = match pending.take() {
-                Some(frame) => Some(frame),
+                // an ahead frame passed the filter on an earlier
+                // pump: its stored generation is its own
+                Some((image, pts, generation)) => Some((image, pts, generation)),
                 None => match vid.player.try_recv() {
-                    Some(crate::video::PlayerMsg::Frame { image, pts }) => Some((image, pts)),
+                    Some(crate::video::PlayerMsg::Frame { image, pts, generation }) => {
+                        Some((image, pts, generation))
+                    }
                     Some(crate::video::PlayerMsg::Eof) => {
                         vid.eof = true;
                         None
@@ -4620,13 +4752,31 @@ impl Browser {
                     None => None,
                 },
             };
-            let Some(frame) = next else {
+            let Some((image, pts, generation)) = next else {
                 break;
             };
-            if frame.1 <= clock + threshold {
-                due = Some(frame);
+            // a seek's stale frames drop unheard: anything stamped
+            // at or before the seek's generation decoded before the
+            // jump. Never seeked means no floor yet (generation is
+            // None).
+            if vid.generation.is_some_and(|g| generation <= g) {
+                continue;
+            }
+            if vid.seeking.is_some() {
+                // the scrub's landing: the first frame of the new
+                // generation shows the target and ends the scrub.
+                // The clock test does not apply here (the audio
+                // clock is stale until the sound runs again); the
+                // landing frame's own pts is the position shown.
+                vid.seeking = None;
+                vid.frozen_at = pts;
+                due = Some((image, pts));
+                break;
+            }
+            if pts <= clock + threshold {
+                due = Some((image, pts));
             } else {
-                pending = Some(frame);
+                pending = Some((image, pts, generation));
                 break;
             }
         }
@@ -4642,6 +4792,8 @@ impl Browser {
             // hint's state change)
             vid.playing = false;
             vid.ended = true;
+            vid.frozen_at = vid.frame.as_ref().map_or(vid.frozen_at, |(_, pts)| *pts);
+            vid.seeking = None;
             cx.notify();
             return;
         }
@@ -4662,19 +4814,91 @@ impl Browser {
             self.request_video_player(path, cx);
             return true;
         }
-        vid.playing = !vid.playing;
         if vid.playing {
-            vid.wall = std::time::Instant::now();
-            vid.player.set_paused(false);
-        } else {
             // stamp before parking: the muted mode's clock_base is
             // where the wall clock resumes; the audio clock freezes
-            // itself (and this stamp is ignored there)
-            vid.clock_base = vid.media_now();
+            // itself (and this stamp is ignored there). The stamp
+            // must read the running clock, so it precedes the flip.
+            vid.frozen_at = vid.media_now();
+            vid.clock_base = vid.frozen_at;
+            vid.playing = false;
             vid.player.set_paused(true);
+        } else {
+            vid.playing = true;
+            vid.wall = std::time::Instant::now();
+            vid.player.set_paused(false);
         }
         cx.notify();
         true
+    }
+
+    /// The video rung's seek, relative: j and l step ten seconds
+    /// from the shown position (the clock while playing, the frozen
+    /// stamp at rest).
+    fn quicklook_video_seek(&mut self, delta: f64, cx: &mut Context<Self>) {
+        let Some(vid) = self.ql_video.as_ref() else {
+            return;
+        };
+        let from = vid.shown_at();
+        self.quicklook_video_seek_to(from + delta, cx);
+    }
+
+    /// The video rung's seek, absolute: the demuxer jumps, both
+    /// decoders and the sink flush, and the pane drops frames short
+    /// of the new generation until the landing arrives. At the end a
+    /// seek replays into the target, paused. The target stops a
+    /// decisecond short of the duration: a jump to the very end
+    /// demuxes straight into eof, and that state is the ended rest's
+    /// own (space replays), not a seek's.
+    fn quicklook_video_seek_to(&mut self, target: f64, cx: &mut Context<Self>) {
+        let Some(vid) = self.ql_video.as_mut() else {
+            return;
+        };
+        let target = if vid.duration > 0.0 {
+            target.clamp(0.0, (vid.duration - 0.1).max(0.0))
+        } else {
+            target.max(0.0)
+        };
+        if vid.ended {
+            // the decode thread left at eof: replay into the target
+            // on a fresh player, paused at the landing
+            let path = vid.path.clone();
+            self.stop_video_player(cx);
+            self.request_video_player_at(path, Some(target), false, cx);
+            return;
+        }
+        vid.seeking = Some(target);
+        vid.eof = false;
+        vid.generation = Some(vid.player.generation());
+        vid.player.request_seek(target);
+        // the muted clock re-anchors at the target; the audio clock
+        // re-anchors itself when the post-seek sound lands
+        vid.clock_base = target;
+        vid.wall = std::time::Instant::now();
+        cx.notify();
+    }
+
+    /// The video rung's volume: integer gain steps, 256 = unity.
+    /// Adjusting while muted unmutes.
+    fn quicklook_video_volume(&mut self, step: i32, cx: &mut Context<Self>) {
+        let Some(vid) = self.ql_video.as_mut() else {
+            return;
+        };
+        vid.volume = (vid.volume as i32 + step).clamp(0, 256) as u32;
+        vid.muted = false;
+        vid.player.set_volume(vid.gain());
+        cx.notify();
+    }
+
+    /// The video rung's mute: gain zero, the previous gain kept for
+    /// the way back.
+    fn quicklook_video_mute(&mut self, cx: &mut Context<Self>) {
+        let Some(vid) = self.ql_video.as_mut() else {
+            return;
+        };
+        vid.muted = !vid.muted;
+        vid.player.set_volume(vid.gain());
+        cx.notify();
     }
 
     /// Kick the background decode for Quick Look's own render (the
@@ -5474,6 +5698,19 @@ impl Browser {
                 "enter" => {
                     self.close_quicklook(cx);
                     self.open_selection(cx);
+                }
+                // the video rung: j/l seek by ten seconds, m mutes,
+                // and +/- re-mean from zoom to volume while a video
+                // is up (videos do not zoom). Arrows keep flipping
+                // files; the Quick Look spine stays put.
+                "j" => self.quicklook_video_seek(-10.0, cx),
+                "l" => self.quicklook_video_seek(10.0, cx),
+                "m" => self.quicklook_video_mute(cx),
+                "=" | "+" if self.ql_video.is_some() => {
+                    self.quicklook_video_volume(32, cx)
+                }
+                "-" | "_" if self.ql_video.is_some() => {
+                    self.quicklook_video_volume(-32, cx)
                 }
                 "=" | "+" => self.quicklook_zoom_step(1.2, cx),
                 "-" | "_" => self.quicklook_zoom_step(1.0 / 1.2, cx),
@@ -7492,9 +7729,33 @@ impl Browser {
             .as_ref()
             .filter(|vid| vid.path == entry.path)
             .map(|vid| match (vid.playing, vid.ended) {
-                (true, _) => "Space pauses · Esc closes",
-                (_, true) => "Space replays · Esc closes",
-                (false, _) => "Space plays · Esc closes",
+                (true, _) => "Space pauses · J/L seek · +/- volume · Esc closes",
+                (_, true) => "Space replays · J/L seek · Esc closes",
+                (false, _) => "Space plays · J/L seek · +/- volume · Esc closes",
+            });
+        // a landed player's glance goes live: elapsed over total,
+        // and the seek bar rides next to it. The static duration
+        // label stands in until the player lands.
+        let vid = self
+            .ql_video
+            .as_ref()
+            .filter(|vid| vid.path == entry.path);
+        let video_time = vid.and_then(|vid| {
+            let total = if vid.duration > 0.0 {
+                crate::video::duration_label(vid.duration)
+            } else {
+                None
+            };
+            let now = crate::video::duration_label(vid.shown_at());
+            match (now, total) {
+                (Some(now), Some(total)) => Some(format!("{now} / {total}")),
+                _ => None,
+            }
+        });
+        let video_fraction =
+            vid.and_then(|vid| {
+                (vid.duration > 0.0)
+                    .then(|| (vid.shown_at() / vid.duration).clamp(0.0, 1.0))
             });
 
         // the top row: name, position in the listing, the close road
@@ -7513,13 +7774,14 @@ impl Browser {
                     .truncate()
                     .child(entry.name.clone()),
             )
-            .children(book_label.or(video_label).map(|label| {
+            .children(book_label.or(video_time).or(video_label).map(|label| {
                 div()
                     .text_size(px(12.))
                     .text_color(theme::text_dim())
                     .truncate()
                     .child(label)
             }))
+            .children(video_fraction.map(|fraction| self.quicklook_seek_bar(fraction, cx)))
             .children(paging.is_some().then(|| {
                 div()
                     .flex()
@@ -7871,7 +8133,57 @@ impl Browser {
                 .flex_col()
                 .bg(theme::sidebar())
                 .child(header)
-                .child(drag_pane),
+                .child(drag_pane)
+                // the seek bar's drag: the press armed it on the
+                // track; the move re-seeks at most every 150ms and
+                // the release lands the pointer's last fraction. On
+                // the root, so the pointer may leave the track.
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    let Some((bounds, last, _)) = this.ql_scrub else {
+                        return;
+                    };
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        this.ql_scrub = None;
+                        return;
+                    }
+                    let Some(vid) = this.ql_video.as_ref() else {
+                        this.ql_scrub = None;
+                        return;
+                    };
+                    if vid.duration <= 0.0 {
+                        this.ql_scrub = None;
+                        return;
+                    }
+                    let x: f32 = (event.position.x - bounds.left()).into();
+                    let width: f32 = bounds.size.width.into();
+                    let fraction = (x / width.max(1.)).clamp(0., 1.) as f64;
+                    if last.elapsed() < Duration::from_millis(150) {
+                        // still inside the throttle window: keep the
+                        // pointer's fraction for the release
+                        if let Some(scrub) = this.ql_scrub.as_mut() {
+                            scrub.2 = fraction;
+                        }
+                        return;
+                    }
+                    let target = fraction * vid.duration;
+                    this.quicklook_video_seek_to(target, cx);
+                    if let Some(scrub) = this.ql_scrub.as_mut() {
+                        scrub.1 = std::time::Instant::now();
+                        scrub.2 = fraction;
+                    }
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    let Some((_, _, fraction)) = this.ql_scrub.take() else {
+                        return;
+                    };
+                    let duration = this
+                        .ql_video
+                        .as_ref()
+                        .map_or(0.0, |vid| vid.duration);
+                    if duration > 0.0 {
+                        this.quicklook_video_seek_to(fraction * duration, cx);
+                    }
+                })),
         )
     }
 
@@ -8621,10 +8933,13 @@ impl Render for Browser {
         // the pump never runs inside a held entity update)
         if self.quicklook.is_some() {
             self.pump_video(cx);
+            // playing: the loop feeds itself. A scrub while paused
+            // also arms: its landing frame arrives asynchronously
+            // and must pump without a resume
             if self
                 .ql_video
                 .as_ref()
-                .is_some_and(|vid| vid.playing && !vid.ended)
+                .is_some_and(|vid| (!vid.playing && vid.seeking.is_some()) || (vid.playing && !vid.ended))
             {
                 window.request_animation_frame();
             }
@@ -10431,8 +10746,9 @@ struct VideoPlayer {
     /// The frame on screen: its pixels and its media time.
     frame: Option<(Arc<RenderImage>, f64)>,
     /// One frame decoded ahead of the clock, not yet due: the ring
-    /// cannot be peeked, so the first not-due frame is held here.
-    ahead: Option<(Arc<RenderImage>, f64)>,
+    /// cannot be peeked, so the first not-due frame is held here,
+    /// with the generation it decoded under.
+    ahead: Option<(Arc<RenderImage>, f64, u32)>,
     /// The stream said eof and the ring is drained.
     eof: bool,
     /// Media time the clock stood at on the last pause (or open).
@@ -10440,6 +10756,26 @@ struct VideoPlayer {
     /// Wall anchor for the current run: media time is clock_base
     /// plus wall time since this Instant.
     wall: std::time::Instant,
+    /// The media time shown while not playing: the pause stamp, a
+    /// scrub's landing, or the last frame at the end. The audio
+    /// clock is stale after a scrub (no sound ran to re-anchor it),
+    /// so at rest the pane shows this instead.
+    frozen_at: f64,
+    /// A scrub in flight: the target the demuxer is jumping to.
+    /// The pump drops frames short of the seek's generation until
+    /// one of it lands, then this clears.
+    seeking: Option<f64>,
+    /// The generation the last seek started from: frames stamped at
+    /// or before it are stale and dropped unheard.
+    generation: Option<u32>,
+    /// The container's duration in seconds (the bar's total, the
+    /// keys' clamp); 0.0 when the header stated none.
+    duration: f64,
+    /// Integer gain, 256 = unity, as the volume keys set it.
+    volume: u32,
+    /// The mute toggle: gain zero at the sink, `volume` kept for
+    /// the way back.
+    muted: bool,
     playing: bool,
     ended: bool,
 }
@@ -10452,12 +10788,32 @@ impl VideoPlayer {
     /// runs out of the sink's latency, the clock sits at the last
     /// written sample, which is where the resume continues. Muted
     /// paused time does not advance: the pump only reads this while
-    /// playing, and a pause stamps clock_base first.
+    /// playing, and a pause stamps clock_base first. At rest the
+    /// frozen stamp wins over both: after a scrub the audio clock
+    /// is stale until the sound runs again.
     fn media_now(&self) -> f64 {
+        if !self.playing {
+            return self.frozen_at;
+        }
         match self.player.clock_micros() {
             Some(micros) => micros as f64 / 1_000_000.0,
             None => self.clock_base + self.wall.elapsed().as_secs_f64(),
         }
+    }
+
+    /// The gain the sink should run at: zero while muted.
+    fn gain(&self) -> u32 {
+        if self.muted {
+            0
+        } else {
+            self.volume
+        }
+    }
+
+    /// The position the time label and the bar show: a scrub shows
+    /// its target while in flight, the clock runs otherwise.
+    fn shown_at(&self) -> f64 {
+        self.seeking.unwrap_or_else(|| self.media_now())
     }
 }
 
@@ -10992,6 +11348,7 @@ const KEY_HINTS: &[(&str, &str)] = &[
     ("Enter", "open"),
     ("Alt+Enter", "info rail"),
     ("Space", "quick look"),
+    ("J/L · +/- · M", "video seek, volume, mute (Quick Look)"),
     ("Backspace", "up folder; pops the filter first"),
     ("Escape", "clear filter, else selection"),
     ("F2", "rename"),
@@ -12176,6 +12533,199 @@ mod browser_ux_keys {
             assert!(browser.ql_video.is_none());
         });
         app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_video_seeks_by_key_and_lands_the_scrub() {
+        let lab = Lab::new("quicklook-video-seek");
+        // a real one-second clip, copied in before the browser loads
+        // so the listing sees it
+        let clip = lab.dir.join("clip.mp4");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.mp4"),
+            &clip,
+        )
+        .unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            let ix = browser
+                .tab()
+                .entries
+                .iter()
+                .position(|entry| entry.name == "clip.mp4")
+                .expect("clip listed");
+            browser.jump_cursor(ix, cx);
+            browser.route_key(&key("space"), cx);
+        });
+        app.run_until_parked(); // the player lands
+        window.update(|browser, _, cx| {
+            browser.pump_video(cx); // frame zero due
+            // j: back ten seconds clamps at the head; l: forward ten
+            // clamps at the duration
+            browser.route_key(&key("j"), cx);
+            assert!(browser.ql_video.as_ref().unwrap().seeking.is_some());
+            browser.route_key(&key("l"), cx);
+            let vid = browser.ql_video.as_ref().unwrap();
+            let target = vid.seeking.expect("a scrub armed");
+            assert!((0.9..=1.0).contains(&target), "target {target}");
+            assert!(vid.playing, "a seek while playing keeps playing");
+        });
+        // the landing: the first frame of the new generation ends the
+        // scrub; everything the ring held before it drops unheard
+        let mut landed = false;
+        for _ in 0..200 {
+            window.update(|browser, _, cx| {
+                browser.pump_video(cx);
+                if let Some(vid) = browser.ql_video.as_ref()
+                    && vid.seeking.is_none()
+                    && vid.frame.as_ref().is_some_and(|(_, pts)| *pts > 0.35)
+                {
+                    landed = true;
+                }
+            });
+            if landed {
+                break;
+            }
+            window.update(|_, window, cx| window.simulate_next_frame(cx));
+            app.run_until_parked();
+        }
+        assert!(landed, "the scrub never landed");
+        // the absolute path clamps a decisecond short of the
+        // duration: the very end is the ended rest's own state
+        window.update(|browser, _, cx| {
+            browser.quicklook_video_seek_to(999.0, cx);
+            let vid = browser.ql_video.as_ref().unwrap();
+            assert_eq!(vid.seeking, Some(vid.duration - 0.1));
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_video_volume_and_mute_keys() {
+        let lab = Lab::new("quicklook-video-volume");
+        let clip = lab.dir.join("clip.mp4");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.mp4"),
+            &clip,
+        )
+        .unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            let ix = browser
+                .tab()
+                .entries
+                .iter()
+                .position(|entry| entry.name == "clip.mp4")
+                .expect("clip listed");
+            browser.jump_cursor(ix, cx);
+            browser.route_key(&key("space"), cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, cx| {
+            // +/- step the gain by 32 from unity, and never leave the
+            // 0..=256 band
+            browser.route_key(&key("-"), cx);
+            assert_eq!(browser.ql_video.as_ref().unwrap().volume, 224);
+            browser.route_key(&key("="), cx);
+            assert_eq!(browser.ql_video.as_ref().unwrap().volume, 256);
+            for _ in 0..9 {
+                browser.route_key(&key("-"), cx);
+            }
+            assert_eq!(browser.ql_video.as_ref().unwrap().volume, 0);
+            // m mutes and unmutes; adjusting while muted unmutes,
+            // and the muted spell never loses the gain
+            browser.route_key(&key("m"), cx);
+            assert!(browser.ql_video.as_ref().unwrap().muted);
+            browser.route_key(&key("="), cx);
+            assert!(!browser.ql_video.as_ref().unwrap().muted);
+            assert_eq!(browser.ql_video.as_ref().unwrap().volume, 32);
+            browser.route_key(&key("m"), cx);
+            assert!(browser.ql_video.as_ref().unwrap().muted);
+            browser.route_key(&key("m"), cx);
+            assert!(!browser.ql_video.as_ref().unwrap().muted);
+            assert_eq!(browser.ql_video.as_ref().unwrap().volume, 32);
+        });
+        app.run_until_parked();
+    }
+
+    #[test]
+    fn quick_look_video_seek_at_the_end_replays_into_the_target() {
+        let lab = Lab::new("quicklook-video-replay-seek");
+        let clip = lab.dir.join("clip.mp4");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.mp4"),
+            &clip,
+        )
+        .unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            let ix = browser
+                .tab()
+                .entries
+                .iter()
+                .position(|entry| entry.name == "clip.mp4")
+                .expect("clip listed");
+            browser.jump_cursor(ix, cx);
+            browser.route_key(&key("space"), cx);
+        });
+        app.run_until_parked();
+        // play the one-second stream out: the ended rest takes about
+        // a second of stream time
+        let mut ended = false;
+        for _ in 0..400 {
+            window.update(|browser, _, cx| browser.pump_video(cx));
+            ended = window.update(|browser, _, _| {
+                browser
+                    .ql_video
+                    .as_ref()
+                    .is_some_and(|vid| vid.ended)
+            });
+            if ended {
+                break;
+            }
+            window.update(|_, window, cx| window.simulate_next_frame(cx));
+            app.run_until_parked();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(ended, "the stream never ended");
+        // a seek at the end: the thread is gone, so the pane replays
+        // into the target on a fresh player, paused at the landing
+        window.update(|browser, _, cx| {
+            browser.route_key(&key("l"), cx);
+            assert!(browser.ql_video.is_none(), "the old player must drop");
+        });
+        app.run_until_parked(); // the fresh player lands
+        let mut landed = false;
+        for _ in 0..200 {
+            window.update(|browser, _, cx| {
+                browser.pump_video(cx);
+                if let Some(vid) = browser.ql_video.as_ref()
+                    && !vid.playing
+                    && vid.seeking.is_none()
+                    && vid.frame.as_ref().is_some_and(|(_, pts)| *pts > 0.35)
+                {
+                    landed = true;
+                }
+            });
+            if landed {
+                break;
+            }
+            window.update(|_, window, cx| window.simulate_next_frame(cx));
+            app.run_until_parked();
+        }
+        assert!(landed, "the replay never landed on its target");
     }
 
     #[test]

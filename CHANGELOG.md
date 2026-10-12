@@ -19,8 +19,10 @@ rides unchanged.
   Sound plays too, through the sound server (PipeWire's pulse-simple
   entry point, dlopen'd; systems without it play muted), and the
   video syncs to the audio clock. Space pauses and resumes a playing
-  clip, and replays one that ran out; the header hint follows the
-  state. No seek bar yet: that lands next.
+  clip, and replays one that ran out. The header gains a seek bar
+  (click or drag), live elapsed-over-total time, and the volume and
+  seek keys: J/L seek by ten seconds, +/- steps the volume, M mutes;
+  the header hint follows the state.
 
 - **Koguma renders SVG files.** The grid shows a true-color thumbnail
   (rasterized in-process at the fit size, so small icons stay crisp),

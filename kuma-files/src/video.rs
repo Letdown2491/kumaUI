@@ -79,6 +79,7 @@ mod imp {
     use super::{PREVIEW_MIN_DELAY, PosterFail, delay_from_pts};
     use std::ffi::CString;
     use std::path::Path;
+    use std::sync::atomic::Ordering::{Acquire, Release};
 
     use ffmpeg_sys_next as sys;
 
@@ -291,10 +292,13 @@ mod imp {
     /// the pane parks cleanly; a thread that dies without sending
     /// (a panic) reads the same through the disconnected channel.
     pub(crate) enum PlayerMsg {
-        /// A decoded frame, fitted, its media time in seconds.
+        /// A decoded frame, fitted, its media time in seconds, and
+        /// the seek generation it was decoded in (frames from before
+        /// the pane's latest seek are stale and dropped unheard).
         Frame {
             image: std::sync::Arc<gpui::RenderImage>,
             pts: f64,
+            generation: u32,
         },
         /// The stream is over; every frame is in the pane's hands.
         Eof,
@@ -328,11 +332,15 @@ mod imp {
         /// whether there is anything to hear: false once the sink is
         /// absent or died, which sends the clock back to the wall
         audible: std::sync::atomic::AtomicBool,
-        /// the pane's `Player` handle is gone. A parked loop never
-        /// reaches a send, so the receiver's drop cannot wake it the
-        /// way it wakes a send-blocked thread: the drop says so
-        /// directly, and the loop leaves without sending.
-        dead: std::sync::atomic::AtomicBool,
+        /// the pane's seek request: one flag and the target in
+        /// container-relative micros. The loop swaps the flag off and
+        /// jumps; a seek also bumps `generation`.
+        seek_request: std::sync::atomic::AtomicBool,
+        seek_target: std::sync::atomic::AtomicI64,
+        /// bumped after every completed seek; the frames carry the
+        /// value they were decoded under, and the pane drops
+        /// anything at or before its last seen generation
+        generation: std::sync::atomic::AtomicU32,
         /// micros of media time at the END of the last chunk written
         /// to the sink; i64::MIN until the first write lands
         pts_written: std::sync::atomic::AtomicI64,
@@ -350,7 +358,9 @@ mod imp {
                 paused: false.into(),
                 volume: std::sync::atomic::AtomicU32::new(256),
                 audible: false.into(),
-                dead: false.into(),
+                seek_request: false.into(),
+                seek_target: 0.into(),
+                generation: 0.into(),
                 pts_written: std::sync::atomic::AtomicI64::new(i64::MIN),
                 latency: 0.into(),
                 wrote_at: 0.into(),
@@ -404,8 +414,7 @@ mod imp {
         /// server would not say (the caller keeps its last reading).
         fn latency_micros(&self) -> Option<u64>;
         /// Discard buffered audio now. A pause does not: the tail
-        /// drains out on its own; a seek will.
-        #[allow(dead_code)] // the seek plumbing is slice 3
+        /// drains out on its own; a seek does.
         fn flush(&mut self);
     }
 
@@ -712,9 +721,36 @@ mod imp {
     pub(crate) struct Player {
         rx: std::sync::mpsc::Receiver<PlayerMsg>,
         share: std::sync::Arc<ClockShare>,
+        /// the container's duration in seconds, from the header at
+        /// open; None when the container states none
+        duration: Option<f64>,
     }
 
     impl Player {
+        /// The container's duration, when the header stated one: the
+        /// seek bar's total and the seek keys' clamp.
+        pub(crate) fn duration_secs(&self) -> Option<f64> {
+            self.duration.filter(|secs| *secs > 0.0)
+        }
+
+        /// Seek to a media time in seconds: the loop jumps the
+        /// demuxer, flushes both decoders and the sink, and bumps the
+        /// generation; frames decoded after carry the new one. The
+        /// target clamps at zero; the container's end is the caller's
+        /// business.
+        pub(crate) fn request_seek(&self, target_secs: f64) {
+            self.share
+                .seek_target
+                .store((target_secs.max(0.0) * 1_000_000.0) as i64, Release);
+            self.share.seek_request.store(true, Release);
+        }
+
+        /// The current seek generation: the pane records it at
+        /// request time and drops frames at or before it.
+        pub(crate) fn generation(&self) -> u32 {
+            self.share.generation.load(Acquire)
+        }
+
         /// Open the container and spawn the decode thread. The open
         /// itself (header parse plus stream info) costs libav tens
         /// of milliseconds: run it off the UI thread like every
@@ -740,6 +776,12 @@ mod imp {
         fn spawn(path: &Path, forced: Option<Box<dyn AudioSink>>) -> Result<Player, PosterFail> {
             let cpath = cpath(path).ok_or(PosterFail::Empty)?;
             let (input, video_index, vctx) = unsafe { open_video_decoder(&cpath)? };
+            // the header's duration (micros): the seek bar's total.
+            // AV_NOPTS_VALUE reads negative, which the filter takes
+            let duration = unsafe {
+                ((*input.0).duration >= 0)
+                    .then(|| (*input.0).duration as f64 / 1_000_000.0)
+            };
             let audio = unsafe { open_audio_decoder(input.0) };
             // the sink: the forced one (tests) wins; otherwise
             // pulse-simple, best effort. Anything missing means
@@ -783,7 +825,7 @@ mod imp {
                     }));
                 });
             spawned.map_err(|_| PosterFail::Empty)?;
-            Ok(Player { rx, share })
+            Ok(Player { rx, share, duration })
         }
 
         /// The next message if one is ready: a frame, the stream's
@@ -800,32 +842,21 @@ mod imp {
             self.share.clock_micros()
         }
 
-        /// Park or unpark the decode loop. While parked the sink's
-        /// bounded tail drains out and the clock sits still.
+        /// Pause or resume. While paused the audio route skips its
+        /// packets (silence, the clock sits still) and the video
+        /// coasts until the ring fills; the sink's bounded tail
+        /// drains out on its own.
         pub(crate) fn set_paused(&self, paused: bool) {
             self.share
                 .paused
                 .store(paused, std::sync::atomic::Ordering::Release);
         }
 
-        /// Integer gain, 256 = unity. The volume keys are slice 3;
-        /// playback runs at unity until they land.
-        #[allow(dead_code)]
+        /// Integer gain, 256 = unity, applied in the S16 conversion.
         pub(crate) fn set_volume(&self, gain: u32) {
             self.share
                 .volume
                 .store(gain.min(256), std::sync::atomic::Ordering::Release);
-        }
-    }
-
-    impl Drop for Player {
-        fn drop(&mut self) {
-            // a parked loop never reaches a send, so the receiver's
-            // drop cannot wake it the way it wakes a send-blocked
-            // thread: say so directly
-            self.share
-                .dead
-                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -884,30 +915,54 @@ mod imp {
             let mut samples: Vec<i16> = Vec::new();
             let mut last_latency: u64 = 0;
             'read: loop {
-                // the pane's pause: park. The sink's bounded tail
-                // drains out during the pause; the resume continues
-                // at the audio's own position, so sound and picture
-                // stay locked (the picture jumps the tail's worth,
-                // at most a buffer length).
-                if share
-                    .paused
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    // the pane is gone (a paused pane still drops its
-                    // player): nothing would wake a parked loop, the
-                    // send-side wake only reaches a send-blocked one
-                    if share.dead.load(std::sync::atomic::Ordering::Acquire) {
-                        return;
+                // the pane's seek: jump the demuxer, flush both
+                // decoders and the sink, and bump the generation.
+                // Frames decoded after carry the new one and the pane
+                // drops everything older, so the ring's stale frames
+                // never show. A failed jump still flushes and still
+                // bumps: the stream plays on from where it was, and
+                // the pane's scrub window closes instead of hanging.
+                if share.seek_request.swap(false, Acquire) {
+                    let target = share.seek_target.load(Acquire);
+                    // stream -1 seeks the container in AV_TIME_BASE
+                    // micros, the poster path's shape
+                    let _ = sys::avformat_seek_file(
+                        input.0,
+                        -1,
+                        i64::MIN,
+                        target,
+                        i64::MAX,
+                        0,
+                    );
+                    sys::avcodec_flush_buffers(vctx.0);
+                    if let Some((_, actx, _, _)) = &audio {
+                        sys::avcodec_flush_buffers(actx.0);
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    continue;
+                    if let Some(sink) = sink.as_mut() {
+                        sink.flush();
+                    }
+                    share.generation.fetch_add(1, Release);
                 }
+                // the pane's pause: sound off, picture coasting. Video
+                // keeps decoding until the ring fills and the send
+                // parks the thread; the receiver's drop wakes a
+                // send-blocked thread, so no park loop is needed. The
+                // resume continues at the audio's own position, so
+                // sound and picture stay locked (the picture jumps
+                // the tail's worth, at most a ring length).
+                let paused = share.paused.load(Acquire);
                 if sys::av_read_frame(input.0, pkt.0) < 0 {
                     break; // eof or read error: the stream is what it is
                 }
                 let index = (*pkt.0).stream_index as usize;
                 let routed_audio = audio.as_ref().is_some_and(|a| a.0 == index);
                 if !routed_audio && index != video_index {
+                    sys::av_packet_unref(pkt.0);
+                    continue;
+                }
+                // a paused pane hears nothing: audio packets skip,
+                // and the clock sits still until the resume
+                if paused && routed_audio {
                     sys::av_packet_unref(pkt.0);
                     continue;
                 }
@@ -1001,6 +1056,7 @@ mod imp {
                             let ship = tx.send(PlayerMsg::Frame {
                                 image: std::sync::Arc::new(image),
                                 pts,
+                                generation: share.generation.load(Acquire),
                             });
                             if ship.is_err() {
                                 return; // the pane moved on: the job is done
@@ -1421,6 +1477,16 @@ mod imp {
         pub(crate) fn set_paused(&self, _paused: bool) {}
 
         pub(crate) fn set_volume(&self, _gain: u32) {}
+
+        pub(crate) fn duration_secs(&self) -> Option<f64> {
+            None
+        }
+
+        pub(crate) fn request_seek(&self, _target_secs: f64) {}
+
+        pub(crate) fn generation(&self) -> u32 {
+            0
+        }
     }
 
     /// The pane matches on these variants, the stub never builds
@@ -1430,6 +1496,7 @@ mod imp {
         Frame {
             image: std::sync::Arc<gpui::RenderImage>,
             pts: f64,
+            generation: u32,
         },
         Eof,
     }
@@ -1621,7 +1688,7 @@ mod tests {
                 assert!(!apkt.is_null());
                 let a_src_tb = sys::AVRational { num: 1, den: 44100 };
                 let a_dst_tb = (**(*octx).streams.add(1)).time_base;
-                let mut write_packet = |pkt: *mut sys::AVPacket| {
+                let write_packet = |pkt: *mut sys::AVPacket| {
                     (*pkt).stream_index = 1;
                     sys::av_packet_rescale_ts(pkt, a_src_tb, a_dst_tb);
                     assert_eq!(sys::av_interleaved_write_frame(octx, pkt), 0);
@@ -1837,6 +1904,114 @@ mod tests {
     }
 
     #[test]
+    fn player_seek_flushes_and_lands_fresh() {
+        let path = Path::new("tests/fixtures/sample.mp4");
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i16>::new()));
+        let player = Player::open_with_sink(
+            path,
+            Box::new(VecSink {
+                samples: recorded.clone(),
+            }),
+        )
+        .expect("player opens");
+        // the header states its duration: the seek bar's total and
+        // the seek keys' clamp
+        let duration = player
+            .duration_secs()
+            .expect("the container states a duration");
+        assert!((0.9..=1.3).contains(&duration), "duration {duration}");
+        // paused first: the scrub's landing frame is a paused pane's
+        // business. The ring parks the thread on its send long before
+        // eof on a twenty-five frame stream, so the seek below always
+        // lands on a live thread.
+        player.set_paused(true);
+        let before = player.generation();
+        player.request_seek(0.8);
+        let started = std::time::Instant::now();
+        let landing = loop {
+            match player.try_recv() {
+                Some(PlayerMsg::Frame { pts, generation, .. }) => {
+                    if generation > before {
+                        break pts;
+                    }
+                    // a pre-seek frame: the decode ran from the start
+                    // and can be no further in than the ring's worth
+                    assert!(pts < 0.35, "pre-seek pts {pts}");
+                }
+                Some(PlayerMsg::Eof) => panic!("eof before the seek's landing"),
+                None => {
+                    // the decode thread runs at its own pace: wait
+                    // for it, but never forever
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10),
+                        "the seek never landed"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        };
+        // the landing is a keyframe at or before the target: the
+        // fixture's twelve-frame gop puts one at half a second
+        assert!((0.35..=0.85).contains(&landing), "landing {landing}");
+        // resume while the stream is still live: the audio route
+        // runs again from the seek's position, and the clock
+        // re-anchors past the landing, never back at the start. The
+        // ring must drain while polling or the thread parks on its
+        // send and the audio stops.
+        player.set_paused(false);
+        let clock = loop {
+            if let Some(c) = player.clock_micros()
+                && c >= 350_000
+            {
+                break c;
+            }
+            loop {
+                match player.try_recv() {
+                    Some(PlayerMsg::Frame { .. }) => continue,
+                    Some(PlayerMsg::Eof) => {
+                        panic!("the stream ended before the clock re-anchored")
+                    }
+                    None => break,
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the clock never re-anchored"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!((350_000..=1_300_000).contains(&clock), "clock {clock}");
+        // the rest of the stream decodes forward from the landing,
+        // all of the new generation, out to eof
+        let mut fresh: Vec<f64> = Vec::new();
+        loop {
+            match player.try_recv() {
+                Some(PlayerMsg::Frame { pts, generation, .. }) => {
+                    assert!(generation > before, "a stale frame after the landing");
+                    assert!(
+                        pts > fresh_last(&landing, &fresh),
+                        "pts {pts} out of order"
+                    );
+                    fresh.push(pts);
+                }
+                Some(PlayerMsg::Eof) => break,
+                None => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10),
+                        "player never ended"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    /// The newest pts a seek test has accepted, for order asserts.
+    fn fresh_last(landing: &f64, fresh: &[f64]) -> f64 {
+        fresh.last().copied().unwrap_or(*landing)
+    }
+
+    #[test]
     fn player_decodes_in_order_and_ends() {
         let path = Path::new("tests/fixtures/sample.mp4");
         let player = Player::open(path).expect("player opens");
@@ -1844,7 +2019,7 @@ mod tests {
         let mut frames: Vec<(f64, u32, u32)> = Vec::new();
         loop {
             match player.try_recv() {
-                Some(PlayerMsg::Frame { image, pts }) => {
+                Some(PlayerMsg::Frame { image, pts, .. }) => {
                     let size = image.size(0);
                     frames.push((pts, u32::from(size.width), u32::from(size.height)));
                 }
