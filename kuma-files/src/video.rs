@@ -4,7 +4,10 @@
 //! from linking libavcodec, libavformat and libswscale. Sound comes
 //! from libswresample plus the sound server's pulse-simple entry
 //! point, dlopen'd (never linked), and any gap in that chain degrades
-//! to muted playback with the wall clock. Videos are hostile input:
+//! to muted playback with the wall clock. The player attempts VAAPI
+//! hardware decode first and copies device surfaces into the same
+//! system-memory path software decode uses; a machine or driver
+//! without VAAPI never notices. Videos are hostile input:
 //! every step is fallible and degrades, so callers fall back to the
 //! type icon or the card. No function here may run libav on the UI
 //! thread; callers wrap the decode in catch_unwind like every other
@@ -119,6 +122,19 @@ mod imp {
     impl Drop for CodecCtx {
         fn drop(&mut self) {
             unsafe { sys::avcodec_free_context(&mut self.0) };
+        }
+    }
+
+    /// RAII for a hardware decode device: a libav device buffer
+    /// (VAAPI), freed by unref. `Send` for the player thread, same
+    /// reasoning as `CodecCtx`.
+    struct HwDevice(*mut sys::AVBufferRef);
+
+    unsafe impl Send for HwDevice {}
+
+    impl Drop for HwDevice {
+        fn drop(&mut self) {
+            unsafe { sys::av_buffer_unref(&mut self.0) };
         }
     }
 
@@ -707,7 +723,7 @@ mod imp {
                 return None;
             }
             let codec = sys::avcodec_find_decoder((*par).codec_id);
-            let actx = avcodec_open(codec, par).ok()?;
+            let actx = avcodec_open(codec, par, None).ok()?;
             Some((index, actx, (*par).sample_rate as u32))
         }
     }
@@ -775,7 +791,12 @@ mod imp {
 
         fn spawn(path: &Path, forced: Option<Box<dyn AudioSink>>) -> Result<Player, PosterFail> {
             let cpath = cpath(path).ok_or(PosterFail::Empty)?;
-            let (input, video_index, vctx) = unsafe { open_video_decoder(&cpath)? };
+            let (input, video_index, vctx, hwdev) =
+                unsafe { open_video_decoder(&cpath, hwaccel_enabled())? };
+            // one line per open: the bench reads it from the journal
+            if hwdev.is_some() {
+                log::info!("video: vaapi decode active");
+            }
             // the header's duration (micros): the seek bar's total.
             // AV_NOPTS_VALUE reads negative, which the filter takes
             let duration = unsafe {
@@ -807,6 +828,10 @@ mod imp {
             let spawned = std::thread::Builder::new()
                 .name("kuma-video-player".into())
                 .spawn(move || {
+                    // the hardware device outlives the loop: this
+                    // binding drops after play_loop has freed the
+                    // decoder context that borrowed it
+                    let _device = hwdev;
                     // hostile input: a panic in libav-land ends the
                     // thread, never the app; the pane reads the dead
                     // channel as eof
@@ -901,6 +926,11 @@ mod imp {
             };
             let mut fallback: f64 = 0.0;
             let mut scaler: Option<Scaler> = None;
+            // the hardware path's landing frame: device surfaces are
+            // copied into this system-memory frame before the scaler
+            // sees them, so software and hardware decode share every
+            // step downstream
+            let hw_landing = Frame::alloc();
             // the audio side travels together: stream index, decoder,
             // the stream's time base, and the stream's rate
             let audio = match (audio_index, actx) {
@@ -1030,8 +1060,25 @@ mod imp {
                             if got < 0 {
                                 break; // EAGAIN or error: next packet
                             }
+                            // a hardware-decoded frame lives in device
+                            // memory: copy it into a system-memory frame
+                            // first, so the scaler and the BGRA bytes run
+                            // on the same plain path as software decode
+                            let src = if (*frame.0).hw_frames_ctx.is_null() {
+                                frame.0
+                            } else {
+                                let Some(landing) = hw_landing.as_ref() else {
+                                    stop = true;
+                                    break;
+                                };
+                                if hw_frame_to_system(landing, frame.0).is_err() {
+                                    stop = true;
+                                    break;
+                                }
+                                landing.0
+                            };
                             let (dw, dh, mut buf) =
-                                match scale_frame(frame.0, &mut scaler, max) {
+                                match scale_frame(src, &mut scaler, max) {
                                     Ok(ok) => ok,
                                     Err(_) => {
                                         stop = true;
@@ -1127,7 +1174,7 @@ mod imp {
         from_head: bool,
     ) -> Result<image::DynamicImage, PosterFail> {
         unsafe {
-            let (input, video_index, mut cctx) = open_video_decoder(path)?;
+            let (input, video_index, mut cctx, _) = open_video_decoder(path, false)?;
             if !from_head {
                 // the seek's timestamp runs in the container time
                 // base, microseconds; ten percent in, one second as
@@ -1161,7 +1208,7 @@ mod imp {
     /// the poster).
     fn preview(path: &CString, max: u32) -> Result<Vec<image::Frame>, PosterFail> {
         unsafe {
-            let (input, video_index, cctx) = open_video_decoder(path)?;
+            let (input, video_index, cctx, _) = open_video_decoder(path, false)?;
             let pkt = Packet::alloc().ok_or(PosterFail::Empty)?;
             let frame = Frame::alloc().ok_or(PosterFail::Empty)?;
             // the container's own time base for the stream: the
@@ -1265,9 +1312,14 @@ mod imp {
     /// Open the container, find the best video stream, open its
     /// decoder. `Err(CodecMissing)` when libav parses the container
     /// but has no decoder for the codec (the named state's trigger).
+    /// `hw` attempts VAAPI first: a device that answers and an open
+    /// that lands decode into device surfaces; either miss falls
+    /// back to the same software decoder. The device, if any, comes
+    /// back owned by the caller.
     unsafe fn open_video_decoder(
         path: &CString,
-    ) -> Result<(FormatInput, usize, CodecCtx), PosterFail> {
+        hw: bool,
+    ) -> Result<(FormatInput, usize, CodecCtx, Option<HwDevice>), PosterFail> {
         unsafe {
             let mut ic: *mut sys::AVFormatContext = std::ptr::null_mut();
             if sys::avformat_open_input(
@@ -1290,14 +1342,25 @@ mod imp {
                 return Err(PosterFail::CodecMissing);
             }
             let codec = sys::avcodec_find_decoder((*par).codec_id);
-            let cctx = avcodec_open(codec, par)?;
-            Ok((input, video_index, cctx))
+            // the hardware attempt: a device that answers, an open
+            // that lands. Either miss is silent and ordinary: the
+            // software decoder below is the plain path.
+            if hw {
+                if let Some(dev) = open_hw_device() {
+                    if let Ok(cctx) = avcodec_open(codec, par, Some(&dev)) {
+                        return Ok((input, video_index, cctx, Some(dev)));
+                    }
+                }
+            }
+            let cctx = avcodec_open(codec, par, None)?;
+            Ok((input, video_index, cctx, None))
         }
     }
 
     unsafe fn avcodec_open(
         codec: *const sys::AVCodec,
         par: *mut sys::AVCodecParameters,
+        hw: Option<&HwDevice>,
     ) -> Result<CodecCtx, PosterFail> {
         unsafe {
             let cctx = sys::avcodec_alloc_context3(codec);
@@ -1305,12 +1368,106 @@ mod imp {
                 return Err(PosterFail::Empty);
             }
             let cctx = CodecCtx(cctx);
-            if sys::avcodec_parameters_to_context(cctx.0, par) < 0
-                || sys::avcodec_open2(cctx.0, codec, std::ptr::null_mut()) < 0
-            {
+            if sys::avcodec_parameters_to_context(cctx.0, par) < 0 {
+                return Err(PosterFail::Empty);
+            }
+            if let Some(dev) = hw {
+                // the decoder borrows the device from here on (it
+                // takes its own reference), and the format callback
+                // steers it at VAAPI surfaces
+                (*cctx.0).hw_device_ctx = sys::av_buffer_ref(dev.0);
+                (*cctx.0).get_format = Some(pick_pixel_format);
+            }
+            if sys::avcodec_open2(cctx.0, codec, std::ptr::null_mut()) < 0 {
                 return Err(PosterFail::Empty);
             }
             Ok(cctx)
+        }
+    }
+
+    /// The machine's VAAPI device, when one answers: a render node
+    /// with a driver behind it. None is the ordinary result in
+    /// containers and on machines without the driver; the caller
+    /// then decodes in software, which is the plain path and never
+    /// the worse one.
+    fn open_hw_device() -> Option<HwDevice> {
+        let mut dev: *mut sys::AVBufferRef = std::ptr::null_mut();
+        let ok = unsafe {
+            sys::av_hwdevice_ctx_create(
+                &mut dev,
+                sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (ok >= 0 && !dev.is_null()).then(|| HwDevice(dev))
+    }
+
+    /// Hardware decode is on unless `KOGUMA_NO_HWACCEL` is set: the
+    /// bench's A/B switch, read once per player open.
+    fn hwaccel_enabled() -> bool {
+        std::env::var_os("KOGUMA_NO_HWACCEL").is_none()
+    }
+
+    /// The decoder's pixel-format callback. With a device attached it
+    /// picks the VAAPI entry, which puts the decoder's surfaces in
+    /// device memory; without one, or when no hardware entry is
+    /// offered, the first candidate, which is libav's own software
+    /// preference order.
+    unsafe extern "C" fn pick_pixel_format(
+        cctx: *mut sys::AVCodecContext,
+        fmts: *const sys::AVPixelFormat,
+    ) -> sys::AVPixelFormat {
+        unsafe { pick_format_impl(!(*cctx).hw_device_ctx.is_null(), fmts) }
+    }
+
+    /// The picker's pure half, table-tested.
+    pub(crate) fn pick_format_impl(
+        hw: bool,
+        fmts: *const sys::AVPixelFormat,
+    ) -> sys::AVPixelFormat {
+        unsafe {
+            let mut i = 0isize;
+            loop {
+                let fmt = *fmts.offset(i);
+                if fmt == sys::AVPixelFormat::AV_PIX_FMT_NONE {
+                    break;
+                }
+                if hw && fmt == sys::AVPixelFormat::AV_PIX_FMT_VAAPI {
+                    return fmt;
+                }
+                i += 1;
+            }
+            *fmts
+        }
+    }
+
+    /// Copy one hardware-decoded frame (device memory) into a
+    /// system-memory frame in the pool's software format, the shape
+    /// the scaler takes. The landing frame is re-filled per call;
+    /// the pts stays on the hardware frame (the caller reads it
+    /// there). Any miss is `Err`, the loop's ordinary stop.
+    unsafe fn hw_frame_to_system(landing: &Frame, hw: *mut sys::AVFrame) -> Result<(), PosterFail> {
+        unsafe {
+            let pool = if (*hw).hw_frames_ctx.is_null() {
+                return Err(PosterFail::Empty);
+            } else {
+                (*(*hw).hw_frames_ctx).data as *mut sys::AVHWFramesContext
+            };
+            if pool.is_null() {
+                return Err(PosterFail::Empty);
+            }
+            sys::av_frame_unref(landing.0);
+            (*landing.0).format = (*pool).sw_format as i32;
+            (*landing.0).width = (*hw).width;
+            (*landing.0).height = (*hw).height;
+            if sys::av_frame_get_buffer(landing.0, 0) < 0
+                || sys::av_hwframe_transfer_data(landing.0, hw, 0) < 0
+            {
+                return Err(PosterFail::Empty);
+            }
+            Ok(())
         }
     }
 
@@ -1534,7 +1691,7 @@ pub(crate) fn write_codec_missing_stream(path: &std::path::Path) {
 mod tests {
     use super::imp::{
         AudioSink, Player, PlayerMsg, decode_poster, decode_preview, heard_micros,
-        poster_dynamic, probe,
+        pick_format_impl, poster_dynamic, probe,
     };
     use super::{delay_from_pts, duration_label};
     use super::PosterFail;
@@ -1857,6 +2014,29 @@ mod tests {
             Some(0)
         }
         fn flush(&mut self) {}
+    }
+
+    /// The format picker's table: with a device it takes the VAAPI
+    /// entry, without one it keeps libav's own order. No GPU here:
+    /// this is the picker's logic, not the device's.
+    #[test]
+    fn format_picker_takes_vaapi_only_with_a_device() {
+        use sys::AVPixelFormat as Fmt;
+        let sw = [Fmt::AV_PIX_FMT_YUV420P, Fmt::AV_PIX_FMT_NONE];
+        let both = [
+            Fmt::AV_PIX_FMT_YUV420P,
+            Fmt::AV_PIX_FMT_VAAPI,
+            Fmt::AV_PIX_FMT_NONE,
+        ];
+        assert_eq!(
+            pick_format_impl(false, sw.as_ptr()),
+            Fmt::AV_PIX_FMT_YUV420P
+        );
+        assert_eq!(
+            pick_format_impl(false, both.as_ptr()),
+            Fmt::AV_PIX_FMT_YUV420P
+        );
+        assert_eq!(pick_format_impl(true, both.as_ptr()), Fmt::AV_PIX_FMT_VAAPI);
     }
 
     #[test]

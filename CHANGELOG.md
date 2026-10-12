@@ -22,7 +22,9 @@ rides unchanged.
   clip, and replays one that ran out. The header gains a seek bar
   (click or drag), live elapsed-over-total time, and the volume and
   seek keys: J/L seek by ten seconds, +/- steps the volume, M mutes;
-  the header hint follows the state.
+  the header hint follows the state. Decode attempts VAAPI hardware
+  first and falls back to software wherever the driver is missing;
+  `KOGUMA_NO_HWACCEL=1` forces software for A/B checks.
 
 - **Koguma renders SVG files.** The grid shows a true-color thumbnail
   (rasterized in-process at the fit size, so small icons stay crisp),
