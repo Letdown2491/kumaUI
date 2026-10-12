@@ -39,7 +39,9 @@ usvg = { version = "0.46.0", default-features = false, features = ["text", "syst
 # Optional by the portability rule: libav is a capability, not a
 # requirement; a system without a matching libav builds with
 # --no-default-features and video degrades to the type icon
-ffmpeg-sys-next = { version = "9", optional = true, default-features = false, features = ["avcodec", "avformat", "swscale"] }
+# swresample: the player's audio path converts decoder output
+# (usually planar float) to the sink's S16NE stereo
+ffmpeg-sys-next = { version = "9", optional = true, default-features = false, features = ["avcodec", "avformat", "swscale", "swresample"] }
 
 [features]
 # video: in-process libav decode, default on. Off, the app builds

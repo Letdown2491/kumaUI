@@ -4587,10 +4587,11 @@ impl Browser {
     /// (the newest due wins; frames it displaces are skipped without
     /// display, the late-drop rule), hold the first not-yet-due frame
     /// back, drop the displaced tile (ADR-0016), and park the loop at
-    /// the stream's end. The threshold is the sync floor; the clock
-    /// is wall time until the audio sink lands.
+    /// the stream's end. The threshold is a frame's own display
+    /// duration when the frame after it is decoded, clamped to the
+    /// sync band; the clock is the audio sink's, wall time when
+    /// muted.
     fn pump_video(&mut self, cx: &mut Context<Self>) {
-        const THRESHOLD: f64 = 0.04;
         let Some(vid) = self.ql_video.as_mut() else {
             return;
         };
@@ -4598,6 +4599,13 @@ impl Browser {
             return;
         }
         let clock = vid.media_now();
+        // the present slack: a frame's own display duration (the pts
+        // delta to the frame after it) when that one is decoded,
+        // clamped to the sync band; the floor alone when it is not
+        let threshold = match (&vid.ahead, &vid.frame) {
+            (Some((_, ahead_pts)), Some((_, pts))) => (ahead_pts - pts).clamp(0.04, 0.1),
+            _ => 0.04,
+        };
         let mut pending = vid.ahead.take();
         let mut due: Option<(Arc<RenderImage>, f64)> = None;
         loop {
@@ -4615,7 +4623,7 @@ impl Browser {
             let Some(frame) = next else {
                 break;
             };
-            if frame.1 <= clock + THRESHOLD {
+            if frame.1 <= clock + threshold {
                 due = Some(frame);
             } else {
                 pending = Some(frame);
@@ -4657,8 +4665,13 @@ impl Browser {
         vid.playing = !vid.playing;
         if vid.playing {
             vid.wall = std::time::Instant::now();
+            vid.player.set_paused(false);
         } else {
+            // stamp before parking: the muted mode's clock_base is
+            // where the wall clock resumes; the audio clock freezes
+            // itself (and this stamp is ignored there)
             vid.clock_base = vid.media_now();
+            vid.player.set_paused(true);
         }
         cx.notify();
         true
@@ -10409,8 +10422,9 @@ struct QuickLook {
 /// The Quick Look video pane's player state: the decoder handle plus
 /// what is on screen. The pane's machine is Poster (no player landed,
 /// or no frame due yet: the poster shows), Playing, Paused, and the
-/// ended rest (the stream ran out; the last frame holds). The audio
-/// sink slice replaces the wall clock; nothing here changes shape.
+/// ended rest (the stream ran out; the last frame holds). The clock
+/// is the audio sink's samples-written clock when there is sound,
+/// wall time when muted.
 struct VideoPlayer {
     path: PathBuf,
     player: crate::video::Player,
@@ -10431,13 +10445,19 @@ struct VideoPlayer {
 }
 
 impl VideoPlayer {
-    /// Media time now: the wall-clock stand-in for the audio clock
-    /// (the sink's samples-written clock replaces the body of this
-    /// in the sync slice). Paused time does not advance: the pump
-    /// only reads this while playing, and a pause stamps clock_base
-    /// first.
+    /// Media time now: the audio clock when the player has sound
+    /// (absolute media time, as heard through the sink), the wall
+    /// clock plus the pause stamp when muted. The audio clock
+    /// freezes itself while parked: writes stop, the interpolation
+    /// runs out of the sink's latency, the clock sits at the last
+    /// written sample, which is where the resume continues. Muted
+    /// paused time does not advance: the pump only reads this while
+    /// playing, and a pause stamps clock_base first.
     fn media_now(&self) -> f64 {
-        self.clock_base + self.wall.elapsed().as_secs_f64()
+        match self.player.clock_micros() {
+            Some(micros) => micros as f64 / 1_000_000.0,
+            None => self.clock_base + self.wall.elapsed().as_secs_f64(),
+        }
     }
 }
 

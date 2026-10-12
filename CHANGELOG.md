@@ -16,9 +16,11 @@ rides unchanged.
 - **Koguma's Quick Look plays videos.** Opening a video now runs the
   file through libav in-process (the same decoder Celluloid uses) and
   presents it frame by frame instead of cycling a short silent loop.
-  Space pauses and resumes a playing clip, and replays one that ran
-  out; the header hint follows the state. No audio yet and no seek
-  bar: those land next, with the audio clock they sync to.
+  Sound plays too, through the sound server (PipeWire's pulse-simple
+  entry point, dlopen'd; systems without it play muted), and the
+  video syncs to the audio clock. Space pauses and resumes a playing
+  clip, and replays one that ran out; the header hint follows the
+  state. No seek bar yet: that lands next.
 
 - **Koguma renders SVG files.** The grid shows a true-color thumbnail
   (rasterized in-process at the fit size, so small icons stay crisp),

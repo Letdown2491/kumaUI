@@ -1,12 +1,16 @@
 //! In-process video decode and playback: kumaOS ships the full libav
 //! as ffmpeg-libs and no CLI (the kumaOS ffmpeg contract), so
 //! posters, preview loops, durations and the Quick Look player come
-//! from linking libavcodec, libavformat and libswscale. Videos are
-//! hostile input: every step is fallible and degrades, so callers
-//! fall back to the type icon or the card. No function here may run
-//! libav on the UI thread; callers wrap the decode in catch_unwind
-//! like every other thumbnail decode, and the player's loop runs on
-//! its own thread (`Player::try_recv` only drains the ring).
+//! from linking libavcodec, libavformat and libswscale. Sound comes
+//! from libswresample plus the sound server's pulse-simple entry
+//! point, dlopen'd (never linked), and any gap in that chain degrades
+//! to muted playback with the wall clock. Videos are hostile input:
+//! every step is fallible and degrades, so callers fall back to the
+//! type icon or the card. No function here may run libav on the UI
+//! thread; callers wrap the decode in catch_unwind like every other
+//! thumbnail decode, and the player's loop runs on its own thread
+//! (`Player::try_recv` only drains the ring, `Player::clock_micros`
+//! only reads the clock's shared state).
 //!
 //! The portability rule: libav is a capability, not a requirement.
 //! The decode path lives behind the `video` feature (default on);
@@ -296,14 +300,418 @@ mod imp {
         Eof,
     }
 
+    /// The audio clock, pure: the media time the sound server is
+    /// playing, from the end of the last chunk written to the sink,
+    /// the latency sampled at that write, and the time since. The
+    /// sink plays its latency down after the write; once it
+    /// underruns the heard time sits at the write's end until the
+    /// next write re-anchors. Table-tested; `ClockShare` is this
+    /// plus the shared reads and writes.
+    pub(crate) fn heard_micros(pts_written: i64, latency: u64, since_write: u64) -> i64 {
+        let behind = latency.saturating_sub(since_write) as i64;
+        pts_written.saturating_sub(behind)
+    }
+
+    /// The audio clock's shared state, plus the pane's two levers on
+    /// the decode thread. The thread publishes per audio chunk; the
+    /// pane's present tick reads lock-free, so a clock read is
+    /// always safe on the UI thread.
+    struct ClockShare {
+        /// the pane's pause: the decode loop checks it per packet
+        /// and parks. The sink's bounded tail drains out during the
+        /// pause, and the resume continues at the audio's own
+        /// position, so sound and picture stay locked (the picture
+        /// jumps the tail's worth, at most a buffer length).
+        paused: std::sync::atomic::AtomicBool,
+        /// integer gain applied in the S16 conversion, 256 = unity
+        volume: std::sync::atomic::AtomicU32,
+        /// whether there is anything to hear: false once the sink is
+        /// absent or died, which sends the clock back to the wall
+        audible: std::sync::atomic::AtomicBool,
+        /// the pane's `Player` handle is gone. A parked loop never
+        /// reaches a send, so the receiver's drop cannot wake it the
+        /// way it wakes a send-blocked thread: the drop says so
+        /// directly, and the loop leaves without sending.
+        dead: std::sync::atomic::AtomicBool,
+        /// micros of media time at the END of the last chunk written
+        /// to the sink; i64::MIN until the first write lands
+        pts_written: std::sync::atomic::AtomicI64,
+        /// the sink's latency, in micros, sampled at that write
+        latency: std::sync::atomic::AtomicU64,
+        /// micros of the player's epoch at that write
+        wrote_at: std::sync::atomic::AtomicU64,
+        /// the epoch every `wrote_at` value runs against
+        epoch: std::time::Instant,
+    }
+
+    impl ClockShare {
+        fn new() -> Self {
+            Self {
+                paused: false.into(),
+                volume: std::sync::atomic::AtomicU32::new(256),
+                audible: false.into(),
+                dead: false.into(),
+                pts_written: std::sync::atomic::AtomicI64::new(i64::MIN),
+                latency: 0.into(),
+                wrote_at: 0.into(),
+                epoch: std::time::Instant::now(),
+            }
+        }
+
+        /// The media time the sink is playing, in micros; None while
+        /// muted (no sink, nothing written, or the sink died).
+        fn clock_micros(&self) -> Option<i64> {
+            use std::sync::atomic::Ordering::Acquire;
+            if !self.audible.load(Acquire) {
+                return None;
+            }
+            let pts = self.pts_written.load(Acquire);
+            if pts == i64::MIN {
+                return None;
+            }
+            let since = self.epoch.elapsed().as_micros() as u64;
+            let since_write = since.saturating_sub(self.wrote_at.load(Acquire));
+            Some(heard_micros(
+                pts,
+                self.latency.load(Acquire),
+                since_write,
+            ))
+        }
+
+        /// The decode thread's per-chunk publish: the chunk's end in
+        /// media time, the latency sampled right after the write.
+        fn publish(&self, end_micros: i64, latency_micros: u64) {
+            use std::sync::atomic::Ordering::Release;
+            self.wrote_at
+                .store(self.epoch.elapsed().as_micros() as u64, Release);
+            self.latency.store(latency_micros, Release);
+            self.pts_written.store(end_micros, Release);
+        }
+    }
+
+    /// Where decoded audio goes: the testability seam for the
+    /// playback engine (the test container has no sound server). The
+    /// real sink is PipeWire through pulse-simple's tiny API; the
+    /// test sink records into a buffer. `write` may block, and that
+    /// blocking is what paces the decode thread to realtime.
+    pub(crate) trait AudioSink: Send {
+        /// Interleaved S16NE samples at the stream's rate. Returns
+        /// false when the sink is done for good (the sound server
+        /// rejected the stream): the caller retires the audio route
+        /// and the clock falls back to the wall.
+        fn write(&mut self, samples: &[i16]) -> bool;
+        /// Audio the sink still holds, in microseconds; None when the
+        /// server would not say (the caller keeps its last reading).
+        fn latency_micros(&self) -> Option<u64>;
+        /// Discard buffered audio now. A pause does not: the tail
+        /// drains out on its own; a seek will.
+        #[allow(dead_code)] // the seek plumbing is slice 3
+        fn flush(&mut self);
+    }
+
+    // The pulse-simple FFI, hand-rolled and dlopen'd: the build never
+    // links libpulse, so a system without it still builds, and a
+    // system without a sound server still plays (muted). The structs
+    // are plain data from pulse's simple.h; only these six symbols
+    // are ever resolved.
+
+    /// pa_sample_spec: S16NE at the stream's rate, stereo.
+    #[repr(C)]
+    struct PaSampleSpec {
+        format: u32,
+        rate: u32,
+        channels: u8,
+    }
+    /// PA_SAMPLE_S16NE
+    const PA_SAMPLE_S16NE: u32 = 3;
+    /// PA_STREAM_PLAYBACK
+    const PA_STREAM_PLAYBACK: i32 = 1;
+
+    /// pa_buffer_attr, all fields in bytes: a modest server-side
+    /// buffer (see `PaSimple::open`).
+    #[repr(C)]
+    struct PaBufferAttr {
+        maxlength: u32,
+        tlength: u32,
+        prebuf: u32,
+        minreq: u32,
+        fragsize: u32,
+    }
+
+    enum PaStream {}
+    enum PaChannelMap {}
+
+    type PaSimpleNewFn = unsafe extern "C" fn(
+        *const std::ffi::c_char,
+        *const std::ffi::c_char,
+        i32,
+        *const std::ffi::c_char,
+        *const std::ffi::c_char,
+        *const PaSampleSpec,
+        *const PaChannelMap,
+        *const PaBufferAttr,
+        *mut i32,
+    ) -> *mut PaStream;
+    type PaSimpleWriteFn =
+        unsafe extern "C" fn(*mut PaStream, *const std::ffi::c_void, libc::size_t, *mut i32) -> i32;
+    type PaSimpleFlushFn = unsafe extern "C" fn(*mut PaStream, *mut i32) -> i32;
+    type PaSimpleGetLatencyFn = unsafe extern "C" fn(*mut PaStream, *mut i32) -> u64;
+    type PaSimpleFreeFn = unsafe extern "C" fn(*mut PaStream);
+
+    /// The dlopen'd libpulse-simple: the resolved symbols for one
+    /// stream. Never dlclosed: one mapped library for the process
+    /// lifetime is cheaper than ordering every drop correctly.
+    struct PaLib {
+        simple_new: PaSimpleNewFn,
+        simple_write: PaSimpleWriteFn,
+        simple_flush: PaSimpleFlushFn,
+        simple_get_latency: PaSimpleGetLatencyFn,
+        simple_free: PaSimpleFreeFn,
+    }
+
+    impl PaLib {
+        fn load() -> Option<PaLib> {
+            let handle = unsafe { libc::dlopen(c"libpulse-simple.so.0".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+            if handle.is_null() {
+                return None;
+            }
+            let sym = |name: &std::ffi::CStr| {
+                let p = unsafe { libc::dlsym(handle, name.as_ptr()) };
+                (!p.is_null()).then_some(p)
+            };
+            Some(PaLib {
+                simple_new: unsafe { std::mem::transmute(sym(c"pa_simple_new")?) },
+                simple_write: unsafe { std::mem::transmute(sym(c"pa_simple_write")?) },
+                simple_flush: unsafe { std::mem::transmute(sym(c"pa_simple_flush")?) },
+                simple_get_latency: unsafe { std::mem::transmute(sym(c"pa_simple_get_latency")?) },
+                simple_free: unsafe { std::mem::transmute(sym(c"pa_simple_free")?) },
+            })
+        }
+    }
+
+    /// A live pulse-simple playback stream: S16NE stereo at the
+    /// stream's rate. The server-side buffer is capped (150ms
+    /// target, 20ms granularity): a pause then leaks at most 150ms
+    /// of tail, and the clock's latency readings stay tight.
+    struct PaSimple {
+        raw: *mut PaStream,
+        simple_write: PaSimpleWriteFn,
+        simple_flush: PaSimpleFlushFn,
+        simple_get_latency: PaSimpleGetLatencyFn,
+        simple_free: PaSimpleFreeFn,
+        broken: bool,
+    }
+
+    impl PaSimple {
+        fn open(lib: &PaLib, rate: u32) -> Option<PaSimple> {
+            let rate = rate.max(8_000);
+            let spec = PaSampleSpec {
+                format: PA_SAMPLE_S16NE,
+                rate,
+                channels: 2,
+            };
+            // stereo S16: four bytes per frame of samples
+            let per_sec = rate * 4;
+            let minreq = per_sec * 20 / 1_000;
+            let attr = PaBufferAttr {
+                maxlength: u32::MAX, // the server default
+                tlength: per_sec * 150 / 1_000,
+                prebuf: minreq, // resume fast after an underrun
+                minreq,
+                fragsize: u32::MAX, // playback: unused
+            };
+            let raw = unsafe {
+                (lib.simple_new)(
+                    std::ptr::null(), // the default server
+                    c"kuma-files".as_ptr(),
+                    PA_STREAM_PLAYBACK,
+                    std::ptr::null(), // the default device
+                    c"Quick Look audio".as_ptr(),
+                    &spec,
+                    std::ptr::null(), // the default map for stereo
+                    &attr,
+                    std::ptr::null_mut(),
+                )
+            };
+            if raw.is_null() {
+                return None;
+            }
+            Some(PaSimple {
+                raw,
+                simple_write: lib.simple_write,
+                simple_flush: lib.simple_flush,
+                simple_get_latency: lib.simple_get_latency,
+                simple_free: lib.simple_free,
+                broken: false,
+            })
+        }
+    }
+
+    impl AudioSink for PaSimple {
+        fn write(&mut self, samples: &[i16]) -> bool {
+            if self.broken {
+                return false;
+            }
+            let ok = unsafe {
+                (self.simple_write)(
+                    self.raw,
+                    samples.as_ptr().cast(),
+                    samples.len() * 2,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok < 0 {
+                // say it once, then this sink is done for good: the
+                // clock falls back and the rest plays silently
+                self.broken = true;
+                log::error!("video player: the sound server rejected audio, playing muted");
+                return false;
+            }
+            true
+        }
+
+        fn latency_micros(&self) -> Option<u64> {
+            let usec = unsafe { (self.simple_get_latency)(self.raw, std::ptr::null_mut()) };
+            // (pa_usec_t)-1 is the error reading
+            (usec != u64::MAX).then_some(usec)
+        }
+
+        fn flush(&mut self) {
+            unsafe { (self.simple_flush)(self.raw, std::ptr::null_mut()) };
+        }
+    }
+
+    impl Drop for PaSimple {
+        fn drop(&mut self) {
+            unsafe { (self.simple_free)(self.raw) };
+        }
+    }
+
+    // The stream lives and dies on the decode thread that owns it;
+    // pulse's rule is only that no two threads touch one stream at
+    // once, the same reasoning as `FormatInput`.
+    unsafe impl Send for PaSimple {}
+
+    /// RAII for the resampler.
+    struct Swr(*mut sys::SwrContext);
+
+    impl Drop for Swr {
+        fn drop(&mut self) {
+            unsafe { sys::swr_free(&mut self.0) };
+        }
+    }
+
+    /// One decoded audio frame into interleaved S16NE stereo samples
+    /// at the stream's rate: the sink's fixed format. The resampler
+    /// is created on the first frame (its layout and rate pin the
+    /// input side; the output is stereo at the same rate, so the
+    /// common case is a pure format conversion and any channel count
+    /// downmixes). The volume rides as an integer gain, 256 = unity.
+    /// Returns the samples per channel converted.
+    unsafe fn audio_frame_to_s16(
+        frame: *mut sys::AVFrame,
+        swr: &mut Option<Swr>,
+        out: &mut Vec<i16>,
+        gain: u32,
+    ) -> Result<i32, PosterFail> {
+        unsafe {
+            let nb = (*frame).nb_samples;
+            if nb <= 0 {
+                return Ok(0);
+            }
+            if swr.is_none() {
+                let mut out_layout: sys::AVChannelLayout = std::mem::zeroed();
+                sys::av_channel_layout_default(&mut out_layout, 2);
+                let mut raw: *mut sys::SwrContext = std::ptr::null_mut();
+                if sys::swr_alloc_set_opts2(
+                    &mut raw,
+                    &out_layout,
+                    sys::AVSampleFormat::AV_SAMPLE_FMT_S16,
+                    (*frame).sample_rate,
+                    std::ptr::addr_of!((*frame).ch_layout),
+                    // the format came from libav itself, its enum
+                    // value is valid by construction
+                    std::mem::transmute::<i32, sys::AVSampleFormat>((*frame).format),
+                    (*frame).sample_rate,
+                    0,
+                    std::ptr::null_mut(),
+                ) < 0
+                {
+                    return Err(PosterFail::Empty);
+                }
+                let ctx = Swr(raw);
+                if sys::swr_init(ctx.0) < 0 {
+                    return Err(PosterFail::Empty);
+                }
+                *swr = Some(ctx);
+            }
+            let ctx = swr.as_ref().unwrap().0;
+            // stereo packed S16: two i16 per frame of samples
+            out.clear();
+            out.reserve(nb as usize * 2);
+            let mut out_planes = [out.as_mut_ptr().cast::<u8>()];
+            let got = sys::swr_convert(
+                ctx,
+                out_planes.as_mut_ptr(),
+                nb,
+                std::ptr::addr_of!((*frame).data).cast(),
+                nb,
+            );
+            if got < 0 {
+                return Err(PosterFail::Empty);
+            }
+            out.set_len(got as usize * 2);
+            if gain != 256 {
+                for sample in out.iter_mut() {
+                    *sample = (((*sample as i32) * gain as i32) >> 8)
+                        .clamp(i16::MIN as i32, i16::MAX as i32)
+                        as i16;
+                }
+            }
+            Ok(got)
+        }
+    }
+
+    /// Open the best audio stream's decoder, best effort: None when
+    /// the file has no audio stream or this system's libav lacks the
+    /// decoder (the muted mode, never a failure).
+    unsafe fn open_audio_decoder(
+        input: *mut sys::AVFormatContext,
+    ) -> Option<(usize, CodecCtx, u32)> {
+        unsafe {
+            let found = sys::av_find_best_stream(
+                input,
+                sys::AVMediaType::AVMEDIA_TYPE_AUDIO,
+                -1,
+                -1,
+                std::ptr::null_mut(),
+                0,
+            );
+            if found < 0 {
+                return None;
+            }
+            let index = found as usize;
+            let streams = *std::ptr::addr_of!((*input).streams);
+            let stream = *streams.add(index);
+            let par = (*stream).codecpar;
+            if decoder_missing((*par).codec_id) || (*par).sample_rate == 0 {
+                return None;
+            }
+            let codec = sys::avcodec_find_decoder((*par).codec_id);
+            let actx = avcodec_open(codec, par).ok()?;
+            Some((index, actx, (*par).sample_rate as u32))
+        }
+    }
+
     /// One playing video: the pane's handle on the decode thread.
-    /// The thread owns libav end to end, decodes ahead into the
-    /// bounded ring, and blocks when the ring is full: the
+    /// The thread owns libav and the sink end to end, decodes ahead
+    /// into the bounded ring, and blocks when the ring is full: the
     /// backpressure is the pause, the drain is the play. Dropping
     /// the `Player` drops the receiver, which fails a thread's next
     /// send and wakes a blocked one: no stop flag, no join.
     pub(crate) struct Player {
         rx: std::sync::mpsc::Receiver<PlayerMsg>,
+        share: std::sync::Arc<ClockShare>,
     }
 
     impl Player {
@@ -311,11 +719,49 @@ mod imp {
         /// itself (header parse plus stream info) costs libav tens
         /// of milliseconds: run it off the UI thread like every
         /// other decode. `Err` names the failure exactly where the
-        /// poster path does. Decodes at `PLAYER_MAX`.
+        /// poster path does. Decodes at `PLAYER_MAX`. Sound is best
+        /// effort: no audio stream, no pulse-simple library, or no
+        /// sound server all mean the muted mode (video on the wall
+        /// clock), which is a degradation, not a failure.
         pub(crate) fn open(path: &Path) -> Result<Player, PosterFail> {
+            Self::spawn(path, None)
+        }
+
+        /// The test seam: the same open with a forced sink, so the
+        /// audio path runs in a container with no sound server.
+        #[cfg(test)]
+        pub(crate) fn open_with_sink(
+            path: &Path,
+            sink: Box<dyn AudioSink>,
+        ) -> Result<Player, PosterFail> {
+            Self::spawn(path, Some(sink))
+        }
+
+        fn spawn(path: &Path, forced: Option<Box<dyn AudioSink>>) -> Result<Player, PosterFail> {
             let cpath = cpath(path).ok_or(PosterFail::Empty)?;
-            let (input, video_index, cctx) = unsafe { open_video_decoder(&cpath)? };
+            let (input, video_index, vctx) = unsafe { open_video_decoder(&cpath)? };
+            let audio = unsafe { open_audio_decoder(input.0) };
+            // the sink: the forced one (tests) wins; otherwise
+            // pulse-simple, best effort. Anything missing means
+            // muted, and then the audio is not decoded at all.
+            let sink = forced.or_else(|| {
+                let rate = audio.as_ref()?.2;
+                let lib = PaLib::load()?;
+                PaSimple::open(&lib, rate).map(|s| Box::new(s) as Box<dyn AudioSink>)
+            });
+            // with nowhere to put the sound, the audio is not
+            // decoded at all: the muted mode runs on the wall clock
+            let audio = if sink.is_some() { audio } else { None };
+            let (audio_index, actx) = match audio {
+                Some((index, actx, _)) => (Some(index), Some(actx)),
+                None => (None, None),
+            };
+            let share = std::sync::Arc::new(ClockShare::new());
+            share
+                .audible
+                .store(sink.is_some(), std::sync::atomic::Ordering::Release);
             let (tx, rx) = std::sync::mpsc::sync_channel(PLAYER_RING);
+            let thread_share = share.clone();
             let spawned = std::thread::Builder::new()
                 .name("kuma-video-player".into())
                 .spawn(move || {
@@ -323,11 +769,21 @@ mod imp {
                     // thread, never the app; the pane reads the dead
                     // channel as eof
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                        play_loop(input, video_index, cctx, tx, PLAYER_MAX);
+                        play_loop(
+                            input,
+                            video_index,
+                            vctx,
+                            audio_index,
+                            actx,
+                            sink,
+                            thread_share,
+                            tx,
+                            PLAYER_MAX,
+                        );
                     }));
                 });
             spawned.map_err(|_| PosterFail::Empty)?;
-            Ok(Player { rx })
+            Ok(Player { rx, share })
         }
 
         /// The next message if one is ready: a frame, the stream's
@@ -337,17 +793,59 @@ mod imp {
         pub(crate) fn try_recv(&self) -> Option<PlayerMsg> {
             self.rx.try_recv().ok()
         }
+
+        /// The media time the sound server is playing, in micros;
+        /// None while muted. Lock-free, safe on the UI thread.
+        pub(crate) fn clock_micros(&self) -> Option<i64> {
+            self.share.clock_micros()
+        }
+
+        /// Park or unpark the decode loop. While parked the sink's
+        /// bounded tail drains out and the clock sits still.
+        pub(crate) fn set_paused(&self, paused: bool) {
+            self.share
+                .paused
+                .store(paused, std::sync::atomic::Ordering::Release);
+        }
+
+        /// Integer gain, 256 = unity. The volume keys are slice 3;
+        /// playback runs at unity until they land.
+        #[allow(dead_code)]
+        pub(crate) fn set_volume(&self, gain: u32) {
+            self.share
+                .volume
+                .store(gain.min(256), std::sync::atomic::Ordering::Release);
+        }
     }
 
-    /// The player's decode loop, on the decode thread: read, decode,
-    /// fit, ship. Ends at eof, a decode error, or a gone pane (the
-    /// send fails once the receiver dropped; a send blocked on the
-    /// full ring wakes the same way). `tx` ships the terminal `Eof`
-    /// so the pane parks cleanly.
+    impl Drop for Player {
+        fn drop(&mut self) {
+            // a parked loop never reaches a send, so the receiver's
+            // drop cannot wake it the way it wakes a send-blocked
+            // thread: say so directly
+            self.share
+                .dead
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The player's decode loop, on the decode thread: read, route
+    /// by stream, decode, ship. Audio packets decode into the sink
+    /// (whose write blocks when the server's buffer is full: that
+    /// blocking is the realtime pace) and publish the audio clock;
+    /// video packets decode into the ring. Ends at eof, a decode
+    /// error, or a gone pane (the send fails once the receiver
+    /// dropped; a send blocked on the full ring wakes the same way).
+    /// `tx` ships the terminal `Eof` so the pane parks cleanly.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn play_loop(
         input: FormatInput,
         video_index: usize,
-        cctx: CodecCtx,
+        vctx: CodecCtx,
+        audio_index: Option<usize>,
+        actx: Option<CodecCtx>,
+        mut sink: Option<Box<dyn AudioSink>>,
+        share: std::sync::Arc<ClockShare>,
         tx: std::sync::mpsc::SyncSender<PlayerMsg>,
         max: u32,
     ) {
@@ -359,12 +857,12 @@ mod imp {
                 return;
             };
             let streams = *std::ptr::addr_of!((*input.0).streams);
-            let stream = *streams.add(video_index);
-            let stream_tb = (*stream).time_base;
+            let vstream = *streams.add(video_index);
+            let v_tb = (*vstream).time_base;
             // the synthetic clock for streams without usable
             // timestamps: the stream's average frame rate, 25fps
             // when unstated
-            let rate = (*cctx.0).framerate;
+            let rate = (*vctx.0).framerate;
             let frame_dur = if rate.num > 0 {
                 rate.den as f64 / rate.num as f64
             } else {
@@ -372,49 +870,154 @@ mod imp {
             };
             let mut fallback: f64 = 0.0;
             let mut scaler: Option<Scaler> = None;
+            // the audio side travels together: stream index, decoder,
+            // the stream's time base, and the stream's rate
+            let audio = match (audio_index, actx) {
+                (Some(index), Some(actx)) => {
+                    let a_tb = (*(*streams.add(index))).time_base;
+                    let a_rate = (*actx.0).sample_rate.max(1) as u32;
+                    Some((index, actx, a_tb, a_rate))
+                }
+                _ => None,
+            };
+            let mut swr: Option<Swr> = None;
+            let mut samples: Vec<i16> = Vec::new();
+            let mut last_latency: u64 = 0;
             'read: loop {
+                // the pane's pause: park. The sink's bounded tail
+                // drains out during the pause; the resume continues
+                // at the audio's own position, so sound and picture
+                // stay locked (the picture jumps the tail's worth,
+                // at most a buffer length).
+                if share
+                    .paused
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    // the pane is gone (a paused pane still drops its
+                    // player): nothing would wake a parked loop, the
+                    // send-side wake only reaches a send-blocked one
+                    if share.dead.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
                 if sys::av_read_frame(input.0, pkt.0) < 0 {
                     break; // eof or read error: the stream is what it is
                 }
-                if (*pkt.0).stream_index != video_index as i32 {
+                let index = (*pkt.0).stream_index as usize;
+                let routed_audio = audio.as_ref().is_some_and(|a| a.0 == index);
+                if !routed_audio && index != video_index {
                     sys::av_packet_unref(pkt.0);
                     continue;
                 }
-                if sys::avcodec_send_packet(cctx.0, pkt.0) < 0 {
-                    sys::av_packet_unref(pkt.0);
-                    break;
+                // one packet's decode: audio into the sink, video
+                // into the ring. `stop` ends the stream, `muted`
+                // retires the audio route only.
+                let mut stop = false;
+                let mut muted = false;
+                if routed_audio {
+                    // paired at open; unroutable audio is not a
+                    // panic, just a skip
+                    let Some((_, actx, a_tb, a_rate)) = &audio else {
+                        sys::av_packet_unref(pkt.0);
+                        continue;
+                    };
+                    let Some(sink) = sink.as_mut() else {
+                        sys::av_packet_unref(pkt.0);
+                        continue;
+                    };
+                    if sys::avcodec_send_packet(actx.0, pkt.0) < 0 {
+                        stop = true;
+                    } else {
+                        loop {
+                            let got = sys::avcodec_receive_frame(actx.0, frame.0);
+                            if got < 0 {
+                                break; // EAGAIN or error: next packet
+                            }
+                            let count = match audio_frame_to_s16(
+                                frame.0,
+                                &mut swr,
+                                &mut samples,
+                                share.volume.load(std::sync::atomic::Ordering::Acquire),
+                            ) {
+                                Ok(ok) => ok,
+                                Err(_) => {
+                                    stop = true;
+                                    break;
+                                }
+                            };
+                            let pts =
+                                frame_pts_seconds(frame.0, *a_tb, actx).unwrap_or(fallback);
+                            // the chunk's end in media time: its start
+                            // plus the samples it holds
+                            let end_micros =
+                                ((pts + count as f64 / *a_rate as f64) * 1_000_000.0) as i64;
+                            sys::av_frame_unref(frame.0);
+                            if !sink.write(&samples) {
+                                // the sink is done for good: keep the
+                                // video going on the wall clock
+                                muted = true;
+                                break;
+                            }
+                            if let Some(lat) = sink.latency_micros() {
+                                last_latency = lat;
+                            }
+                            share.publish(end_micros, last_latency);
+                        }
+                    }
+                } else {
+                    if sys::avcodec_send_packet(vctx.0, pkt.0) < 0 {
+                        stop = true;
+                    } else {
+                        loop {
+                            let got = sys::avcodec_receive_frame(vctx.0, frame.0);
+                            if got < 0 {
+                                break; // EAGAIN or error: next packet
+                            }
+                            let (dw, dh, mut buf) =
+                                match scale_frame(frame.0, &mut scaler, max) {
+                                    Ok(ok) => ok,
+                                    Err(_) => {
+                                        stop = true;
+                                        break;
+                                    }
+                                };
+                            let pts = frame_pts_seconds(frame.0, v_tb, &vctx)
+                                .unwrap_or(fallback);
+                            fallback = pts + frame_dur;
+                            sys::av_frame_unref(frame.0);
+                            // gpui's atlas wants BGRA
+                            for pixel in buf.chunks_exact_mut(4) {
+                                pixel.swap(0, 2);
+                            }
+                            let Some(rgba) = image::RgbaImage::from_raw(dw, dh, buf) else {
+                                stop = true;
+                                break;
+                            };
+                            let image = gpui::RenderImage::new(smallvec::SmallVec::from_buf([
+                                image::Frame::new(rgba),
+                            ]));
+                            let ship = tx.send(PlayerMsg::Frame {
+                                image: std::sync::Arc::new(image),
+                                pts,
+                            });
+                            if ship.is_err() {
+                                return; // the pane moved on: the job is done
+                            }
+                        }
+                    }
                 }
-                loop {
-                    let got = sys::avcodec_receive_frame(cctx.0, frame.0);
-                    if got < 0 {
-                        break; // EAGAIN or error: next packet
-                    }
-                    let (dw, dh, mut buf) = match scale_frame(frame.0, &mut scaler, max) {
-                        Ok(ok) => ok,
-                        Err(_) => break 'read,
-                    };
-                    let pts = frame_pts_seconds(frame.0, stream_tb, &cctx).unwrap_or(fallback);
-                    fallback = pts + frame_dur;
-                    sys::av_frame_unref(frame.0);
-                    // gpui's atlas wants BGRA
-                    for pixel in buf.chunks_exact_mut(4) {
-                        pixel.swap(0, 2);
-                    }
-                    let Some(rgba) = image::RgbaImage::from_raw(dw, dh, buf) else {
-                        break 'read;
-                    };
-                    let image = gpui::RenderImage::new(smallvec::SmallVec::from_buf([
-                        image::Frame::new(rgba),
-                    ]));
-                    let ship = tx.send(PlayerMsg::Frame {
-                        image: std::sync::Arc::new(image),
-                        pts,
-                    });
-                    if ship.is_err() {
-                        return; // the pane moved on: the job is done
-                    }
+                if muted {
+                    let _ = sink.take();
+                    share
+                        .audible
+                        .store(false, std::sync::atomic::Ordering::Release);
                 }
                 sys::av_packet_unref(pkt.0);
+                if stop {
+                    break 'read;
+                }
             }
             let _ = tx.send(PlayerMsg::Eof);
         }
@@ -810,6 +1413,14 @@ mod imp {
         pub(crate) fn try_recv(&self) -> Option<PlayerMsg> {
             None
         }
+
+        pub(crate) fn clock_micros(&self) -> Option<i64> {
+            None
+        }
+
+        pub(crate) fn set_paused(&self, _paused: bool) {}
+
+        pub(crate) fn set_volume(&self, _gain: u32) {}
     }
 
     /// The pane matches on these variants, the stub never builds
@@ -854,7 +1465,10 @@ pub(crate) fn write_codec_missing_stream(path: &std::path::Path) {
 
 #[cfg(all(test, feature = "video"))]
 mod tests {
-    use super::imp::{Player, PlayerMsg, decode_poster, decode_preview, poster_dynamic, probe};
+    use super::imp::{
+        AudioSink, Player, PlayerMsg, decode_poster, decode_preview, heard_micros,
+        poster_dynamic, probe,
+    };
     use super::{delay_from_pts, duration_label};
     use super::PosterFail;
     use super::write_codec_missing_stream;
@@ -865,23 +1479,25 @@ mod tests {
     use std::time::Duration;
 
     /// One-time fixture generator: a one-second 64x64 mpeg4 with
-    /// moving luma bars, committed as tests/fixtures/sample.mp4 so
-    /// the decode tests run headless with no GPU and no encoder at
-    /// test time; its ten-second twin pins the preview budget. Run
-    /// with `--ignored` to regenerate.
+    /// moving luma bars and a flac audio track (440Hz stereo at
+    /// 44100, the free build's audio encoder), committed as
+    /// tests/fixtures/sample.mp4 so the decode tests run headless
+    /// with no GPU and no encoder at test time; its ten-second twin
+    /// (video only) pins the preview budget. Run with `--ignored` to
+    /// regenerate.
     #[test]
     #[ignore]
     fn generate_fixture() {
-        encode_fixture(Path::new("tests/fixtures/sample.mp4"), 25);
+        encode_fixture(Path::new("tests/fixtures/sample.mp4"), 25, true);
     }
 
     #[test]
     #[ignore]
     fn generate_long_fixture() {
-        encode_fixture(Path::new("tests/fixtures/sample-long.mp4"), 250);
+        encode_fixture(Path::new("tests/fixtures/sample-long.mp4"), 250, false);
     }
 
-    fn encode_fixture(path: &Path, frames: i64) {
+    fn encode_fixture(path: &Path, frames: i64, audio: bool) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let cpath = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         unsafe {
@@ -912,6 +1528,30 @@ mod tests {
                 0
             );
             (*ost).time_base = sys::AVRational { num: 1, den: 25 };
+
+            // the audio stream, when wanted: one second of 440Hz
+            // stereo, encoded flac
+            let mut aenc: *mut sys::AVCodecContext = std::ptr::null_mut();
+            if audio {
+                let codec = sys::avcodec_find_encoder(sys::AVCodecID::AV_CODEC_ID_FLAC);
+                assert!(!codec.is_null(), "the free build has the flac encoder");
+                let ast = sys::avformat_new_stream(octx, codec);
+                assert!(!ast.is_null());
+                aenc = sys::avcodec_alloc_context3(codec);
+                assert!(!aenc.is_null());
+                // this encoder takes s16 packed (its log says so)
+                (*aenc).sample_fmt = sys::AVSampleFormat::AV_SAMPLE_FMT_S16;
+                (*aenc).sample_rate = 44100;
+                sys::av_channel_layout_default(&mut (*aenc).ch_layout, 2);
+                (*aenc).time_base = sys::AVRational { num: 1, den: 44100 };
+                assert_eq!(sys::avcodec_open2(aenc, codec, std::ptr::null_mut()), 0);
+                assert_eq!(
+                    sys::avcodec_parameters_from_context((*ast).codecpar, aenc),
+                    0
+                );
+                (*ast).time_base = sys::AVRational { num: 1, den: 44100 };
+            }
+
             assert_eq!(
                 sys::avio_open(
                     &mut (*octx).pb as *mut *mut sys::AVIOContext,
@@ -965,6 +1605,69 @@ mod tests {
                 send(i);
             }
             send(-1); // eof: flush the encoder
+
+            if audio {
+                // the audio track: 44100 samples of 440Hz sine in
+                // 1024-sample blocks, s16 packed (the flac encoder's
+                // format)
+                let mut aframe = sys::av_frame_alloc();
+                assert!(!aframe.is_null());
+                (*aframe).format = sys::AVSampleFormat::AV_SAMPLE_FMT_S16 as i32;
+                (*aframe).sample_rate = 44100;
+                (*aframe).nb_samples = (*aenc).frame_size.max(1);
+                sys::av_channel_layout_default(&mut (*aframe).ch_layout, 2);
+                assert_eq!(sys::av_frame_get_buffer(aframe, 0), 0);
+                let mut apkt = sys::av_packet_alloc();
+                assert!(!apkt.is_null());
+                let a_src_tb = sys::AVRational { num: 1, den: 44100 };
+                let a_dst_tb = (**(*octx).streams.add(1)).time_base;
+                let mut write_packet = |pkt: *mut sys::AVPacket| {
+                    (*pkt).stream_index = 1;
+                    sys::av_packet_rescale_ts(pkt, a_src_tb, a_dst_tb);
+                    assert_eq!(sys::av_interleaved_write_frame(octx, pkt), 0);
+                };
+                // the flac encoder demands exactly frame_size per
+                // frame (the last one may run short); the frame
+                // buffer above was allocated at that block size
+                let block = (*aenc).frame_size.max(1) as i64;
+                let total = 44100i64;
+                let mut written = 0i64;
+                while written < total {
+                    let n = block.min(total - written) as i32;
+                    (*aframe).nb_samples = n;
+                    // packed s16: both channels interleaved in plane 0
+                    let plane = (*aframe).data[0] as *mut i16;
+                    for s in 0..n as usize {
+                        let t = (written + s as i64) as f64 / 44100.0;
+                        let v = (0.5 * std::f64::consts::TAU * 440.0 * t).sin() as f32;
+                        let v = (v * i16::MAX as f32) as i16;
+                        *plane.add(s * 2) = v;
+                        *plane.add(s * 2 + 1) = v;
+                    }
+                    (*aframe).pts = written;
+                    assert_eq!(sys::avcodec_send_frame(aenc, aframe), 0);
+                    loop {
+                        let got = sys::avcodec_receive_packet(aenc, apkt);
+                        if got < 0 {
+                            break;
+                        }
+                        write_packet(apkt);
+                    }
+                    written += n as i64;
+                }
+                sys::avcodec_send_frame(aenc, std::ptr::null_mut());
+                loop {
+                    let got = sys::avcodec_receive_packet(aenc, apkt);
+                    if got < 0 {
+                        break;
+                    }
+                    write_packet(apkt);
+                }
+                sys::av_packet_free(&mut apkt);
+                sys::av_frame_free(&mut aframe);
+                sys::avcodec_free_context(&mut aenc);
+            }
+
             assert_eq!(sys::av_write_trailer(octx), 0);
             sys::avio_closep(&mut (*octx).pb as *mut *mut sys::AVIOContext);
             sys::av_frame_free(&mut frame);
@@ -1059,6 +1762,81 @@ mod tests {
     }
 
     #[test]
+    fn heard_clock_sits_when_the_sink_underruns() {
+        // two seconds written, 150ms in the sink at the write
+        let (pts, latency) = (2_000_000, 150_000u64);
+        // at the write: the server is playing pts - latency
+        assert_eq!(heard_micros(pts, latency, 0), 1_850_000);
+        // half drained
+        assert_eq!(heard_micros(pts, latency, 75_000), 1_925_000);
+        // drained, or the thread stalled past the buffer: the heard
+        // time sits at the write's end, never runs backwards
+        assert_eq!(heard_micros(pts, latency, 150_000), 2_000_000);
+        assert_eq!(heard_micros(pts, latency, 400_000), 2_000_000);
+    }
+
+    /// The test sink: records what the player wrote. Latency zero,
+    /// so the heard clock is the last write's end exactly.
+    struct VecSink {
+        samples: std::sync::Arc<std::sync::Mutex<Vec<i16>>>,
+    }
+
+    impl AudioSink for VecSink {
+        fn write(&mut self, samples: &[i16]) -> bool {
+            self.samples.lock().unwrap().extend_from_slice(samples);
+            true
+        }
+        fn latency_micros(&self) -> Option<u64> {
+            Some(0)
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn player_feeds_the_sink_and_anchors_the_clock() {
+        let path = Path::new("tests/fixtures/sample.mp4");
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i16>::new()));
+        let player = Player::open_with_sink(
+            path,
+            Box::new(VecSink {
+                samples: recorded.clone(),
+            }),
+        )
+        .expect("player opens");
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        loop {
+            match player.try_recv() {
+                Some(PlayerMsg::Frame { .. }) => frames += 1,
+                Some(PlayerMsg::Eof) => break,
+                None => {
+                    // the decode thread runs at its own pace: wait
+                    // for it, but never forever
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10),
+                        "player never ended"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+        // the video stream still decoded alongside
+        assert!(frames >= 20, "frames {frames}");
+        let written = recorded.lock().unwrap();
+        // one second of 44.1kHz stereo S16, plus the encoder's
+        // padding
+        assert!(
+            (80_000..=100_000).contains(&written.len()),
+            "samples {}",
+            written.len()
+        );
+        // the mock's latency is zero: the heard clock is the last
+        // write's end, about one second into the stream
+        let clock = player.clock_micros().expect("the audio clock anchored");
+        assert!((900_000..=1_300_000).contains(&clock), "clock {clock}");
+    }
+
+    #[test]
     fn player_decodes_in_order_and_ends() {
         let path = Path::new("tests/fixtures/sample.mp4");
         let player = Player::open(path).expect("player opens");
@@ -1097,6 +1875,10 @@ mod tests {
                 pair[1].0
             );
         }
+        // this container has no sound server: the muted mode ran,
+        // so the audio clock never anchored and the video decoded
+        // anyway
+        assert!(player.clock_micros().is_none());
     }
 
     #[test]
