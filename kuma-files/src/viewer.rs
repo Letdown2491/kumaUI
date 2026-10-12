@@ -1,9 +1,10 @@
 //! The standalone open surface: a full-window viewer for the types
-//! kuma-files claims as the system default opener (images and pdf).
-//! The peek (spacebar in the grid) and this window share everything
-//! underneath: the same decode arms, the same zoom and pan math, the
-//! same fail-soft honesty. The peek is transient and grid-coupled;
-//! this one is a plain window an xdg-open can land in.
+//! kuma-files claims as the system default opener (images, pdf, and
+//! video). The peek (spacebar in the grid) and this window share
+//! everything underneath: the same decode arms, the same zoom and
+//! pan math, the same fail-soft honesty, and (for video) the same
+//! player pane the Quick Look drives. The peek is transient and
+//! grid-coupled; this one is a plain window an xdg-open can land in.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,6 +21,7 @@ use gpui::{
 use crate::browser::{
     parse_pdf_pages, ql_clamp_pan, ql_fit_scale, write_recent, Browser, QL_DECODE_MAX, QL_ZOOM_MAX,
 };
+use crate::videopane;
 use crate::{icons, theme};
 
 /// Every open window root in the process: the manager (created
@@ -121,13 +123,14 @@ fn file_title(path: &Path) -> String {
 /// decoder here and stays unclaimed (it is in is_image's own list),
 /// so the grid's Enter keeps handing it to whatever the system
 /// already opens it with. SVGs claim through the in-process
-/// rasterizer.
+/// rasterizer; videos play through the shared pane.
 pub(crate) fn is_openable(name: &str) -> bool {
     let ext = Path::new(name)
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase());
     icons::is_pdf(name)
         || icons::is_svg(name)
+        || icons::is_video(name)
         || (icons::is_image(name) && ext.as_deref() != Some("avif"))
 }
 
@@ -157,6 +160,20 @@ pub(crate) struct Viewer {
     page: usize,
     pages: Option<usize>,
     counting: bool,
+    /// The video player: the shared pane (the state machine and the
+    /// transport strip live in videopane), armed for video files.
+    video: Option<videopane::VideoPane>,
+    /// The player has been asked for the current video (one ask per
+    /// open path; reset on file flips and teardown).
+    video_asked: bool,
+    /// A failed open lands here, keyed by path: the named card's
+    /// codec-missing line.
+    video_fail: Option<(PathBuf, crate::video::PosterFail)>,
+    /// The window went fullscreen for the video (F11). The window is
+    /// the real state; this flag is the pane's memory of the
+    /// request, so escape unwinds it before closing. It survives
+    /// file flips, like the Quick Look pane's flag.
+    fullscreen: bool,
     focus: FocusHandle,
 }
 
@@ -185,6 +202,10 @@ impl Viewer {
             page: 1,
             pages: None,
             counting: false,
+            video: None,
+            video_asked: false,
+            video_fail: None,
+            fullscreen: false,
             focus,
         };
         viewer.load(path, window, cx);
@@ -219,6 +240,8 @@ impl Viewer {
         self.render = None;
         self.inflight = None;
         self.failed = false;
+        self.stop_video(cx);
+        self.video_fail = None;
         self.zoom = 1.0;
         self.pan = (0.0, 0.0);
         self.rotation = 0;
@@ -264,21 +287,41 @@ impl Viewer {
         });
     }
 
+    /// The video pane's teardown: the held frame tile drops (the
+    /// registry owns tile lifetime, ADR-0016), the Player's drop
+    /// wakes the decode thread, and the ask flag resets so a reopen
+    /// asks fresh.
+    fn stop_video(&mut self, cx: &mut Context<Self>) {
+        self.video_asked = false;
+        if let Some(mut vid) = self.video.take() {
+            if let Some((image, _)) = vid.frame.take() {
+                cx.drop_image(image, None);
+            }
+        }
+    }
+
     /// Kick the decode for the current file (and page, for a pdf).
     /// One ask per (path, page); a held tile for the same path
-    /// stays up while the next page decodes.
+    /// stays up while the next page decodes. A video arms the
+    /// player instead (once per file) and decodes only its poster:
+    /// the still beat holds the pane until the player's first
+    /// frame is due.
     fn kick(&mut self, cx: &mut Context<Self>) {
         let name = file_title(&self.path);
         let is_pdf = icons::is_pdf(&name);
         let is_image = icons::is_image(&name);
         let is_svg = icons::is_svg(&name);
+        let is_video = icons::is_video(&name);
         let page = if is_pdf { self.page } else { 0 };
-        if !is_pdf && !is_image && !is_svg {
+        if !is_pdf && !is_image && !is_svg && !is_video {
             // an unclaimed type landed here via a direct CLI call:
             // the failed card is the honest surface
             self.failed = true;
             cx.notify();
             return;
+        }
+        if is_video {
+            videopane::request_player(self.path.clone(), None, true, self, cx);
         }
         if self
             .render
@@ -294,8 +337,9 @@ impl Viewer {
             return;
         };
         // the peek's cap: decoding cost is in the file read, not
-        // the resize
-        if meta.len() > 32 * 1024 * 1024 {
+        // the resize. Videos stream through libav's seek, so the
+        // file-size cap does not apply to them.
+        if !is_pdf && !is_video && meta.len() > 32 * 1024 * 1024 {
             self.failed = true;
             cx.notify();
             return;
@@ -310,14 +354,25 @@ impl Viewer {
                 .background_spawn(async move {
                     std::panic::catch_unwind(move || {
                         if is_pdf {
-                            icons::decode_pdf_thumbnail(&bg_path, page, VIEWER_DECODE_MAX)
+                            (
+                                icons::decode_pdf_thumbnail(&bg_path, page, VIEWER_DECODE_MAX),
+                                None,
+                            )
+                        } else if is_video {
+                            // the still beat: one frame, the poster;
+                            // the player owns the pane from its own
+                            // first frame on
+                            match crate::video::decode_poster(&bg_path, VIEWER_DECODE_MAX) {
+                                Ok(render) => (Some(render), None),
+                                Err(fail) => (None, Some(fail)),
+                            }
                         } else {
                             let dynamic = if is_svg {
                                 icons::decode_svg_dynamic(&bg_path, VIEWER_DECODE_MAX)
                             } else {
                                 icons::decode_thumbnail_dynamic(&bg_path)
                             };
-                            dynamic
+                            let render = dynamic
                                 .map(|image| match rotation {
                                     1 => image.rotate90(),
                                     2 => image.rotate180(),
@@ -330,10 +385,11 @@ impl Viewer {
                                         VIEWER_DECODE_MAX,
                                         VIEWER_DECODE_MAX,
                                     )
-                                })
+                                });
+                            (render, None)
                         }
                     })
-                    .unwrap_or(None)
+                    .unwrap_or((None, None))
                 })
                 .await;
             let update = this.update(cx, |this, cx| {
@@ -341,15 +397,25 @@ impl Viewer {
                     this.inflight = None;
                 }
                 match render {
-                    Some(render) => {
+                    (Some(render), _) => {
                         this.render = Some((path.clone(), page, Arc::new(render)));
                     }
-                    None => match &this.render {
-                        // paging: the held tile stays up, the page
-                        // reverts to the one it shows
+                    (None, Some(fail)) => {
+                        // the named state: the container parses but
+                        // this system's libav has no decoder for the
+                        // codec
+                        this.video_fail = Some((path.clone(), fail));
+                        match &this.render {
+                            // paging: the held tile stays up, the page
+                            // reverts to the one it shows
+                            Some((p, pg, _)) if *p == path && is_pdf => this.page = *pg,
+                            // nothing held (the opening decode failed):
+                            // the card stands in
+                            _ => this.failed = true,
+                        }
+                    }
+                    (None, None) => match &this.render {
                         Some((p, pg, _)) if *p == path && is_pdf => this.page = *pg,
-                        // nothing held (the opening decode failed):
-                        // the card stands in
                         _ => this.failed = true,
                     },
                 }
@@ -450,9 +516,36 @@ impl Viewer {
         let keystroke = &event.keystroke;
         let shift = keystroke.modifiers.shift;
         match keystroke.key.as_str() {
-            // escape closes the window; ctrl+q too, like the manager
-            "escape" => window.remove_window(),
+            // escape unwinds the video's fullscreen first, then
+            // closes the window; ctrl+q too, like the manager
+            "escape" => {
+                if self.fullscreen {
+                    self.fullscreen = false;
+                    window.toggle_fullscreen();
+                    cx.notify();
+                } else {
+                    window.remove_window();
+                }
+            }
             "q" if keystroke.modifiers.control => window.remove_window(),
+            // the video rung: space pauses, resumes, or (at the end)
+            // replays; j/l seek ten seconds; m mutes; +/- re-mean
+            // from zoom to volume while a video is up (videos do not
+            // zoom); F11 is the fullscreen toggle, the viewers'
+            // convention. Arrows keep flipping files.
+            "space" if self.video.is_some() => {
+                videopane::toggle(self, cx);
+            }
+            "j" => videopane::seek(self, -10.0, cx),
+            "l" => videopane::seek(self, 10.0, cx),
+            "m" => videopane::mute_toggle(self, cx),
+            "=" | "+" if self.video.is_some() => videopane::volume_step(self, 32, cx),
+            "-" | "_" if self.video.is_some() => videopane::volume_step(self, -32, cx),
+            "f11" if self.video.is_some() => {
+                self.fullscreen = !self.fullscreen;
+                window.toggle_fullscreen();
+                cx.notify();
+            }
             "left" | "up" => {
                 if shift && icons::is_pdf(&file_title(&self.path)) {
                     self.page_step(-1, cx);
@@ -490,12 +583,15 @@ impl Viewer {
 }
 
 /// Whether two file names belong to the same nav kind: pdfs group
-/// with pdfs, images with images, svgs with svgs.
+/// with pdfs, images with images, svgs with svgs, videos with
+/// videos.
 fn same_kind(a: &str, b: &str) -> bool {
     if icons::is_pdf(b) {
         icons::is_pdf(a)
     } else if icons::is_svg(b) {
         icons::is_svg(a)
+    } else if icons::is_video(b) {
+        icons::is_video(a)
     } else if icons::is_image(b) {
         icons::is_image(a)
     } else {
@@ -505,8 +601,24 @@ fn same_kind(a: &str, b: &str) -> bool {
 
 impl Render for Viewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // the video pane's present tick runs at the head of every
+        // draw pass: due frames land in the slot before this pass's
+        // tree reads them, and the compositor frame callback keeps
+        // the loop armed while a video plays (notify-only, so the
+        // pump never runs inside a held entity update)
+        videopane::pump(self, cx);
+        let video_pumping = self
+            .video
+            .as_ref()
+            .is_some_and(|vid| {
+                (!vid.playing && vid.seeking.is_some()) || (vid.playing && !vid.ended)
+            });
+        if video_pumping {
+            window.request_animation_frame();
+        }
         let name = file_title(&self.path);
         let is_pdf = icons::is_pdf(&name);
+        let is_video = icons::is_video(&name);
         // the nav position and the pdf's page label
         let pos_label = (!self.siblings.is_empty())
             .then(|| format!("{} of {}", self.index + 1, self.siblings.len()));
@@ -515,7 +627,9 @@ impl Render for Viewer {
         } else {
             None
         };
-        let hint = if is_pdf {
+        let hint = if is_video {
+            "Space pause · J/L seek · +/- volume · F11 full screen · Esc closes".to_string()
+        } else if is_pdf {
             "PgUp/PgDn pages · Esc closes".to_string()
         } else {
             "←/→ files · +/- zoom · R rotate · Esc closes".to_string()
@@ -526,6 +640,14 @@ impl Render for Viewer {
             .as_ref()
             .filter(|(p, pg, _)| *p == self.path && *pg == if is_pdf { self.page } else { 0 })
             .map(|(_, _, render)| render.clone());
+        // the player's presented frame wins over the poster the
+        // moment one is due: the poster holds the pane only for the
+        // open beat. The loop itself arms in render, from the
+        // playing state alone.
+        let vid_frame = self
+            .video
+            .as_ref()
+            .and_then(|vid| vid.frame.as_ref().map(|(image, _)| image.clone()));
 
         // the top row: name, page label, position in the kind, the
         // close road
@@ -576,9 +698,35 @@ impl Render for Viewer {
                     .child("×"),
             );
 
-        // the pane: the decoded tile with the peek's fit, zoom, and
-        // pan mechanics, or the honest card
-        let pane = if let Some(render) = held {
+        // the pane: the video's presented frame at fit (no zoom, no
+        // pan: the +/- keys re-mean to volume while a video is up),
+        // the decoded tile with the peek's fit, zoom, and pan
+        // mechanics, or the honest card
+        let pane = if let Some(frame) = vid_frame {
+            let viewport = window.viewport_size();
+            let avail_w = (viewport.width - px(16.)).max(px(1.)).into();
+            // the header and the transport strip stand over the pane
+            let avail_h = (viewport.height - px(72.)).max(px(1.)).into();
+            let natural = frame.size(0);
+            let natural = (
+                u32::from(natural.width) as f32,
+                u32::from(natural.height) as f32,
+            );
+            let fit = ql_fit_scale(natural, (avail_w, avail_h));
+            div()
+                .id("viewer-video")
+                .debug_selector(|| "viewer-video".into())
+                .flex_1()
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    img(ImageSource::Render(frame))
+                        .w(px(natural.0 * fit))
+                        .h(px(natural.1 * fit)),
+                )
+        } else if let Some(render) = held {
             let viewport = window.viewport_size();
             let avail_w = (viewport.width - px(16.)).max(px(1.)).into();
             let avail_h = (viewport.height - px(40.)).max(px(1.)).into();
@@ -681,7 +829,26 @@ impl Render for Viewer {
                             "rendering…".to_string()
                         }),
                 )
+                // the named state: the container parses but this
+                // system's libav has no decoder for the codec
+                .children(self
+                    .video_fail
+                    .as_ref()
+                    .filter(|(p, _)| *p == self.path)
+                    .is_some_and(|(_, fail)| {
+                        *fail == crate::video::PosterFail::CodecMissing
+                    })
+                    .then(|| {
+                        div()
+                            .debug_selector(|| "viewer-codec-missing".into())
+                            .max_w(px(320.))
+                            .text_size(px(12.))
+                            .text_color(theme::text_dim())
+                            .child("codec unavailable in this system's libav")
+                    }))
         };
+
+        let footer = videopane::footer(self.video.as_ref(), cx);
 
         div()
             .size_full()
@@ -695,6 +862,53 @@ impl Render for Viewer {
             .text_color(theme::text())
             .child(header)
             .child(pane)
+            .children(footer)
+            // the seek bar's drag: the press armed it on the track;
+            // the move re-seeks at most every 150ms and the release
+            // lands the pointer's last fraction. On the root, so the
+            // pointer may leave the track (the shared handlers).
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                videopane::scrub_move(this, event, cx);
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                videopane::scrub_up(this, cx);
+            }))
+    }
+}
+
+/// The viewer's side of the shared video pane: the pane sits on the
+/// viewer, a failed open lands keyed by path, and a replay (the
+/// ended rest's space, a seek at the end) asks again for this file.
+/// The state machine lives in videopane.
+impl videopane::Host for Viewer {
+    fn pane(&mut self) -> &mut Option<videopane::VideoPane> {
+        &mut self.video
+    }
+
+    fn open_asked(&mut self) -> &mut bool {
+        &mut self.video_asked
+    }
+
+    fn pane_wants(&self, path: &Path) -> bool {
+        self.path == path
+    }
+
+    fn pane_failed(&mut self, path: &Path, fail: crate::video::PosterFail) {
+        self.video_fail = Some((path.to_path_buf(), fail));
+    }
+
+    fn stop_player(&mut self, cx: &mut Context<Self>) {
+        self.stop_video(cx);
+    }
+
+    fn replay(
+        &mut self,
+        path: PathBuf,
+        target: Option<f64>,
+        playing: bool,
+        cx: &mut Context<Self>,
+    ) {
+        videopane::request_player(path, target, playing, self, cx);
     }
 }
 
@@ -787,11 +1001,101 @@ mod tests {
         assert!(is_openable("LOGO.SVG"));
         assert!(is_openable("photo.png"));
         assert!(is_openable("scan.pdf"));
+        assert!(is_openable("clip.mp4"));
         assert!(!is_openable("photo.avif"));
         assert!(!is_openable("song.mp3"));
-        // svg siblings walk svg siblings, not the images beside them
+        // svg siblings walk svg siblings, not the images beside
+        // them; videos walk videos
         assert!(same_kind("a.svg", "b.svg"));
         assert!(!same_kind("a.svg", "b.png"));
+        assert!(same_kind("a.mp4", "b.mkv"));
+        assert!(!same_kind("a.mp4", "b.png"));
+    }
+
+    #[test]
+    fn viewer_opens_a_video_and_plays_it() {
+        let lab = Lab::new("viewer-video");
+        // a real one-second clip, copied in before the viewer loads
+        // so the sibling walk sees it
+        let clip = lab.dir.join("clip.mp4");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.mp4"),
+            &clip,
+        )
+        .unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(crate::icons::Assets),
+        );
+        let mut window = open_viewer(&mut app, &clip);
+        app.run_until_parked(); // the player lands
+        window.update(|viewer, _, _| {
+            assert!(viewer
+                .video
+                .as_ref()
+                .is_some_and(|vid| vid.path == clip && vid.playing));
+        });
+        window.update(|viewer, _, cx| {
+            // the frame at media time zero is due on the first pump
+            videopane::pump(viewer, cx);
+            assert!(
+                viewer.video.as_ref().unwrap().frame.is_some(),
+                "the video never showed a frame"
+            );
+        });
+        // space pauses and holds the frame; space resumes
+        window.update(|viewer, window, cx| {
+            viewer.route_key(&key("space"), window, cx);
+            assert!(!viewer.video.as_ref().unwrap().playing);
+            let before = viewer
+                .video
+                .as_ref()
+                .unwrap()
+                .frame
+                .as_ref()
+                .map(|(_, pts)| *pts);
+            videopane::pump(viewer, cx);
+            let after = viewer
+                .video
+                .as_ref()
+                .unwrap()
+                .frame
+                .as_ref()
+                .map(|(_, pts)| *pts);
+            assert_eq!(before, after, "paused time must not move");
+            viewer.route_key(&key("space"), window, cx);
+            assert!(viewer.video.as_ref().unwrap().playing);
+        });
+    }
+
+    #[test]
+    fn viewer_video_fullscreen_unwinds_before_the_close() {
+        let lab = Lab::new("viewer-video-fullscreen");
+        let clip = lab.dir.join("clip.mp4");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.mp4"),
+            &clip,
+        )
+        .unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(crate::icons::Assets),
+        );
+        let mut window = open_viewer(&mut app, &clip);
+        app.run_until_parked(); // the player lands
+        window.update(|viewer, window, cx| {
+            viewer.route_key(&key("f11"), window, cx);
+            assert!(viewer.fullscreen);
+            // the first escape unwinds the fullscreen, the second
+            // one closes the window
+            viewer.route_key(&key("escape"), window, cx);
+            assert!(!viewer.fullscreen);
+            viewer.route_key(&key("escape"), window, cx);
+        });
+        app.run_until_parked();
+        // the window is gone: the root handle no longer updates
+        assert!(app
+            .update(|cx| window.handle().update(cx, |_, _, _| {}).is_err()));
     }
 
     #[test]

@@ -29,6 +29,11 @@ rides unchanged.
   volume and seek keys stay: J/L seek by ten seconds, +/- steps the
   volume, M mutes; F11 fullscreens the window while a video is up
   and escape unwinds it before closing the pane.
+  The standalone viewer plays videos too, with the same engine and
+  the same transport: `kuma-files clip.mp4` opens a playing surface,
+  and the desktop file now claims `video/mp4`, `video/webm`,
+  `video/x-matroska`, `video/quicktime`, and `video/x-msvideo` (audio
+  files wait for the viewer's audio pane and stay with Celluloid).
   Decode attempts VAAPI hardware first and falls back to software
   wherever the driver is missing; `KOGUMA_NO_HWACCEL=1` forces
   software for A/B checks.

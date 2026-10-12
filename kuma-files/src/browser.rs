@@ -16,7 +16,7 @@ use gpui::{
     ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, Font,
     HighlightStyle, ImageSource, KeyDownEvent, MouseDownEvent, MouseMoveEvent, MouseButton,
     MouseUpEvent, ObjectFit, Pixels, Point, Render, RenderImage, Rgba, ScrollWheelEvent, Stateful,
-    StyledText, TextRun, UnderlineStyle, Window, canvas, div, img, list, point, prelude::*, px,
+    StyledText, TextRun, UnderlineStyle, Window, div, img, list, point, prelude::*, px,
     relative, rgba, rgb, svg, uniform_list, FontStyle, FontWeight, SharedString,
 };
 use trash::{os_limited, TrashItem};
@@ -26,6 +26,7 @@ use notify::Watcher as _;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::input;
+use crate::videopane;
 
 /// Thumbnail cache bound. 256x256 RGBA each, so ~300 thumbs is the
 /// most memory the cache can hold (about 75 MiB worst case).
@@ -1442,20 +1443,15 @@ pub(crate) struct Browser {
     /// duration (one ask per open path; reset on file flips). A
     /// header that will not read just leaves the label out.
     video_meta_asked: bool,
-    /// The Quick Look video player: the muted playback engine. The
-    /// wall clock stands in for the audio clock until the sink
-    /// lands; space toggles play/pause while a video is up.
-    ql_video: Option<VideoPlayer>,
+    /// The Quick Look video player: the muted playback engine, the
+    /// shared pane (the state machine and the transport strip live
+    /// in videopane). The wall clock stands in for the audio clock
+    /// until the sink lands; space toggles play/pause while a video
+    /// is up.
+    ql_video: Option<videopane::VideoPane>,
     /// The player has been asked for the current video (one ask per
     /// open path; reset on file flips, close, and teardown).
     video_player_asked: bool,
-    /// An armed seek-bar drag: the track's bounds (for pointer-to-
-    /// fraction), the last throttled seek's instant, and the pointer's
-    /// latest fraction for the release's final seek.
-    ql_scrub: Option<(gpui::Bounds<Pixels>, std::time::Instant, f64)>,
-    /// The seek bar track's bounds, captured at paint by the track's
-    /// canvas; the mouse handlers read them to map the pointer.
-    ql_track: std::rc::Rc<std::cell::RefCell<Option<gpui::Bounds<Pixels>>>>,
     /// The window went fullscreen for the video (F11). The window is
     /// the real state; this flag is the pane's memory of the request,
     /// so escape unwinds it before closing and a close path restores
@@ -1605,8 +1601,6 @@ impl Browser {
             video_meta_asked: false,
             ql_video: None,
             video_player_asked: false,
-            ql_scrub: None,
-            ql_track: std::rc::Rc::new(std::cell::RefCell::new(None)),
             ql_fullscreen: false,
             sel_video: None,
             sel_video_len: None,
@@ -4247,7 +4241,6 @@ impl Browser {
     /// video_player_asked reset, so a reopen asks fresh.
     fn stop_video_player(&mut self, cx: &mut Context<Self>) {
         self.video_player_asked = false;
-        self.ql_scrub = None;
         if let Some(mut vid) = self.ql_video.take() {
             if let Some((image, _)) = vid.frame.take() {
                 cx.drop_image(image, None);
@@ -4457,89 +4450,6 @@ impl Browser {
             .child(glyph)
     }
 
-    /// The video footer's seek bar: a full-width track (flex_1 in the
-    /// strip) with the played fraction filled and a knob on its edge,
-    /// both laid by relative lengths against the track. A press jumps
-    /// there and arms the drag; the drag re-seeks at most every 150ms
-    /// (the move and release handlers ride the overlay root, so the
-    /// pointer may leave the track); the release lands the pointer's
-    /// final fraction. The track's bounds come from a canvas capture
-    /// at paint, since the handlers only see window coordinates.
-    fn quicklook_seek_bar(
-        &self,
-        fraction: f64,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let track = self.ql_track.clone();
-        let fill = fraction as f32;
-        div()
-            .id("ql-video-seek")
-            .relative()
-            .flex_1()
-            .h(px(16.))
-            .cursor_pointer()
-            .child(
-                canvas(
-                    {
-                        let track = track.clone();
-                        move |bounds, _, _| {
-                            *track.borrow_mut() = Some(bounds);
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(6.))
-                    .w_full()
-                    .h(px(4.))
-                    .rounded_sm()
-                    .bg(theme::row_hover()),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(6.))
-                    .w(relative(fill))
-                    .h(px(4.))
-                    .rounded_sm()
-                    .bg(theme::accent()),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(relative(fill))
-                    .ml(px(-6.))
-                    .top(px(2.))
-                    .size(px(12.))
-                    .rounded_full()
-                    .bg(theme::accent()),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(
-                    |this, event: &MouseDownEvent, _, cx| {
-                        let Some(bounds) = this.ql_track.borrow().as_ref().copied() else {
-                            return;
-                        };
-                        let x: f32 = (event.position.x - bounds.left()).into();
-                        let width: f32 = bounds.size.width.into();
-                        let fraction = (x / width.max(1.)).clamp(0., 1.) as f64;
-                        this.ql_scrub = Some((bounds, std::time::Instant::now(), fraction));
-                        let target = fraction
-                            * this.ql_video.as_ref().map_or(0.0, |vid| vid.duration);
-                        this.quicklook_video_seek_to(target, cx);
-                    },
-                ),
-            )
-    }
-
     /// Ask how many pages the open document has: pdfinfo for PDFs,
     /// the spine for epubs. One ask per open path; a missing tool or
     /// a failed call lands as None and paging stays dormant.
@@ -4626,7 +4536,8 @@ impl Browser {
     /// path. The landing starts Playing at media time zero; the
     /// pane's poster shows until the first frame is due. A failed
     /// open lands in the named card slot exactly where the poster
-    /// path's failures land.
+    /// path's failures land. The shared open lives in videopane;
+    /// the stale-landing check is this host's part.
     fn request_video_player(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.request_video_player_at(path, None, true, cx);
     }
@@ -4643,266 +4554,35 @@ impl Browser {
         start_playing: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.video_player_asked {
-            return;
-        }
-        self.video_player_asked = true;
-        cx.spawn(async move |this, cx| {
-            let bg_path = path.clone();
-            let opened = cx
-                .background_spawn(async move {
-                    std::panic::catch_unwind(|| crate::video::Player::open(&bg_path))
-                        .unwrap_or(Err(crate::video::PosterFail::Empty))
-                })
-                .await;
-            let update = this.update(cx, |this, cx| {
-                // the pane may have closed or flipped files while the
-                // open ran: a stale landing drops unheard
-                if !this
-                    .quicklook
-                    .as_ref()
-                    .is_some_and(|ql| ql.path == path)
-                {
-                    return;
-                }
-                match opened {
-                    Ok(player) => {
-                        let mut vid = VideoPlayer {
-                            path,
-                            player,
-                            frame: None,
-                            ahead: None,
-                            eof: false,
-                            clock_base: 0.0,
-                            wall: std::time::Instant::now(),
-                            frozen_at: 0.0,
-                            seeking: None,
-                            generation: None,
-                            duration: 0.0,
-                            volume: 256,
-                            muted: false,
-                            playing: start_playing,
-                            ended: false,
-                        };
-                        vid.duration = vid.player.duration_secs().unwrap_or(0.0);
-                        if let Some(target) = target {
-                            vid.seeking = Some(target);
-                            vid.generation = Some(vid.player.generation());
-                            vid.frozen_at = target;
-                            vid.clock_base = target;
-                            vid.player.request_seek(target);
-                        }
-                        this.ql_video = Some(vid);
-                        cx.notify();
-                    }
-                    Err(fail) => {
-                        this.ql_failed = Some((path, fail));
-                        cx.notify();
-                    }
-                }
-            });
-            if let Err(err) = update {
-                log::error!("video player open failed: {err:#}");
-            }
-        })
-        .detach();
+        videopane::request_player(path, target, start_playing, self, cx);
     }
 
-    /// The video pane's present tick, run once per compositor frame
-    /// while a video plays: drain the frames the clock has reached
-    /// (the newest due wins; frames it displaces are skipped without
-    /// display, the late-drop rule), hold the first not-yet-due frame
-    /// back, drop the displaced tile (ADR-0016), and park the loop at
-    /// the stream's end. The threshold is a frame's own display
-    /// duration when the frame after it is decoded, clamped to the
-    /// sync band; the clock is the audio sink's, wall time when
-    /// muted.
-    fn pump_video(&mut self, cx: &mut Context<Self>) {
-        let Some(vid) = self.ql_video.as_mut() else {
-            return;
-        };
-        if vid.ended {
-            return;
-        }
-        // a scrub pumps while paused too: its landing frame must
-        // reach the screen without a resume
-        let scrubbing = vid.seeking.is_some();
-        if !vid.playing && !scrubbing {
-            return;
-        }
-        let clock = vid.media_now();
-        // the present slack: a frame's own display duration (the pts
-        // delta to the frame after it) when that one is decoded,
-        // clamped to the sync band; the floor alone when it is not
-        let threshold = match (&vid.ahead, &vid.frame) {
-            (Some((_, ahead_pts, _)), Some((_, pts))) => (ahead_pts - pts).clamp(0.04, 0.1),
-            _ => 0.04,
-        };
-        let mut pending = vid.ahead.take();
-        let mut due: Option<(Arc<RenderImage>, f64)> = None;
-        loop {
-            let next = match pending.take() {
-                // an ahead frame passed the filter on an earlier
-                // pump: its stored generation is its own
-                Some((image, pts, generation)) => Some((image, pts, generation)),
-                None => match vid.player.try_recv() {
-                    Some(crate::video::PlayerMsg::Frame { image, pts, generation }) => {
-                        Some((image, pts, generation))
-                    }
-                    Some(crate::video::PlayerMsg::Eof) => {
-                        vid.eof = true;
-                        None
-                    }
-                    None => None,
-                },
-            };
-            let Some((image, pts, generation)) = next else {
-                break;
-            };
-            // a seek's stale frames drop unheard: anything stamped
-            // at or before the seek's generation decoded before the
-            // jump. Never seeked means no floor yet (generation is
-            // None).
-            if vid.generation.is_some_and(|g| generation <= g) {
-                continue;
-            }
-            if vid.seeking.is_some() {
-                // the scrub's landing: the first frame of the new
-                // generation shows the target and ends the scrub.
-                // The clock test does not apply here (the audio
-                // clock is stale until the sound runs again); the
-                // landing frame's own pts is the position shown.
-                vid.seeking = None;
-                vid.frozen_at = pts;
-                due = Some((image, pts));
-                break;
-            }
-            if pts <= clock + threshold {
-                due = Some((image, pts));
-            } else {
-                pending = Some((image, pts, generation));
-                break;
-            }
-        }
-        vid.ahead = pending;
-        if let Some((image, pts)) = due {
-            if let Some((old, _)) = vid.frame.replace((image, pts)) {
-                cx.drop_image(old, None);
-            }
-        }
-        if vid.eof && vid.ahead.is_none() {
-            // the stream ran out and everything due is on screen:
-            // hold the last frame, park the loop (one notify for the
-            // hint's state change)
-            vid.playing = false;
-            vid.ended = true;
-            vid.frozen_at = vid.frame.as_ref().map_or(vid.frozen_at, |(_, pts)| *pts);
-            vid.seeking = None;
-            cx.notify();
-            return;
-        }
-    }
-
+    /// The video rung's controls, thin delegates onto the shared
+    /// pane (the state machine's rules live in videopane).
     /// Space while a video is up: pause, resume, or (at the end)
     /// replay from the head. Returns false when no player owns the
     /// key, so the caller's space-to-close can have it.
     fn quicklook_video_toggle(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(vid) = self.ql_video.as_mut() else {
-            return false;
-        };
-        if vid.ended {
-            // replay: a fresh player and the clock back to zero; the
-            // held tile drops with the teardown
-            let path = vid.path.clone();
-            self.stop_video_player(cx);
-            self.request_video_player(path, cx);
-            return true;
-        }
-        if vid.playing {
-            // stamp before parking: the muted mode's clock_base is
-            // where the wall clock resumes; the audio clock freezes
-            // itself (and this stamp is ignored there). The stamp
-            // must read the running clock, so it precedes the flip.
-            vid.frozen_at = vid.media_now();
-            vid.clock_base = vid.frozen_at;
-            vid.playing = false;
-            vid.player.set_paused(true);
-        } else {
-            vid.playing = true;
-            vid.wall = std::time::Instant::now();
-            vid.player.set_paused(false);
-        }
-        cx.notify();
-        true
+        videopane::toggle(self, cx)
     }
 
     /// The video rung's seek, relative: j and l step ten seconds
     /// from the shown position (the clock while playing, the frozen
     /// stamp at rest).
     fn quicklook_video_seek(&mut self, delta: f64, cx: &mut Context<Self>) {
-        let Some(vid) = self.ql_video.as_ref() else {
-            return;
-        };
-        let from = vid.shown_at();
-        self.quicklook_video_seek_to(from + delta, cx);
-    }
-
-    /// The video rung's seek, absolute: the demuxer jumps, both
-    /// decoders and the sink flush, and the pane drops frames short
-    /// of the new generation until the landing arrives. At the end a
-    /// seek replays into the target, paused. The target stops a
-    /// decisecond short of the duration: a jump to the very end
-    /// demuxes straight into eof, and that state is the ended rest's
-    /// own (space replays), not a seek's.
-    fn quicklook_video_seek_to(&mut self, target: f64, cx: &mut Context<Self>) {
-        let Some(vid) = self.ql_video.as_mut() else {
-            return;
-        };
-        let target = if vid.duration > 0.0 {
-            target.clamp(0.0, (vid.duration - 0.1).max(0.0))
-        } else {
-            target.max(0.0)
-        };
-        if vid.ended {
-            // the decode thread left at eof: replay into the target
-            // on a fresh player, paused at the landing
-            let path = vid.path.clone();
-            self.stop_video_player(cx);
-            self.request_video_player_at(path, Some(target), false, cx);
-            return;
-        }
-        vid.seeking = Some(target);
-        vid.eof = false;
-        vid.generation = Some(vid.player.generation());
-        vid.player.request_seek(target);
-        // the muted clock re-anchors at the target; the audio clock
-        // re-anchors itself when the post-seek sound lands
-        vid.clock_base = target;
-        vid.wall = std::time::Instant::now();
-        cx.notify();
+        videopane::seek(self, delta, cx)
     }
 
     /// The video rung's volume: integer gain steps, 256 = unity.
     /// Adjusting while muted unmutes.
     fn quicklook_video_volume(&mut self, step: i32, cx: &mut Context<Self>) {
-        let Some(vid) = self.ql_video.as_mut() else {
-            return;
-        };
-        vid.volume = (vid.volume as i32 + step).clamp(0, 256) as u32;
-        vid.muted = false;
-        vid.player.set_volume(vid.gain());
-        cx.notify();
+        videopane::volume_step(self, step, cx)
     }
 
     /// The video rung's mute: gain zero, the previous gain kept for
     /// the way back.
     fn quicklook_video_mute(&mut self, cx: &mut Context<Self>) {
-        let Some(vid) = self.ql_video.as_mut() else {
-            return;
-        };
-        vid.muted = !vid.muted;
-        vid.player.set_volume(vid.gain());
-        cx.notify();
+        videopane::mute_toggle(self, cx)
     }
 
     /// The video rung's fullscreen: the window itself goes (F11, the
@@ -7762,26 +7442,10 @@ impl Browser {
             .collect::<Vec<_>>()
             .join(" · ");
 
-        // the video footer's two ends and fraction: the transport
-        // strip under the pane. The header's glance carries the
-        // video's dims until the player lands; its duration is the
-        // footer's own.
-        let vid = self
-            .ql_video
-            .as_ref()
-            .filter(|vid| vid.path == entry.path);
-        // the footer's two ends, labeled apart: the strip owns the
-        // width now, the header only keeps the static glance
-        let video_now = vid.and_then(|vid| crate::video::duration_label(vid.shown_at()));
-        let video_total = vid.and_then(|vid| {
-            (vid.duration > 0.0)
-                .then(|| crate::video::duration_label(vid.duration))
-                .flatten()
-        });
-        let video_fraction = vid.and_then(|vid| {
-            (vid.duration > 0.0)
-                .then(|| (vid.shown_at() / vid.duration).clamp(0.0, 1.0))
-        });
+        // the video footer's labels and bar come from the shared
+        // pane (below, at the strip): the header's glance carries
+        // the video's dims until the player lands; its duration is
+        // the footer's own.
 
         // the top row: name, position in the listing, the close road
         let header = div()
@@ -8159,28 +7823,14 @@ impl Browser {
         // the video footer: the transport strip under the pane, the
         // players' convention. Elapsed, the full-width bar, total.
         // It appears once the player has landed with a duration.
-        let footer = video_fraction.map(|fraction| {
-            div()
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap_3()
-                .px_3()
-                .pb_2()
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme::text_dim())
-                        .child(video_now.clone().unwrap_or_default()),
-                )
-                .child(self.quicklook_seek_bar(fraction, cx).flex_1())
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme::text_dim())
-                        .child(video_total.unwrap_or_default()),
-                )
-        });
+        // The pane is filtered by the entry being painted, so a
+        // stale pane mid-flip never shows its strip here.
+        let footer = videopane::footer(
+            self.ql_video
+                .as_ref()
+                .filter(|vid| vid.path == entry.path),
+            cx,
+        );
 
         Some(
             div()
@@ -8196,52 +7846,13 @@ impl Browser {
                 // the seek bar's drag: the press armed it on the
                 // track; the move re-seeks at most every 150ms and
                 // the release lands the pointer's last fraction. On
-                // the root, so the pointer may leave the track.
+                // the root, so the pointer may leave the track. The
+                // shared handlers live in videopane.
                 .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                    let Some((bounds, last, _)) = this.ql_scrub else {
-                        return;
-                    };
-                    if event.pressed_button != Some(MouseButton::Left) {
-                        this.ql_scrub = None;
-                        return;
-                    }
-                    let Some(vid) = this.ql_video.as_ref() else {
-                        this.ql_scrub = None;
-                        return;
-                    };
-                    if vid.duration <= 0.0 {
-                        this.ql_scrub = None;
-                        return;
-                    }
-                    let x: f32 = (event.position.x - bounds.left()).into();
-                    let width: f32 = bounds.size.width.into();
-                    let fraction = (x / width.max(1.)).clamp(0., 1.) as f64;
-                    if last.elapsed() < Duration::from_millis(150) {
-                        // still inside the throttle window: keep the
-                        // pointer's fraction for the release
-                        if let Some(scrub) = this.ql_scrub.as_mut() {
-                            scrub.2 = fraction;
-                        }
-                        return;
-                    }
-                    let target = fraction * vid.duration;
-                    this.quicklook_video_seek_to(target, cx);
-                    if let Some(scrub) = this.ql_scrub.as_mut() {
-                        scrub.1 = std::time::Instant::now();
-                        scrub.2 = fraction;
-                    }
+                    videopane::scrub_move(this, event, cx);
                 }))
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    let Some((_, _, fraction)) = this.ql_scrub.take() else {
-                        return;
-                    };
-                    let duration = this
-                        .ql_video
-                        .as_ref()
-                        .map_or(0.0, |vid| vid.duration);
-                    if duration > 0.0 {
-                        this.quicklook_video_seek_to(fraction * duration, cx);
-                    }
+                    videopane::scrub_up(this, cx);
                 })),
         )
     }
@@ -8991,7 +8602,7 @@ impl Render for Browser {
         // keeps the loop armed while a video plays (notify-only, so
         // the pump never runs inside a held entity update)
         if self.quicklook.is_some() {
-            self.pump_video(cx);
+            videopane::pump(self, cx);
             // playing: the loop feeds itself. A scrub while paused
             // also arms: its landing frame arrives asynchronously
             // and must pump without a resume
@@ -10816,80 +10427,40 @@ struct QuickLook {
 /// ended rest (the stream ran out; the last frame holds). The clock
 /// is the audio sink's samples-written clock when there is sound,
 /// wall time when muted.
-struct VideoPlayer {
-    path: PathBuf,
-    player: crate::video::Player,
-    /// The frame on screen: its pixels and its media time.
-    frame: Option<(Arc<RenderImage>, f64)>,
-    /// One frame decoded ahead of the clock, not yet due: the ring
-    /// cannot be peeked, so the first not-due frame is held here,
-    /// with the generation it decoded under.
-    ahead: Option<(Arc<RenderImage>, f64, u32)>,
-    /// The stream said eof and the ring is drained.
-    eof: bool,
-    /// Media time the clock stood at on the last pause (or open).
-    clock_base: f64,
-    /// Wall anchor for the current run: media time is clock_base
-    /// plus wall time since this Instant.
-    wall: std::time::Instant,
-    /// The media time shown while not playing: the pause stamp, a
-    /// scrub's landing, or the last frame at the end. The audio
-    /// clock is stale after a scrub (no sound ran to re-anchor it),
-    /// so at rest the pane shows this instead.
-    frozen_at: f64,
-    /// A scrub in flight: the target the demuxer is jumping to.
-    /// The pump drops frames short of the seek's generation until
-    /// one of it lands, then this clears.
-    seeking: Option<f64>,
-    /// The generation the last seek started from: frames stamped at
-    /// or before it are stale and dropped unheard.
-    generation: Option<u32>,
-    /// The container's duration in seconds (the bar's total, the
-    /// keys' clamp); 0.0 when the header stated none.
-    duration: f64,
-    /// Integer gain, 256 = unity, as the volume keys set it.
-    volume: u32,
-    /// The mute toggle: gain zero at the sink, `volume` kept for
-    /// the way back.
-    muted: bool,
-    playing: bool,
-    ended: bool,
-}
-
-impl VideoPlayer {
-    /// Media time now: the audio clock when the player has sound
-    /// (absolute media time, as heard through the sink), the wall
-    /// clock plus the pause stamp when muted. The audio clock
-    /// freezes itself while parked: writes stop, the interpolation
-    /// runs out of the sink's latency, the clock sits at the last
-    /// written sample, which is where the resume continues. Muted
-    /// paused time does not advance: the pump only reads this while
-    /// playing, and a pause stamps clock_base first. At rest the
-    /// frozen stamp wins over both: after a scrub the audio clock
-    /// is stale until the sound runs again.
-    fn media_now(&self) -> f64 {
-        if !self.playing {
-            return self.frozen_at;
-        }
-        match self.player.clock_micros() {
-            Some(micros) => micros as f64 / 1_000_000.0,
-            None => self.clock_base + self.wall.elapsed().as_secs_f64(),
-        }
+/// The manager's side of the shared video pane: where the pane
+/// sits, where failures land, and how its close and rebuild paths
+/// run. The state machine itself lives in videopane.
+impl videopane::Host for Browser {
+    fn pane(&mut self) -> &mut Option<videopane::VideoPane> {
+        &mut self.ql_video
     }
 
-    /// The gain the sink should run at: zero while muted.
-    fn gain(&self) -> u32 {
-        if self.muted {
-            0
-        } else {
-            self.volume
-        }
+    fn open_asked(&mut self) -> &mut bool {
+        &mut self.video_player_asked
     }
 
-    /// The position the time label and the bar show: a scrub shows
-    /// its target while in flight, the clock runs otherwise.
-    fn shown_at(&self) -> f64 {
-        self.seeking.unwrap_or_else(|| self.media_now())
+    fn pane_wants(&self, path: &Path) -> bool {
+        self.quicklook
+            .as_ref()
+            .is_some_and(|ql| ql.path == path)
+    }
+
+    fn pane_failed(&mut self, path: &Path, fail: crate::video::PosterFail) {
+        self.ql_failed = Some((path.to_path_buf(), fail));
+    }
+
+    fn stop_player(&mut self, cx: &mut Context<Self>) {
+        self.stop_video_player(cx);
+    }
+
+    fn replay(
+        &mut self,
+        path: PathBuf,
+        target: Option<f64>,
+        playing: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_video_player_at(path, target, playing, cx);
     }
 }
 
@@ -12583,7 +12154,7 @@ mod browser_ux_keys {
             let vid = browser.ql_video.as_ref().expect("player landed");
             assert!(vid.playing && vid.path == clip);
             // the frame at media time zero is due on the first pump
-            browser.pump_video(cx);
+            videopane::pump(browser, cx);
             assert!(browser.ql_video.as_ref().unwrap().frame.is_some());
             // space pauses now (no longer closes) and holds the frame
             browser.route_key(&key("space"), cx);
@@ -12595,7 +12166,7 @@ mod browser_ux_keys {
                 .frame
                 .as_ref()
                 .map(|(_, pts)| *pts);
-            browser.pump_video(cx);
+            videopane::pump(browser, cx);
             let after = browser
                 .ql_video
                 .as_ref()
@@ -12641,7 +12212,7 @@ mod browser_ux_keys {
         });
         app.run_until_parked(); // the player lands
         window.update(|browser, _, cx| {
-            browser.pump_video(cx); // frame zero due
+            videopane::pump(browser, cx); // frame zero due
             // j: back ten seconds clamps at the head; l: forward ten
             // clamps at the duration
             browser.route_key(&key("j"), cx);
@@ -12657,7 +12228,7 @@ mod browser_ux_keys {
         let mut landed = false;
         for _ in 0..200 {
             window.update(|browser, _, cx| {
-                browser.pump_video(cx);
+                videopane::pump(browser, cx);
                 if let Some(vid) = browser.ql_video.as_ref()
                     && vid.seeking.is_none()
                     && vid.frame.as_ref().is_some_and(|(_, pts)| *pts > 0.35)
@@ -12675,7 +12246,7 @@ mod browser_ux_keys {
         // the absolute path clamps a decisecond short of the
         // duration: the very end is the ended rest's own state
         window.update(|browser, _, cx| {
-            browser.quicklook_video_seek_to(999.0, cx);
+            videopane::seek_to(browser, 999.0, cx);
             let vid = browser.ql_video.as_ref().unwrap();
             assert_eq!(vid.seeking, Some(vid.duration - 0.1));
         });
@@ -12843,7 +12414,7 @@ mod browser_ux_keys {
         // a second of stream time
         let mut ended = false;
         for _ in 0..400 {
-            window.update(|browser, _, cx| browser.pump_video(cx));
+            window.update(|browser, _, cx| videopane::pump(browser, cx));
             ended = window.update(|browser, _, _| {
                 browser
                     .ql_video
@@ -12868,7 +12439,7 @@ mod browser_ux_keys {
         let mut landed = false;
         for _ in 0..200 {
             window.update(|browser, _, cx| {
-                browser.pump_video(cx);
+                videopane::pump(browser, cx);
                 if let Some(vid) = browser.ql_video.as_ref()
                     && !vid.playing
                     && vid.seeking.is_none()

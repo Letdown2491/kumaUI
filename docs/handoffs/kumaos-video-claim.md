@@ -18,8 +18,8 @@ app. The claim moves to Koguma.
   in a playing surface, not a card. Without this the flip trades
   Celluloid for a picture of a filmstrip. (kumaUI work, tracked below;
   reuses the Quick Look player in `kuma-files/src/video.rs`.)
-- [ ] `kuma-files/packaging/kuma-files.desktop.in` declares the same
-  MIME types the claim pins (the list is below). It lands in the same
+- [ ] `kuma-files/packaging/kuma-files.desktop.in` declares the video
+  types the claim repoints (the list is below). It lands in the same
   kumaUI commit as the viewer's video pane.
 - [ ] The image's kumaUI pin is bumped past that commit, so the
   installed desktop file actually carries the new `MimeType=` line.
@@ -36,8 +36,15 @@ to `io.github.celluloid_player.Celluloid.desktop`:
     video/mp4, video/webm, video/ogg, video/x-matroska,
     audio/mpeg, audio/flac, audio/ogg, audio/webm
 
-Repoint that same list at `kuma-files.desktop`. Nothing else in the
-hunk moves:
+Repoint only the video types Koguma plays today, the five the desktop
+file declares, at `kuma-files.desktop`:
+
+    video/mp4, video/webm, video/x-matroska, video/quicktime, video/x-msvideo
+
+The audio types (and `video/ogg`, which Koguma's extension list does
+not cover) stay pinned to Celluloid until the viewer grows an
+audio-only pane; a claim traded for a "no preview" card is a
+regression, not a flip. Nothing else in the hunk moves:
 
 - Celluloid stays shipped (its Flathub declaration stays: niri.toml
   line 81, cosmic.toml line 43, vm.kuma.toml line 36). The claim moves;
@@ -50,7 +57,8 @@ hunk moves:
 ## Verify (in the kumaOS session, after the image lands)
 
     xdg-mime query default video/mp4     # kuma-files.desktop
-    xdg-mime query default audio/flac    # kuma-files.desktop
+    xdg-mime query default video/x-matroska    # kuma-files.desktop
+    xdg-mime query default audio/flac    # io.github.celluloid_player.Celluloid.desktop (unchanged)
 
 Then on the running system: Enter on a video in Koguma's listing opens
 Koguma's viewer playing; double-click from another manager does the

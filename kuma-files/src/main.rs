@@ -10,6 +10,7 @@ mod browser;
 mod epub;
 mod icons;
 mod video;
+mod videopane;
 mod input;
 mod theme;
 mod viewer;
