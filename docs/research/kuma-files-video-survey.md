@@ -79,10 +79,10 @@ All paths below are in the kumaOS clone, `src/containerfile/blocks.rs`.
   `pulseaudio-libs` 17.0, which also ships `libpulse-simple.so.0`, the
   library that defines `pa_simple_new` (verified: `rpm -qf
   /usr/lib64/libpulse-simple.so.0` answers pulseaudio-libs-17.0-9.fc44, and
-  `nm -D` shows `pa_simple_new@@PULSE_0` defined in it). Caveat stated
-  honestly: this chain is measured on the dev host, not inside a composed
-  kumaOS image; before code lands, `rpm -q pulseaudio-libs` in the composed
-  image should confirm it.
+  `nm -D` shows `pa_simple_new@@PULSE_0` defined in it). Verified inside a
+  composed image 2026-10-12: the dev host runs the composed appliance (the
+  production `kuma-shell.service` is active here), and its rpm database
+  answers `pulseaudio-libs-17.0-9.fc44` with `libpulse-simple.so.0` present.
 - `pipewire-alsa` is NOT shipped (no `alsa` hit in any package list beyond
   `alsa-*` absence; the only ALSA-adjacent strings in blocks.rs are
   comments). What that means for cpal is in the next section. On this dev
@@ -710,8 +710,11 @@ and issue 25's UX principles (discoverable shortcuts, honest states):
      entity (the house pattern, and enough for one pane) or as a small
      dedicated entity. Recommendation: ql_* fields until a second consumer
      exists, per the just-in-time extraction rule (issue 25).
-  6. Verify on a composed image before landing: `rpm -q pulseaudio-libs`
-     (the pavucontrol dependency chain is measured, not composed) and
-     confirm pipewire-pulse is enabled in the user session, so the audio
+  6. Verified 2026-10-12 on the running appliance (the dev host is the
+     composed image; the production kuma-shell.service is active on it):
+     `rpm -q pulseaudio-libs` answers 17.0-9.fc44, `libpulse-simple.so.0`
+     is present, and pipewire-pulse is in the session the Fedora way: the
+     `.socket` unit enabled and active, the service unit disabled by design
+     (socket activation starts it on the first client). The audio
      capability check and the degraded pane have a real trigger to point
      at.
