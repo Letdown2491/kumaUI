@@ -65,25 +65,18 @@ fn become_single_instance(dir: Option<PathBuf>) -> Option<std::os::unix::net::Un
 }
 
 /// The version line `--version` prints and the boot log carries: the
-/// crate version plus the commit build.sh stamped in (option_env!
-/// falls back when cargo runs without the stamp), so a running
-/// instance pins to an exact build.
+/// crate version plus the commit build.sh stamped in (unstamped builds
+/// read unknown), so a running instance pins to an exact build. The
+/// format lives in the platform crate; the version stays a call-site
+/// argument because it is this crate's.
 pub(crate) fn version_line() -> String {
-    format!(
-        "kuma-files {} (g{})",
-        env!("CARGO_PKG_VERSION"),
-        option_env!("KUMA_GIT_SHA").unwrap_or("unknown"),
-    )
+    kuma_platform::version::line("kuma-files", env!("CARGO_PKG_VERSION"))
 }
 
 /// The sidebar's short tag: the version alone, the name is already
 /// in the title bar.
 pub(crate) fn version_tag() -> String {
-    format!(
-        "v{} (g{})",
-        env!("CARGO_PKG_VERSION"),
-        option_env!("KUMA_GIT_SHA").unwrap_or("unknown"),
-    )
+    kuma_platform::version::tag(env!("CARGO_PKG_VERSION"))
 }
 
 fn main() {
@@ -321,29 +314,13 @@ mod tests {
         assert!(tag.contains("(g"));
     }
 
-    /// The version the changelog's newest release section names for
-    /// the given app, or None when the section or the app's line is
-    /// missing. The three version lines sit at column 0 under the
-    /// heading; bullets start with a dash or a bracket, so a plain
-    /// prefix match reads only the header.
-    fn changelog_version(changelog: &str, app: &str) -> Option<String> {
-        let rest = changelog.split_once("\n## v")?.1;
-        let newest = rest.split("\n## ").next()?;
-        let prefix = format!("{app} ");
-        newest
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix(prefix.as_str()))
-            .map(str::trim)
-            .find(|v| !v.is_empty())
-            .map(str::to_string)
-    }
-
     #[test]
     fn the_changelog_names_this_version() {
-        // bumping Cargo.toml without writing the changelog fails here
+        // bumping Cargo.toml without writing the changelog fails here;
+        // the parser lives in the platform crate
         let md = include_str!("../../CHANGELOG.md");
         assert_eq!(
-            changelog_version(md, "kuma-files").as_deref(),
+            kuma_platform::version::changelog_version(md, "kuma-files").as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
     }
