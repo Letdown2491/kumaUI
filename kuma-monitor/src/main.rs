@@ -10,6 +10,7 @@ use gpui_platform::application;
 
 mod niri;
 mod sample;
+mod theme;
 mod view;
 
 /// The version line `--version` prints: the crate version plus the
