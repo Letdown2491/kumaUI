@@ -392,14 +392,10 @@ impl MonitorView {
         // -- row one: the processor's story, the cpu card the hero
         // at two columns wide (its sparkline earns the longer window
         // that keeps bars from going fat), temp beside at one. The
-        // basis of one gap keeps temp exactly one grid unit wide: a
-        // two-card row has one gap where a three-card row has two,
-        // and flex math would otherwise widen temp by the
-        // difference.
-        let cpu_card = self
-            .card_base("CPU")
-            .flex_grow(2.)
-            .flex_basis(px(8.))
+        // rows are grids sharing one three-column lattice, so a
+        // single-width card is the same width in every row by
+        // construction; flex distribution kept drifting by pixels.
+        let cpu_card = self.card_base("CPU").col_span(2)
             .child(
                 div()
                     .text_size(px(14.))
@@ -644,7 +640,8 @@ impl MonitorView {
             .debug_selector(|| "vitals-area".into())
             .child(
                 div()
-                    .flex()
+                    .grid()
+                    .grid_cols(3)
                     .gap_2()
                     .debug_selector(|| "vitals-strip".into())
                     .child(cpu_card)
@@ -652,7 +649,8 @@ impl MonitorView {
             )
             .child(
                 div()
-                    .flex()
+                    .grid()
+                    .grid_cols(3)
                     .gap_2()
                     .debug_selector(|| "vitals-strip-2".into())
                     .child(psi_card)
@@ -661,7 +659,8 @@ impl MonitorView {
             )
             .child(
                 div()
-                    .flex()
+                    .grid()
+                    .grid_cols(3)
                     .gap_2()
                     .debug_selector(|| "vitals-strip-3".into())
                     .child(mem_card)
@@ -1357,6 +1356,33 @@ mod tests {
             "fill at 100% is {:?} of track {:?}",
             fill.size,
             track.size
+        );
+        // the grid: every single-width card is exactly as wide as
+        // its neighbors in the other rows, and the cpu hero is two
+        // units plus one gap. Taffy rounds per cell, so the slack
+        // forgives half a pixel per cell.
+        let width_of = |sel: &str| {
+            cards
+                .iter()
+                .find(|(probe_sel, _, _)| probe_sel == sel)
+                .unwrap()
+                .2
+                .size
+                .width
+        };
+        let unit = width_of("card-mem");
+        for sel in ["card-temp", "card-psi", "card-load", "card-procs", "card-disk", "card-net"] {
+            let w = width_of(sel);
+            assert!(
+                (w - unit).abs() < px(1.),
+                "{sel} is {w:?} wide but the grid unit is {unit:?}"
+            );
+        }
+        let cpu = width_of("card-cpu");
+        assert!(
+            (cpu - (unit * 2. + px(8.))).abs() < px(2.),
+            "cpu hero is {cpu:?} wide but two units plus a gap is {:?}",
+            unit * 2. + px(8.)
         );
         // a quarter: the fill is a quarter of the track
         app.run_until_parked();
