@@ -18,6 +18,8 @@ static BORDER: AtomicU32 = AtomicU32::new(0x2a2f3a);
 static TEXT: AtomicU32 = AtomicU32::new(0xd8dce3);
 static TEXT_DIM: AtomicU32 = AtomicU32::new(0x8a93a3);
 static ACCENT: AtomicU32 = AtomicU32::new(0x4f8cc9);
+static SURFACE: AtomicU32 = AtomicU32::new(0x1b1e24);
+static INSET: AtomicU32 = AtomicU32::new(0x14161a);
 
 fn get(slot: &AtomicU32) -> Rgba {
     rgb(slot.load(Ordering::Relaxed))
@@ -40,6 +42,14 @@ pub(crate) fn text_dim() -> Rgba {
 }
 pub(crate) fn accent() -> Rgba {
     get(&ACCENT)
+}
+/// The card fill, one step above the background.
+pub(crate) fn surface() -> Rgba {
+    get(&SURFACE)
+}
+/// The well a fill grows out of (the memory bar's track).
+pub(crate) fn inset() -> Rgba {
+    get(&INSET)
 }
 /// The accent at a whisper: the graph's history fill, loud only as a
 /// shape, not as a color.
@@ -89,6 +99,7 @@ impl Default for Palette {
 /// table rows are cards, the focused row wears the selection color.
 pub(crate) fn apply_palette(palette: &Palette) {
     BG.store(palette.inset, Ordering::Relaxed);
+    SURFACE.store(palette.surface, Ordering::Relaxed);
     BORDER.store(palette.divider, Ordering::Relaxed);
     TEXT.store(palette.text, Ordering::Relaxed);
     TEXT_DIM.store(palette.text_dim, Ordering::Relaxed);

@@ -17,6 +17,8 @@ pub(crate) struct RawRow {
     pub name: String,
     pub cpu: f32,
     pub mem: u64,
+    /// Read+write bytes per second (sysinfo's disk_usage delta).
+    pub disk: u64,
 }
 
 /// The window half the join attaches: the app_id the dock matches
@@ -37,6 +39,8 @@ pub(crate) struct ProcRow {
     pub name: String,
     pub cpu: f32,
     pub mem: u64,
+    /// Read+write bytes per second.
+    pub disk: u64,
     pub window: Option<WindowRef>,
 }
 
@@ -53,6 +57,8 @@ pub(crate) struct AppGroup {
     pub name: String,
     pub cpu: f32,
     pub mem: u64,
+    /// Read+write bytes per second across the members.
+    pub disk: u64,
     /// No member carries a window: session plumbing, summarized
     /// behind one line instead of a wall of daemon names.
     pub background: bool,
@@ -69,6 +75,8 @@ pub(crate) struct Snapshot {
     pub cpu_total: f32,
     pub mem_used: u64,
     pub mem_total: u64,
+    pub swap_used: u64,
+    pub swap_total: u64,
     pub rows: Vec<ProcRow>,
 }
 
@@ -129,6 +137,12 @@ impl Sampler {
                 // which bills zen's shared pages to every one of
                 // its forked content processes.
                 mem: private_mem(p.pid().as_u32(), p.memory()),
+                // read+write deltas, already computed by the refresh
+                // we were doing anyway
+                disk: {
+                    let usage = p.disk_usage();
+                    usage.read_bytes.saturating_add(usage.written_bytes)
+                },
             })
             .collect();
 
@@ -136,6 +150,8 @@ impl Sampler {
             cpu_total: self.system.global_cpu_usage(),
             mem_used: self.system.used_memory(),
             mem_total: self.system.total_memory(),
+            swap_used: self.system.used_swap(),
+            swap_total: self.system.total_swap(),
             rows: join(raw, windows),
         }
     }
@@ -221,6 +237,7 @@ pub(crate) fn join(raw: Vec<RawRow>, windows: &[NiriWindow]) -> Vec<ProcRow> {
                 name: row.name,
                 cpu: row.cpu,
                 mem: row.mem,
+                disk: row.disk,
                 window,
             }
         })
@@ -300,6 +317,7 @@ impl AppGroup {
         AppGroup {
             cpu: members.iter().map(|row| row.cpu).sum(),
             mem: members.iter().map(|row| row.mem).sum(),
+            disk: members.iter().map(|row| row.disk).sum(),
             background: !members.iter().any(|row| row.window.is_some()),
             has_focused: members
                 .iter()
@@ -329,26 +347,6 @@ pub(crate) fn sort_groups(groups: &mut [AppGroup], key: SortKey) {
         SortKey::Mem => groups.sort_by(|a, b| b.mem.cmp(&a.mem)),
         SortKey::Name => groups.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
         SortKey::Pid => groups.sort_by(|a, b| a.members[0].pid.cmp(&b.members[0].pid)),
-    }
-}
-
-/// The row's lead identity: the window's app when joined, the
-/// process name otherwise. The name sort runs on this, so a windowed
-/// process files under its app, not its binary.
-pub(crate) fn lead(row: &ProcRow) -> &str {
-    match &row.window {
-        Some(window) => window
-            .app_id
-            .as_deref()
-            .or_else(|| {
-                if window.title.is_empty() {
-                    None
-                } else {
-                    Some(window.title.as_str())
-                }
-            })
-            .unwrap_or(&row.name),
-        None => &row.name,
     }
 }
 
@@ -386,6 +384,7 @@ mod tests {
             name: name.to_string(),
             cpu: 0.,
             mem: 0,
+            disk: 0,
         }
     }
 
@@ -396,6 +395,7 @@ mod tests {
             name: name.to_string(),
             cpu,
             mem,
+            disk: 0,
             window: None,
         }
     }
@@ -407,6 +407,7 @@ mod tests {
             name: name.to_string(),
             cpu: 0.,
             mem: 0,
+            disk: 0,
             window: Some(WindowRef {
                 app_id: Some(app_id.to_string()),
                 title: format!("{app_id} title"),
@@ -458,8 +459,10 @@ mod tests {
         let mut zen = windowed(100, "zen", "zen", true);
         zen.cpu = 2.;
         zen.mem = 100;
+        zen.disk = 50;
         let mut helper = row(102, "zen-worker", 4., 300);
         helper.parent = Some(100);
+        helper.disk = 150;
         let mut groups = Vec::new();
         merge_groups(
             &mut groups,
@@ -471,6 +474,7 @@ mod tests {
         assert_eq!(group.members.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![100, 101, 102]);
         assert_eq!(group.cpu, 9.);
         assert_eq!(group.mem, 600);
+        assert_eq!(group.disk, 200);
         assert!(group.has_focused);
         assert!(!group.background);
     }
@@ -568,19 +572,5 @@ mod tests {
         assert_eq!(human_mem(0), "0.0 KiB");
         assert_eq!(human_mem(1024 * 1024 * 5), "5.0 MiB");
         assert_eq!(human_mem(1024 * 1024 * 1024 * 31), "31.0 GiB");
-    }
-
-    #[test]
-    fn lead_prefers_the_app_id_then_the_title() {
-        let mut row = windowed(1, "electron", "kuma-term", false);
-        assert_eq!(lead(&row), "kuma-term");
-        row.window = Some(WindowRef {
-            app_id: None,
-            title: "Some Window".into(),
-            focused: false,
-        });
-        assert_eq!(lead(&row), "Some Window");
-        row.window = None;
-        assert_eq!(lead(&row), "electron");
     }
 }

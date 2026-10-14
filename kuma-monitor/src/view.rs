@@ -10,16 +10,21 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    prelude::*, ClickEvent, Context, Div, IntoElement, Render, SharedString, Stateful,
+    prelude::*, relative, ClickEvent, Context, Div, IntoElement, Render, SharedString, Stateful,
     UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
 };
 
 use crate::niri;
 use crate::sample::{self, AppGroup, ProcRow, Sampler, Snapshot, SortKey};
+use crate::stats::{Stats, Vitals};
 use crate::theme;
 
 /// Two minutes of history at the 1s tick.
 const HISTORY: usize = 120;
+
+/// A group's disk suffix appears at or above this throughput; below
+/// it the identity line stays quiet.
+const DISK_SUFFIX_AT: u64 = 100 * 1024;
 
 /// The table's columns, one spec for the header and the rows: the
 /// same builder shapes both, so a value cannot drift off its title.
@@ -83,12 +88,23 @@ enum Item {
     },
     BgSummary {
         open: bool,
+        count: usize,
+        cpu: f32,
+        mem: u64,
     },
 }
 
 pub(crate) struct MonitorView {
     sampler: Sampler,
+    stats: Stats,
     history: Vec<f32>,
+    vitals: Vitals,
+    /// Per-core usage from the last beat, shown when the CPU card
+    /// opens.
+    core_usage: Vec<f32>,
+    show_cores: bool,
+    swap_used: u64,
+    swap_total: u64,
     /// The app groups, persistent across beats: existing groups keep
     /// their position, the dead drop out, first-seen apps join at the
     /// tail, and only a header click reorders any of it.
@@ -108,7 +124,13 @@ impl MonitorView {
     pub(crate) fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             sampler: Sampler::new(),
+            stats: Stats::new(),
             history: Vec::new(),
+            vitals: Vitals::default(),
+            core_usage: Vec::new(),
+            show_cores: false,
+            swap_used: 0,
+            swap_total: 0,
             groups: Vec::new(),
             expanded_apps: HashSet::new(),
             show_background: false,
@@ -182,6 +204,13 @@ impl MonitorView {
         }
         self.mem_used = snap.mem_used;
         self.mem_total = snap.mem_total;
+        self.swap_used = snap.swap_used;
+        self.swap_total = snap.swap_total;
+        let (vitals, cores) = self.stats.beat();
+        self.vitals = vitals;
+        if !cores.is_empty() {
+            self.core_usage = cores;
+        }
     }
 
     fn set_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
@@ -235,6 +264,9 @@ impl Render for MonitorView {
         if !background.is_empty() {
             items.push(Item::BgSummary {
                 open: self.show_background,
+                count: bg_count,
+                cpu: bg_cpu,
+                mem: bg_mem,
             });
         }
         if self.show_background {
@@ -257,6 +289,7 @@ impl Render for MonitorView {
             }
         }
         let count = items.len();
+        let total_procs: usize = self.groups.iter().map(|group| group.members.len()).sum();
         let groups = self.groups.clone();
         let this2 = this.clone();
 
@@ -267,7 +300,8 @@ impl Render for MonitorView {
             .bg(theme::bg())
             .text_color(theme::text())
             .text_size(px(13.))
-            .child(self.graph_panel(cpu_now))
+            .child(self.vitals_strip(cpu_now, &this))
+            .child(self.graph_panel())
             .child(
                 div()
                     .flex()
@@ -299,14 +333,157 @@ impl Render for MonitorView {
                         .track_scroll(&self.scroll),
                     ),
             )
-            .child(self.footer(bg_count, bg_cpu, bg_mem))
+            .child(self.footer(total_procs))
     }
 }
 
 impl MonitorView {
-    /// The top strip: totals on one line (dim labels, bright values),
-    /// the two-minute history under them as one quiet silhouette.
-    fn graph_panel(&self, cpu_now: f32) -> Div {
+    /// The vitals row: five quiet cards, label over value over
+    /// detail. The CPU card is the one click surface (it opens the
+    /// per-core row); the rest read and stay still.
+    fn vitals_strip(&self, cpu_now: f32, this: &WeakEntity<MonitorView>) -> Div {
+        let v = &self.vitals;
+        let mem_pct = if self.mem_total > 0 {
+            self.mem_used as f64 / self.mem_total as f64
+        } else {
+            0.
+        };
+        let psi_strained = v.psi.iter().flatten().copied().any(|p| p > 10.);
+        let psi_value = v
+            .psi
+            .iter()
+            .map(|p| match p {
+                Some(p) => format!("{p:.1}"),
+                None => "\u{2014}".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" \u{b7} ");
+
+        let cpu_card = self
+            .card(
+                "CPU",
+                format!("{cpu_now:.1}%"),
+                {
+                    let cores = self.core_usage.len();
+                    if cores > 0 {
+                        format!("{cores} cores")
+                    } else {
+                        String::new()
+                    }
+                },
+                false,
+            )
+            .id("card-cpu")
+            .on_click({
+                let this = this.clone();
+                move |_, _, app| {
+                    let _ = this.update(app, |this, cx| {
+                        this.show_cores = !this.show_cores;
+                        cx.notify();
+                    });
+                }
+            });
+        let mem_sub = if self.swap_total > 0 {
+            format!(
+                "swap {} / {}",
+                sample::human_mem(self.swap_used),
+                sample::human_mem(self.swap_total)
+            )
+        } else {
+            format!(
+                "{} / {}",
+                sample::human_mem(self.mem_used),
+                sample::human_mem(self.mem_total)
+            )
+        };
+        let mem_card = div().flex_1().flex().flex_col().gap_1()
+            .px_2()
+            .py_1()
+            .h(px(56.))
+            .bg(theme::surface())
+            .child(div().text_size(px(10.)).text_color(theme::text_dim()).child("MEM"))
+            .child(
+                div()
+                    .h(px(4.))
+                    .w_full()
+                    .bg(theme::inset())
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(mem_pct as f32))
+                            .bg(theme::accent()),
+                    ),
+            )
+            .child(div().text_size(px(11.)).child(mem_sub));
+
+        div()
+            .flex()
+            .gap_2()
+            .px_3()
+            .pt_2()
+            .pb_1()
+            .child(cpu_card)
+            .child(mem_card)
+            .child(self.card(
+                "DISK",
+                format!("R {}", rate(v.io_read)),
+                format!("W {}", rate(v.io_write)),
+                false,
+            ))
+            .child(self.card(
+                "NET",
+                format!("\u{2193} {}", rate(v.net_rx)),
+                format!("\u{2191} {}", rate(v.net_tx)),
+                false,
+            ))
+            .child(self.card(
+                "PRESSURE",
+                psi_value,
+                "cpu \u{b7} mem \u{b7} io".to_string(),
+                psi_strained,
+            ))
+    }
+
+    /// One vitals card: dim label, bright value (accent when the
+    /// metric is strained), dim detail line.
+    fn card(&self, label: &str, value: String, detail: String, hot: bool) -> Div {
+        let mut card = div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .h(px(56.))
+            .bg(theme::surface())
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(theme::text_dim())
+                    .child(label.to_string()),
+            );
+        if !value.is_empty() {
+            card = card.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(if hot {
+                        theme::accent()
+                    } else {
+                        theme::text()
+                    })
+                    .child(value),
+            );
+        }
+        if !detail.is_empty() {
+            card = card
+                .child(div().text_size(px(10.)).text_color(theme::text_dim()).child(detail));
+        }
+        card
+    }
+
+    /// The silhouette: the two-minute cpu history as one quiet line,
+    /// with the per-core row under it when the CPU card is open.
+    fn graph_panel(&self) -> Div {
         let bars = self
             .history
             .iter()
@@ -319,32 +496,29 @@ impl MonitorView {
                     .bg(theme::ghost())
             })
             .collect::<Vec<_>>();
-
-        div()
+        let mut panel = div()
             .px_3()
-            .pt_3()
             .pb_2()
             .flex()
             .flex_col()
-            .gap_2()
             .border_b_1()
             .border_color(theme::border())
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(div().child("CPU").text_color(theme::text_dim()))
-                    .child(format!("{cpu_now:.1}%"))
-                    .child(div().flex_1())
-                    .child("MEM")
-                    .text_color(theme::text_dim())
-                    .child(format!(
-                        "{} / {}",
-                        sample::human_mem(self.mem_used),
-                        sample::human_mem(self.mem_total)
-                    )),
-            )
-            .child(div().h(px(36.)).flex().items_end().children(bars))
+            .child(div().h(px(36.)).flex().items_end().children(bars));
+        if self.show_cores && !self.core_usage.is_empty() {
+            panel = panel.child(
+                div().h(px(18.)).mt_1().flex().items_end().children(
+                    self.core_usage.iter().map(|pct| {
+                        div().flex_1().flex().items_end().justify_center().child(
+                            div()
+                                .w(px(4.))
+                                .h(px((pct / 100. * 18.).clamp(1., 18.)))
+                                .bg(theme::ghost()),
+                        )
+                    }),
+                ),
+            );
+        }
+        panel
     }
 
     /// The column title, from the same Col spec the rows use: the
@@ -378,14 +552,16 @@ impl MonitorView {
         }
     }
 
-    /// The line under the table: the app and process counts on the
-    /// left, the build stamp on the right (which build this window
-    /// is: a monitor that cannot say its own build invites judging it
-    /// against the previous one).
-    fn footer(&self, processes: usize, _bg_cpu: f32, _bg_mem: u64) -> Div {
+    /// The line under the table: load and uptime on the left, the
+    /// app and process counts, the build stamp on the right (which
+    /// build this window is: a monitor that cannot say its own build
+    /// invites judging it against the previous one).
+    fn footer(&self, processes: usize) -> Div {
         let apps = self.groups.iter().filter(|g| !g.background).count();
+        let v = &self.vitals;
         div()
             .flex()
+            .items_center()
             .border_t_1()
             .border_color(theme::border())
             .py_1()
@@ -393,14 +569,16 @@ impl MonitorView {
             .text_size(px(11.))
             .text_color(theme::text_dim())
             .child(format!(
-                "{} apps \u{b7} {} processes",
-                apps, processes
+                "load {:.2} {:.2} {:.2} \u{b7} up {}",
+                v.load[0], v.load[1], v.load[2],
+                human_uptime(v.uptime_secs)
             ))
+            .child(div().flex_1())
+            .child(format!("{apps} apps \u{b7} {processes} processes"))
             .child(
                 div()
-                    .flex_1()
+                    .pl_3()
                     .text_size(px(10.))
-                    .text_color(theme::text_dim())
                     .child(crate::version_line()),
             )
     }
@@ -436,7 +614,12 @@ fn list_item(
             dim,
         } => group_row(&groups[*index], key, *open, *dim, this),
         Item::Member { group, member } => member_row(&groups[*group].members[*member]),
-        Item::BgSummary { open } => background_row(*open, this),
+        Item::BgSummary {
+            open,
+            count,
+            cpu,
+            mem,
+        } => background_row(*open, *count, *cpu, *mem, this),
     }
 }
 
@@ -465,6 +648,14 @@ fn group_row(
                 .truncate()
                 .text_color(theme::text_dim())
                 .child(format!("\u{b7} {} procs", group.members.len())),
+        );
+    }
+    if let Some(active) = disk_suffix(group.disk) {
+        name = name.child(
+            div()
+                .truncate()
+                .text_color(theme::text_dim())
+                .child(active),
         );
     }
     div()
@@ -510,7 +701,13 @@ fn group_row(
 /// The background summary: the session's plumbing, folded. Collapsed
 /// it counts (processes, their cpu and memory); expanded it offers
 /// the way back and the daemon rows beneath it.
-fn background_row(open: bool, this: &WeakEntity<MonitorView>) -> Stateful<Div> {
+fn background_row(
+    open: bool,
+    count: usize,
+    cpu: f32,
+    mem: u64,
+    this: &WeakEntity<MonitorView>,
+) -> Stateful<Div> {
     let this = this.clone();
     div()
         .id("bg-summary")
@@ -531,9 +728,17 @@ fn background_row(open: bool, this: &WeakEntity<MonitorView>) -> Stateful<Div> {
                     .flex_1()
                     .text_color(theme::text_dim())
                     .child(if open {
-                        "\u{25be} hide background processes".to_string()
+                        format!(
+                            "\u{25be} hide {} background processes \u{b7} {cpu:.1}% \u{b7} {}",
+                            count,
+                            sample::human_mem(mem)
+                        )
                     } else {
-                        "\u{25b8} background processes".to_string()
+                        format!(
+                            "\u{25b8} {} background processes \u{b7} {cpu:.1}% \u{b7} {}",
+                            count,
+                            sample::human_mem(mem)
+                        )
                     }),
                 Col::Name,
             )
@@ -607,6 +812,33 @@ fn member_lead(row: &ProcRow) -> String {
     match &row.window {
         Some(window) if !window.title.is_empty() => window.title.clone(),
         _ => row.name.clone(),
+    }
+}
+
+/// The identity's activity whisper: what the app is doing to the
+/// disk right now, shown only while it does enough to matter.
+fn disk_suffix(disk: u64) -> Option<String> {
+    (disk >= DISK_SUFFIX_AT)
+        .then(|| format!("\u{b7} {}/s", sample::human_mem(disk)))
+}
+
+/// Bytes per second at the table's width.
+fn rate(bps: f64) -> String {
+    format!("{}/s", sample::human_mem(bps.max(0.) as u64))
+}
+
+/// "3d 4h 12m", "4h 12m", "12m": the machine's age at a glance.
+fn human_uptime(secs: f64) -> String {
+    let secs = secs as u64;
+    let mins = (secs / 60) % 60;
+    let hours = (secs / 3600) % 24;
+    let days = secs / 86400;
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins}m")
     }
 }
 
@@ -699,6 +931,7 @@ mod tests {
             name: "electron".into(),
             cpu: 0.,
             mem: 0,
+            disk: 0,
             window: Some(sample::WindowRef {
                 app_id: Some("kuma-term".into()),
                 title: "main".into(),
@@ -711,6 +944,16 @@ mod tests {
         assert_eq!(member_lead(&row), "electron");
         row.window = None;
         assert_eq!(member_lead(&row), "electron");
+    }
+
+    #[test]
+    fn the_disk_suffix_whispers_only_when_busy() {
+        assert_eq!(disk_suffix(0), None);
+        assert_eq!(disk_suffix(200 * 1024), Some("\u{b7} 200.0 KiB/s".to_string()));
+        assert_eq!(rate(1.5 * 1024. * 1024.), "1.5 MiB/s".to_string());
+        assert_eq!(human_uptime(3. * 86400. + 4. * 3600. + 12. * 60.), "3d 4h 12m");
+        assert_eq!(human_uptime(4. * 3600. + 12. * 60.), "4h 12m");
+        assert_eq!(human_uptime(12. * 60.), "12m");
     }
 
     /// The proof the last rounds lacked: header and rows get their

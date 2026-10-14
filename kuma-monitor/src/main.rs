@@ -10,6 +10,7 @@ use gpui_platform::application;
 
 mod niri;
 mod sample;
+mod stats;
 mod theme;
 mod view;
 
