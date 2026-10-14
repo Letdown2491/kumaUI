@@ -3100,6 +3100,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kuma-platform"
+version = "0.1.0"
+
+[[package]]
 name = "kuma-shell"
 version = "0.3.0"
 dependencies = [
@@ -3135,6 +3139,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "gpui_wgpu",
+ "kuma-platform",
  "libc",
  "log",
  "rustc-hash 1.1.0",

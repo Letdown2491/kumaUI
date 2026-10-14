@@ -21,15 +21,11 @@ use gpui::{App, AppContext, TitlebarOptions, WindowBounds, WindowOptions, px, si
 use gpui_platform::application;
 
 /// The version line `--version` prints: the crate version plus the
-/// commit build.sh stamped in (option_env! falls back when cargo
-/// runs without the stamp), so a running instance pins to an exact
-/// build.
+/// commit build.sh stamped in, so a running instance pins to an exact
+/// build. The format lives in the platform crate; the version stays a
+/// call-site argument because it is this crate's.
 fn version_line() -> String {
-    format!(
-        "kuma-term {} (g{})",
-        env!("CARGO_PKG_VERSION"),
-        option_env!("KUMA_GIT_SHA").unwrap_or("unknown"),
-    )
+    kuma_platform::version::line("kuma-term", env!("CARGO_PKG_VERSION"))
 }
 
 fn main() {
@@ -147,29 +143,13 @@ mod tests {
         assert!(line.contains("(g"));
     }
 
-    /// The version the changelog's newest release section names for
-    /// the given app, or None when the section or the app's line is
-    /// missing. The three version lines sit at column 0 under the
-    /// heading; bullets start with a dash or a bracket, so a plain
-    /// prefix match reads only the header.
-    fn changelog_version(changelog: &str, app: &str) -> Option<String> {
-        let rest = changelog.split_once("\n## v")?.1;
-        let newest = rest.split("\n## ").next()?;
-        let prefix = format!("{app} ");
-        newest
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix(prefix.as_str()))
-            .map(str::trim)
-            .find(|v| !v.is_empty())
-            .map(str::to_string)
-    }
-
     #[test]
     fn the_changelog_names_this_version() {
-        // bumping Cargo.toml without writing the changelog fails here
+        // bumping Cargo.toml without writing the changelog fails here;
+        // the parser lives in the platform crate
         let md = include_str!("../../CHANGELOG.md");
         assert_eq!(
-            changelog_version(md, "kuma-term").as_deref(),
+            kuma_platform::version::changelog_version(md, "kuma-term").as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
     }
