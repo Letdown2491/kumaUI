@@ -908,9 +908,10 @@ fn group_row(
         )
 }
 
-/// The background summary: the session's plumbing, folded. Collapsed
-/// it counts (processes, their cpu and memory); expanded it offers
-/// the way back and the daemon rows beneath it.
+/// The background summary: the session's plumbing, folded. Built on
+/// the group row's anatomy (triangle at the same indent, the sums in
+/// the same columns as the headers they answer to), all of it dim:
+/// it is a footnote, not an app.
 fn background_row(
     open: bool,
     count: usize,
@@ -919,12 +920,23 @@ fn background_row(
     this: &WeakEntity<MonitorView>,
 ) -> Stateful<Div> {
     let this = this.clone();
+    let name = div()
+        .flex()
+        .gap_2()
+        .truncate()
+        .child(div().child(if open { "\u{25be}" } else { "\u{25b8}" }))
+        .child(
+            div()
+                .truncate()
+                .child(format!("{count} background processes")),
+        );
     div()
         .id("bg-summary")
         .h(px(26.))
         .w_full()
         .flex()
         .items_center()
+        .text_color(theme::text_dim())
         .debug_selector(|| "row-line".into())
         .on_click(move |_, _, app| {
             let _ = this.update(app, |this, cx| {
@@ -932,31 +944,10 @@ fn background_row(
                 cx.notify();
             });
         })
-        .child(
-            apply_spec(
-                div()
-                    .flex_1()
-                    .text_color(theme::text_dim())
-                    .child(if open {
-                        format!(
-                            "\u{25be} hide {} background processes \u{b7} {cpu:.1}% \u{b7} {}",
-                            count,
-                            sample::human_mem(mem)
-                        )
-                    } else {
-                        format!(
-                            "\u{25b8} {} background processes \u{b7} {cpu:.1}% \u{b7} {}",
-                            count,
-                            sample::human_mem(mem)
-                        )
-                    }),
-                Col::Name,
-            )
-            .pl(px(2.)),
-        )
+        .child(apply_spec(name.flex_1(), Col::Name))
         .child(apply_spec(div(), Col::Pid))
-        .child(apply_spec(div(), Col::Cpu))
-        .child(apply_spec(div(), Col::Mem))
+        .child(apply_spec(div().child(format!("{cpu:.1}")), Col::Cpu))
+        .child(apply_spec(div().child(sample::human_mem(mem)), Col::Mem))
 }
 
 /// A member row: the window's title when it has one (the app's name
