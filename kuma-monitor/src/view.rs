@@ -114,6 +114,10 @@ pub(crate) struct MonitorView {
     net_hist: Vec<f32>,
     temp_hist: Vec<f32>,
     procs_hist: Vec<f32>,
+    /// Memory usage in percent, the mem card's sparkline: a fixed
+    /// 0-100 scale, since memory's moves are too small for
+    /// peak-scaling to tell the truth about.
+    mem_hist: Vec<f32>,
     /// Per-core usage from the last beat, shown when the CPU card
     /// opens.
     core_usage: Vec<f32>,
@@ -146,6 +150,7 @@ impl MonitorView {
             net_hist: Vec::new(),
             temp_hist: Vec::new(),
             procs_hist: Vec::new(),
+            mem_hist: Vec::new(),
             core_usage: Vec::new(),
             show_cores: false,
             swap_used: 0,
@@ -237,6 +242,12 @@ impl MonitorView {
             push_hist(&mut self.temp_hist, temp, CARD_HIST);
         }
         push_hist(&mut self.procs_hist, vitals.procs_running as f32, CARD_HIST);
+        let mem_pct_now = if snap.mem_total > 0 {
+            snap.mem_used as f32 / snap.mem_total as f32 * 100.
+        } else {
+            0.
+        };
+        push_hist(&mut self.mem_hist, mem_pct_now, CARD_HIST);
         self.vitals = vitals;
         if !cores.is_empty() {
             self.core_usage = cores;
@@ -380,10 +391,15 @@ impl MonitorView {
 
         // -- row one: the processor's story, the cpu card the hero
         // at two columns wide (its sparkline earns the longer window
-        // that keeps bars from going fat), temp beside at one
+        // that keeps bars from going fat), temp beside at one. The
+        // basis of one gap keeps temp exactly one grid unit wide: a
+        // two-card row has one gap where a three-card row has two,
+        // and flex math would otherwise widen temp by the
+        // difference.
         let cpu_card = self
             .card_base("CPU")
             .flex_grow(2.)
+            .flex_basis(px(8.))
             .child(
                 div()
                     .text_size(px(14.))
@@ -523,20 +539,32 @@ impl MonitorView {
             )
             .debug_selector(|| "card-procs".into());
 
-        // -- row two: the memory and the wires
+        // -- row two: the memory and the wires. The memory card
+        // reads the same heights as its neighbors (value, spark,
+        // detail) with the bar folded into the value line, where it
+        // spans the leftover width like a headline's underline.
         let mem_card = self
             .card_base("MEM")
             .child(
                 div()
-                    .text_size(px(14.))
-                    .truncate()
-                    .debug_selector(|| "val-mem".into())
-                    .child(format!("{:.0}%", mem_pct * 100.)),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .truncate()
+                            .debug_selector(|| "val-mem".into())
+                            .child(format!("{:.0}%", mem_pct * 100.)),
+                    )
+                    .child(
+                        meter(mem_pct as f32, theme::accent(), Some("mem-fill"))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .debug_selector(|| "mem-track".into()),
+                    ),
             )
-            .child(
-                meter(mem_pct as f32, theme::accent(), Some("mem-fill"))
-                    .debug_selector(|| "mem-track".into()),
-            )
+            .child(self.spark(&self.mem_hist, Some(100.)))
             .child(
                 div()
                     .text_size(px(9.))
@@ -1286,6 +1314,7 @@ mod tests {
             view.disk_hist = vec![1.2e9; CARD_HIST];
             view.net_hist = vec![6.6e9; CARD_HIST];
             view.procs_hist = vec![3.; CARD_HIST];
+            view.mem_hist = vec![87.; CARD_HIST];
             cx.notify();
         });
         app.run_until_parked();
