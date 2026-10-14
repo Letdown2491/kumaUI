@@ -1,5 +1,5 @@
 [workspace]
-members = ["kuma-files", "kuma-platform", "kuma-shell", "kuma-term"]
+members = ["kuma-files", "kuma-monitor", "kuma-platform", "kuma-shell", "kuma-term"]
 exclude = ["vendor"]
 resolver = "2"
 
