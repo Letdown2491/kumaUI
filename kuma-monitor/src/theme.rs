@@ -13,7 +13,6 @@ use gpui::{Rgba, rgb, rgba};
 // picks it up, no restart, no gpui global plumbing.
 
 static BG: AtomicU32 = AtomicU32::new(0x14161a);
-static ROW: AtomicU32 = AtomicU32::new(0x1d2129);
 static ROW_SELECTED: AtomicU32 = AtomicU32::new(0x2d4260);
 static BORDER: AtomicU32 = AtomicU32::new(0x2a2f3a);
 static TEXT: AtomicU32 = AtomicU32::new(0xd8dce3);
@@ -26,9 +25,6 @@ fn get(slot: &AtomicU32) -> Rgba {
 
 pub(crate) fn bg() -> Rgba {
     get(&BG)
-}
-pub(crate) fn row() -> Rgba {
-    get(&ROW)
 }
 pub(crate) fn row_selected() -> Rgba {
     get(&ROW_SELECTED)
@@ -44,6 +40,11 @@ pub(crate) fn text_dim() -> Rgba {
 }
 pub(crate) fn accent() -> Rgba {
     get(&ACCENT)
+}
+/// The accent at a whisper: the graph's history fill, loud only as a
+/// shape, not as a color.
+pub(crate) fn ghost() -> Rgba {
+    rgba((ACCENT.load(Ordering::Relaxed) << 8) | 0x66)
 }
 pub(crate) fn clear() -> Rgba {
     rgba(0x00000000)
@@ -88,7 +89,6 @@ impl Default for Palette {
 /// table rows are cards, the focused row wears the selection color.
 pub(crate) fn apply_palette(palette: &Palette) {
     BG.store(palette.inset, Ordering::Relaxed);
-    ROW.store(palette.surface, Ordering::Relaxed);
     BORDER.store(palette.divider, Ordering::Relaxed);
     TEXT.store(palette.text, Ordering::Relaxed);
     TEXT_DIM.store(palette.text_dim, Ordering::Relaxed);

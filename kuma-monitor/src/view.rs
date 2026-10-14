@@ -15,8 +15,13 @@ use crate::theme;
 /// Two minutes of history at the 1s tick.
 const HISTORY: usize = 120;
 
-/// The window column's width, matching its header cell.
+/// The table's column spec, shared by the header and the rows so the
+/// two always line up: the same width and the same px_2 inside every
+/// cell, the numbers right-set in both.
+const PID_COL: f32 = 64.;
 const WINDOW_COL: f32 = 280.;
+const CPU_COL: f32 = 72.;
+const MEM_COL: f32 = 104.;
 
 pub(crate) struct MonitorView {
     sampler: Sampler,
@@ -141,18 +146,18 @@ impl Render for MonitorView {
 
 impl MonitorView {
     /// The top strip: totals on one line (dim labels, bright values),
-    /// the two-minute bar history under them.
+    /// the two-minute history under them as one quiet silhouette.
     fn graph_panel(&self, cpu_now: f32) -> Div {
         let bars = self
             .history
             .iter()
             .map(|pct| {
-                let height = (pct / 100. * 34.).clamp(1.5, 34.);
+                let height = (pct / 100. * 36.).clamp(2., 36.);
                 div()
                     .flex_1()
                     .h(px(height))
                     .min_w(px(1.))
-                    .bg(theme::accent())
+                    .bg(theme::ghost())
             })
             .collect::<Vec<_>>();
 
@@ -169,32 +174,48 @@ impl MonitorView {
                 div()
                     .flex()
                     .gap_2()
-                    .text_color(theme::text_dim())
                     .child(div().child("CPU").text_color(theme::text_dim()))
                     .child(format!("{cpu_now:.1}%"))
                     .child(div().flex_1())
-                    .child("MEM")
+                    .child("MEM").text_color(theme::text_dim())
                     .child(format!(
                         "{} / {}",
                         sample::human_mem(self.mem_used),
                         sample::human_mem(self.mem_total)
                     )),
             )
-            .child(div().h(px(36.)).flex().items_end().gap(px(1.)).children(bars))
+            .child(div().h(px(36.)).flex().items_end().children(bars))
     }
 
-    /// The column titles. The sortable ones are clicks (the active
-    /// one wears the accent); WINDOW has no sort of its own yet and
-    /// stays an honest label.
+    /// The column titles, sharing the rows' exact column spec: the
+    /// same widths, the same px_2, the same right-setting. The
+    /// sortable ones are clicks (the active one wears the accent);
+    /// WINDOW has no sort of its own yet and stays an honest label.
     fn header(&self, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
             .items_center()
-            .px_1()
             .border_b_1()
             .border_color(theme::border())
-            .child(self.sort_cell("col-pid", "PID", SortKey::Pid, Some(60.), cx))
-            .child(self.sort_cell("col-name", "NAME", SortKey::Name, None, cx))
+            .child(self.sort_cell("col-pid", "PID", SortKey::Pid, PID_COL, true, cx))
+            .child({
+                let active = self.sort == SortKey::Name;
+                div()
+                    .id("col-name")
+                    .flex_1()
+                    .py_1()
+                    .px_2()
+                    .text_size(px(11.))
+                    .text_color(if active {
+                        theme::accent()
+                    } else {
+                        theme::text_dim()
+                    })
+                    .on_click(cx.listener(|this, _click: &ClickEvent, _, cx| {
+                        this.set_sort(SortKey::Name, cx);
+                    }))
+                    .child("NAME")
+            })
             .child(
                 div()
                     .w(px(WINDOW_COL))
@@ -204,8 +225,8 @@ impl MonitorView {
                     .text_color(theme::text_dim())
                     .child("WINDOW"),
             )
-            .child(self.sort_cell("col-cpu", "CPU%", SortKey::Cpu, Some(72.), cx))
-            .child(self.sort_cell("col-mem", "MEM", SortKey::Mem, Some(100.), cx))
+            .child(self.sort_cell("col-cpu", "CPU%", SortKey::Cpu, CPU_COL, true, cx))
+            .child(self.sort_cell("col-mem", "MEM", SortKey::Mem, MEM_COL, true, cx))
     }
 
     fn sort_cell(
@@ -213,12 +234,14 @@ impl MonitorView {
         id: &'static str,
         label: &'static str,
         key: SortKey,
-        width: Option<f32>,
+        width: f32,
+        right: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let active = self.sort == key;
         let cell = div()
             .id(id)
+            .w(px(width))
             .py_1()
             .px_2()
             .text_size(px(11.))
@@ -231,32 +254,21 @@ impl MonitorView {
                 this.set_sort(key, cx);
             }))
             .child(label);
-        match width {
-            Some(w) => cell.w(px(w)),
-            None => cell.flex_1(),
+        if right {
+            cell.flex().justify_end()
+        } else {
+            cell
         }
     }
 }
 
-/// One table row: numbers right-set in their columns, the window
-/// column carrying app_id (bright) and title (dim), the focused
-/// window's row wearing the palette's selection color.
+/// One table row, the header's column spec verbatim: same widths,
+/// same px_2, same right-setting, so a value sits exactly under its
+/// title. One highlight only: the focused window's row. Zebra
+/// striping and the rest of the decoration went to the calm of a
+/// plain table.
 fn row_view(row: &ProcRow) -> Div {
     let focused = row.window.as_ref().is_some_and(|w| w.focused);
-    let base = div()
-        .h(px(24.))
-        .flex()
-        .items_center()
-        .px_1()
-        .bg(if focused {
-            theme::row_selected()
-        } else if row.pid % 2 == 0 {
-            theme::row()
-        } else {
-            theme::clear()
-        });
-
-    let name_cell = div().flex_1().truncate().px_2().child(row.name.clone());
 
     let window_cell = match &row.window {
         Some(window) => div()
@@ -281,22 +293,45 @@ fn row_view(row: &ProcRow) -> Div {
                     .text_color(theme::text_dim())
                     .child(format!("· {}", window.title)),
             ),
-        None => div().w(px(WINDOW_COL)).px_2().text_color(theme::text_dim()).child("-"),
+        None => div()
+            .w(px(WINDOW_COL))
+            .px_2()
+            .text_color(theme::text_dim())
+            .child("-"),
     };
 
-    base.child(div().w(px(60.)).flex().justify_end().text_color(theme::text_dim()).child(row.pid.to_string()))
-        .child(name_cell)
+    div()
+        .h(px(26.))
+        .flex()
+        .items_center()
+        .bg(if focused {
+            theme::row_selected()
+        } else {
+            theme::clear()
+        })
+        .child(
+            div()
+                .w(px(PID_COL))
+                .px_2()
+                .flex()
+                .justify_end()
+                .text_color(theme::text_dim())
+                .child(row.pid.to_string()),
+        )
+        .child(div().flex_1().px_2().truncate().child(row.name.clone()))
         .child(window_cell)
         .child(
             div()
-                .w(px(72.))
+                .w(px(CPU_COL))
+                .px_2()
                 .flex()
                 .justify_end()
-                .child(format!("{:>6.1}", row.cpu)),
+                .child(format!("{:.1}", row.cpu)),
         )
         .child(
             div()
-                .w(px(100.))
+                .w(px(MEM_COL))
+                .px_2()
                 .flex()
                 .justify_end()
                 .text_color(theme::text_dim())
