@@ -3,6 +3,7 @@
 //! per-core cpu. Every source is one small file read per beat, and
 //! the parsers are pure so the tests can pin them.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 /// One beat of the machine's state, at the same 1s tick as the table.
@@ -20,12 +21,18 @@ pub(crate) struct Vitals {
     pub net_tx: f64,
     pub io_read: f64,
     pub io_write: f64,
+    /// The cpu's temperature in degrees celsius. None where no
+    /// known sensor chip exists (containers, some VMs).
+    pub cpu_temp: Option<f32>,
 }
 
 pub(crate) struct Stats {
     net: Option<Counters>,
     io: Option<Counters>,
     cores: Vec<(u64, u64)>,
+    /// The hwmon chip to read the temperature from, discovered once:
+    /// the sensor does not move between beats.
+    temp_chip: Option<PathBuf>,
     last: Instant,
 }
 
@@ -41,6 +48,7 @@ impl Stats {
             net: None,
             io: None,
             cores: Vec::new(),
+            temp_chip: discover_temp_chip(),
             last: Instant::now(),
         }
     }
@@ -63,6 +71,7 @@ impl Stats {
             read_pressure("/proc/pressure/memory"),
             read_pressure("/proc/pressure/io"),
         ];
+        let cpu_temp = self.temp_chip.as_ref().and_then(|chip| read_temp(chip));
 
         let net = std::fs::read_to_string("/proc/net/dev")
             .as_deref()
@@ -95,6 +104,7 @@ impl Stats {
                 net_tx,
                 io_read,
                 io_write,
+                cpu_temp,
             },
             core_usage,
         )
@@ -179,6 +189,45 @@ fn parse_pressure(text: &str) -> Option<f32> {
 
 fn read_pressure(path: &str) -> Option<f32> {
     parse_pressure(&std::fs::read_to_string(path).ok()?)
+}
+
+/// The cpu's sensor chip under /sys/class/hwmon: k10temp or zenpower
+/// (AMD), coretemp (Intel), cpu_thermal (ARM boards). The names are
+/// the kernel's stable drivers; anything else is not the package
+/// sensor and would read a nvme drive or a motherboard chipset.
+fn discover_temp_chip() -> Option<PathBuf> {
+    for entry in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
+        let name = std::fs::read_to_string(entry.path().join("name")).ok()?;
+        if matches!(
+            name.trim(),
+            "k10temp" | "zenpower" | "coretemp" | "cpu_thermal"
+        ) {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// The hottest input of the chip, in degrees celsius. coretemp
+/// exposes one input per core plus a package: the max is the one
+/// that throttles.
+fn read_temp(chip: &std::path::Path) -> Option<f32> {
+    let mut hottest = None;
+    for entry in std::fs::read_dir(chip).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("temp") || !name.ends_with("_input") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(milli) = text.trim().parse::<f32>() else {
+            continue;
+        };
+        hottest = Some(hottest.map_or(milli, |best: f32| best.max(milli)));
+    }
+    hottest.map(|milli| milli / 1000.)
 }
 
 /// Summed rx/tx byte counters over every interface but lo.
@@ -303,6 +352,11 @@ mod tests {
         assert!(vitals.net_rx >= 0. && vitals.net_tx >= 0.);
         assert!(vitals.io_read >= 0. && vitals.io_write >= 0.);
         assert!(vitals.psi.iter().all(|p| p.is_none_or(|v| v >= 0.)));
+        // a sensor may or may not exist here (the build container has
+        // no hwmon); when it does it reads like a temperature
+        assert!(vitals
+            .cpu_temp
+            .is_none_or(|t| (0. ..=150.).contains(&t)));
         // the first beat has no delta baseline: usage comes empty,
         // like the throughput rates
         assert!(cores.is_empty());

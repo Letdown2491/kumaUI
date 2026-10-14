@@ -19,9 +19,6 @@ use crate::sample::{self, AppGroup, ProcRow, Sampler, Snapshot, SortKey};
 use crate::stats::{Stats, Vitals};
 use crate::theme;
 
-/// Two minutes of history at the 1s tick.
-const HISTORY: usize = 120;
-
 /// A card sparkline's window: forty seconds of the recent past.
 const CARD_HIST: usize = 40;
 
@@ -106,9 +103,11 @@ pub(crate) struct MonitorView {
     history: Vec<f32>,
     vitals: Vitals,
     /// The cards' own windows: disk and network throughput, recent
-    /// past, for their sparklines.
+    /// past, for their sparklines. The temperature joins only while a
+    /// sensor exists.
     disk_hist: Vec<f32>,
     net_hist: Vec<f32>,
+    temp_hist: Vec<f32>,
     /// Per-core usage from the last beat, shown when the CPU card
     /// opens.
     core_usage: Vec<f32>,
@@ -139,6 +138,7 @@ impl MonitorView {
             vitals: Vitals::default(),
             disk_hist: Vec::new(),
             net_hist: Vec::new(),
+            temp_hist: Vec::new(),
             core_usage: Vec::new(),
             show_cores: false,
             swap_used: 0,
@@ -210,10 +210,7 @@ impl MonitorView {
             sample::merge_groups(&mut self.groups, snap.rows);
         }
 
-        self.history.push(snap.cpu_total);
-        if self.history.len() > HISTORY {
-            self.history.remove(0);
-        }
+        push_hist(&mut self.history, snap.cpu_total);
         self.mem_used = snap.mem_used;
         self.mem_total = snap.mem_total;
         self.swap_used = snap.swap_used;
@@ -221,6 +218,9 @@ impl MonitorView {
         let (vitals, cores) = self.stats.beat();
         push_hist(&mut self.disk_hist, (vitals.io_read + vitals.io_write) as f32);
         push_hist(&mut self.net_hist, (vitals.net_rx + vitals.net_tx) as f32);
+        if let Some(temp) = vitals.cpu_temp {
+            push_hist(&mut self.temp_hist, temp);
+        }
         self.vitals = vitals;
         if !cores.is_empty() {
             self.core_usage = cores;
@@ -314,8 +314,7 @@ impl Render for MonitorView {
             .bg(theme::bg())
             .text_color(theme::text())
             .text_size(px(13.))
-            .child(self.vitals_strip(cpu_now, &this))
-            .child(self.graph_panel())
+            .child(self.vitals_area(cpu_now, &this))
             .child(
                 div()
                     .flex()
@@ -355,7 +354,7 @@ impl MonitorView {
     /// The vitals row: five quiet cards, label over value over
     /// detail. The CPU card is the one click surface (it opens the
     /// per-core row); the rest read and stay still.
-    fn vitals_strip(&self, cpu_now: f32, this: &WeakEntity<MonitorView>) -> Div {
+    fn vitals_area(&self, cpu_now: f32, this: &WeakEntity<MonitorView>) -> Div {
         let v = &self.vitals;
         let mem_pct = if self.mem_total > 0 {
             self.mem_used as f64 / self.mem_total as f64
@@ -363,16 +362,17 @@ impl MonitorView {
             0.
         };
 
+        // -- row one: the processor's story (load, heat, strain)
         let cpu_card = self
             .card_base("CPU")
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(px(14.))
                     .truncate()
                     .debug_selector(|| "val-cpu".into())
                     .child(format!("{cpu_now:.1}%")),
             )
-            .child(self.spark(&self.history))
+            .child(self.spark(&self.history, None))
             .child(
                 div()
                     .text_size(px(9.))
@@ -381,7 +381,7 @@ impl MonitorView {
                     .child({
                         let cores = self.core_usage.len();
                         if cores > 0 {
-                            format!("{cores} cores")
+                            format!("{cores} cores \u{b7} click for each")
                         } else {
                             " ".to_string()
                         }
@@ -399,11 +399,58 @@ impl MonitorView {
             })
             .debug_selector(|| "card-cpu".into());
 
+        let temp_card = self
+            .card_base("TEMP")
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .truncate()
+                    .child(match v.cpu_temp {
+                        Some(t) => format!("{t:.1}\u{b0}C"),
+                        None => "\u{2014}".to_string(),
+                    }),
+            )
+            .children((!self.temp_hist.is_empty()).then(|| self.spark(&self.temp_hist, Some(100.))))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .truncate()
+                    .child({
+                        match (&v.cpu_temp, self.temp_hist.len() < CARD_HIST) {
+                            (Some(_), true) => "warming the sparkline".to_string(),
+                            (Some(_), false) => "package sensor".to_string(),
+                            (None, _) => "no sensor found".to_string(),
+                        }
+                    }),
+            )
+            .debug_selector(|| "card-temp".into());
+
+        // pressure: one slim meter per resource, the fill lit when
+        // that resource is the one straining
+        let mut psi_card = self.card_base("PRESSURE");
+        if v.psi.iter().all(Option::is_none) {
+            psi_card = psi_card.child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .child("not exposed by this kernel"),
+            );
+        } else {
+            psi_card = psi_card.child(
+                div().flex().flex_col().gap_1().justify_center().h_full().children(
+                    PSI_ROWS.map(|(name, slot)| psi_row(name, v.psi[slot])),
+                ),
+            );
+        }
+        let psi_card = psi_card.debug_selector(|| "card-psi".into());
+
+        // -- row two: the memory and the wires
         let mem_card = self
             .card_base("MEM")
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(px(14.))
                     .truncate()
                     .debug_selector(|| "val-mem".into())
                     .child(format!("{:.0}%", mem_pct * 100.)),
@@ -425,7 +472,10 @@ impl MonitorView {
                             sample::human_mem(self.mem_total)
                         );
                         if self.swap_total > 0 {
-                            text.push_str(&format!(" \u{b7} swap {}", sample::human_mem(self.swap_used)));
+                            text.push_str(&format!(
+                                " \u{b7} swap {}",
+                                sample::human_mem(self.swap_used)
+                            ));
                         }
                         text
                     }),
@@ -436,12 +486,12 @@ impl MonitorView {
             .card_base("DISK")
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(px(14.))
                     .truncate()
                     .debug_selector(|| "val-disk".into())
                     .child(rate(v.io_read + v.io_write)),
             )
-            .child(self.spark(&self.disk_hist))
+            .child(self.spark(&self.disk_hist, None))
             .child(
                 div()
                     .text_size(px(9.))
@@ -459,12 +509,12 @@ impl MonitorView {
             .card_base("NET")
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(px(14.))
                     .truncate()
                     .debug_selector(|| "val-net".into())
                     .child(rate(v.net_rx + v.net_tx)),
             )
-            .child(self.spark(&self.net_hist))
+            .child(self.spark(&self.net_hist, None))
             .child(
                 div()
                     .text_size(px(9.))
@@ -478,35 +528,57 @@ impl MonitorView {
             )
             .debug_selector(|| "card-net".into());
 
-        // pressure: one slim meter per resource, the fill lit when
-        // that resource is the one straining
-        let mut psi_card = self.card_base("PRESSURE");
-        if v.psi.iter().all(Option::is_none) {
-            psi_card = psi_card.child(
-                div()
-                    .text_size(px(9.))
-                    .text_color(theme::text_dim())
-                    .child("not exposed by this kernel"),
-            );
-        } else {
-            for (name, p) in PSI_ROWS.map(|(n, i)| (n, v.psi[i])) {
-                psi_card = psi_card.child(psi_row(name, p));
-            }
-        }
-        let psi_card = psi_card.debug_selector(|| "card-psi".into());
-
         div()
             .flex()
+            .flex_col()
             .gap_2()
             .px_3()
             .pt_2()
             .pb_2()
-            .debug_selector(|| "vitals-strip".into())
-            .child(cpu_card)
-            .child(mem_card)
-            .child(disk_card)
-            .child(net_card)
-            .child(psi_card)
+            .border_b_1()
+            .border_color(theme::border())
+            .debug_selector(|| "vitals-area".into())
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .debug_selector(|| "vitals-strip".into())
+                    .child(cpu_card)
+                    .child(temp_card)
+                    .child(psi_card),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .debug_selector(|| "vitals-strip-2".into())
+                    .child(mem_card)
+                    .child(disk_card)
+                    .child(net_card),
+            )
+            .children((self.show_cores && !self.core_usage.is_empty()).then(|| self.cores_row()))
+    }
+
+    /// The per-core drop-down: one thin bar per core, under the
+    /// strip, opened by clicking the CPU card.
+    fn cores_row(&self) -> Div {
+        div()
+            .h(px(20.))
+            .flex()
+            .items_end()
+            .children(self.core_usage.iter().map(|pct| {
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_end()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(4.))
+                            .h(px((pct / 100. * 18.).clamp(1., 18.)))
+                            .bg(theme::ghost()),
+                    )
+            }))
     }
 
     /// One vitals card's frame: rounded, hairline border, dim label,
@@ -522,7 +594,7 @@ impl MonitorView {
             .gap_1()
             .px_2()
             .py_2()
-            .h(px(84.))
+            .h(px(96.))
             .bg(theme::surface())
             .border_1()
             .border_color(theme::border())
@@ -536,63 +608,25 @@ impl MonitorView {
     }
 
     /// A micro history: the last CARD_HIST samples as one quiet line
-    /// of bars, scaled to the window's own peak (never the global
-    /// 100%, or an idle line would be invisible).
-    fn spark(&self, history: &[f32]) -> Div {
+    /// of bars. Scaled to the window's own peak (never the global
+    /// 100%, or an idle line would be invisible) unless a fixed
+    /// ceiling is given, as the temperature needs: its drama lives in
+    /// single degrees, and peak-scaling would lie about the slope.
+    fn spark(&self, history: &[f32], ceiling: Option<f32>) -> Div {
         let start = history.len().saturating_sub(CARD_HIST);
         let window = &history[start..];
-        let peak = window.iter().copied().fold(1.0_f32, f32::max);
+        let peak = ceiling.unwrap_or_else(|| window.iter().copied().fold(1.0_f32, f32::max));
         let bars = window
             .iter()
             .map(|v| {
                 div()
                     .flex_1()
                     .min_w(px(1.))
-                    .h(px((v / peak * 16.).clamp(1., 16.)))
+                    .h(px((v / peak * 18.).clamp(1., 18.)))
                     .bg(theme::ghost())
             })
             .collect::<Vec<_>>();
-        div().h(px(16.)).w_full().flex().items_end().children(bars)
-    }
-
-    /// The silhouette: the two-minute cpu history as one quiet line,
-    /// with the per-core row under it when the CPU card is open.
-    fn graph_panel(&self) -> Div {
-        let bars = self
-            .history
-            .iter()
-            .map(|pct| {
-                let height = (pct / 100. * 36.).clamp(2., 36.);
-                div()
-                    .flex_1()
-                    .h(px(height))
-                    .min_w(px(1.))
-                    .bg(theme::ghost())
-            })
-            .collect::<Vec<_>>();
-        let mut panel = div()
-            .px_3()
-            .pb_2()
-            .flex()
-            .flex_col()
-            .border_b_1()
-            .border_color(theme::border())
-            .child(div().h(px(36.)).flex().items_end().children(bars));
-        if self.show_cores && !self.core_usage.is_empty() {
-            panel = panel.child(
-                div().h(px(18.)).mt_1().flex().items_end().children(
-                    self.core_usage.iter().map(|pct| {
-                        div().flex_1().flex().items_end().justify_center().child(
-                            div()
-                                .w(px(4.))
-                                .h(px((pct / 100. * 18.).clamp(1., 18.)))
-                                .bg(theme::ghost()),
-                        )
-                    }),
-                ),
-            );
-        }
-        panel
+        div().h(px(18.)).w_full().flex().items_end().children(bars)
     }
 
     /// The column title, from the same Col spec the rows use: the
@@ -1138,10 +1172,12 @@ mod tests {
             view.vitals.io_read = 1.2e9;
             view.vitals.io_write = 4096.;
             view.vitals.psi = [Some(99.9), Some(50.), None];
+            view.vitals.cpu_temp = Some(99.9);
             view.mem_used = view.mem_total;
             view.swap_used = 8 * 1024 * 1024 * 1024;
             view.swap_total = view.swap_used;
-            view.history = vec![87.; HISTORY];
+            view.history = vec![87.; CARD_HIST];
+            view.temp_hist = vec![95.; CARD_HIST];
             view.disk_hist = vec![1.2e9; CARD_HIST];
             view.net_hist = vec![6.6e9; CARD_HIST];
             cx.notify();
@@ -1153,23 +1189,39 @@ mod tests {
                     .debug_element_bounds(sel)
                     .unwrap_or_else(|| panic!("{sel} never painted"))
             };
-            let strip = probe("vitals-strip");
-            let cards: Vec<_> = ["card-cpu", "card-mem", "card-disk", "card-net", "card-psi"]
+            let rows: Vec<(String, _)> = ["vitals-strip", "vitals-strip-2"]
                 .iter()
                 .map(|sel| (sel.to_string(), probe(sel)))
                 .collect();
+            // (card selector, its row selector, bounds)
+            let cards: Vec<(String, String, _)> = [
+                ("card-cpu", "vitals-strip"),
+                ("card-temp", "vitals-strip"),
+                ("card-psi", "vitals-strip"),
+                ("card-mem", "vitals-strip-2"),
+                ("card-disk", "vitals-strip-2"),
+                ("card-net", "vitals-strip-2"),
+            ]
+            .iter()
+            .map(|(card, row)| (card.to_string(), row.to_string(), probe(card)))
+            .collect();
             let track = probe("mem-track");
             let fill = probe("mem-fill");
-            (strip, cards, track, fill)
+            (rows, cards, track, fill)
         });
-        let (strip, cards, track, fill) = bounds;
-        for (sel, card) in &cards {
+        let (rows, cards, track, fill) = bounds;
+        for (sel, row_sel, card) in &cards {
+            let row = &rows
+                .iter()
+                .find(|(probe_sel, _)| probe_sel == row_sel)
+                .unwrap()
+                .1;
             assert!(
-                card.origin.x >= strip.origin.x - px(0.5)
+                card.origin.x >= row.origin.x - px(0.5)
                     && card.size.width + card.origin.x
-                        <= strip.size.width + strip.origin.x + px(0.5)
-                    && card.size.height <= strip.size.height + px(0.5),
-                "{sel} escaped the strip: card {card:?} in strip {strip:?}"
+                        <= row.size.width + row.origin.x + px(0.5)
+                    && card.size.height <= row.size.height + px(0.5),
+                "{sel} escaped {row_sel}: card {card:?} in row {row:?}"
             );
         }
         // full: the fill is the whole track
