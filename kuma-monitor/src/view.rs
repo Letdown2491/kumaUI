@@ -1,15 +1,23 @@
 //! The spike's one view: a CPU graph over the last two minutes, the
-//! memory line, a sortable header, and the joined process list. The
-//! look is the house's: the shell's published palette applied live,
-//! the wallpaper deciding the colors.
+//! memory line, and the table. The table leads with identity (the
+//! window when there is one, the process name when not), keeps its
+//! order stable while values tick (the order moves on a click, never
+//! on a beat), and folds the system's unwindowed long tail behind
+//! one summary line: the app's question is which window is eating
+//! the machine, and the answer should be visible in eight rows, not
+//! two hundred.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use gpui::{ClickEvent, Context, Div, IntoElement, Render, Stateful, UniformListScrollHandle, Window, div, px, uniform_list, prelude::*};
+use gpui::{
+    ClickEvent, Context, Div, IntoElement, Render, Stateful, UniformListScrollHandle, Window,
+    div, px, uniform_list, prelude::*,
+};
 
 use crate::niri;
-use crate::sample::{self, ProcRow, Sampler, SortKey};
+use crate::sample::{self, ProcRow, Sampler, Snapshot, SortKey};
 use crate::theme;
 
 /// Two minutes of history at the 1s tick.
@@ -18,8 +26,6 @@ const HISTORY: usize = 120;
 /// The table's column spec, shared by the header and the rows so the
 /// two always line up: the same width and the same px_2 inside every
 /// cell, the numbers right-set in both.
-const PID_COL: f32 = 64.;
-const WINDOW_COL: f32 = 280.;
 const CPU_COL: f32 = 72.;
 const MEM_COL: f32 = 104.;
 
@@ -28,6 +34,7 @@ pub(crate) struct MonitorView {
     history: Vec<f32>,
     rows: Vec<ProcRow>,
     sort: SortKey,
+    expanded: bool,
     mem_used: u64,
     mem_total: u64,
     palette_mtime: Option<SystemTime>,
@@ -41,6 +48,7 @@ impl MonitorView {
             history: Vec::new(),
             rows: Vec::new(),
             sort: SortKey::Cpu,
+            expanded: false,
             mem_used: 0,
             mem_total: 0,
             palette_mtime: None,
@@ -48,6 +56,7 @@ impl MonitorView {
         };
         view.sync_palette();
         view.beat(cx);
+        sample::sort_rows(&mut view.rows, view.sort);
 
         // The tick: sample, land, wait a second, again. The bar's
         // loop shape (kuma-shell/src/bar.rs): update-or-die, then the
@@ -90,15 +99,35 @@ impl MonitorView {
             Vec::new()
         });
         let snap = self.sampler.beat(&windows);
+        self.apply_snapshot(snap);
+        cx.notify();
+    }
+
+    /// Land a beat. Values move in place; the order only moves when
+    /// the user clicks a header. A table that reshuffles every second
+    /// cannot be read, and a hog announces itself by its number, not
+    /// by jumping rows.
+    fn apply_snapshot(&mut self, snap: Snapshot) {
+        let mut fresh: HashMap<u32, ProcRow> =
+            snap.rows.into_iter().map(|row| (row.pid, row)).collect();
+        self.rows.retain_mut(|row| match fresh.remove(&row.pid) {
+            Some(new) => {
+                *row = new;
+                true
+            }
+            // the process died between beats
+            None => false,
+        });
+        // spawned since the last beat: they join at the section's
+        // tail, the next header click files them
+        self.rows.extend(fresh.into_values());
+
         self.history.push(snap.cpu_total);
         if self.history.len() > HISTORY {
             self.history.remove(0);
         }
         self.mem_used = snap.mem_used;
         self.mem_total = snap.mem_total;
-        self.rows = snap.rows;
-        sample::sort_rows(&mut self.rows, self.sort);
-        cx.notify();
     }
 
     fn set_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
@@ -111,8 +140,17 @@ impl MonitorView {
 impl Render for MonitorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let cpu_now = self.history.last().copied().unwrap_or(0.);
-        let rows = self.rows.clone();
-        let count = rows.len();
+        let (windowed, system): (Vec<ProcRow>, Vec<ProcRow>) = self
+            .rows
+            .clone()
+            .into_iter()
+            .partition(|row| row.window.is_some());
+        let list = if self.expanded {
+            self.rows.clone()
+        } else {
+            windowed
+        };
+        let count = list.len();
 
         div()
             .size_full()
@@ -135,12 +173,13 @@ impl Render for MonitorView {
                     .flex_col()
                     .child(
                         uniform_list("proc-rows", count, move |range, _, _| {
-                            rows[range.clone()].iter().map(row_view).collect()
+                            list[range.clone()].iter().map(row_view).collect()
                         })
                         .flex_1()
                         .track_scroll(&self.scroll),
                     ),
             )
+            .child(self.footer(&system, cx))
     }
 }
 
@@ -177,7 +216,8 @@ impl MonitorView {
                     .child(div().child("CPU").text_color(theme::text_dim()))
                     .child(format!("{cpu_now:.1}%"))
                     .child(div().flex_1())
-                    .child("MEM").text_color(theme::text_dim())
+                    .child("MEM")
+                    .text_color(theme::text_dim())
                     .child(format!(
                         "{} / {}",
                         sample::human_mem(self.mem_used),
@@ -188,45 +228,17 @@ impl MonitorView {
     }
 
     /// The column titles, sharing the rows' exact column spec: the
-    /// same widths, the same px_2, the same right-setting. The
-    /// sortable ones are clicks (the active one wears the accent);
-    /// WINDOW has no sort of its own yet and stays an honest label.
+    /// same widths, the same px_2, the same right-setting. All three
+    /// sort; the active one wears the accent.
     fn header(&self, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
             .items_center()
             .border_b_1()
             .border_color(theme::border())
-            .child(self.sort_cell("col-pid", "PID", SortKey::Pid, PID_COL, true, cx))
-            .child({
-                let active = self.sort == SortKey::Name;
-                div()
-                    .id("col-name")
-                    .flex_1()
-                    .py_1()
-                    .px_2()
-                    .text_size(px(11.))
-                    .text_color(if active {
-                        theme::accent()
-                    } else {
-                        theme::text_dim()
-                    })
-                    .on_click(cx.listener(|this, _click: &ClickEvent, _, cx| {
-                        this.set_sort(SortKey::Name, cx);
-                    }))
-                    .child("NAME")
-            })
-            .child(
-                div()
-                    .w(px(WINDOW_COL))
-                    .py_1()
-                    .px_2()
-                    .text_size(px(11.))
-                    .text_color(theme::text_dim())
-                    .child("WINDOW"),
-            )
-            .child(self.sort_cell("col-cpu", "CPU%", SortKey::Cpu, CPU_COL, true, cx))
-            .child(self.sort_cell("col-mem", "MEM", SortKey::Mem, MEM_COL, true, cx))
+            .child(self.sort_cell("col-name", "NAME", SortKey::Name, None, false, cx))
+            .child(self.sort_cell("col-cpu", "CPU%", SortKey::Cpu, Some(CPU_COL), true, cx))
+            .child(self.sort_cell("col-mem", "MEM", SortKey::Mem, Some(MEM_COL), true, cx))
     }
 
     fn sort_cell(
@@ -234,14 +246,13 @@ impl MonitorView {
         id: &'static str,
         label: &'static str,
         key: SortKey,
-        width: f32,
+        width: Option<f32>,
         right: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let active = self.sort == key;
         let cell = div()
             .id(id)
-            .w(px(width))
             .py_1()
             .px_2()
             .text_size(px(11.))
@@ -254,51 +265,96 @@ impl MonitorView {
                 this.set_sort(key, cx);
             }))
             .child(label);
+        let cell = match width {
+            Some(w) => cell.w(px(w)),
+            None => cell.flex_1(),
+        };
         if right {
             cell.flex().justify_end()
         } else {
             cell
         }
     }
+
+    /// The summary line under the table: the system's unwindowed long
+    /// tail, folded. Collapsed it counts (n processes, their cpu and
+    /// memory); expanded it offers the way back. One click, one
+    /// state, no second view.
+    fn footer(&self, system: &[ProcRow], cx: &mut Context<Self>) -> Stateful<Div> {
+        let cpu: f32 = system.iter().map(|row| row.cpu).sum();
+        let mem: u64 = system.iter().map(|row| row.mem).sum();
+        let label = if self.expanded {
+            "- hide the system's unwindowed processes".to_string()
+        } else {
+            format!(
+                "+ {} system processes \u{b7} {cpu:.1}% \u{b7} {}",
+                system.len(),
+                sample::human_mem(mem)
+            )
+        };
+        div()
+            .id("system-toggle")
+            .border_t_1()
+            .border_color(theme::border())
+            .py_1()
+            .px_3()
+            .text_size(px(11.))
+            .text_color(theme::text_dim())
+            .on_click(cx.listener(|this, _click: &ClickEvent, _, cx| {
+                this.expanded = !this.expanded;
+                cx.notify();
+            }))
+            .child(label)
+    }
 }
 
-/// One table row, the header's column spec verbatim: same widths,
-/// same px_2, same right-setting, so a value sits exactly under its
-/// title. One highlight only: the focused window's row. Zebra
-/// striping and the rest of the decoration went to the calm of a
-/// plain table.
+/// One table row, the header's column spec verbatim. Identity leads:
+/// the window's app and title when joined, the process name when not
+/// (dimmed: unwindowed rows are the expanded view's residents). The
+/// focused window's row is the single highlight.
 fn row_view(row: &ProcRow) -> Div {
     let focused = row.window.as_ref().is_some_and(|w| w.focused);
+    let unwindowed = row.window.is_none();
 
-    let window_cell = match &row.window {
-        Some(window) => div()
-            .w(px(WINDOW_COL))
-            .flex()
-            .gap_1()
-            .px_2()
-            .truncate()
-            .child(
-                div()
-                    .truncate()
-                    .text_color(if focused {
-                        theme::text()
-                    } else {
-                        theme::text_dim()
-                    })
-                    .child(window.app_id.clone().unwrap_or_else(|| "?".into())),
-            )
-            .child(
-                div()
-                    .truncate()
-                    .text_color(theme::text_dim())
-                    .child(format!("· {}", window.title)),
-            ),
-        None => div()
-            .w(px(WINDOW_COL))
-            .px_2()
-            .text_color(theme::text_dim())
-            .child("-"),
+    let (lead, suffix) = match &row.window {
+        Some(window) => {
+            let app = window.app_id.clone().unwrap_or_default();
+            let title = window.title.trim().to_string();
+            if title.is_empty() || title == app {
+                (if app.is_empty() { row.name.clone() } else { app }, String::new())
+            } else if app.is_empty() {
+                (title, String::new())
+            } else {
+                (app, format!("\u{b7} {title}"))
+            }
+        }
+        None => (row.name.clone(), String::new()),
     };
+
+    let mut name_cell = div()
+        .flex_1()
+        .px_3()
+        .flex()
+        .gap_2()
+        .truncate()
+        .child(
+            div()
+                .truncate()
+                .text_color(if unwindowed {
+                    theme::text_dim()
+                } else {
+                    theme::text()
+                })
+                .child(lead),
+        );
+    if !suffix.is_empty() {
+        name_cell = name_cell.child(
+            div()
+                .truncate()
+                .text_color(theme::text_dim())
+                .child(suffix),
+        );
+    }
 
     div()
         .h(px(26.))
@@ -309,17 +365,7 @@ fn row_view(row: &ProcRow) -> Div {
         } else {
             theme::clear()
         })
-        .child(
-            div()
-                .w(px(PID_COL))
-                .px_2()
-                .flex()
-                .justify_end()
-                .text_color(theme::text_dim())
-                .child(row.pid.to_string()),
-        )
-        .child(div().flex_1().px_2().truncate().child(row.name.clone()))
-        .child(window_cell)
+        .child(name_cell)
         .child(
             div()
                 .w(px(CPU_COL))

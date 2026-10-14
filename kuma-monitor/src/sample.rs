@@ -122,22 +122,40 @@ pub(crate) fn join(raw: Vec<RawRow>, windows: &[NiriWindow]) -> Vec<ProcRow> {
         .collect()
 }
 
+/// The row's lead identity: the window's app when joined, the
+/// process name otherwise. The name sort runs on this, so a windowed
+/// process files under its app, not its binary.
+pub(crate) fn lead(row: &ProcRow) -> &str {
+    match &row.window {
+        Some(window) => window
+            .app_id
+            .as_deref()
+            .or_else(|| {
+                if window.title.is_empty() {
+                    None
+                } else {
+                    Some(window.title.as_str())
+                }
+            })
+            .unwrap_or(&row.name),
+        None => &row.name,
+    }
+}
+
 /// The table's order. Cpu and Mem sort down (the hog first), Name
-/// and Pid sort up; a spike needs no direction toggle.
+/// sorts up; a spike needs no direction toggle.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum SortKey {
     Cpu,
     Mem,
     Name,
-    Pid,
 }
 
 pub(crate) fn sort_rows(rows: &mut [ProcRow], key: SortKey) {
     match key {
         SortKey::Cpu => rows.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)),
         SortKey::Mem => rows.sort_by(|a, b| b.mem.cmp(&a.mem)),
-        SortKey::Name => rows.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-        SortKey::Pid => rows.sort_by(|a, b| a.pid.cmp(&b.pid)),
+        SortKey::Name => rows.sort_by(|a, b| lead(a).to_lowercase().cmp(&lead(b).to_lowercase())),
     }
 }
 
@@ -225,6 +243,30 @@ mod tests {
         assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["A", "b", "c"]);
         sort_rows(&mut rows, SortKey::Mem);
         assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn lead_prefers_the_app_id_then_the_title() {
+        let mut row = ProcRow {
+            pid: 1,
+            name: "electron".into(),
+            cpu: 0.,
+            mem: 0,
+            window: Some(WindowRef {
+                app_id: Some("kuma-term".into()),
+                title: "kuma-term".into(),
+                focused: false,
+            }),
+        };
+        assert_eq!(lead(&row), "kuma-term");
+        row.window = Some(WindowRef {
+            app_id: None,
+            title: "Some Window".into(),
+            focused: false,
+        });
+        assert_eq!(lead(&row), "Some Window");
+        row.window = None;
+        assert_eq!(lead(&row), "electron");
     }
 
     /// A live beat in the build container: the sampler's own half of
