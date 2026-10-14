@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    prelude::*, relative, ClickEvent, Context, Div, IntoElement, Render, SharedString, Stateful,
+    prelude::*, ClickEvent, Context, Div, IntoElement, Render, Rgba, SharedString, Stateful,
     UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
 };
 
@@ -21,6 +21,12 @@ use crate::theme;
 
 /// Two minutes of history at the 1s tick.
 const HISTORY: usize = 120;
+
+/// A card sparkline's window: forty seconds of the recent past.
+const CARD_HIST: usize = 40;
+
+/// The pressure card's rows in display order: (label, psi slot).
+const PSI_ROWS: [(&str, usize); 3] = [("cpu", 0), ("mem", 1), ("io", 2)];
 
 /// A group's disk suffix appears at or above this throughput; below
 /// it the identity line stays quiet.
@@ -99,6 +105,10 @@ pub(crate) struct MonitorView {
     stats: Stats,
     history: Vec<f32>,
     vitals: Vitals,
+    /// The cards' own windows: disk and network throughput, recent
+    /// past, for their sparklines.
+    disk_hist: Vec<f32>,
+    net_hist: Vec<f32>,
     /// Per-core usage from the last beat, shown when the CPU card
     /// opens.
     core_usage: Vec<f32>,
@@ -127,6 +137,8 @@ impl MonitorView {
             stats: Stats::new(),
             history: Vec::new(),
             vitals: Vitals::default(),
+            disk_hist: Vec::new(),
+            net_hist: Vec::new(),
             core_usage: Vec::new(),
             show_cores: false,
             swap_used: 0,
@@ -207,6 +219,8 @@ impl MonitorView {
         self.swap_used = snap.swap_used;
         self.swap_total = snap.swap_total;
         let (vitals, cores) = self.stats.beat();
+        push_hist(&mut self.disk_hist, (vitals.io_read + vitals.io_write) as f32);
+        push_hist(&mut self.net_hist, (vitals.net_rx + vitals.net_tx) as f32);
         self.vitals = vitals;
         if !cores.is_empty() {
             self.core_usage = cores;
@@ -348,30 +362,30 @@ impl MonitorView {
         } else {
             0.
         };
-        let psi_strained = v.psi.iter().flatten().copied().any(|p| p > 10.);
-        let psi_value = v
-            .psi
-            .iter()
-            .map(|p| match p {
-                Some(p) => format!("{p:.1}"),
-                None => "\u{2014}".to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(" \u{b7} ");
 
         let cpu_card = self
-            .card(
-                "CPU",
-                format!("{cpu_now:.1}%"),
-                {
-                    let cores = self.core_usage.len();
-                    if cores > 0 {
-                        format!("{cores} cores")
-                    } else {
-                        String::new()
-                    }
-                },
-                false,
+            .card_base("CPU")
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .truncate()
+                    .debug_selector(|| "val-cpu".into())
+                    .child(format!("{cpu_now:.1}%")),
+            )
+            .child(self.spark(&self.history))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .truncate()
+                    .child({
+                        let cores = self.core_usage.len();
+                        if cores > 0 {
+                            format!("{cores} cores")
+                        } else {
+                            " ".to_string()
+                        }
+                    }),
             )
             .id("card-cpu")
             .on_click({
@@ -382,103 +396,163 @@ impl MonitorView {
                         cx.notify();
                     });
                 }
-            });
-        let mem_sub = if self.swap_total > 0 {
-            format!(
-                "swap {} / {}",
-                sample::human_mem(self.swap_used),
-                sample::human_mem(self.swap_total)
-            )
-        } else {
-            format!(
-                "{} / {}",
-                sample::human_mem(self.mem_used),
-                sample::human_mem(self.mem_total)
-            )
-        };
-        let mem_card = div().flex_1().flex().flex_col().gap_1()
-            .px_2()
-            .py_1()
-            .h(px(56.))
-            .bg(theme::surface())
-            .child(div().text_size(px(10.)).text_color(theme::text_dim()).child("MEM"))
+            })
+            .debug_selector(|| "card-cpu".into());
+
+        let mem_card = self
+            .card_base("MEM")
             .child(
                 div()
-                    .h(px(4.))
-                    .w_full()
-                    .bg(theme::inset())
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(mem_pct as f32))
-                            .bg(theme::accent()),
-                    ),
+                    .text_size(px(13.))
+                    .truncate()
+                    .debug_selector(|| "val-mem".into())
+                    .child(format!("{:.0}%", mem_pct * 100.)),
             )
-            .child(div().text_size(px(11.)).child(mem_sub));
+            .child(
+                meter(mem_pct as f32, theme::accent(), Some("mem-fill"))
+                    .debug_selector(|| "mem-track".into()),
+            )
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .truncate()
+                    .debug_selector(|| "sub-mem".into())
+                    .child({
+                        let mut text = format!(
+                            "{} / {}",
+                            sample::human_mem(self.mem_used),
+                            sample::human_mem(self.mem_total)
+                        );
+                        if self.swap_total > 0 {
+                            text.push_str(&format!(" \u{b7} swap {}", sample::human_mem(self.swap_used)));
+                        }
+                        text
+                    }),
+            )
+            .debug_selector(|| "card-mem".into());
+
+        let disk_card = self
+            .card_base("DISK")
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .truncate()
+                    .debug_selector(|| "val-disk".into())
+                    .child(rate(v.io_read + v.io_write)),
+            )
+            .child(self.spark(&self.disk_hist))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .truncate()
+                    .child(format!(
+                        "R {} \u{b7} W {}",
+                        rate(v.io_read),
+                        rate(v.io_write)
+                    )),
+            )
+            .debug_selector(|| "card-disk".into());
+
+        let net_card = self
+            .card_base("NET")
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .truncate()
+                    .debug_selector(|| "val-net".into())
+                    .child(rate(v.net_rx + v.net_tx)),
+            )
+            .child(self.spark(&self.net_hist))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .truncate()
+                    .child(format!(
+                        "\u{2193} {} \u{b7} \u{2191} {}",
+                        rate(v.net_rx),
+                        rate(v.net_tx)
+                    )),
+            )
+            .debug_selector(|| "card-net".into());
+
+        // pressure: one slim meter per resource, the fill lit when
+        // that resource is the one straining
+        let mut psi_card = self.card_base("PRESSURE");
+        if v.psi.iter().all(Option::is_none) {
+            psi_card = psi_card.child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .child("not exposed by this kernel"),
+            );
+        } else {
+            for (name, p) in PSI_ROWS.map(|(n, i)| (n, v.psi[i])) {
+                psi_card = psi_card.child(psi_row(name, p));
+            }
+        }
+        let psi_card = psi_card.debug_selector(|| "card-psi".into());
 
         div()
             .flex()
             .gap_2()
             .px_3()
             .pt_2()
-            .pb_1()
+            .pb_2()
+            .debug_selector(|| "vitals-strip".into())
             .child(cpu_card)
             .child(mem_card)
-            .child(self.card(
-                "DISK",
-                format!("R {}", rate(v.io_read)),
-                format!("W {}", rate(v.io_write)),
-                false,
-            ))
-            .child(self.card(
-                "NET",
-                format!("\u{2193} {}", rate(v.net_rx)),
-                format!("\u{2191} {}", rate(v.net_tx)),
-                false,
-            ))
-            .child(self.card(
-                "PRESSURE",
-                psi_value,
-                "cpu \u{b7} mem \u{b7} io".to_string(),
-                psi_strained,
-            ))
+            .child(disk_card)
+            .child(net_card)
+            .child(psi_card)
     }
 
-    /// One vitals card: dim label, bright value (accent when the
-    /// metric is strained), dim detail line.
-    fn card(&self, label: &str, value: String, detail: String, hot: bool) -> Div {
-        let mut card = div()
+    /// One vitals card's frame: rounded, hairline border, dim label,
+    /// overflow that can never escape (flex's automatic minimum would
+    /// otherwise let the content push the card past the strip).
+    fn card_base(&self, label: &str) -> Div {
+        div()
             .flex_1()
+            .min_w(px(0.))
+            .overflow_hidden()
             .flex()
             .flex_col()
             .gap_1()
             .px_2()
-            .py_1()
-            .h(px(56.))
+            .py_2()
+            .h(px(84.))
             .bg(theme::surface())
+            .border_1()
+            .border_color(theme::border())
+            .rounded_sm()
             .child(
                 div()
-                    .text_size(px(10.))
+                    .text_size(px(9.))
                     .text_color(theme::text_dim())
                     .child(label.to_string()),
-            );
-        if !value.is_empty() {
-            card = card.child(
+            )
+    }
+
+    /// A micro history: the last CARD_HIST samples as one quiet line
+    /// of bars, scaled to the window's own peak (never the global
+    /// 100%, or an idle line would be invisible).
+    fn spark(&self, history: &[f32]) -> Div {
+        let start = history.len().saturating_sub(CARD_HIST);
+        let window = &history[start..];
+        let peak = window.iter().copied().fold(1.0_f32, f32::max);
+        let bars = window
+            .iter()
+            .map(|v| {
                 div()
-                    .text_size(px(12.))
-                    .text_color(if hot {
-                        theme::accent()
-                    } else {
-                        theme::text()
-                    })
-                    .child(value),
-            );
-        }
-        if !detail.is_empty() {
-            card = card
-                .child(div().text_size(px(10.)).text_color(theme::text_dim()).child(detail));
-        }
-        card
+                    .flex_1()
+                    .min_w(px(1.))
+                    .h(px((v / peak * 16.).clamp(1., 16.)))
+                    .bg(theme::ghost())
+            })
+            .collect::<Vec<_>>();
+        div().h(px(16.)).w_full().flex().items_end().children(bars)
     }
 
     /// The silhouette: the two-minute cpu history as one quiet line,
@@ -827,6 +901,81 @@ fn rate(bps: f64) -> String {
     format!("{}/s", sample::human_mem(bps.max(0.) as u64))
 }
 
+/// A slim horizontal meter: the fill and the remainder split the
+/// track by flex-grow, so the fraction is layout-guaranteed and no
+/// width arithmetic can disagree with the parent. The fill can carry
+/// a debug selector for the bounds tests.
+fn meter(frac: f32, fill: Rgba, fill_sel: Option<&str>) -> Div {
+    let frac = frac.clamp(0., 1.);
+    let mut fill_div = div().h_full().flex_grow(frac).min_w(px(0.)).bg(fill);
+    if let Some(sel) = fill_sel {
+        fill_div = fill_div.debug_selector(move || sel.into());
+    }
+    div()
+        .h(px(5.))
+        .w_full()
+        .flex()
+        .bg(theme::inset())
+        .rounded_full()
+        .overflow_hidden()
+        .child(fill_div)
+        .child(div().h_full().flex_grow(1. - frac).min_w(px(0.)))
+}
+
+/// The pressure card's one row: a three-letter label, a meter whose
+/// fill lights when this resource stalls tasks, the avg10 figure.
+fn psi_row(name: &str, pressure: Option<f32>) -> Div {
+    let p = pressure.unwrap_or(0.);
+    let strained = p > 10.;
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .w(px(24.))
+                .text_size(px(9.))
+                .text_color(theme::text_dim())
+                .child(name.to_string()),
+        )
+        .child(
+            meter(
+                p / 100.,
+                if strained {
+                    theme::accent()
+                } else {
+                    theme::ghost()
+                },
+                None,
+            )
+            .flex_1()
+            .min_w(px(0.)),
+        )
+        .child(
+            div()
+                .w(px(28.))
+                .text_size(px(9.))
+                .text_color(if strained {
+                    theme::text()
+                } else {
+                    theme::text_dim()
+                })
+                .truncate()
+                .child(match pressure {
+                    Some(p) => format!("{p:.1}"),
+                    None => "\u{2014}".to_string(),
+                }),
+        )
+}
+
+/// Slide a sample into a card's history window.
+fn push_hist(buf: &mut Vec<f32>, value: f32) {
+    buf.push(value);
+    if buf.len() > CARD_HIST {
+        buf.remove(0);
+    }
+}
+
 /// "3d 4h 12m", "4h 12m", "12m": the machine's age at a glance.
 fn human_uptime(secs: f64) -> String {
     let secs = secs as u64;
@@ -954,6 +1103,102 @@ mod tests {
         assert_eq!(human_uptime(3. * 86400. + 4. * 3600. + 12. * 60.), "3d 4h 12m");
         assert_eq!(human_uptime(4. * 3600. + 12. * 60.), "4h 12m");
         assert_eq!(human_uptime(12. * 60.), "12m");
+    }
+
+    #[test]
+    fn the_card_histories_cap_at_their_window() {
+        let mut hist = Vec::new();
+        for sample in 0..60 {
+            push_hist(&mut hist, sample as f32);
+        }
+        assert_eq!(hist.len(), CARD_HIST);
+        assert_eq!(hist[0], (60 - CARD_HIST) as f32);
+        assert_eq!(hist[CARD_HIST - 1], 59.);
+    }
+
+    /// The overflow the first strip died of: cards that refused to
+    /// shrink below their text and a memory bar whose width arithmetic
+    /// disagreed with its track. Asserts the layout consequences in a
+    /// real painted window with absurd injected values: no card may
+    /// escape the strip, and the fill must be exactly the fraction of
+    /// its track at 100% and at a quarter.
+    #[test]
+    fn the_vitals_cards_hold_their_numbers() {
+        use std::sync::Arc;
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| MonitorView::new(window, cx));
+        app.run_until_parked();
+        window.update(|view, _, cx| {
+            view.vitals.net_rx = 3.7e9;
+            view.vitals.net_tx = 2.9e9;
+            view.vitals.io_read = 1.2e9;
+            view.vitals.io_write = 4096.;
+            view.vitals.psi = [Some(99.9), Some(50.), None];
+            view.mem_used = view.mem_total;
+            view.swap_used = 8 * 1024 * 1024 * 1024;
+            view.swap_total = view.swap_used;
+            view.history = vec![87.; HISTORY];
+            view.disk_hist = vec![1.2e9; CARD_HIST];
+            view.net_hist = vec![6.6e9; CARD_HIST];
+            cx.notify();
+        });
+        app.run_until_parked();
+        let bounds = window.update(|_, window, _| {
+            let probe = |sel: &str| {
+                window
+                    .debug_element_bounds(sel)
+                    .unwrap_or_else(|| panic!("{sel} never painted"))
+            };
+            let strip = probe("vitals-strip");
+            let cards: Vec<_> = ["card-cpu", "card-mem", "card-disk", "card-net", "card-psi"]
+                .iter()
+                .map(|sel| (sel.to_string(), probe(sel)))
+                .collect();
+            let track = probe("mem-track");
+            let fill = probe("mem-fill");
+            (strip, cards, track, fill)
+        });
+        let (strip, cards, track, fill) = bounds;
+        for (sel, card) in &cards {
+            assert!(
+                card.origin.x >= strip.origin.x - px(0.5)
+                    && card.size.width + card.origin.x
+                        <= strip.size.width + strip.origin.x + px(0.5)
+                    && card.size.height <= strip.size.height + px(0.5),
+                "{sel} escaped the strip: card {card:?} in strip {strip:?}"
+            );
+        }
+        // full: the fill is the whole track
+        assert!(
+            (fill.size.width - track.size.width).abs() < px(1.),
+            "fill at 100% is {:?} of track {:?}",
+            fill.size,
+            track.size
+        );
+        // a quarter: the fill is a quarter of the track
+        app.run_until_parked();
+        window.update(|view, _, cx| {
+            view.mem_used = view.mem_total / 4;
+            cx.notify();
+        });
+        app.run_until_parked();
+        let quarter = window.update(|_, window, _| {
+            let track = window.debug_element_bounds("mem-track").unwrap();
+            let fill = window.debug_element_bounds("mem-fill").unwrap();
+            (track, fill)
+        });
+        let (track, fill) = quarter;
+        assert!(
+            (fill.size.width - track.size.width / 4.).abs() < px(1.),
+            "fill at 25% is {:?} of track {:?}",
+            fill.size,
+            track.size
+        );
+        assert!(fill.size.width + fill.origin.x <= track.size.width + track.origin.x + px(0.5));
     }
 
     /// The proof the last rounds lacked: header and rows get their
