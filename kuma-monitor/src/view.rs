@@ -22,6 +22,10 @@ use crate::theme;
 /// A card sparkline's window: forty seconds of the recent past.
 const CARD_HIST: usize = 40;
 
+/// The cpu card spans two columns, so its sparkline carries twice
+/// the window to keep the bars from going fat.
+const CPU_HIST: usize = 80;
+
 /// The pressure card's rows in display order: (label, psi slot).
 const PSI_ROWS: [(&str, usize); 3] = [("cpu", 0), ("mem", 1), ("io", 2)];
 
@@ -104,10 +108,12 @@ pub(crate) struct MonitorView {
     vitals: Vitals,
     /// The cards' own windows: disk and network throughput, recent
     /// past, for their sparklines. The temperature joins only while a
-    /// sensor exists.
+    /// sensor exists, the runnable count because its burstiness is
+    /// the story the instant count can't tell.
     disk_hist: Vec<f32>,
     net_hist: Vec<f32>,
     temp_hist: Vec<f32>,
+    procs_hist: Vec<f32>,
     /// Per-core usage from the last beat, shown when the CPU card
     /// opens.
     core_usage: Vec<f32>,
@@ -139,6 +145,7 @@ impl MonitorView {
             disk_hist: Vec::new(),
             net_hist: Vec::new(),
             temp_hist: Vec::new(),
+            procs_hist: Vec::new(),
             core_usage: Vec::new(),
             show_cores: false,
             swap_used: 0,
@@ -210,17 +217,26 @@ impl MonitorView {
             sample::merge_groups(&mut self.groups, snap.rows);
         }
 
-        push_hist(&mut self.history, snap.cpu_total);
+        push_hist(&mut self.history, snap.cpu_total, CPU_HIST);
         self.mem_used = snap.mem_used;
         self.mem_total = snap.mem_total;
         self.swap_used = snap.swap_used;
         self.swap_total = snap.swap_total;
         let (vitals, cores) = self.stats.beat();
-        push_hist(&mut self.disk_hist, (vitals.io_read + vitals.io_write) as f32);
-        push_hist(&mut self.net_hist, (vitals.net_rx + vitals.net_tx) as f32);
+        push_hist(
+            &mut self.disk_hist,
+            (vitals.io_read + vitals.io_write) as f32,
+            CARD_HIST,
+        );
+        push_hist(
+            &mut self.net_hist,
+            (vitals.net_rx + vitals.net_tx) as f32,
+            CARD_HIST,
+        );
         if let Some(temp) = vitals.cpu_temp {
-            push_hist(&mut self.temp_hist, temp);
+            push_hist(&mut self.temp_hist, temp, CARD_HIST);
         }
+        push_hist(&mut self.procs_hist, vitals.procs_running as f32, CARD_HIST);
         self.vitals = vitals;
         if !cores.is_empty() {
             self.core_usage = cores;
@@ -362,9 +378,12 @@ impl MonitorView {
             0.
         };
 
-        // -- row one: the processor's story (load, heat, strain)
+        // -- row one: the processor's story, the cpu card the hero
+        // at two columns wide (its sparkline earns the longer window
+        // that keeps bars from going fat), temp beside at one
         let cpu_card = self
             .card_base("CPU")
+            .flex_grow(2.)
             .child(
                 div()
                     .text_size(px(14.))
@@ -379,7 +398,7 @@ impl MonitorView {
                     .text_color(theme::text_dim())
                     .truncate()
                     .child({
-                        let cores = self.core_usage.len();
+                        let cores = v.core_count;
                         if cores > 0 {
                             format!("{cores} cores \u{b7} click for each")
                         } else {
@@ -426,8 +445,9 @@ impl MonitorView {
             )
             .debug_selector(|| "card-temp".into());
 
-        // pressure: one slim meter per resource, the fill lit when
-        // that resource is the one straining
+        // -- row two: the scheduler's story (suffering, queueing,
+        // who is stuck), the diagnosis row, in the same clothes as
+        // the state rows
         let mut psi_card = self.card_base("PRESSURE");
         if v.psi.iter().all(Option::is_none) {
             psi_card = psi_card.child(
@@ -444,6 +464,64 @@ impl MonitorView {
             );
         }
         let psi_card = psi_card.debug_selector(|| "card-psi".into());
+
+        // load: the familiar decayed count. Each window gets a meter
+        // scaled against the core count, so a full bar means one
+        // runnable task per core and the figure rides along.
+        let cores = v.core_count.max(1) as f32;
+        let load_card = {
+            let mut card = self.card_base("LOAD");
+            if v.core_count > 0 {
+                card = card.child(
+                    div().flex().flex_col().gap_1().justify_center().h_full().children(
+                        ["1m", "5m", "15m"]
+                            .iter()
+                            .zip(v.load)
+                            .map(|(window, value)| {
+                                meter_row(
+                                    window,
+                                    format!("{value:.2}"),
+                                    (value / cores).clamp(0., 1.),
+                                    value > cores,
+                                )
+                            }),
+                    ),
+                );
+            }
+            card.child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .truncate()
+                    .child(format!("{} cores", v.core_count)),
+            )
+            .debug_selector(|| "card-load".into())
+        };
+
+        // procs: the same counts the load average decays, but right
+        // now. Blocked is the abnormal one: uninterruptible waits are
+        // io or a driver not answering, so it wears the light.
+        let procs_card = self
+            .card_base("PROCS")
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .truncate()
+                    .child(format!("{} running", v.procs_running)),
+            )
+            .child(self.spark(&self.procs_hist, None))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(if v.procs_blocked > 0 {
+                        theme::accent()
+                    } else {
+                        theme::text_dim()
+                    })
+                    .truncate()
+                    .child(format!("{} blocked", v.procs_blocked)),
+            )
+            .debug_selector(|| "card-procs".into());
 
         // -- row two: the memory and the wires
         let mem_card = self
@@ -544,14 +622,22 @@ impl MonitorView {
                     .gap_2()
                     .debug_selector(|| "vitals-strip".into())
                     .child(cpu_card)
-                    .child(temp_card)
-                    .child(psi_card),
+                    .child(temp_card),
             )
             .child(
                 div()
                     .flex()
                     .gap_2()
                     .debug_selector(|| "vitals-strip-2".into())
+                    .child(psi_card)
+                    .child(load_card)
+                    .child(procs_card),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .debug_selector(|| "vitals-strip-3".into())
                     .child(mem_card)
                     .child(disk_card)
                     .child(net_card),
@@ -607,16 +693,15 @@ impl MonitorView {
             )
     }
 
-    /// A micro history: the last CARD_HIST samples as one quiet line
-    /// of bars. Scaled to the window's own peak (never the global
+    /// A micro history: the buffer's samples as one quiet line of
+    /// bars (each history vec is already capped to its card's
+    /// window). Scaled to the window's own peak (never the global
     /// 100%, or an idle line would be invisible) unless a fixed
     /// ceiling is given, as the temperature needs: its drama lives in
     /// single degrees, and peak-scaling would lie about the slope.
     fn spark(&self, history: &[f32], ceiling: Option<f32>) -> Div {
-        let start = history.len().saturating_sub(CARD_HIST);
-        let window = &history[start..];
-        let peak = ceiling.unwrap_or_else(|| window.iter().copied().fold(1.0_f32, f32::max));
-        let bars = window
+        let peak = ceiling.unwrap_or_else(|| history.iter().copied().fold(1.0_f32, f32::max));
+        let bars = history
             .iter()
             .map(|v| {
                 div()
@@ -958,9 +1043,10 @@ fn meter(frac: f32, fill: Rgba, fill_sel: Option<&str>) -> Div {
 
 /// The pressure card's one row: a three-letter label, a meter whose
 /// fill lights when this resource stalls tasks, the avg10 figure.
-fn psi_row(name: &str, pressure: Option<f32>) -> Div {
-    let p = pressure.unwrap_or(0.);
-    let strained = p > 10.;
+/// One labeled meter row: a short label, a track whose fill lights
+/// when the resource is in distress, the figure at the right. The
+/// pressure and load cards share it, so their meters read the same.
+fn meter_row(label: &str, value: String, frac: f32, lit: bool) -> Div {
     div()
         .flex()
         .items_center()
@@ -970,12 +1056,12 @@ fn psi_row(name: &str, pressure: Option<f32>) -> Div {
                 .w(px(24.))
                 .text_size(px(9.))
                 .text_color(theme::text_dim())
-                .child(name.to_string()),
+                .child(label.to_string()),
         )
         .child(
             meter(
-                p / 100.,
-                if strained {
+                frac,
+                if lit {
                     theme::accent()
                 } else {
                     theme::ghost()
@@ -989,23 +1075,34 @@ fn psi_row(name: &str, pressure: Option<f32>) -> Div {
             div()
                 .w(px(28.))
                 .text_size(px(9.))
-                .text_color(if strained {
+                .text_color(if lit {
                     theme::text()
                 } else {
                     theme::text_dim()
                 })
                 .truncate()
-                .child(match pressure {
-                    Some(p) => format!("{p:.1}"),
-                    None => "\u{2014}".to_string(),
-                }),
+                .child(value),
         )
 }
 
+fn psi_row(name: &str, pressure: Option<f32>) -> Div {
+    let p = pressure.unwrap_or(0.);
+    let strained = p > 10.;
+    meter_row(
+        name,
+        match pressure {
+            Some(p) => format!("{p:.1}"),
+            None => "\u{2014}".to_string(),
+        },
+        p / 100.,
+        strained,
+    )
+}
+
 /// Slide a sample into a card's history window.
-fn push_hist(buf: &mut Vec<f32>, value: f32) {
+fn push_hist(buf: &mut Vec<f32>, value: f32, cap: usize) {
     buf.push(value);
-    if buf.len() > CARD_HIST {
+    if buf.len() > cap {
         buf.remove(0);
     }
 }
@@ -1143,11 +1240,19 @@ mod tests {
     fn the_card_histories_cap_at_their_window() {
         let mut hist = Vec::new();
         for sample in 0..60 {
-            push_hist(&mut hist, sample as f32);
+            push_hist(&mut hist, sample as f32, CARD_HIST);
         }
         assert_eq!(hist.len(), CARD_HIST);
         assert_eq!(hist[0], (60 - CARD_HIST) as f32);
         assert_eq!(hist[CARD_HIST - 1], 59.);
+        // the cpu card's window runs longer, to match its width
+        let mut cpu = Vec::new();
+        for sample in 0..(CPU_HIST as u32 + 5) {
+            push_hist(&mut cpu, sample as f32, CPU_HIST);
+        }
+        assert_eq!(cpu.len(), CPU_HIST);
+        assert_eq!(cpu[0], 5.);
+        assert_eq!(cpu[CPU_HIST - 1], (CPU_HIST + 4) as f32);
     }
 
     /// The overflow the first strip died of: cards that refused to
@@ -1176,10 +1281,11 @@ mod tests {
             view.mem_used = view.mem_total;
             view.swap_used = 8 * 1024 * 1024 * 1024;
             view.swap_total = view.swap_used;
-            view.history = vec![87.; CARD_HIST];
+            view.history = vec![87.; CPU_HIST];
             view.temp_hist = vec![95.; CARD_HIST];
             view.disk_hist = vec![1.2e9; CARD_HIST];
             view.net_hist = vec![6.6e9; CARD_HIST];
+            view.procs_hist = vec![3.; CARD_HIST];
             cx.notify();
         });
         app.run_until_parked();
@@ -1189,7 +1295,7 @@ mod tests {
                     .debug_element_bounds(sel)
                     .unwrap_or_else(|| panic!("{sel} never painted"))
             };
-            let rows: Vec<(String, _)> = ["vitals-strip", "vitals-strip-2"]
+            let rows: Vec<(String, _)> = ["vitals-strip", "vitals-strip-2", "vitals-strip-3"]
                 .iter()
                 .map(|sel| (sel.to_string(), probe(sel)))
                 .collect();
@@ -1197,10 +1303,12 @@ mod tests {
             let cards: Vec<(String, String, _)> = [
                 ("card-cpu", "vitals-strip"),
                 ("card-temp", "vitals-strip"),
-                ("card-psi", "vitals-strip"),
-                ("card-mem", "vitals-strip-2"),
-                ("card-disk", "vitals-strip-2"),
-                ("card-net", "vitals-strip-2"),
+                ("card-psi", "vitals-strip-2"),
+                ("card-load", "vitals-strip-2"),
+                ("card-procs", "vitals-strip-2"),
+                ("card-mem", "vitals-strip-3"),
+                ("card-disk", "vitals-strip-3"),
+                ("card-net", "vitals-strip-3"),
             ]
             .iter()
             .map(|(card, row)| (card.to_string(), row.to_string(), probe(card)))

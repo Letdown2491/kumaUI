@@ -24,6 +24,12 @@ pub(crate) struct Vitals {
     /// The cpu's temperature in degrees celsius. None where no
     /// known sensor chip exists (containers, some VMs).
     pub cpu_temp: Option<f32>,
+    /// Instantaneous scheduler counts: the numbers the load average
+    /// is a decayed memory of.
+    pub procs_running: u32,
+    pub procs_blocked: u32,
+    /// How many cpuN lines the kernel reports.
+    pub core_count: usize,
 }
 
 pub(crate) struct Stats {
@@ -72,6 +78,8 @@ impl Stats {
             read_pressure("/proc/pressure/io"),
         ];
         let cpu_temp = self.temp_chip.as_ref().and_then(|chip| read_temp(chip));
+        let stat_text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+        let (procs_running, procs_blocked) = parse_procs(&stat_text);
 
         let net = std::fs::read_to_string("/proc/net/dev")
             .as_deref()
@@ -93,7 +101,8 @@ impl Stats {
             tx: io.1,
         });
 
-        let core_usage = self.core_beat();
+        let core_usage = self.core_beat(&stat_text);
+        let core_count = self.cores.len();
 
         (
             Vitals {
@@ -105,6 +114,9 @@ impl Stats {
                 io_read,
                 io_write,
                 cpu_temp,
+                procs_running,
+                procs_blocked,
+                core_count,
             },
             core_usage,
         )
@@ -124,8 +136,7 @@ impl Stats {
 
     /// Per-core usage against the previous beat: (busy time, total
     /// time) deltas per core, htop's math from /proc/stat.
-    fn core_beat(&mut self) -> Vec<f32> {
-        let text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+    fn core_beat(&mut self, text: &str) -> Vec<f32> {
         let cores: Vec<(u64, u64)> = text
             .lines()
             .filter(|line| line.starts_with("cpu") && !line.starts_with("cpu "))
@@ -185,6 +196,18 @@ fn parse_pressure(text: &str) -> Option<f32> {
         .trim_end_matches('%')
         .parse()
         .ok()
+}
+
+/// The scheduler's instantaneous counts from /proc/stat: the numbers
+/// the load average is a decayed memory of.
+fn parse_procs(text: &str) -> (u32, u32) {
+    let field = |wanted: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(wanted))
+            .and_then(|rest| rest.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (field("procs_running "), field("procs_blocked "))
 }
 
 fn read_pressure(path: &str) -> Option<f32> {
@@ -308,6 +331,9 @@ mod tests {
         let psi = "some avg10=0.34 avg60=1.20 avg300=2.00 total=6000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
         assert_eq!(parse_pressure(psi), Some(0.34));
         assert_eq!(parse_pressure("full avg10=1.00"), None);
+        let procs = "intr 123\nctxt 456\nprocs_running 3\nprocs_blocked 1";
+        assert_eq!(parse_procs(procs), (3, 1));
+        assert_eq!(parse_procs(""), (0, 0));
     }
 
     #[test]
@@ -357,6 +383,8 @@ mod tests {
         assert!(vitals
             .cpu_temp
             .is_none_or(|t| (0. ..=150.).contains(&t)));
+        assert!(vitals.procs_running >= 1, "this test itself is running");
+        assert!(vitals.core_count >= 1);
         // the first beat has no delta baseline: usage comes empty,
         // like the throughput rates
         assert!(cores.is_empty());

@@ -51,7 +51,7 @@ fn main() {
     }
 
     application().run(move |cx: &mut App| {
-        let bounds = gpui::Bounds::centered(None, size(px(860.), px(560.)), cx);
+        let bounds = gpui::Bounds::centered(None, size(px(860.), px(640.)), cx);
         let _ = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
