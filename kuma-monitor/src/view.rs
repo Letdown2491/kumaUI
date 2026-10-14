@@ -343,12 +343,12 @@ impl Render for MonitorView {
             .text_size(px(13.))
             .child(self.vitals_area(cpu_now, &this))
             .child(
+                // the header floats: no rule above or below, its dim
+                // text and the row padding do the separating
                 div()
                     .flex()
                     .items_center()
                     .px_3()
-                    .border_b_1()
-                    .border_color(theme::border())
                     .children(COLS.map(|col| self.header_cell(col, cx))),
             )
             .child(
@@ -641,8 +641,6 @@ impl MonitorView {
             .px_3()
             .pt_2()
             .pb_2()
-            .border_b_1()
-            .border_color(theme::border())
             .debug_selector(|| "vitals-area".into())
             .child(
                 div()
@@ -777,9 +775,11 @@ impl MonitorView {
     /// app and process counts, the build stamp on the right (which
     /// build this window is: a monitor that cannot say its own build
     /// invites judging it against the previous one).
+    /// The line under the table: the list's own counts on the left,
+    /// the machine's age on the right. Load has a card; the build
+    /// stamp answers to --version, not to every frame.
     fn footer(&self, processes: usize) -> Div {
         let apps = self.groups.iter().filter(|g| !g.background).count();
-        let v = &self.vitals;
         div()
             .flex()
             .items_center()
@@ -789,19 +789,9 @@ impl MonitorView {
             .px_3()
             .text_size(px(11.))
             .text_color(theme::text_dim())
-            .child(format!(
-                "load {:.2} {:.2} {:.2} \u{b7} up {}",
-                v.load[0], v.load[1], v.load[2],
-                human_uptime(v.uptime_secs)
-            ))
-            .child(div().flex_1())
             .child(format!("{apps} apps \u{b7} {processes} processes"))
-            .child(
-                div()
-                    .pl_3()
-                    .text_size(px(10.))
-                    .child(crate::version_line()),
-            )
+            .child(div().flex_1())
+            .child(format!("up {}", human_uptime(self.vitals.uptime_secs)))
     }
 }
 
