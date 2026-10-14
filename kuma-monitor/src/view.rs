@@ -2,10 +2,9 @@
 //! memory line, and the table. The table leads with identity (the
 //! window when there is one, the process name when not), keeps its
 //! order stable while values tick (the order moves on a click, never
-//! on a beat), and folds the system's unwindowed long tail behind
-//! one summary line: the app's question is which window is eating
-//! the machine, and the answer should be visible in eight rows, not
-//! two hundred.
+//! on a beat), and folds only the kernel's threads behind one summary
+//! line: the app's question is which window is eating the machine,
+//! and the session's own processes stay in sight.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,11 +22,52 @@ use crate::theme;
 /// Two minutes of history at the 1s tick.
 const HISTORY: usize = 120;
 
-/// The table's column spec, shared by the header and the rows so the
-/// two always line up: the same width and the same px_2 inside every
-/// cell, the numbers right-set in both.
-const CPU_COL: f32 = 72.;
-const MEM_COL: f32 = 104.;
+/// The table's columns, one spec for the header and the rows: the
+/// same builder shapes both, so a value cannot drift off its title.
+/// NAME is the flex column; the rest are fixed and right-set.
+#[derive(Clone, Copy, PartialEq)]
+enum Col {
+    Name,
+    Pid,
+    Cpu,
+    Mem,
+}
+
+const COLS: [Col; 4] = [Col::Name, Col::Pid, Col::Cpu, Col::Mem];
+
+impl Col {
+    fn label(self) -> &'static str {
+        match self {
+            Col::Name => "NAME",
+            Col::Pid => "PID",
+            Col::Cpu => "CPU%",
+            Col::Mem => "MEM",
+        }
+    }
+
+    /// None: the column flexes (NAME); Some: fixed pixels.
+    fn width(self) -> Option<f32> {
+        match self {
+            Col::Name => None,
+            Col::Pid => Some(88.),
+            Col::Cpu => Some(72.),
+            Col::Mem => Some(104.),
+        }
+    }
+
+    fn right(self) -> bool {
+        !matches!(self, Col::Name)
+    }
+
+    fn key(self) -> SortKey {
+        match self {
+            Col::Name => SortKey::Name,
+            Col::Pid => SortKey::Pid,
+            Col::Cpu => SortKey::Cpu,
+            Col::Mem => SortKey::Mem,
+        }
+    }
+}
 
 pub(crate) struct MonitorView {
     sampler: Sampler,
@@ -118,8 +158,8 @@ impl MonitorView {
             // the process died between beats
             None => false,
         });
-        // spawned since the last beat: they join at the section's
-        // tail, the next header click files them
+        // spawned since the last beat: they join at the tail, the
+        // next header click files them
         self.rows.extend(fresh.into_values());
 
         self.history.push(snap.cpu_total);
@@ -140,15 +180,14 @@ impl MonitorView {
 impl Render for MonitorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let cpu_now = self.history.last().copied().unwrap_or(0.);
-        let (windowed, system): (Vec<ProcRow>, Vec<ProcRow>) = self
-            .rows
-            .clone()
+        let rows = self.rows.clone();
+        let (kernel, shown): (Vec<ProcRow>, Vec<ProcRow>) = rows
             .into_iter()
-            .partition(|row| row.window.is_some());
+            .partition(|row| row.window.is_none() && sample::is_kernel(row));
         let list = if self.expanded {
             self.rows.clone()
         } else {
-            windowed
+            shown
         };
         let count = list.len();
 
@@ -160,7 +199,15 @@ impl Render for MonitorView {
             .text_color(theme::text())
             .text_size(px(13.))
             .child(self.graph_panel(cpu_now))
-            .child(self.header(cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .children(COLS.map(|col| self.header_cell(col, cx))),
+            )
             .child(
                 // the wrapper is an explicit flex column and the list
                 // grows into it: an Auto-sized deferred element is a
@@ -169,6 +216,7 @@ impl Render for MonitorView {
                 div()
                     .flex_1()
                     .overflow_hidden()
+                    .px_3()
                     .flex()
                     .flex_col()
                     .child(
@@ -179,7 +227,7 @@ impl Render for MonitorView {
                         .track_scroll(&self.scroll),
                     ),
             )
-            .child(self.footer(&system, cx))
+            .child(self.footer(&kernel, cx))
     }
 }
 
@@ -227,32 +275,13 @@ impl MonitorView {
             .child(div().h(px(36.)).flex().items_end().children(bars))
     }
 
-    /// The column titles, sharing the rows' exact column spec: the
-    /// same widths, the same px_2, the same right-setting. All three
-    /// sort; the active one wears the accent.
-    fn header(&self, cx: &mut Context<Self>) -> Div {
-        div()
-            .flex()
-            .items_center()
-            .border_b_1()
-            .border_color(theme::border())
-            .child(self.sort_cell("col-name", "NAME", SortKey::Name, None, false, cx))
-            .child(self.sort_cell("col-cpu", "CPU%", SortKey::Cpu, Some(CPU_COL), true, cx))
-            .child(self.sort_cell("col-mem", "MEM", SortKey::Mem, Some(MEM_COL), true, cx))
-    }
-
-    fn sort_cell(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        key: SortKey,
-        width: Option<f32>,
-        right: bool,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let active = self.sort == key;
+    /// The column title, from the same Col spec the rows use: the
+    /// same width, the same px_2, the same right-setting. Every
+    /// column sorts; the active one wears the accent.
+    fn header_cell(&self, col: Col, cx: &mut Context<Self>) -> Stateful<Div> {
+        let active = self.sort == col.key();
         let cell = div()
-            .id(id)
+            .id(col.label())
             .py_1()
             .px_2()
             .text_size(px(11.))
@@ -262,33 +291,32 @@ impl MonitorView {
                 theme::text_dim()
             })
             .on_click(cx.listener(move |this, _click: &ClickEvent, _, cx| {
-                this.set_sort(key, cx);
+                this.set_sort(col.key(), cx);
             }))
-            .child(label);
-        let cell = match width {
+            .child(col.label());
+        let cell = match col.width() {
             Some(w) => cell.w(px(w)),
             None => cell.flex_1(),
         };
-        if right {
+        if col.right() {
             cell.flex().justify_end()
         } else {
             cell
         }
     }
 
-    /// The summary line under the table: the system's unwindowed long
-    /// tail, folded. Collapsed it counts (n processes, their cpu and
-    /// memory); expanded it offers the way back. One click, one
-    /// state, no second view.
-    fn footer(&self, system: &[ProcRow], cx: &mut Context<Self>) -> Stateful<Div> {
-        let cpu: f32 = system.iter().map(|row| row.cpu).sum();
-        let mem: u64 = system.iter().map(|row| row.mem).sum();
+    /// The summary line under the table: the kernel's threads, folded.
+    /// Collapsed it counts (n threads, their cpu and memory, both of
+    /// which are nearly nothing); expanded it offers the way back.
+    fn footer(&self, kernel: &[ProcRow], cx: &mut Context<Self>) -> Stateful<Div> {
+        let cpu: f32 = kernel.iter().map(|row| row.cpu).sum();
+        let mem: u64 = kernel.iter().map(|row| row.mem).sum();
         let label = if self.expanded {
-            "- hide the system's unwindowed processes".to_string()
+            "- hide the kernel's threads".to_string()
         } else {
             format!(
-                "+ {} system processes \u{b7} {cpu:.1}% \u{b7} {}",
-                system.len(),
+                "+ {} kernel threads \u{b7} {cpu:.1}% \u{b7} {}",
+                kernel.len(),
                 sample::human_mem(mem)
             )
         };
@@ -308,15 +336,83 @@ impl MonitorView {
     }
 }
 
-/// One table row, the header's column spec verbatim. Identity leads:
-/// the window's app and title when joined, the process name when not
-/// (dimmed: unwindowed rows are the expanded view's residents). The
-/// focused window's row is the single highlight.
+/// One table row, from the same Col spec the header uses: same
+/// widths, same px_2, same right-setting, so a value sits exactly
+/// under its title. Identity leads; unwindowed rows wear dim (they
+/// are the session's residents, the expanded view's extra residents
+/// are the kernel's); the focused window's row is the single
+/// highlight.
 fn row_view(row: &ProcRow) -> Div {
     let focused = row.window.as_ref().is_some_and(|w| w.focused);
-    let unwindowed = row.window.is_none();
+    let mut base = div()
+        .h(px(26.))
+        .flex()
+        .items_center()
+        .bg(if focused {
+            theme::row_selected()
+        } else {
+            theme::clear()
+        });
+    for col in COLS {
+        base = base.child(child_cell(row, col));
+    }
+    base
+}
 
-    let (lead, suffix) = match &row.window {
+/// The row's cell for one column: content first, then the shared
+/// spec (width, padding, alignment) applied identically to the
+/// header's cells.
+fn child_cell(row: &ProcRow, col: Col) -> Div {
+    let mut cell = match col {
+        Col::Name => identity_cell(row),
+        Col::Pid => div().child(row.pid.to_string()).text_color(theme::text_dim()),
+        Col::Cpu => div().child(format!("{:.1}", row.cpu)),
+        Col::Mem => div()
+            .child(sample::human_mem(row.mem))
+            .text_color(theme::text_dim()),
+    };
+    cell = match col.width() {
+        Some(w) => cell.w(px(w)),
+        None => cell.flex_1(),
+    };
+    cell = cell.px_2();
+    if col.right() {
+        cell.flex().justify_end()
+    } else {
+        cell
+    }
+}
+
+/// The identity column's content: the window's app and title when
+/// joined (a title that repeats the app says nothing twice), the
+/// process name when not.
+fn identity_cell(row: &ProcRow) -> Div {
+    let (lead, suffix) = identity(row);
+    let unwindowed = row.window.is_none();
+    let mut cell = div().flex().gap_2().truncate().child(
+        div()
+            .truncate()
+            .text_color(if unwindowed {
+                theme::text_dim()
+            } else {
+                theme::text()
+            })
+            .child(lead),
+    );
+    if !suffix.is_empty() {
+        cell = cell.child(
+            div()
+                .truncate()
+                .text_color(theme::text_dim())
+                .child(suffix),
+        );
+    }
+    cell
+}
+
+/// The identity pair: lead (bright) and suffix (dim).
+fn identity(row: &ProcRow) -> (String, String) {
+    match &row.window {
         Some(window) => {
             let app = window.app_id.clone().unwrap_or_default();
             let title = window.title.trim().to_string();
@@ -329,60 +425,7 @@ fn row_view(row: &ProcRow) -> Div {
             }
         }
         None => (row.name.clone(), String::new()),
-    };
-
-    let mut name_cell = div()
-        .flex_1()
-        .px_3()
-        .flex()
-        .gap_2()
-        .truncate()
-        .child(
-            div()
-                .truncate()
-                .text_color(if unwindowed {
-                    theme::text_dim()
-                } else {
-                    theme::text()
-                })
-                .child(lead),
-        );
-    if !suffix.is_empty() {
-        name_cell = name_cell.child(
-            div()
-                .truncate()
-                .text_color(theme::text_dim())
-                .child(suffix),
-        );
     }
-
-    div()
-        .h(px(26.))
-        .flex()
-        .items_center()
-        .bg(if focused {
-            theme::row_selected()
-        } else {
-            theme::clear()
-        })
-        .child(name_cell)
-        .child(
-            div()
-                .w(px(CPU_COL))
-                .px_2()
-                .flex()
-                .justify_end()
-                .child(format!("{:.1}", row.cpu)),
-        )
-        .child(
-            div()
-                .w(px(MEM_COL))
-                .px_2()
-                .flex()
-                .justify_end()
-                .text_color(theme::text_dim())
-                .child(sample::human_mem(row.mem)),
-        )
 }
 
 // ---------- the shell's palette handshake (from kuma-files) ----------
@@ -464,5 +507,40 @@ mod tests {
         assert_eq!(palette.text, 0xd8dce3);
         // a bad value keeps the default
         assert_eq!(palette.text_dim, theme::Palette::default().text_dim);
+    }
+
+    #[test]
+    fn identity_prefers_the_app_then_the_title_then_the_name() {
+        let mut row = ProcRow {
+            pid: 1,
+            parent: None,
+            name: "electron".into(),
+            cpu: 0.,
+            mem: 0,
+            window: Some(sample::WindowRef {
+                app_id: Some("kuma-term".into()),
+                title: "kuma-term".into(),
+                focused: false,
+            }),
+        };
+        // a title that repeats the app says nothing twice
+        let (lead, suffix) = identity(&row);
+        assert_eq!(lead, "kuma-term");
+        assert!(suffix.is_empty());
+        // a real title rides along, dim, after the app
+        row.window.as_mut().unwrap().title = "main".into();
+        let (lead, suffix) = identity(&row);
+        assert_eq!(lead, "kuma-term");
+        assert_eq!(suffix, "\u{b7} main");
+        // no app_id: the title speaks
+        row.window.as_mut().unwrap().app_id = None;
+        let (lead, suffix) = identity(&row);
+        assert_eq!(lead, "main");
+        assert!(suffix.is_empty());
+        // no window: the process name
+        row.window = None;
+        let (lead, suffix) = identity(&row);
+        assert_eq!(lead, "electron");
+        assert!(suffix.is_empty());
     }
 }

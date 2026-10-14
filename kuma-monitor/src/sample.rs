@@ -11,6 +11,7 @@ use crate::niri::NiriWindow;
 /// A process row's sysinfo half, before the join.
 pub(crate) struct RawRow {
     pub pid: u32,
+    pub parent: Option<u32>,
     pub name: String,
     pub cpu: f32,
     pub mem: u64,
@@ -30,6 +31,7 @@ pub(crate) struct WindowRef {
 #[derive(Clone, Debug)]
 pub(crate) struct ProcRow {
     pub pid: u32,
+    pub parent: Option<u32>,
     pub name: String,
     pub cpu: f32,
     pub mem: u64,
@@ -71,6 +73,7 @@ impl Sampler {
             .values()
             .map(|p| RawRow {
                 pid: p.pid().as_u32(),
+                parent: p.parent().map(|p| p.as_u32()),
                 name: p.name().to_string_lossy().into_owned(),
                 cpu: p.cpu_usage(),
                 mem: p.memory(),
@@ -113,6 +116,7 @@ pub(crate) fn join(raw: Vec<RawRow>, windows: &[NiriWindow]) -> Vec<ProcRow> {
             });
             ProcRow {
                 pid: row.pid,
+                parent: row.parent,
                 name: row.name,
                 cpu: row.cpu,
                 mem: row.mem,
@@ -120,6 +124,13 @@ pub(crate) fn join(raw: Vec<RawRow>, windows: &[NiriWindow]) -> Vec<ProcRow> {
             }
         })
         .collect()
+}
+
+/// The kernel's threads are kthreadd's children (ppid 2, reparenting
+/// lands orphans on init, not here): the one noise source that never
+/// carries a window and never needs a row.
+pub(crate) fn is_kernel(row: &ProcRow) -> bool {
+    row.parent == Some(2)
 }
 
 /// The row's lead identity: the window's app when joined, the
@@ -143,12 +154,13 @@ pub(crate) fn lead(row: &ProcRow) -> &str {
 }
 
 /// The table's order. Cpu and Mem sort down (the hog first), Name
-/// sorts up; a spike needs no direction toggle.
+/// and Pid sort up; a spike needs no direction toggle.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum SortKey {
     Cpu,
     Mem,
     Name,
+    Pid,
 }
 
 pub(crate) fn sort_rows(rows: &mut [ProcRow], key: SortKey) {
@@ -156,6 +168,7 @@ pub(crate) fn sort_rows(rows: &mut [ProcRow], key: SortKey) {
         SortKey::Cpu => rows.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)),
         SortKey::Mem => rows.sort_by(|a, b| b.mem.cmp(&a.mem)),
         SortKey::Name => rows.sort_by(|a, b| lead(a).to_lowercase().cmp(&lead(b).to_lowercase())),
+        SortKey::Pid => rows.sort_by(|a, b| a.pid.cmp(&b.pid)),
     }
 }
 
@@ -189,6 +202,7 @@ mod tests {
     fn raw(pid: u32, name: &str) -> RawRow {
         RawRow {
             pid,
+            parent: None,
             name: name.to_string(),
             cpu: 0.,
             mem: 0,
@@ -233,9 +247,9 @@ mod tests {
     #[test]
     fn sorts_cpu_down_and_name_up() {
         let mut rows = vec![
-            ProcRow { pid: 1, name: "b".into(), cpu: 1., mem: 10, window: None },
-            ProcRow { pid: 2, name: "A".into(), cpu: 9., mem: 50, window: None },
-            ProcRow { pid: 3, name: "c".into(), cpu: 4., mem: 30, window: None },
+            ProcRow { pid: 1, parent: None, name: "b".into(), cpu: 1., mem: 10, window: None },
+            ProcRow { pid: 2, parent: None, name: "A".into(), cpu: 9., mem: 50, window: None },
+            ProcRow { pid: 3, parent: None, name: "c".into(), cpu: 4., mem: 30, window: None },
         ];
         sort_rows(&mut rows, SortKey::Cpu);
         assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![2, 3, 1]);
@@ -243,12 +257,27 @@ mod tests {
         assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["A", "b", "c"]);
         sort_rows(&mut rows, SortKey::Mem);
         assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![2, 3, 1]);
+        sort_rows(&mut rows, SortKey::Pid);
+        assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn kernel_threads_are_kthreadd_children() {
+        let mut row = raw(99, "kworker/3:1");
+        row.parent = Some(2);
+        let rows = join(vec![row], &[]);
+        assert!(is_kernel(&rows[0]));
+        let mut row = raw(98, "systemd");
+        row.parent = Some(1);
+        let rows = join(vec![row], &[]);
+        assert!(!is_kernel(&rows[0]));
     }
 
     #[test]
     fn lead_prefers_the_app_id_then_the_title() {
         let mut row = ProcRow {
             pid: 1,
+            parent: None,
             name: "electron".into(),
             cpu: 0.,
             mem: 0,
