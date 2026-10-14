@@ -110,9 +110,15 @@ impl Render for MonitorView {
             .child(self.graph_panel(cpu_now))
             .child(self.header(cx))
             .child(
+                // the wrapper is an explicit flex column and the list
+                // grows into it: an Auto-sized deferred element is a
+                // zero-content div to taffy and paints nothing without
+                // a height (the quicklook list's own note)
                 div()
                     .flex_1()
                     .overflow_hidden()
+                    .flex()
+                    .flex_col()
                     .child(
                         uniform_list("proc-rows", count, move |range, _, _| {
                             rows[range.clone()].iter().map(row_view).collect()

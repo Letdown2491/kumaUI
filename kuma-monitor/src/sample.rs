@@ -227,6 +227,18 @@ mod tests {
         assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![2, 3, 1]);
     }
 
+    /// A live beat in the build container: the sampler's own half of
+    /// the table yields rows (the container's /proc holds cargo and
+    /// friends during the run), cpu and memory read as finite totals.
+    #[test]
+    fn a_live_beat_yields_rows() {
+        let mut sampler = Sampler::new();
+        let snap = sampler.beat(&[]);
+        assert!(snap.rows.len() >= 1, "no rows from a live beat");
+        assert!(snap.cpu_total >= 0.);
+        assert!(snap.mem_total > 0);
+    }
+
     #[test]
     fn human_mem_names_the_unit() {
         assert_eq!(human_mem(0), "0.0 KiB");
