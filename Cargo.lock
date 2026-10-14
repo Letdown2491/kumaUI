@@ -3108,6 +3108,7 @@ dependencies = [
  "env_logger",
  "gpui",
  "gpui_platform",
+ "gpui_wgpu",
  "kuma-platform",
  "log",
  "serde",

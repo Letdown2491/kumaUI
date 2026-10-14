@@ -1,10 +1,12 @@
 //! The sampler: one beat of process rows joined with niri's windows,
-//! and the sort that orders the table. The join is pure so the tests
-//! can pin it without a live system.
+//! the app grouping that folds a windowed process and its helpers
+//! into one row, and the sorts. The join and the grouping are pure so
+//! the tests can pin them without a live system.
 
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::niri::NiriWindow;
 
@@ -38,6 +40,29 @@ pub(crate) struct ProcRow {
     pub window: Option<WindowRef>,
 }
 
+/// One app, however many processes carry it: the windowed process and
+/// its helpers under one row, with the sums the user actually reasons
+/// about (what does this app cost, what does closing it return).
+#[derive(Clone, Debug)]
+pub(crate) struct AppGroup {
+    /// The stable identity beats merge on: the app_id lowercased,
+    /// or the binary's name lowercased for background groups.
+    pub key: String,
+    /// What the row leads with: the app_id's own case when windowed,
+    /// else the binary's name.
+    pub name: String,
+    pub cpu: f32,
+    pub mem: u64,
+    /// No member carries a window: session plumbing, summarized
+    /// behind one line instead of a wall of daemon names.
+    pub background: bool,
+    /// True while any member's window holds focus: the row highlight.
+    pub has_focused: bool,
+    /// Members by pid: a stable roster, so the expand state reads the
+    /// same list in the same order every beat.
+    pub members: Vec<ProcRow>,
+}
+
 /// One beat of the whole table: totals for the graph and the rows
 /// for the list.
 pub(crate) struct Snapshot {
@@ -51,21 +76,43 @@ pub(crate) struct Snapshot {
 /// the previous refresh, so the Sampler must live across the tick.
 pub(crate) struct Sampler {
     system: System,
+    /// The uid the walk scopes to: the monitor's question is which of
+    /// the user's apps eat the machine, and the root half of /proc
+    /// (systemd, the kernel's threads) is noise the walk then never
+    /// pays for either.
+    uid: u32,
 }
 
 impl Sampler {
     pub(crate) fn new() -> Self {
-        // new_all, not new: the first beat lands on a filled system
-        // so the window opens with numbers instead of a zero frame
-        let mut system = System::new_all();
+        // an EMPTY cache, seeded by the first beat's uid-scoped walk:
+        // new_all would load every root process into the table
+        let mut system = System::new();
         system.refresh_cpu_usage();
-        Self { system }
+        let uid = std::fs::metadata("/proc/self")
+            .map(|meta| meta.uid())
+            .unwrap_or(u32::MAX);
+        Self { system, uid }
     }
 
     pub(crate) fn beat(&mut self, windows: &[NiriWindow]) -> Snapshot {
-        self.system.refresh_processes(ProcessesToUpdate::All, true);
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
+
+        // the user's own pids: one readdir, one stat per /proc dir,
+        // no file reads. Refreshing cached pids too (dead ones are
+        // then refreshed-and-dead, which remove_dead_processes
+        // prunes; unrefreshed cache entries would linger forever).
+        let live = live_user_pids(self.uid);
+        let mut update: Vec<Pid> = self.system.processes().keys().copied().collect();
+        let seen: std::collections::HashSet<u32> =
+            update.iter().map(|pid| pid.as_u32()).collect();
+        update.extend(
+            live.into_iter()
+                .filter(|pid| !seen.contains(&pid.as_u32())),
+        );
+        self.system
+            .refresh_processes(ProcessesToUpdate::Some(&update), true);
 
         let raw = self
             .system
@@ -76,7 +123,12 @@ impl Sampler {
                 parent: p.parent().map(|p| p.as_u32()),
                 name: p.name().to_string_lossy().into_owned(),
                 cpu: p.cpu_usage(),
-                mem: p.memory(),
+                // what a death returns, not what the process
+                // displays: RSS minus the pages other processes
+                // also hold. sysinfo only exposes the RSS half,
+                // which bills zen's shared pages to every one of
+                // its forked content processes.
+                mem: private_mem(p.pid().as_u32(), p.memory()),
             })
             .collect();
 
@@ -87,6 +139,55 @@ impl Sampler {
             rows: join(raw, windows),
         }
     }
+}
+
+/// The user's own pids out of /proc: a numeric entry, one stat, a uid
+/// compare. Cheap enough to run every beat.
+fn live_user_pids(uid: u32) -> Vec<Pid> {
+    let mut pids = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(entry.path()) else {
+            continue;
+        };
+        if meta.uid() == uid {
+            pids.push(Pid::from_u32(pid));
+        }
+    }
+    pids
+}
+
+/// The private half of memory from statm (resident minus shared, in
+/// pages). One cheap read per process, unlike smaps_rollup whose
+/// page-table walk measured ~30ms per big process on this machine:
+/// proportional set size would cost more than the whole sysinfo walk.
+/// Falls back to RSS when the read fails.
+fn private_mem(pid: u32, rss_fallback: u64) -> u64 {
+    let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/statm")) else {
+        return rss_fallback;
+    };
+    parse_statm(&text)
+        .map(|(resident, shared)| (resident.saturating_sub(shared)) * PAGE_SIZE)
+        .unwrap_or(rss_fallback)
+}
+
+const PAGE_SIZE: u64 = 4096;
+
+/// statm: "size resident shared text lib data dt", all in pages.
+fn parse_statm(text: &str) -> Option<(u64, u64)> {
+    let mut fields = text.split_whitespace();
+    let _size = fields.next()?.parse::<u64>().ok()?;
+    let resident = fields.next()?.parse::<u64>().ok()?;
+    let shared = fields.next()?.parse::<u64>().ok()?;
+    Some((resident, shared))
 }
 
 /// The join: attach each pid's window, the focused one winning when
@@ -126,11 +227,109 @@ pub(crate) fn join(raw: Vec<RawRow>, windows: &[NiriWindow]) -> Vec<ProcRow> {
         .collect()
 }
 
-/// The kernel's threads are kthreadd's children (ppid 2, reparenting
-/// lands orphans on init, not here): the one noise source that never
-/// carries a window and never needs a row.
-pub(crate) fn is_kernel(row: &ProcRow) -> bool {
-    row.parent == Some(2)
+/// Fold a walk's rows into app groups. A row files under the nearest
+/// WINDOWED ANCESTOR: zen's forked content processes under zen,
+/// WebKit's helpers under epiphany, whatever each binary is named.
+/// A row with no windowed ancestor is background plumbing and groups
+/// under its own name. Existing groups keep their position (the
+/// order only moves on a header click), dead groups drop out,
+/// first-seen groups join at the tail.
+pub(crate) fn merge_groups(groups: &mut Vec<AppGroup>, rows: Vec<ProcRow>) {
+    // key first (the ancestor walk reads the whole table), consume after
+    let keys: Vec<String> = rows.iter().map(|row| group_key(&rows, row)).collect();
+    let mut by_key: HashMap<String, Vec<ProcRow>> = HashMap::new();
+    for (key, row) in keys.into_iter().zip(rows.into_iter()) {
+        by_key.entry(key).or_default().push(row);
+    }
+    groups.retain_mut(|group| match by_key.remove(&group.key) {
+        Some(members) => {
+            *group = AppGroup::build(group.key.clone(), members);
+            true
+        }
+        // the whole app died between walks
+        None => false,
+    });
+    let mut new_keys: Vec<String> = by_key.keys().cloned().collect();
+    new_keys.sort();
+    for key in new_keys {
+        let members = by_key.remove(&key).unwrap();
+        groups.push(AppGroup::build(key, members));
+    }
+}
+
+/// A row's grouping key: its own app_id when windowed, else the
+/// app_id of the nearest windowed ancestor (walking ppid up to a
+/// bounded depth), else the process's own name.
+fn group_key(all: &[ProcRow], row: &ProcRow) -> String {
+    if let Some(app) = row
+        .window
+        .as_ref()
+        .and_then(|window| window.app_id.as_ref())
+    {
+        return app.to_lowercase();
+    }
+    let mut pid = row.parent;
+    let mut hops = 0;
+    while let Some(ancestor_pid) = pid {
+        if hops >= 32 {
+            break;
+        }
+        hops += 1;
+        let Some(ancestor) = all.iter().find(|row| row.pid == ancestor_pid) else {
+            break;
+        };
+        if let Some(app) = ancestor
+            .window
+            .as_ref()
+            .and_then(|window| window.app_id.as_ref())
+        {
+            return app.to_lowercase();
+        }
+        pid = ancestor.parent;
+    }
+    row.name.to_lowercase()
+}
+
+impl AppGroup {
+    fn build(key: String, mut members: Vec<ProcRow>) -> Self {
+        members.sort_by_key(|row| row.pid);
+        let name = members
+            .iter()
+            .find_map(|row| row.window.as_ref().and_then(|w| w.app_id.clone()))
+            .unwrap_or_else(|| members[0].name.clone());
+        AppGroup {
+            cpu: members.iter().map(|row| row.cpu).sum(),
+            mem: members.iter().map(|row| row.mem).sum(),
+            background: !members.iter().any(|row| row.window.is_some()),
+            has_focused: members
+                .iter()
+                .any(|row| row.window.as_ref().is_some_and(|w| w.focused)),
+            key,
+            name,
+            members,
+        }
+    }
+}
+
+/// The table's order over app groups. Cpu and Mem sort down (the hog
+/// first), Name and Pid sort up; a spike needs no direction toggle.
+/// Pid compares a group's first member (its lowest pid).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum SortKey {
+    Cpu,
+    Mem,
+    Name,
+    Pid,
+}
+
+pub(crate) fn sort_groups(groups: &mut [AppGroup], key: SortKey) {
+    match key {
+        SortKey::Cpu => groups
+            .sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)),
+        SortKey::Mem => groups.sort_by(|a, b| b.mem.cmp(&a.mem)),
+        SortKey::Name => groups.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        SortKey::Pid => groups.sort_by(|a, b| a.members[0].pid.cmp(&b.members[0].pid)),
+    }
 }
 
 /// The row's lead identity: the window's app when joined, the
@@ -150,25 +349,6 @@ pub(crate) fn lead(row: &ProcRow) -> &str {
             })
             .unwrap_or(&row.name),
         None => &row.name,
-    }
-}
-
-/// The table's order. Cpu and Mem sort down (the hog first), Name
-/// and Pid sort up; a spike needs no direction toggle.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum SortKey {
-    Cpu,
-    Mem,
-    Name,
-    Pid,
-}
-
-pub(crate) fn sort_rows(rows: &mut [ProcRow], key: SortKey) {
-    match key {
-        SortKey::Cpu => rows.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)),
-        SortKey::Mem => rows.sort_by(|a, b| b.mem.cmp(&a.mem)),
-        SortKey::Name => rows.sort_by(|a, b| lead(a).to_lowercase().cmp(&lead(b).to_lowercase())),
-        SortKey::Pid => rows.sort_by(|a, b| a.pid.cmp(&b.pid)),
     }
 }
 
@@ -209,6 +389,32 @@ mod tests {
         }
     }
 
+    fn row(pid: u32, name: &str, cpu: f32, mem: u64) -> ProcRow {
+        ProcRow {
+            pid,
+            parent: None,
+            name: name.to_string(),
+            cpu,
+            mem,
+            window: None,
+        }
+    }
+
+    fn windowed(pid: u32, name: &str, app_id: &str, focused: bool) -> ProcRow {
+        ProcRow {
+            pid,
+            parent: None,
+            name: name.to_string(),
+            cpu: 0.,
+            mem: 0,
+            window: Some(WindowRef {
+                app_id: Some(app_id.to_string()),
+                title: format!("{app_id} title"),
+                focused,
+            }),
+        }
+    }
+
     #[test]
     fn join_attaches_the_window_to_its_pid() {
         let windows = vec![window(2298, "kuma-term", true)];
@@ -245,62 +451,109 @@ mod tests {
     }
 
     #[test]
-    fn sorts_cpu_down_and_name_up() {
-        let mut rows = vec![
-            ProcRow { pid: 1, parent: None, name: "b".into(), cpu: 1., mem: 10, window: None },
-            ProcRow { pid: 2, parent: None, name: "A".into(), cpu: 9., mem: 50, window: None },
-            ProcRow { pid: 3, parent: None, name: "c".into(), cpu: 4., mem: 30, window: None },
-        ];
-        sort_rows(&mut rows, SortKey::Cpu);
-        assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![2, 3, 1]);
-        sort_rows(&mut rows, SortKey::Name);
-        assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["A", "b", "c"]);
-        sort_rows(&mut rows, SortKey::Mem);
-        assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![2, 3, 1]);
-        sort_rows(&mut rows, SortKey::Pid);
-        assert_eq!(rows.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![1, 2, 3]);
+    fn groups_merge_app_with_helpers_and_sum() {
+        // zen's window plus two forked content processes: one row,
+        // the sums, the members rostered by pid. The helpers file
+        // under the windowed ancestor whatever they are named.
+        let mut zen = windowed(100, "zen", "zen", true);
+        zen.cpu = 2.;
+        zen.mem = 100;
+        let mut helper = row(102, "zen-worker", 4., 300);
+        helper.parent = Some(100);
+        let mut groups = Vec::new();
+        merge_groups(
+            &mut groups,
+            vec![zen.clone(), helper, row(101, "zen", 3., 200)],
+        );
+        assert_eq!(groups.len(), 1, "the app and its helpers must share a group");
+        let group = &groups[0];
+        assert_eq!(group.name, "zen");
+        assert_eq!(group.members.iter().map(|r| r.pid).collect::<Vec<_>>(), vec![100, 101, 102]);
+        assert_eq!(group.cpu, 9.);
+        assert_eq!(group.mem, 600);
+        assert!(group.has_focused);
+        assert!(!group.background);
     }
 
     #[test]
-    fn kernel_threads_are_kthreadd_children() {
-        let mut row = raw(99, "kworker/3:1");
-        row.parent = Some(2);
-        let rows = join(vec![row], &[]);
-        assert!(is_kernel(&rows[0]));
-        let mut row = raw(98, "systemd");
-        row.parent = Some(1);
-        let rows = join(vec![row], &[]);
-        assert!(!is_kernel(&rows[0]));
+    fn helpers_file_under_the_windowed_ancestors_app_id() {
+        // a helper whose binary name shares nothing with the app:
+        // WebKit's processes under epiphany
+        let browser = windowed(10, "epiphany", "org.gnome.Epiphany", false);
+        let mut helper = row(11, "WebKitWebProces", 1., 90);
+        helper.parent = Some(10);
+        let mut groups = Vec::new();
+        merge_groups(&mut groups, vec![browser, helper]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "org.gnome.Epiphany");
     }
 
     #[test]
-    fn lead_prefers_the_app_id_then_the_title() {
-        let mut row = ProcRow {
-            pid: 1,
-            parent: None,
-            name: "electron".into(),
-            cpu: 0.,
-            mem: 0,
-            window: Some(WindowRef {
-                app_id: Some("kuma-term".into()),
-                title: "kuma-term".into(),
-                focused: false,
-            }),
-        };
-        assert_eq!(lead(&row), "kuma-term");
-        row.window = Some(WindowRef {
-            app_id: None,
-            title: "Some Window".into(),
-            focused: false,
-        });
-        assert_eq!(lead(&row), "Some Window");
-        row.window = None;
-        assert_eq!(lead(&row), "electron");
+    fn orphan_processes_are_background() {
+        // no window anywhere in the ancestor chain: session plumbing,
+        // grouped by name and marked background
+        let mut daemon = row(20, "pipewire", 0.5, 30);
+        daemon.parent = Some(1);
+        let mut groups = Vec::new();
+        merge_groups(&mut groups, vec![daemon, row(21, "pipewire", 0.2, 10)]);
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].background);
+        assert!(!groups[0].has_focused);
     }
 
-    /// A live beat in the build container: the sampler's own half of
-    /// the table yields rows (the container's /proc holds cargo and
-    /// friends during the run), cpu and memory read as finite totals.
+    #[test]
+    fn groups_keep_their_order_and_drop_the_dead() {
+        let mut groups = Vec::new();
+        merge_groups(&mut groups, vec![row(1, "a", 0., 0), row(2, "b", 0., 0)]);
+        assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        merge_groups(
+            &mut groups,
+            vec![row(1, "a", 0., 0), row(2, "b", 0., 0), row(3, "c", 0., 0)],
+        );
+        assert_eq!(
+            groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"],
+            "existing groups keep their position, new ones join at the tail"
+        );
+        merge_groups(&mut groups, vec![row(2, "b", 0., 0), row(3, "c", 0., 0)]);
+        assert_eq!(
+            groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c"],
+            "a group whose last member died drops out"
+        );
+    }
+
+    #[test]
+    fn sort_groups_by_each_key() {
+        let mut groups = Vec::new();
+        merge_groups(
+            &mut groups,
+            vec![
+                row(1, "b", 1., 10),
+                row(2, "A", 9., 50),
+                row(3, "c", 4., 30),
+            ],
+        );
+        sort_groups(&mut groups, SortKey::Cpu);
+        assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["A", "c", "b"]);
+        sort_groups(&mut groups, SortKey::Name);
+        assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["A", "b", "c"]);
+        sort_groups(&mut groups, SortKey::Mem);
+        assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["A", "c", "b"]);
+        sort_groups(&mut groups, SortKey::Pid);
+        assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["b", "A", "c"]);
+    }
+
+    #[test]
+    fn parse_statm_reads_pages() {
+        assert_eq!(parse_statm("123 100 60 10 0 40 0"), Some((100, 60)));
+        assert_eq!(parse_statm("junk"), None);
+        assert_eq!(parse_statm("1 2"), None);
+    }
+
+    /// A live beat in the build container: the uid-scoped walk yields
+    /// rows (the container's /proc holds cargo and friends during the
+    /// run), cpu and memory read as finite totals.
     #[test]
     fn a_live_beat_yields_rows() {
         let mut sampler = Sampler::new();
@@ -315,5 +568,19 @@ mod tests {
         assert_eq!(human_mem(0), "0.0 KiB");
         assert_eq!(human_mem(1024 * 1024 * 5), "5.0 MiB");
         assert_eq!(human_mem(1024 * 1024 * 1024 * 31), "31.0 GiB");
+    }
+
+    #[test]
+    fn lead_prefers_the_app_id_then_the_title() {
+        let mut row = windowed(1, "electron", "kuma-term", false);
+        assert_eq!(lead(&row), "kuma-term");
+        row.window = Some(WindowRef {
+            app_id: None,
+            title: "Some Window".into(),
+            focused: false,
+        });
+        assert_eq!(lead(&row), "Some Window");
+        row.window = None;
+        assert_eq!(lead(&row), "electron");
     }
 }

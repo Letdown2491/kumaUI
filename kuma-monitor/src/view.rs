@@ -1,22 +1,21 @@
 //! The spike's one view: a CPU graph over the last two minutes, the
-//! memory line, and the table. The table leads with identity (the
-//! window when there is one, the process name when not), keeps its
-//! order stable while values tick (the order moves on a click, never
-//! on a beat), and folds only the kernel's threads behind one summary
-//! line: the app's question is which window is eating the machine,
-//! and the session's own processes stay in sight.
+//! memory line, and the table. The table speaks in apps, not
+//! processes: every process an app owns files under one row (the
+//! windowed process and its helpers together), clicking it unfolds
+//! the member roster in place, and the session's background plumbing
+//! (the daemons nothing recognizes) hides behind one summary line.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    ClickEvent, Context, Div, IntoElement, Render, Stateful, UniformListScrollHandle, Window,
-    div, px, uniform_list, prelude::*,
+    prelude::*, ClickEvent, Context, Div, IntoElement, Render, SharedString, Stateful,
+    UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
 };
 
 use crate::niri;
-use crate::sample::{self, ProcRow, Sampler, Snapshot, SortKey};
+use crate::sample::{self, AppGroup, ProcRow, Sampler, Snapshot, SortKey};
 use crate::theme;
 
 /// Two minutes of history at the 1s tick.
@@ -25,7 +24,7 @@ const HISTORY: usize = 120;
 /// The table's columns, one spec for the header and the rows: the
 /// same builder shapes both, so a value cannot drift off its title.
 /// NAME is the flex column; the rest are fixed and right-set.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Col {
     Name,
     Pid,
@@ -69,12 +68,36 @@ impl Col {
     }
 }
 
+/// One visible line: an app's row (with its fold state), one of its
+/// members when unfolded, or the background summary.
+enum Item {
+    Group {
+        index: usize,
+        key: String,
+        open: bool,
+        dim: bool,
+    },
+    Member {
+        group: usize,
+        member: usize,
+    },
+    BgSummary {
+        open: bool,
+    },
+}
+
 pub(crate) struct MonitorView {
     sampler: Sampler,
     history: Vec<f32>,
-    rows: Vec<ProcRow>,
+    /// The app groups, persistent across beats: existing groups keep
+    /// their position, the dead drop out, first-seen apps join at the
+    /// tail, and only a header click reorders any of it.
+    groups: Vec<AppGroup>,
+    /// Which app groups are unfolded, keyed by the group key so the
+    /// state survives the members churning underneath it.
+    expanded_apps: HashSet<String>,
+    show_background: bool,
     sort: SortKey,
-    expanded: bool,
     mem_used: u64,
     mem_total: u64,
     palette_mtime: Option<SystemTime>,
@@ -86,9 +109,10 @@ impl MonitorView {
         let mut view = Self {
             sampler: Sampler::new(),
             history: Vec::new(),
-            rows: Vec::new(),
+            groups: Vec::new(),
+            expanded_apps: HashSet::new(),
+            show_background: false,
             sort: SortKey::Cpu,
-            expanded: false,
             mem_used: 0,
             mem_total: 0,
             palette_mtime: None,
@@ -96,7 +120,7 @@ impl MonitorView {
         };
         view.sync_palette();
         view.beat(cx);
-        sample::sort_rows(&mut view.rows, view.sort);
+        sample::sort_groups(&mut view.groups, view.sort);
 
         // The tick: sample, land, wait a second, again. The bar's
         // loop shape (kuma-shell/src/bar.rs): update-or-die, then the
@@ -148,19 +172,9 @@ impl MonitorView {
     /// cannot be read, and a hog announces itself by its number, not
     /// by jumping rows.
     fn apply_snapshot(&mut self, snap: Snapshot) {
-        let mut fresh: HashMap<u32, ProcRow> =
-            snap.rows.into_iter().map(|row| (row.pid, row)).collect();
-        self.rows.retain_mut(|row| match fresh.remove(&row.pid) {
-            Some(new) => {
-                *row = new;
-                true
-            }
-            // the process died between beats
-            None => false,
-        });
-        // spawned since the last beat: they join at the tail, the
-        // next header click files them
-        self.rows.extend(fresh.into_values());
+        if !snap.rows.is_empty() {
+            sample::merge_groups(&mut self.groups, snap.rows);
+        }
 
         self.history.push(snap.cpu_total);
         if self.history.len() > HISTORY {
@@ -172,7 +186,7 @@ impl MonitorView {
 
     fn set_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
         self.sort = key;
-        sample::sort_rows(&mut self.rows, key);
+        sample::sort_groups(&mut self.groups, key);
         cx.notify();
     }
 }
@@ -180,16 +194,71 @@ impl MonitorView {
 impl Render for MonitorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let cpu_now = self.history.last().copied().unwrap_or(0.);
-        let rows = self.rows.clone();
-        let (kernel, shown): (Vec<ProcRow>, Vec<ProcRow>) = rows
-            .into_iter()
-            .partition(|row| row.window.is_none() && sample::is_kernel(row));
-        let list = if self.expanded {
-            self.rows.clone()
-        } else {
-            shown
-        };
-        let count = list.len();
+        let this = cx.weak_entity();
+        // apps first, then the background summary, then (unfolded)
+        // the background groups: each keeps the groups' sorted order
+        let mut items: Vec<Item> = Vec::new();
+        let mut background: Vec<usize> = Vec::new();
+        for (index, group) in self.groups.iter().enumerate() {
+            if group.background {
+                background.push(index);
+                continue;
+            }
+            let open = self.expanded_apps.contains(&group.key);
+            items.push(Item::Group {
+                index,
+                key: group.key.clone(),
+                open,
+                dim: false,
+            });
+            if open {
+                for member in 0..group.members.len() {
+                    items.push(Item::Member {
+                        group: index,
+                        member,
+                    });
+                }
+            }
+        }
+        let bg_count: usize = background
+            .iter()
+            .map(|index| self.groups[*index].members.len())
+            .sum();
+        let bg_cpu: f32 = background
+            .iter()
+            .map(|index| self.groups[*index].members.iter().map(|row| row.cpu).sum::<f32>())
+            .sum();
+        let bg_mem: u64 = background
+            .iter()
+            .map(|index| self.groups[*index].members.iter().map(|row| row.mem).sum::<u64>())
+            .sum();
+        if !background.is_empty() {
+            items.push(Item::BgSummary {
+                open: self.show_background,
+            });
+        }
+        if self.show_background {
+            for index in &background {
+                let open = self.expanded_apps.contains(&self.groups[*index].key);
+                items.push(Item::Group {
+                    index: *index,
+                    key: self.groups[*index].key.clone(),
+                    open,
+                    dim: true,
+                });
+                if open {
+                    for member in 0..self.groups[*index].members.len() {
+                        items.push(Item::Member {
+                            group: *index,
+                            member,
+                        });
+                    }
+                }
+            }
+        }
+        let count = items.len();
+        let groups = self.groups.clone();
+        let this2 = this.clone();
 
         div()
             .size_full()
@@ -221,13 +290,16 @@ impl Render for MonitorView {
                     .flex_col()
                     .child(
                         uniform_list("proc-rows", count, move |range, _, _| {
-                            list[range.clone()].iter().map(row_view).collect()
+                            items[range.clone()]
+                                .iter()
+                                .map(|item| list_item(item, &groups, &this2))
+                                .collect()
                         })
                         .flex_1()
                         .track_scroll(&self.scroll),
                     ),
             )
-            .child(self.footer(&kernel, cx))
+            .child(self.footer(bg_count, bg_cpu, bg_mem))
     }
 }
 
@@ -282,6 +354,7 @@ impl MonitorView {
         let active = self.sort == col.key();
         let cell = div()
             .id(col.label())
+            .debug_selector(move || format!("hdr-{}", col.label()))
             .py_1()
             .px_2()
             .text_size(px(11.))
@@ -305,77 +378,44 @@ impl MonitorView {
         }
     }
 
-    /// The summary line under the table: the kernel's threads, folded.
-    /// Collapsed it counts (n threads, their cpu and memory, both of
-    /// which are nearly nothing); expanded it offers the way back.
-    fn footer(&self, kernel: &[ProcRow], cx: &mut Context<Self>) -> Stateful<Div> {
-        let cpu: f32 = kernel.iter().map(|row| row.cpu).sum();
-        let mem: u64 = kernel.iter().map(|row| row.mem).sum();
-        let label = if self.expanded {
-            "- hide the kernel's threads".to_string()
-        } else {
-            format!(
-                "+ {} kernel threads \u{b7} {cpu:.1}% \u{b7} {}",
-                kernel.len(),
-                sample::human_mem(mem)
-            )
-        };
+    /// The line under the table: the app and process counts on the
+    /// left, the build stamp on the right (which build this window
+    /// is: a monitor that cannot say its own build invites judging it
+    /// against the previous one).
+    fn footer(&self, processes: usize, _bg_cpu: f32, _bg_mem: u64) -> Div {
+        let apps = self.groups.iter().filter(|g| !g.background).count();
         div()
-            .id("system-toggle")
+            .flex()
             .border_t_1()
             .border_color(theme::border())
             .py_1()
             .px_3()
             .text_size(px(11.))
             .text_color(theme::text_dim())
-            .on_click(cx.listener(|this, _click: &ClickEvent, _, cx| {
-                this.expanded = !this.expanded;
-                cx.notify();
-            }))
-            .child(label)
+            .child(format!(
+                "{} apps \u{b7} {} processes",
+                apps, processes
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(10.))
+                    .text_color(theme::text_dim())
+                    .child(crate::version_line()),
+            )
     }
 }
 
-/// One table row, from the same Col spec the header uses: same
-/// widths, same px_2, same right-setting, so a value sits exactly
-/// under its title. Identity leads; unwindowed rows wear dim (they
-/// are the session's residents, the expanded view's extra residents
-/// are the kernel's); the focused window's row is the single
-/// highlight.
-fn row_view(row: &ProcRow) -> Div {
-    let focused = row.window.as_ref().is_some_and(|w| w.focused);
-    let mut base = div()
-        .h(px(26.))
-        .flex()
-        .items_center()
-        .bg(if focused {
-            theme::row_selected()
-        } else {
-            theme::clear()
-        });
-    for col in COLS {
-        base = base.child(child_cell(row, col));
-    }
-    base
-}
-
-/// The row's cell for one column: content first, then the shared
-/// spec (width, padding, alignment) applied identically to the
-/// header's cells.
-fn child_cell(row: &ProcRow, col: Col) -> Div {
-    let mut cell = match col {
-        Col::Name => identity_cell(row),
-        Col::Pid => div().child(row.pid.to_string()).text_color(theme::text_dim()),
-        Col::Cpu => div().child(format!("{:.1}", row.cpu)),
-        Col::Mem => div()
-            .child(sample::human_mem(row.mem))
-            .text_color(theme::text_dim()),
-    };
-    cell = match col.width() {
+/// The shared cell spec: width, padding, right-setting. The header
+/// builds its own cells (stateful, clickable) but every row kind
+/// passes through this one function, so the extents cannot drift.
+fn apply_spec(cell: Div, col: Col) -> Div {
+    let cell = match col.width() {
         Some(w) => cell.w(px(w)),
         None => cell.flex_1(),
     };
-    cell = cell.px_2();
+    let cell = cell.px_2();
+    let cell = cell.debug_selector(move || format!("row-{}", col.label()));
     if col.right() {
         cell.flex().justify_end()
     } else {
@@ -383,48 +423,190 @@ fn child_cell(row: &ProcRow, col: Col) -> Div {
     }
 }
 
-/// The identity column's content: the window's app and title when
-/// joined (a title that repeats the app says nothing twice), the
-/// process name when not.
-fn identity_cell(row: &ProcRow) -> Div {
-    let (lead, suffix) = identity(row);
-    let unwindowed = row.window.is_none();
-    let mut cell = div().flex().gap_2().truncate().child(
-        div()
-            .truncate()
-            .text_color(if unwindowed {
-                theme::text_dim()
-            } else {
-                theme::text()
-            })
-            .child(lead),
-    );
-    if !suffix.is_empty() {
-        cell = cell.child(
+fn list_item(
+    item: &Item,
+    groups: &[AppGroup],
+    this: &WeakEntity<MonitorView>,
+) -> Stateful<Div> {
+    match item {
+        Item::Group {
+            index,
+            key,
+            open,
+            dim,
+        } => group_row(&groups[*index], key, *open, *dim, this),
+        Item::Member { group, member } => member_row(&groups[*group].members[*member]),
+        Item::BgSummary { open } => background_row(*open, this),
+    }
+}
+
+/// The app's row: its sums, its process count, and the fold for the
+/// roster. Clicking anywhere in it unfolds the members in place.
+fn group_row(
+    group: &AppGroup,
+    key: &str,
+    open: bool,
+    dim: bool,
+    this: &WeakEntity<MonitorView>,
+) -> Stateful<Div> {
+    let click_key = key.to_string();
+    let this = this.clone();
+    let text = if dim { theme::text_dim() } else { theme::text() };
+    let mut name = div().flex().gap_2().truncate()
+        .child(
+            div()
+                .text_color(theme::text_dim())
+                .child(if open { "\u{25be}" } else { "\u{25b8}" }),
+        )
+        .child(div().truncate().text_color(text).child(group.name.clone()));
+    if group.members.len() > 1 {
+        name = name.child(
             div()
                 .truncate()
                 .text_color(theme::text_dim())
-                .child(suffix),
+                .child(format!("\u{b7} {} procs", group.members.len())),
         );
     }
-    cell
+    div()
+        .id(SharedString::from(key.to_string()))
+        .h(px(26.))
+        .w_full()
+        .flex()
+        .items_center()
+        .debug_selector(|| "row-line".into())
+        .bg(if group.has_focused {
+            theme::row_selected()
+        } else {
+            theme::clear()
+        })
+        .on_click(move |_, _, app| {
+            let _ = this.update(app, |this, cx| {
+                if !this.expanded_apps.remove(&click_key) {
+                    this.expanded_apps.insert(click_key.clone());
+                }
+                cx.notify();
+            });
+        })
+        .child(apply_spec(name.flex_1(), Col::Name))
+        .child(apply_spec(div(), Col::Pid))
+        .child(
+            apply_spec(
+                div()
+                    .child(format!("{:.1}", group.cpu))
+                    .text_color(text),
+                Col::Cpu,
+            ),
+        )
+        .child(
+            apply_spec(
+                div()
+                    .child(sample::human_mem(group.mem))
+                    .text_color(theme::text_dim()),
+                Col::Mem,
+            ),
+        )
 }
 
-/// The identity pair: lead (bright) and suffix (dim).
-fn identity(row: &ProcRow) -> (String, String) {
+/// The background summary: the session's plumbing, folded. Collapsed
+/// it counts (processes, their cpu and memory); expanded it offers
+/// the way back and the daemon rows beneath it.
+fn background_row(open: bool, this: &WeakEntity<MonitorView>) -> Stateful<Div> {
+    let this = this.clone();
+    div()
+        .id("bg-summary")
+        .h(px(26.))
+        .w_full()
+        .flex()
+        .items_center()
+        .debug_selector(|| "row-line".into())
+        .on_click(move |_, _, app| {
+            let _ = this.update(app, |this, cx| {
+                this.show_background = !this.show_background;
+                cx.notify();
+            });
+        })
+        .child(
+            apply_spec(
+                div()
+                    .flex_1()
+                    .text_color(theme::text_dim())
+                    .child(if open {
+                        "\u{25be} hide background processes".to_string()
+                    } else {
+                        "\u{25b8} background processes".to_string()
+                    }),
+                Col::Name,
+            )
+            .pl(px(2.)),
+        )
+        .child(apply_spec(div(), Col::Pid))
+        .child(apply_spec(div(), Col::Cpu))
+        .child(apply_spec(div(), Col::Mem))
+}
+
+/// A member row: the window's title when it has one (the app's name
+/// is the group header now: saying it twice is noise), the process
+/// name when not; indented a step under its app.
+fn member_row(row: &ProcRow) -> Stateful<Div> {
+    let windowed = row.window.is_some();
+    let focused = row.window.as_ref().is_some_and(|w| w.focused);
+    let lead = member_lead(row);
+    div()
+        .id(SharedString::from(format!("m-{}", row.pid)))
+        .h(px(26.))
+        .w_full()
+        .flex()
+        .items_center()
+        .debug_selector(|| "row-line".into())
+        .bg(if focused {
+            theme::row_selected()
+        } else {
+            theme::clear()
+        })
+        .child(
+            apply_spec(
+                div()
+                    .flex()
+                    .gap_2()
+                    .truncate()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(if windowed {
+                                theme::text()
+                            } else {
+                                theme::text_dim()
+                            })
+                            .child(lead),
+                    )
+                    .flex_1(),
+                Col::Name,
+            )
+            .pl(px(24.)),
+        )
+        .child(
+            apply_spec(
+                div().child(row.pid.to_string()).text_color(theme::text_dim()),
+                Col::Pid,
+            ),
+        )
+        .child(apply_spec(div().child(format!("{:.1}", row.cpu)), Col::Cpu))
+        .child(
+            apply_spec(
+                div()
+                    .child(sample::human_mem(row.mem))
+                    .text_color(theme::text_dim()),
+                Col::Mem,
+            ),
+        )
+}
+
+/// A member's lead: the title when the window has one, the process
+/// name otherwise.
+fn member_lead(row: &ProcRow) -> String {
     match &row.window {
-        Some(window) => {
-            let app = window.app_id.clone().unwrap_or_default();
-            let title = window.title.trim().to_string();
-            if title.is_empty() || title == app {
-                (if app.is_empty() { row.name.clone() } else { app }, String::new())
-            } else if app.is_empty() {
-                (title, String::new())
-            } else {
-                (app, format!("\u{b7} {title}"))
-            }
-        }
-        None => (row.name.clone(), String::new()),
+        Some(window) if !window.title.is_empty() => window.title.clone(),
+        _ => row.name.clone(),
     }
 }
 
@@ -510,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_prefers_the_app_then_the_title_then_the_name() {
+    fn member_leads_with_the_title_then_the_name() {
         let mut row = ProcRow {
             pid: 1,
             parent: None,
@@ -519,28 +701,92 @@ mod tests {
             mem: 0,
             window: Some(sample::WindowRef {
                 app_id: Some("kuma-term".into()),
-                title: "kuma-term".into(),
+                title: "main".into(),
                 focused: false,
             }),
         };
-        // a title that repeats the app says nothing twice
-        let (lead, suffix) = identity(&row);
-        assert_eq!(lead, "kuma-term");
-        assert!(suffix.is_empty());
-        // a real title rides along, dim, after the app
-        row.window.as_mut().unwrap().title = "main".into();
-        let (lead, suffix) = identity(&row);
-        assert_eq!(lead, "kuma-term");
-        assert_eq!(suffix, "\u{b7} main");
-        // no app_id: the title speaks
-        row.window.as_mut().unwrap().app_id = None;
-        let (lead, suffix) = identity(&row);
-        assert_eq!(lead, "main");
-        assert!(suffix.is_empty());
-        // no window: the process name
+        // the app's name is the group header: the member says the title
+        assert_eq!(member_lead(&row), "main");
+        row.window.as_mut().unwrap().title = String::new();
+        assert_eq!(member_lead(&row), "electron");
         row.window = None;
-        let (lead, suffix) = identity(&row);
-        assert_eq!(lead, "electron");
-        assert!(suffix.is_empty());
+        assert_eq!(member_lead(&row), "electron");
+    }
+
+    /// The proof the last rounds lacked: header and rows get their
+    /// cells from one Col spec, and this asserts they land on the
+    /// same x-extents in a real painted window, not in my reasoning.
+    #[test]
+    fn row_cells_share_the_header_s_column_extents() {
+        use std::sync::Arc;
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| MonitorView::new(window, cx));
+        app.run_until_parked();
+        // in the test container there are no windows and no windowed
+        // ancestors: unfold the background roster so the table surely
+        // paints member rows
+        window.update(|view, _, cx| {
+            view.show_background = true;
+            view.expanded_apps = view.groups.iter().map(|g| g.key.clone()).collect();
+            cx.notify();
+        });
+        app.run_until_parked();
+        let extents = window.update(|_, window, _| {
+            let probe = |sel: &str| {
+                window
+                    .debug_element_bounds(sel)
+                    .map(|b| (sel.to_string(), b))
+            };
+            let mut all: Vec<(String, gpui::Bounds<gpui::Pixels>)> = Vec::new();
+            all.extend(probe("hdr-line"));
+            all.extend(probe("row-line"));
+            for col in COLS {
+                all.extend(probe(&format!("hdr-{}", col.label())));
+                all.extend(probe(&format!("row-{}", col.label())));
+            }
+            all
+        });
+        let bad: Vec<String> = COLS
+            .iter()
+            .filter_map(|col| {
+                let hdr = extents
+                    .iter()
+                    .find(|(sel, _)| *sel == format!("hdr-{}", col.label()))
+                    .map(|(_, b)| *b)?;
+                let row = extents
+                    .iter()
+                    .find(|(sel, _)| *sel == format!("row-{}", col.label()))
+                    .map(|(_, b)| *b)?;
+                if (hdr.origin.x - row.origin.x).abs() < px(1.)
+                    && (hdr.size.width - row.size.width).abs() < px(1.)
+                {
+                    None
+                } else {
+                    Some(format!(
+                        "{col:?}: hdr x={} w={} | row x={} w={}",
+                        hdr.origin.x, hdr.size.width, row.origin.x, row.size.width
+                    ))
+                }
+            })
+            .collect();
+        let dump = extents
+            .iter()
+            .map(|(sel, b)| {
+                format!(
+                    "{sel}: x={} y={} w={} h={}",
+                    b.origin.x, b.origin.y, b.size.width, b.size.height
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        assert!(
+            bad.is_empty(),
+            "column extents diverge:\n{}\nall bounds:\n  {dump}",
+            bad.join("\n")
+        );
     }
 }
