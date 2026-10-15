@@ -140,7 +140,11 @@ pub(crate) struct MonitorView {
 }
 
 impl MonitorView {
-    pub(crate) fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // the window surface must opt into alpha before anything
+        // paints, and subpixel AA is wrong over a translucent
+        // background (kuma-term/src/view.rs, same stack)
+        window.set_background_appearance(gpui::WindowBackgroundAppearance::Transparent);
         let mut view = Self {
             sampler: Sampler::new(),
             stats: Stats::new(),
@@ -262,7 +266,17 @@ impl MonitorView {
 }
 
 impl Render for MonitorView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // background alpha: the focused window shows the most
+        // wallpaper, inactive windows dim toward solid for contrast
+        // (kuma-term/src/view.rs). Picked here because render is the
+        // one place that sees the window; a focus flip repaints on
+        // the next beat at the latest.
+        theme::set_window_opacity(if window.is_window_active() {
+            theme::BG_OPACITY_FOCUSED
+        } else {
+            theme::BG_OPACITY_UNFOCUSED
+        });
         let cpu_now = self.history.last().copied().unwrap_or(0.);
         let this = cx.weak_entity();
         // apps first, then the background summary, then (unfolded)

@@ -21,15 +21,37 @@ static ACCENT: AtomicU32 = AtomicU32::new(0x4f8cc9);
 static SURFACE: AtomicU32 = AtomicU32::new(0x1b1e24);
 static INSET: AtomicU32 = AtomicU32::new(0x14161a);
 
+/// The window's mass fades to the terminal's 80/90: focused shows the
+/// most wallpaper, unfocused dims toward solid for contrast. Stored
+/// as the alpha byte the mass colors get OR'd in with, so the palette
+/// slots keep holding plain RGB.
+static OPACITY: AtomicU32 = AtomicU32::new(0xFF);
+
+/// Background opacity with the window focused (kuma-term's number).
+pub(crate) const BG_OPACITY_FOCUSED: f32 = 0.80;
+/// Background opacity with the window unfocused (kuma-term's number).
+pub(crate) const BG_OPACITY_UNFOCUSED: f32 = 0.90;
+
+pub(crate) fn set_window_opacity(opacity: f32) {
+    OPACITY.store((((opacity * 255.) + 0.5) as u32) & 0xFF, Ordering::Relaxed);
+}
+
 fn get(slot: &AtomicU32) -> Rgba {
     rgb(slot.load(Ordering::Relaxed))
 }
 
+/// A mass color: the palette value under the window's current
+/// opacity. Only the window's mass fades (bg, surface, inset, row
+/// selection); ink (text, accent, borders) stays opaque over it.
+fn fading(slot: &AtomicU32) -> Rgba {
+    rgba((slot.load(Ordering::Relaxed) << 8) | OPACITY.load(Ordering::Relaxed))
+}
+
 pub(crate) fn bg() -> Rgba {
-    get(&BG)
+    fading(&BG)
 }
 pub(crate) fn row_selected() -> Rgba {
-    get(&ROW_SELECTED)
+    fading(&ROW_SELECTED)
 }
 pub(crate) fn border() -> Rgba {
     get(&BORDER)
@@ -45,11 +67,11 @@ pub(crate) fn accent() -> Rgba {
 }
 /// The card fill, one step above the background.
 pub(crate) fn surface() -> Rgba {
-    get(&SURFACE)
+    fading(&SURFACE)
 }
 /// The well a fill grows out of (the memory bar's track).
 pub(crate) fn inset() -> Rgba {
-    get(&INSET)
+    fading(&INSET)
 }
 /// The accent at a whisper: the graph's history fill, loud only as a
 /// shape, not as a color.
