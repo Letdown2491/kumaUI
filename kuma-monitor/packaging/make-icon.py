@@ -2,12 +2,12 @@
 """Generates kuma-monitor.png, the Kamuy app icon.
 
 Koguma and Higuma's sibling, by the same recipe and palette: the
-family ears at the same two spots peeking over the body's edge, a
-face of dark dot eyes and a nose on the accent body. The body is
-the difference: a crescent bowl, the moon the watching spirit
-inhabits, horns sweeping down on either side and a hollow under
-the face. Filled shapes, not outlines: an app icon needs visual
-mass to read at 24px in the dock.
+family ears at the same two spots peeking over the body's edge,
+dark dot eyes and a nose on the accent body. The body is the
+difference: a round head wearing the moon as a dark crescent
+birthmark on the forehead, the watching spirit marked by the moon
+it keeps watch under. Filled shapes, not outlines: an app icon
+needs visual mass to read at 24px in the dock.
 
 Like the other icons this ships as a 256x256 PNG: raster icons
 decode through the true-color path, while the shell tints SVG
@@ -35,11 +35,12 @@ def s(v: float) -> float:
 
 
 # the geometry, on the 48 grid
-MOON = (24.0, 25.0, 15.5)  # the crescent's outer circle
-BITE = (24.0, 29.5, 14.0)  # the circle cut away, leaving the bowl
+HEAD = (24.0, 26.5, 16.0)
 EARS = [(14.5, 13.8, 4.4), (33.5, 13.8, 4.4)]  # the family placement
-EYES = [(18.5, 13.0, 1.9), (29.5, 13.0, 1.9)]
-NOSE = (24.0, 14.2, 2.2, 1.3)  # center x, y, radii x and y
+MARK = (24.0, 17.5, 4.2)  # the moon mark: a dark crescent
+MARK_BITE = (25.8, 16.3, 3.6)
+EYES = [(18.5, 26.0, 2.0), (29.5, 26.0, 2.0)]
+NOSE = (24.0, 30.5, 2.2, 1.6)  # center x, y, radii x and y
 
 
 def in_circle(cx: float, cy: float, r: float, x: float, y: float) -> bool:
@@ -47,19 +48,22 @@ def in_circle(cx: float, cy: float, r: float, x: float, y: float) -> bool:
 
 
 def pixel(x: float, y: float) -> tuple:
+    # the dark features win over the body where they overlap
     for ex, ey, er in EYES:
         if in_circle(ex, ey, er, x, y):
             return PANEL_BG
     nx, ny, nrx, nry = NOSE
     if ((x - nx) / nrx) ** 2 + ((y - ny) / nry) ** 2 <= 1.0:
         return PANEL_BG
-    # ears union the crescent; the bite is carved from the moon only
+    mx, my, mr = MARK
+    bx, by, br = MARK_BITE
+    if in_circle(mx, my, mr, x, y) and not in_circle(bx, by, br, x, y):
+        return PANEL_BG
     for ex, ey, er in EARS:
         if in_circle(ex, ey, er, x, y):
             return ACCENT
-    mx, my, mr = MOON
-    bx, by, br = BITE
-    if in_circle(mx, my, mr, x, y) and not in_circle(bx, by, br, x, y):
+    hx, hy, hr = HEAD
+    if in_circle(hx, hy, hr, x, y):
         return ACCENT
     return CLEAR
 
