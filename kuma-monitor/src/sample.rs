@@ -340,6 +340,15 @@ pub(crate) enum SortKey {
     Pid,
 }
 
+impl SortKey {
+    /// The direction the key sorts in: the arrow in the active
+    /// header announces it, since the click that changes columns
+    /// never flips direction.
+    pub(crate) fn sorts_down(self) -> bool {
+        matches!(self, SortKey::Cpu | SortKey::Mem)
+    }
+}
+
 pub(crate) fn sort_groups(groups: &mut [AppGroup], key: SortKey) {
     match key {
         SortKey::Cpu => groups
@@ -577,6 +586,11 @@ mod tests {
         assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["A", "c", "b"]);
         sort_groups(&mut groups, SortKey::Pid);
         assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["b", "A", "c"]);
+        // the arrow in the header announces each key's fixed direction
+        assert!(SortKey::Cpu.sorts_down());
+        assert!(SortKey::Mem.sorts_down());
+        assert!(!SortKey::Name.sorts_down());
+        assert!(!SortKey::Pid.sorts_down());
     }
 
     #[test]

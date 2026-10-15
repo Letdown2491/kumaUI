@@ -20,6 +20,7 @@ static TEXT_DIM: AtomicU32 = AtomicU32::new(0x8a93a3);
 static ACCENT: AtomicU32 = AtomicU32::new(0x4f8cc9);
 static SURFACE: AtomicU32 = AtomicU32::new(0x1b1e24);
 static INSET: AtomicU32 = AtomicU32::new(0x14161a);
+static HOVER: AtomicU32 = AtomicU32::new(0x272d38);
 
 /// The window's mass fades to the terminal's 80/90: focused shows the
 /// most wallpaper, unfocused dims toward solid for contrast. Stored
@@ -68,6 +69,11 @@ pub(crate) fn accent() -> Rgba {
 /// The card fill, one step above the background.
 pub(crate) fn surface() -> Rgba {
     fading(&SURFACE)
+}
+/// The hovered row's lift, the shell's own surface_hover: a mass
+/// color, faded with the window like the rest of the floors.
+pub(crate) fn row_hover() -> Rgba {
+    fading(&HOVER)
 }
 /// The well a fill grows out of (the memory bar's track).
 pub(crate) fn inset() -> Rgba {
@@ -122,6 +128,7 @@ impl Default for Palette {
 pub(crate) fn apply_palette(palette: &Palette) {
     BG.store(palette.inset, Ordering::Relaxed);
     SURFACE.store(palette.surface, Ordering::Relaxed);
+    HOVER.store(palette.surface_hover, Ordering::Relaxed);
     BORDER.store(palette.divider, Ordering::Relaxed);
     TEXT.store(palette.text, Ordering::Relaxed);
     TEXT_DIM.store(palette.text_dim, Ordering::Relaxed);

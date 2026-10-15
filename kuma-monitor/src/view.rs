@@ -7,12 +7,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
-    prelude::*, App, ClickEvent, Context, Div, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    Keystroke, Render, Rgba, SharedString, Stateful, UniformListScrollHandle, WeakEntity, Window,
-    div, px, uniform_list,
+    prelude::*, App, ClickEvent, ClipboardItem, Context, Div, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, Keystroke, MouseButton, Render, Rgba, SharedString, Stateful,
+    UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
 };
 
 use crate::niri;
@@ -155,6 +155,9 @@ pub(crate) struct MonitorView {
     /// The table's filter: plain typing lands here, escape clears,
     /// an empty string is no filter at all.
     filter: String,
+    /// The row the user last copied: its name and when, so the
+    /// footer can confirm the copy for a couple of seconds.
+    copied_flash: Option<(String, Instant)>,
     focus: FocusHandle,
 }
 
@@ -196,6 +199,7 @@ impl MonitorView {
             palette_mtime: None,
             scroll: UniformListScrollHandle::new(),
             filter: String::new(),
+            copied_flash: None,
             focus,
         };
         view.sync_palette();
@@ -1069,7 +1073,17 @@ impl MonitorView {
             .on_click(cx.listener(move |this, _click: &ClickEvent, _, cx| {
                 this.set_sort(col.key(), cx);
             }))
-            .child(col.label());
+            .child(if active {
+                // the direction is fixed per key; the arrow just
+                // announces it
+                format!(
+                    "{} {}",
+                    col.label(),
+                    if col.key().sorts_down() { "\u{25be}" } else { "\u{25b4}" }
+                )
+            } else {
+                col.label().to_string()
+            });
         // while a filter is active it lives in the name header:
         // state that must never be invisible, at zero layout cost
         let cell = if col == Col::Name && !self.filter.is_empty() {
@@ -1097,10 +1111,18 @@ impl MonitorView {
     }
 
     /// The line under the table: the list's own counts on the left,
-    /// the machine's age on the right. Load has a card; the build
-    /// stamp answers to --version, not to every frame.
+    /// the machine's age on the right. A fresh right-click copy
+    /// speaks there for two seconds (a beat re-renders every second,
+    /// so the confirmation retires itself). Load has a card; the
+    /// build stamp answers to --version, not to every frame.
     fn footer(&self, processes: usize) -> Div {
         let apps = self.groups.iter().filter(|g| !g.background).count();
+        let lead = match &self.copied_flash {
+            Some((name, at)) if at.elapsed() < Duration::from_secs(2) => {
+                format!("copied {name}")
+            }
+            _ => format!("{apps} apps \u{b7} {processes} processes"),
+        };
         div()
             .flex()
             .items_center()
@@ -1110,7 +1132,7 @@ impl MonitorView {
             .px_3()
             .text_size(px(11.))
             .text_color(theme::text_dim())
-            .child(format!("{apps} apps \u{b7} {processes} processes"))
+            .child(lead)
             .child(div().flex_1())
             .child(format!("up {}", human_uptime(self.vitals.uptime_secs)))
     }
@@ -1182,7 +1204,7 @@ fn list_item(
             hists.get(key).map(|ring| ring.as_slice()),
             this,
         ),
-        Item::Member { group, member } => member_row(&groups[*group].members[*member]),
+        Item::Member { group, member } => member_row(&groups[*group].members[*member], this),
         Item::BgSummary {
             open,
             count,
@@ -1243,6 +1265,9 @@ fn group_row(
 ) -> Stateful<Div> {
     let click_key = key.to_string();
     let this = this.clone();
+    let copy_this = this.clone();
+    let line = group_line(group);
+    let flash = group.name.clone();
     let text = if dim { theme::text_dim() } else { theme::text() };
     let mut name = div().flex().gap_2().truncate()
         .child(
@@ -1278,6 +1303,17 @@ fn group_row(
             theme::row_selected()
         } else {
             theme::clear()
+        })
+        // the focused row is already lit; the others lift on hover
+        .when(!group.has_focused, |row| {
+            row.hover(|style| style.bg(theme::row_hover()))
+        })
+        .on_mouse_down(MouseButton::Right, move |_, _, app| {
+            let _ = copy_this.update(app, |this, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(line.clone()));
+                this.copied_flash = Some((flash.clone(), Instant::now()));
+                cx.notify();
+            });
         })
         .on_click(move |_, _, app| {
             let _ = this.update(app, |this, cx| {
@@ -1336,6 +1372,11 @@ fn background_row(
     this: &WeakEntity<MonitorView>,
 ) -> Stateful<Div> {
     let this = this.clone();
+    let copy_this = this.clone();
+    let line = format!(
+        "{count} background processes  {cpu:.1}%  {}",
+        sample::human_mem(mem)
+    );
     let name = div()
         .flex()
         .gap_2()
@@ -1354,6 +1395,14 @@ fn background_row(
         .items_center()
         .text_color(theme::text_dim())
         .debug_selector(|| "row-line".into())
+        .hover(|style| style.bg(theme::row_hover()))
+        .on_mouse_down(MouseButton::Right, move |_, _, app| {
+            let _ = copy_this.update(app, |this, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(line.clone()));
+                this.copied_flash = Some(("background".to_string(), Instant::now()));
+                cx.notify();
+            });
+        })
         .on_click(move |_, _, app| {
             let _ = this.update(app, |this, cx| {
                 this.show_background = !this.show_background;
@@ -1369,7 +1418,10 @@ fn background_row(
 /// A member row: the window's title when it has one (the app's name
 /// is the group header now: saying it twice is noise), the process
 /// name when not; indented a step under its app.
-fn member_row(row: &ProcRow) -> Stateful<Div> {
+fn member_row(row: &ProcRow, this: &WeakEntity<MonitorView>) -> Stateful<Div> {
+    let this = this.clone();
+    let line = member_line(row);
+    let flash = member_lead(row);
     let windowed = row.window.is_some();
     let focused = row.window.as_ref().is_some_and(|w| w.focused);
     let lead = member_lead(row);
@@ -1384,6 +1436,16 @@ fn member_row(row: &ProcRow) -> Stateful<Div> {
             theme::row_selected()
         } else {
             theme::clear()
+        })
+        .when(!focused, |member| {
+            member.hover(|style| style.bg(theme::row_hover()))
+        })
+        .on_mouse_down(MouseButton::Right, move |_, _, app| {
+            let _ = this.update(app, |this, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(line.clone()));
+                this.copied_flash = Some((flash.clone(), Instant::now()));
+                cx.notify();
+            });
         })
         .child(
             apply_spec(
@@ -1430,6 +1492,29 @@ fn member_lead(row: &ProcRow) -> String {
         Some(window) if !window.title.is_empty() => window.title.clone(),
         _ => row.name.clone(),
     }
+}
+
+/// The row as one clipboard line: what the row says, in the order
+/// the columns say it.
+fn group_line(group: &AppGroup) -> String {
+    let pids: Vec<String> = group.members.iter().map(|m| m.pid.to_string()).collect();
+    format!(
+        "{}  {:.1}%  {}  pids {}",
+        group.name,
+        group.cpu,
+        sample::human_mem(group.mem),
+        pids.join(", ")
+    )
+}
+
+fn member_line(row: &ProcRow) -> String {
+    format!(
+        "{}  {:.1}%  {}  pid {}",
+        member_lead(row),
+        row.cpu,
+        sample::human_mem(row.mem),
+        row.pid
+    )
 }
 
 /// The identity's activity whisper: what the app is doing to the
@@ -1656,6 +1741,46 @@ mod tests {
         assert_eq!(member_lead(&row), "electron");
         row.window = None;
         assert_eq!(member_lead(&row), "electron");
+    }
+
+    #[test]
+    fn rows_copy_as_one_greppable_line() {
+        let zen = ProcRow {
+            pid: 100,
+            parent: None,
+            name: "zen".into(),
+            cpu: 12.34,
+            mem: 1_234_567_890,
+            disk: 0,
+            window: Some(sample::WindowRef {
+                app_id: Some("zen".into()),
+                title: "blog post".into(),
+                focused: false,
+            }),
+        };
+        let helper = ProcRow {
+            pid: 101,
+            parent: Some(100),
+            name: "zen-worker".into(),
+            cpu: 3.,
+            mem: 1000,
+            disk: 0,
+            window: None,
+        };
+        // the group row: the app's name and sums, every member pid
+        let group = AppGroup {
+            key: "zen".into(),
+            name: "Zen".into(),
+            cpu: 15.34,
+            mem: 1_234_568_890,
+            disk: 0,
+            background: false,
+            has_focused: false,
+            members: vec![zen.clone(), helper],
+        };
+        assert_eq!(group_line(&group), "Zen  15.3%  1.1 GiB  pids 100, 101");
+        // the member row: the lead it displays (the title here)
+        assert_eq!(member_line(&zen), "blog post  12.3%  1.1 GiB  pid 100");
     }
 
     #[test]
