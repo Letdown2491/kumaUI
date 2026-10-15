@@ -818,7 +818,7 @@ impl MonitorView {
     /// index under it. Opened by clicking the CPU card and hung
     /// directly beneath it, so it reads as that card's own detail.
     fn cores_row(&self) -> Div {
-        self.dropdown_base("CORES", None)
+        self.dropdown_base("CORES")
             .h(px(96.))
             .child(
                 div().flex_1().flex().items_end().children(
@@ -855,8 +855,8 @@ impl MonitorView {
     /// A drop-down's frame: the cards' chrome at full width, the
     /// height content-sized (it hangs below the lattice, so the
     /// strips' ninety-six rhythm does not bind it; the cores card
-    /// pins its own). A note rides the label row's right end.
-    fn dropdown_base(&self, label: &str, note: Option<String>) -> Div {
+    /// pins its own).
+    fn dropdown_base(&self, label: &str) -> Div {
         div()
             .w_full()
             .min_w(px(0.))
@@ -872,73 +872,92 @@ impl MonitorView {
             .rounded_sm()
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_size(px(9.))
-                            .text_color(theme::text_dim())
-                            .child(label.to_string()),
-                    )
-                    .children(note.map(|note| {
-                        div()
-                            .flex_1()
-                            .flex()
-                            .justify_end()
-                            .text_size(px(9.))
-                            .text_color(theme::text_dim())
-                            .truncate()
-                            .child(note)
-                    })),
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .child(label.to_string()),
             )
     }
 
-    /// The memory drop-down: the cards' chrome full width, one meter
-    /// row per bucket of RAM's anatomy, every fill ghost: nothing in
-    /// this card is distress (the pressure card owns that), the
-    /// shares just say where the memory went, and the buckets plus
-    /// other close to one hundred.
-    fn mem_detail(&self) -> Div {
+    /// The memory drop-down's rows: the two sections that answer to
+    /// the card above (in use is the card's own used figure,
+    /// available is total minus it, so the pair always closes to the
+    /// total), then the anatomy under each. Other takes what the
+    /// in-use side's named buckets miss (gpu buffers, boot
+    /// reservations, unreclaimed fragments); cache is the
+    /// headroom's mass, mostly page cache. Rows are
+    /// (label, bytes, share of total, is a section).
+    fn mem_rows(&self) -> Vec<(&'static str, u64, f32, bool)> {
         let mem = &self.vitals.mem;
-        let total = mem.total as f32;
-        let bucket = |label: &str, bytes: u64| {
-            div()
-                .h(px(20.))
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .w(px(48.))
-                        .text_size(px(9.))
-                        .text_color(theme::text_dim())
-                        .child(label.to_string()),
-                )
-                .child(
-                    meter(if total > 0. { bytes as f32 / total } else { 0. }, theme::ghost(), None)
-                        .flex_1()
-                        .min_w(px(0.)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .justify_end()
-                        .text_size(px(9.))
-                        .text_color(theme::text_dim())
-                        .truncate()
-                        .child(sample::human_mem(bytes)),
-                )
+        let total = self.mem_total as f32;
+        let frac = |bytes: u64| {
+            if total > 0. {
+                bytes as f32 / total
+            } else {
+                0.
+            }
         };
-        self.dropdown_base(
-            "MEMORY",
-            Some(format!("available {}", sample::human_mem(mem.available))),
-        )
-        .child(bucket("APPS", mem.apps))
-        .child(bucket("SHARED", mem.shared))
-        .child(bucket("CACHE", mem.cache))
-        .child(bucket("KERNEL", mem.kernel))
-        .child(bucket("FREE", mem.free))
-        .child(bucket("OTHER", mem.other))
+        let available = self.mem_total.saturating_sub(self.mem_used);
+        let other = self
+            .mem_used
+            .saturating_sub(mem.apps)
+            .saturating_sub(mem.shared)
+            .saturating_sub(mem.kernel);
+        let cache = available.saturating_sub(mem.free);
+        vec![
+            ("IN USE", self.mem_used, frac(self.mem_used), true),
+            ("APPS", mem.apps, frac(mem.apps), false),
+            ("SHARED", mem.shared, frac(mem.shared), false),
+            ("KERNEL", mem.kernel, frac(mem.kernel), false),
+            ("OTHER", other, frac(other), false),
+            ("AVAILABLE", available, frac(available), true),
+            ("FREE", mem.free, frac(mem.free), false),
+            ("CACHE", cache, frac(cache), false),
+        ]
+    }
+
+    /// The memory drop-down: two sections closing against the card
+    /// above (the card's own used figure, then the headroom), each
+    /// with its anatomy underneath. Section meters carry the card's
+    /// accent (in use) and a ghost fill (available); the buckets are
+    /// ghost throughout, nothing here is distress.
+    fn mem_detail(&self) -> Div {
+        self.dropdown_base("MEMORY")
+            .children(self.mem_rows().into_iter().map(
+                |(label, bytes, share, section)| {
+                    let ink = if section {
+                        theme::text()
+                    } else {
+                        theme::text_dim()
+                    };
+                    let fill = if label == "IN USE" {
+                        theme::accent()
+                    } else {
+                        theme::ghost()
+                    };
+                    div()
+                        .h(px(20.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(48.))
+                                .text_size(px(9.))
+                                .text_color(ink)
+                                .child(label.to_string()),
+                        )
+                        .child(meter(share, fill, None).flex_1().min_w(px(0.)))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .text_size(px(9.))
+                                .text_color(ink)
+                                .truncate()
+                                .child(sample::human_mem(bytes)),
+                        )
+                },
+            ))
     }
 
     /// The per-device drop-down: the cards' chrome full width, one
@@ -946,7 +965,7 @@ impl MonitorView {
     /// dim nine-pixel label, a ghost meter of the device's share of
     /// the beat's total, the down and up figures closing the line.
     fn devices_card(&self, label: &str, devs: &[(String, f64, f64)], total: f64) -> Div {
-        self.dropdown_base(label, None).children(devs.iter().map(|(name, down, up)| {
+        self.dropdown_base(label).children(devs.iter().map(|(name, down, up)| {
             div()
                 .h(px(20.))
                 .flex()
@@ -1608,6 +1627,55 @@ mod tests {
         assert_eq!(cpu.len(), CPU_HIST);
         assert_eq!(cpu[0], 5.);
         assert_eq!(cpu[CPU_HIST - 1], (CPU_HIST + 4) as f32);
+    }
+
+    /// The memory drop-down closes against the card: the in-use row
+    /// is the card's own used figure, available is what remains, and
+    /// every bucket sums into its section, so the rows land on the
+    /// total with nothing double counted.
+    #[test]
+    fn the_memory_rows_close_to_the_card() {
+        use std::sync::Arc;
+
+        use crate::stats::MemInfo;
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| MonitorView::new(window, cx));
+        app.run_until_parked();
+        window.update(|view, _, _| {
+            // this machine's shape, at the beat the user audited
+            view.mem_total = 14_868_776 * 1024;
+            view.mem_used = 4_471_152 * 1024;
+            view.vitals.mem = MemInfo {
+                apps: 2_742_076 * 1024,
+                shared: 48_716 * 1024,
+                kernel: 336_992 * 1024,
+                free: 758_992 * 1024,
+                ..MemInfo::default()
+            };
+            let rows = view.mem_rows();
+            let row = |name: &str| {
+                rows.iter()
+                    .find(|r| r.0 == name)
+                    .map(|&(_, bytes, _, _)| bytes)
+                    .unwrap_or_else(|| panic!("{name} missing"))
+            };
+            // the sections answer to the card's own arithmetic
+            assert_eq!(row("IN USE"), view.mem_used);
+            assert_eq!(row("AVAILABLE"), view.mem_total - view.mem_used);
+            // the buckets nest: each side sums to its section
+            assert_eq!(
+                row("APPS") + row("SHARED") + row("KERNEL") + row("OTHER"),
+                view.mem_used
+            );
+            assert_eq!(row("FREE") + row("CACHE"), view.mem_total - view.mem_used);
+            // and every byte of ram is spoken for exactly once
+            let all: u64 = rows.iter().filter(|r| !r.3).map(|r| r.1).sum();
+            assert_eq!(all, view.mem_total);
+        });
     }
 
     /// The overflow the first strip died of: cards that refused to
