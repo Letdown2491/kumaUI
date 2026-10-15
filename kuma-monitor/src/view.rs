@@ -23,6 +23,13 @@ use crate::theme;
 /// A card sparkline's window: forty seconds of the recent past.
 const CARD_HIST: usize = 40;
 
+/// The vitals cards' sparkline height; the rows whisper at theirs.
+const CARD_SPARK_H: f32 = 18.;
+
+/// The row spark's height: a strip at the cpu cell's bottom, clear
+/// of the digits above it.
+const ROW_SPARK_H: f32 = 8.;
+
 /// The cpu card spans two columns, so its sparkline carries twice
 /// the window to keep the bars from going fat.
 const CPU_HIST: usize = 80;
@@ -516,7 +523,7 @@ impl MonitorView {
                     .debug_selector(|| "val-cpu".into())
                     .child(format!("{cpu_now:.1}%")),
             )
-            .child(spark(&self.history, None))
+            .child(spark(&self.history, None, CARD_SPARK_H))
             .child(
                 div()
                     .text_size(px(9.))
@@ -554,7 +561,7 @@ impl MonitorView {
                         None => "\u{2014}".to_string(),
                     }),
             )
-            .children((!self.temp_hist.is_empty()).then(|| spark(&self.temp_hist, Some(100.))))
+            .children((!self.temp_hist.is_empty()).then(|| spark(&self.temp_hist, Some(100.), CARD_SPARK_H)))
             .child(
                 div()
                     .text_size(px(9.))
@@ -634,7 +641,7 @@ impl MonitorView {
                     .truncate()
                     .child(format!("{} running", v.procs_running)),
             )
-            .child(spark(&self.procs_hist, None))
+            .child(spark(&self.procs_hist, None, CARD_SPARK_H))
             .child(
                 div()
                     .text_size(px(9.))
@@ -673,7 +680,7 @@ impl MonitorView {
                             .debug_selector(|| "mem-track".into()),
                     ),
             )
-            .child(spark(&self.mem_hist, Some(100.)))
+            .child(spark(&self.mem_hist, Some(100.), CARD_SPARK_H))
             .child(
                 div()
                     .text_size(px(9.))
@@ -717,7 +724,7 @@ impl MonitorView {
                     .debug_selector(|| "val-disk".into())
                     .child(rate(v.io_read + v.io_write)),
             )
-            .child(spark(&self.disk_hist, None))
+            .child(spark(&self.disk_hist, None, CARD_SPARK_H))
             .child(
                 div()
                     .text_size(px(9.))
@@ -750,7 +757,7 @@ impl MonitorView {
                     .debug_selector(|| "val-net".into())
                     .child(rate(v.net_rx + v.net_tx)),
             )
-            .child(spark(&self.net_hist, None))
+            .child(spark(&self.net_hist, None, CARD_SPARK_H))
             .child(
                 div()
                     .text_size(px(9.))
@@ -1121,7 +1128,9 @@ impl Focusable for MonitorView {
 /// 100%, or an idle line would be invisible) unless a fixed
 /// ceiling is given, as the temperature needs: its drama lives in
 /// single degrees, and peak-scaling would lie about the slope.
-fn spark(history: &[f32], ceiling: Option<f32>) -> Div {
+/// The height is the caller's: the cards announce at eighteen,
+/// the rows whisper.
+fn spark(history: &[f32], ceiling: Option<f32>, height: f32) -> Div {
     let peak = ceiling.unwrap_or_else(|| history.iter().copied().fold(1.0_f32, f32::max));
     let bars = history
         .iter()
@@ -1129,11 +1138,11 @@ fn spark(history: &[f32], ceiling: Option<f32>) -> Div {
             div()
                 .flex_1()
                 .min_w(px(1.))
-                .h(px((v / peak * 18.).clamp(1., 18.)))
+                .h(px((v / peak * height).clamp(1., height)))
                 .bg(theme::ghost())
         })
         .collect::<Vec<_>>();
-    div().h(px(18.)).w_full().flex().items_end().children(bars)
+    div().h(px(height)).w_full().flex().items_end().children(bars)
 }
 
 /// The shared cell spec: width, padding, right-setting. The header
@@ -1218,11 +1227,12 @@ fn push_group_rows(
 
 /// The app's row: its sums, its process count, and the fold for the
 /// roster. The cpu figure carries the group's recent history as a
-/// spark laid behind it, in the figure's own column, like the cards
-/// pair a value with its spark: full bar is one core's worth, fixed
-/// rather than peak-scaled, so sparks are comparable row to row and
-/// a hog's row reads busy before its number does. Clicking anywhere
-/// in it unfolds the members in place.
+/// spark strip at its cell's bottom, the figure floating clear
+/// above: the row-shaped echo of the cards' value-over-spark
+/// pairing. Full bar is one core's worth, fixed rather than
+/// peak-scaled, so sparks are comparable row to row and a hog's row
+/// reads busy before its number does. Clicking anywhere in it
+/// unfolds the members in place.
 fn group_row(
     group: &AppGroup,
     key: &str,
@@ -1280,23 +1290,26 @@ fn group_row(
         .child(apply_spec(name, Col::Name))
         .child(apply_spec(div(), Col::Pid))
         .child(apply_spec(
-            // the ring behind the figure: the spark lives in the
-            // column it explains, absolute so the number keeps its
-            // layout, the cell's own 72px its width
+            // the ring lives in the column it explains, as a strip
+            // at the cell's bottom: the figure floats clear above
+            // it, the row-shaped echo of the cards' value-over-spark
             div()
                 .relative()
+                .h_full()
+                .flex()
+                .items_center()
                 .children(hist.map(|ring| {
                     div()
                         .absolute()
-                        .top_0()
-                        .bottom_0()
                         .left_0()
                         .right_0()
+                        .bottom_0()
+                        .h(px(ROW_SPARK_H))
                         .flex()
-                        .items_center()
+                        .items_end()
                         .overflow_hidden()
                         .debug_selector(|| "row-spark".into())
-                        .child(spark(ring, Some(100.)))
+                        .child(spark(ring, Some(100.), ROW_SPARK_H))
                 }))
                 .child(div().child(format!("{:.1}", group.cpu)).text_color(text)),
             Col::Cpu,
@@ -1769,10 +1782,11 @@ mod tests {
         });
     }
 
-    /// The row spark paints behind the name: inside the row's box,
-    /// never taller than the row.
+    /// The row spark paints under the cpu figure: a short strip at
+    /// the cell's bottom, inside the cpu column, never tall enough
+    /// to reach the digits.
     #[test]
-    fn the_row_spark_paints_behind_the_name() {
+    fn the_row_spark_paints_under_the_cpu_figure() {
         use std::sync::Arc;
 
         let mut app = gpui::TestApp::with_text_system_and_assets(
@@ -1815,14 +1829,24 @@ mod tests {
             (row, spark)
         });
         let (row, spark) = bounds;
-        // the spark lives in the cpu column (72px, left of the mem
-        // column's 104): its own small width, its right edge no
-        // further left than the column's
+        // a whisper strip: short, pinned to the row's bottom, and
+        // living in the cpu column (72px, left of the mem column's
+        // 104)
+        assert!(
+            spark.size.height <= px(ROW_SPARK_H + 1.),
+            "spark is {:?} tall",
+            spark.size
+        );
         assert!(
             spark.size.width <= px(73.),
             "spark is {:?} wide, the cell is {:?}",
             spark.size,
             row.size
+        );
+        let row_bottom = row.origin.y + row.size.height;
+        assert!(
+            (spark.origin.y + spark.size.height - row_bottom).abs() < px(1.5),
+            "spark {spark:?} is not anchored at the row's bottom {row:?}"
         );
         let row_right = row.origin.x + row.size.width;
         assert!(
