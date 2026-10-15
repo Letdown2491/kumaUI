@@ -350,6 +350,37 @@ pub(crate) fn sort_groups(groups: &mut [AppGroup], key: SortKey) {
     }
 }
 
+/// What a filter query finds in one group: the whole group (the name
+/// matched) or a subset of members (a member name or pid matched).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GroupHit {
+    All,
+    Members(Vec<usize>),
+}
+
+/// The filter's one predicate: a case-insensitive substring on the
+/// group's name, else on member names, else a pid prefix when the
+/// query is all digits. None hides the group outright.
+pub(crate) fn match_group(group: &AppGroup, q: &str) -> Option<GroupHit> {
+    if q.is_empty() {
+        return Some(GroupHit::All);
+    }
+    if group.name.to_lowercase().contains(q) {
+        return Some(GroupHit::All);
+    }
+    let digits = q.bytes().all(|b| b.is_ascii_digit());
+    let hits: Vec<usize> = group
+        .members
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.name.to_lowercase().contains(q) || (digits && row.pid.to_string().starts_with(q))
+        })
+        .map(|(ix, _)| ix)
+        .collect();
+    (!hits.is_empty()).then_some(GroupHit::Members(hits))
+}
+
 /// Bytes at the table's width: one decimal, the unit carrying the
 /// magnitude (KiB, MiB, GiB), TiB the honest cap.
 pub(crate) fn human_mem(bytes: u64) -> String {
@@ -546,6 +577,34 @@ mod tests {
         assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["A", "c", "b"]);
         sort_groups(&mut groups, SortKey::Pid);
         assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), vec!["b", "A", "c"]);
+    }
+
+    #[test]
+    fn the_filter_matches_by_name_member_and_pid() {
+        // zen's window plus two helpers: the group name answers the
+        // query whole, a member name or pid narrows to the matches,
+        // and a miss hides the group outright
+        let mut zen = windowed(100, "zen", "zen", true);
+        zen.cpu = 2.;
+        let mut helper = row(102, "zen-worker", 4., 300);
+        helper.parent = Some(100);
+        let mut webkit = row(101, "WebKitWebProces", 1., 90);
+        webkit.parent = Some(100);
+        let mut groups = Vec::new();
+        merge_groups(&mut groups, vec![zen, helper, webkit]);
+        let group = &groups[0];
+
+        // the group's own name, case-insensitive (the query arrives
+        // lowercased; the view does it once per beat)
+        assert_eq!(match_group(group, "ze"), Some(GroupHit::All));
+        // a member's name
+        assert_eq!(match_group(group, "webkit"), Some(GroupHit::Members(vec![1])));
+        // a pid prefix, digits only
+        assert_eq!(match_group(group, "10"), Some(GroupHit::Members(vec![0, 1, 2])));
+        // nothing matches: hide
+        assert_eq!(match_group(group, "firefox"), None);
+        // an empty query is no filter at all
+        assert_eq!(match_group(group, ""), Some(GroupHit::All));
     }
 
     #[test]

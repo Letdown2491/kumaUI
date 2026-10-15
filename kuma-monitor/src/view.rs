@@ -10,12 +10,13 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    prelude::*, ClickEvent, Context, Div, IntoElement, Render, Rgba, SharedString, Stateful,
-    UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
+    prelude::*, App, ClickEvent, Context, Div, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    Keystroke, Render, Rgba, SharedString, Stateful, UniformListScrollHandle, WeakEntity, Window,
+    div, px, uniform_list,
 };
 
 use crate::niri;
-use crate::sample::{self, AppGroup, ProcRow, Sampler, Snapshot, SortKey};
+use crate::sample::{self, AppGroup, GroupHit, ProcRow, Sampler, Snapshot, SortKey};
 use crate::stats::{Stats, Vitals};
 use crate::theme;
 
@@ -137,6 +138,10 @@ pub(crate) struct MonitorView {
     mem_total: u64,
     palette_mtime: Option<SystemTime>,
     scroll: UniformListScrollHandle,
+    /// The table's filter: plain typing lands here, escape clears,
+    /// an empty string is no filter at all.
+    filter: String,
+    focus: FocusHandle,
 }
 
 impl MonitorView {
@@ -145,6 +150,11 @@ impl MonitorView {
         // paints, and subpixel AA is wrong over a translucent
         // background (kuma-term/src/view.rs, same stack)
         window.set_background_appearance(gpui::WindowBackgroundAppearance::Transparent);
+        // the filter rides the window's focus: the view takes it at
+        // birth and nothing in the table steals it, so plain typing
+        // always lands in the buffer
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
         let mut view = Self {
             sampler: Sampler::new(),
             stats: Stats::new(),
@@ -167,6 +177,8 @@ impl MonitorView {
             mem_total: 0,
             palette_mtime: None,
             scroll: UniformListScrollHandle::new(),
+            filter: String::new(),
+            focus,
         };
         view.sync_palette();
         view.beat(cx);
@@ -263,6 +275,108 @@ impl MonitorView {
         sample::sort_groups(&mut self.groups, key);
         cx.notify();
     }
+
+    /// The table's rows for the current beat: apps first, then the
+    /// background summary, then the unfolded background groups, each
+    /// keeping the groups' sorted order. With a filter active, a
+    /// group matched by name shows whole (its expand state still
+    /// decides the members), a group matched through a member or pid
+    /// pulls its header along and shows just the matches, and
+    /// matching background groups surface past the fold. The
+    /// summary's sums stay machine-wide regardless: a filtered view
+    /// must not shrink the plumbing.
+    fn visible_items(&self) -> Vec<Item> {
+        let q = self.filter.to_lowercase();
+        let filtering = !q.is_empty();
+        let mut items: Vec<Item> = Vec::new();
+        let mut background: Vec<(usize, Option<GroupHit>)> = Vec::new();
+        for (index, group) in self.groups.iter().enumerate() {
+            let hit = if filtering {
+                sample::match_group(group, &q)
+            } else {
+                Some(GroupHit::All)
+            };
+            if group.background {
+                background.push((index, hit));
+                continue;
+            }
+            if let Some(hit) = hit {
+                push_group_rows(
+                    &mut items,
+                    &self.groups,
+                    index,
+                    &hit,
+                    false,
+                    &self.expanded_apps,
+                );
+            }
+        }
+        let bg_count: usize = background
+            .iter()
+            .map(|(index, _)| self.groups[*index].members.len())
+            .sum();
+        let bg_cpu: f32 = background
+            .iter()
+            .map(|(index, _)| self.groups[*index].members.iter().map(|row| row.cpu).sum::<f32>())
+            .sum();
+        let bg_mem: u64 = background
+            .iter()
+            .map(|(index, _)| self.groups[*index].members.iter().map(|row| row.mem).sum::<u64>())
+            .sum();
+        if !background.is_empty() {
+            items.push(Item::BgSummary {
+                open: self.show_background,
+                count: bg_count,
+                cpu: bg_cpu,
+                mem: bg_mem,
+            });
+        }
+        for (index, hit) in &background {
+            let surfaced = if filtering { hit.is_some() } else { self.show_background };
+            if surfaced {
+                push_group_rows(
+                    &mut items,
+                    &self.groups,
+                    *index,
+                    hit.as_ref().unwrap_or(&GroupHit::All),
+                    true,
+                    &self.expanded_apps,
+                );
+            }
+        }
+        items
+    }
+
+    /// The filter buffer takes the window's plain typing: printable
+    /// keys ride key_char, backspace pops, escape clears. Anything
+    /// with a modifier held is not typing. Returns whether the
+    /// buffer changed, so a stray keystroke spends no repaint.
+    fn filter_key(&mut self, keystroke: &Keystroke) -> bool {
+        let modifiers = &keystroke.modifiers;
+        match keystroke.key.as_str() {
+            "escape" => {
+                if self.filter.is_empty() {
+                    false
+                } else {
+                    self.filter.clear();
+                    true
+                }
+            }
+            "backspace" => self.filter.pop().is_some(),
+            _ => {
+                if modifiers.control || modifiers.alt || modifiers.platform || modifiers.function {
+                    return false;
+                }
+                match keystroke.key_char.as_ref() {
+                    Some(ch) => {
+                        self.filter.push_str(ch);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        }
+    }
 }
 
 impl Render for MonitorView {
@@ -279,70 +393,9 @@ impl Render for MonitorView {
         });
         let cpu_now = self.history.last().copied().unwrap_or(0.);
         let this = cx.weak_entity();
-        // apps first, then the background summary, then (unfolded)
-        // the background groups: each keeps the groups' sorted order
-        let mut items: Vec<Item> = Vec::new();
-        let mut background: Vec<usize> = Vec::new();
-        for (index, group) in self.groups.iter().enumerate() {
-            if group.background {
-                background.push(index);
-                continue;
-            }
-            let open = self.expanded_apps.contains(&group.key);
-            items.push(Item::Group {
-                index,
-                key: group.key.clone(),
-                open,
-                dim: false,
-            });
-            if open {
-                for member in 0..group.members.len() {
-                    items.push(Item::Member {
-                        group: index,
-                        member,
-                    });
-                }
-            }
-        }
-        let bg_count: usize = background
-            .iter()
-            .map(|index| self.groups[*index].members.len())
-            .sum();
-        let bg_cpu: f32 = background
-            .iter()
-            .map(|index| self.groups[*index].members.iter().map(|row| row.cpu).sum::<f32>())
-            .sum();
-        let bg_mem: u64 = background
-            .iter()
-            .map(|index| self.groups[*index].members.iter().map(|row| row.mem).sum::<u64>())
-            .sum();
-        if !background.is_empty() {
-            items.push(Item::BgSummary {
-                open: self.show_background,
-                count: bg_count,
-                cpu: bg_cpu,
-                mem: bg_mem,
-            });
-        }
-        if self.show_background {
-            for index in &background {
-                let open = self.expanded_apps.contains(&self.groups[*index].key);
-                items.push(Item::Group {
-                    index: *index,
-                    key: self.groups[*index].key.clone(),
-                    open,
-                    dim: true,
-                });
-                if open {
-                    for member in 0..self.groups[*index].members.len() {
-                        items.push(Item::Member {
-                            group: *index,
-                            member,
-                        });
-                    }
-                }
-            }
-        }
+        // the table's rows for this beat: the filter decides what hides
+        let items = self.visible_items();
+        let filtering = !self.filter.is_empty();
         let count = items.len();
         let total_procs: usize = self.groups.iter().map(|group| group.members.len()).sum();
         let groups = self.groups.clone();
@@ -352,6 +405,12 @@ impl Render for MonitorView {
             .size_full()
             .flex()
             .flex_col()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.filter_key(&event.keystroke) {
+                    cx.notify();
+                }
+            }))
             .bg(theme::bg())
             .text_color(theme::text())
             .text_size(px(13.))
@@ -376,16 +435,24 @@ impl Render for MonitorView {
                     .px_3()
                     .flex()
                     .flex_col()
-                    .child(
-                        uniform_list("proc-rows", count, move |range, _, _| {
-                            items[range.clone()]
-                                .iter()
-                                .map(|item| list_item(item, &groups, &this2))
-                                .collect()
-                        })
-                        .flex_1()
-                        .track_scroll(&self.scroll),
-                    ),
+                    .child(if filtering && items.is_empty() {
+                        // a silent table is never ambiguous
+                        div()
+                            .py_2()
+                            .text_color(theme::text_dim())
+                            .child(format!("no processes match \"{}\"", self.filter))
+                    } else {
+                        div().flex_1().flex().flex_col().child(
+                            uniform_list("proc-rows", count, move |range, _, _| {
+                                items[range.clone()]
+                                    .iter()
+                                    .map(|item| list_item(item, &groups, &this2))
+                                    .collect()
+                            })
+                            .flex_1()
+                            .track_scroll(&self.scroll),
+                        )
+                    }),
             )
             .child(self.footer(total_procs))
     }
@@ -773,6 +840,21 @@ impl MonitorView {
                 this.set_sort(col.key(), cx);
             }))
             .child(col.label());
+        // while a filter is active it lives in the name header:
+        // state that must never be invisible, at zero layout cost
+        let cell = if col == Col::Name && !self.filter.is_empty() {
+            cell.flex()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .text_color(theme::text_dim())
+                        .child(format!(" \u{b7} \"{}\" (esc clears)", self.filter)),
+                )
+        } else {
+            cell
+        };
         let cell = match col.width() {
             Some(w) => cell.w(px(w)),
             None => cell.flex_1(),
@@ -784,10 +866,6 @@ impl MonitorView {
         }
     }
 
-    /// The line under the table: load and uptime on the left, the
-    /// app and process counts, the build stamp on the right (which
-    /// build this window is: a monitor that cannot say its own build
-    /// invites judging it against the previous one).
     /// The line under the table: the list's own counts on the left,
     /// the machine's age on the right. Load has a card; the build
     /// stamp answers to --version, not to every frame.
@@ -805,6 +883,12 @@ impl MonitorView {
             .child(format!("{apps} apps \u{b7} {processes} processes"))
             .child(div().flex_1())
             .child(format!("up {}", human_uptime(self.vitals.uptime_secs)))
+    }
+}
+
+impl Focusable for MonitorView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
     }
 }
 
@@ -844,6 +928,39 @@ fn list_item(
             cpu,
             mem,
         } => background_row(*open, *count, *cpu, *mem, this),
+    }
+}
+
+/// One group row plus its visible members: the whole roster when the
+/// hit is All (the expand state still decides), or just the matching
+/// members when the query found them (the header pulled along,
+/// effectively open so the triangle never lies).
+fn push_group_rows(
+    items: &mut Vec<Item>,
+    groups: &[AppGroup],
+    index: usize,
+    hit: &GroupHit,
+    dim: bool,
+    expanded: &HashSet<String>,
+) {
+    let group = &groups[index];
+    let (open, members): (bool, Vec<usize>) = match hit {
+        GroupHit::All => (
+            expanded.contains(&group.key),
+            (0..group.members.len()).collect(),
+        ),
+        GroupHit::Members(hits) => (true, hits.clone()),
+    };
+    items.push(Item::Group {
+        index,
+        key: group.key.clone(),
+        open,
+        dim,
+    });
+    if open {
+        for member in members {
+            items.push(Item::Member { group: index, member });
+        }
     }
 }
 
@@ -1486,5 +1603,132 @@ mod tests {
             "column extents diverge:\n{}\nall bounds:\n  {dump}",
             bad.join("\n")
         );
+    }
+
+    // ---------- the filter ----------
+
+    fn prow(pid: u32, name: &str) -> ProcRow {
+        ProcRow {
+            pid,
+            parent: None,
+            name: name.to_string(),
+            cpu: 1.,
+            mem: 10,
+            disk: 0,
+            window: None,
+        }
+    }
+
+    fn fgroup(name: &str, background: bool, members: Vec<ProcRow>) -> AppGroup {
+        AppGroup {
+            key: name.to_lowercase(),
+            name: name.to_string(),
+            cpu: members.iter().map(|m| m.cpu).sum(),
+            mem: members.iter().map(|m| m.mem).sum(),
+            disk: 0,
+            background,
+            has_focused: false,
+            members,
+        }
+    }
+
+    fn k(key: &str, ch: Option<&str>) -> Keystroke {
+        Keystroke {
+            key: key.to_string(),
+            modifiers: gpui::Modifiers::default(),
+            key_char: ch.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_filter_takes_plain_typing_only() {
+        use std::sync::Arc;
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| MonitorView::new(window, cx));
+        app.run_until_parked();
+        window.update(|view, _, _| {
+            assert!(view.filter_key(&k("k", Some("k"))));
+            assert!(view.filter_key(&k("u", Some("u"))));
+            assert_eq!(view.filter, "ku");
+            // a plain key without key_char (enter, the arrows) is not typing
+            assert!(!view.filter_key(&k("down", None)));
+            // a modifier disqualifies even with a char
+            let mut ctrl = k("k", Some("k"));
+            ctrl.modifiers.control = true;
+            assert!(!view.filter_key(&ctrl));
+            // backspace pops, escape clears, escape on empty is a no-op
+            assert!(view.filter_key(&k("backspace", None)));
+            assert_eq!(view.filter, "k");
+            assert!(view.filter_key(&k("escape", None)));
+            assert_eq!(view.filter, "");
+            assert!(!view.filter_key(&k("escape", None)));
+        });
+    }
+
+    #[test]
+    fn the_filter_hides_what_it_misses_and_surfaces_what_it_finds() {
+        use std::sync::Arc;
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| MonitorView::new(window, cx));
+        app.run_until_parked();
+        window.update(|view, _, _| {
+            view.groups = vec![
+                fgroup("Firefox", false, vec![prow(1, "firefox"), prow(2, "Web Content")]),
+                fgroup("zen", false, vec![prow(3, "zen")]),
+                fgroup("pipewire", true, vec![prow(4, "pipewire")]),
+            ];
+            // no filter: both app groups plus the background summary
+            // (the background group itself sits behind the closed fold)
+            assert_eq!(view.visible_items().len(), 3);
+
+            // a member match pulls its header along, narrowed to the matches
+            view.filter = "content".into();
+            let items = view.visible_items();
+            assert_eq!(items.len(), 3, "firefox header, the match, the summary");
+            match &items[0] {
+                Item::Group { index, open, .. } => {
+                    assert_eq!(*index, 0);
+                    assert!(*open, "a member-matched group shows its matches");
+                }
+                _ => panic!("expected a group row"),
+            }
+            match &items[1] {
+                Item::Member { group, member } => {
+                    assert_eq!(*group, 0);
+                    assert_eq!(*member, 1);
+                }
+                _ => panic!("expected the matched member"),
+            }
+            assert!(matches!(items[2], Item::BgSummary { .. }));
+
+            // a background match surfaces past the fold: "pipe" hits
+            // the group's name, so the expand state governs (closed
+            // until clicked), the row itself dim
+            view.filter = "pipe".into();
+            let items = view.visible_items();
+            assert_eq!(items.len(), 2);
+            match &items[1] {
+                Item::Group { index, dim, open, .. } => {
+                    assert_eq!(*index, 2);
+                    assert!(*dim);
+                    assert!(!*open);
+                }
+                _ => panic!("expected the surfaced background group"),
+            }
+
+            // a miss hides everything, and the empty state with it
+            view.filter = "qqq".into();
+            assert_eq!(view.visible_items().len(), 1, "the summary alone");
+            view.groups.clear();
+            assert!(view.visible_items().is_empty());
+        });
     }
 }
