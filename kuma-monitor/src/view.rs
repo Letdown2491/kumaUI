@@ -19,6 +19,42 @@ use crate::sample::{self, AppGroup, GroupHit, ProcRow, Sampler, Snapshot, SortKe
 use crate::stats::{Stats, Vitals};
 use crate::theme;
 
+/// One beat's sampling state, living in the tick's background task:
+/// both halves compute deltas against the previous beat, so the state
+/// must survive across beats. It never touches the UI thread; a beat
+/// lands as a `BeatOut` the view reads like a letter.
+struct BeatState {
+    sampler: Sampler,
+    stats: Stats,
+}
+
+/// What one beat produced: the table's snapshot and the cards'
+/// vitals. Plain data, shipped across the executor boundary.
+struct BeatOut {
+    snap: Snapshot,
+    vitals: Vitals,
+    cores: Vec<f32>,
+}
+
+impl BeatState {
+    fn new() -> Self {
+        Self {
+            sampler: Sampler::new(),
+            stats: Stats::new(),
+        }
+    }
+
+    fn run(&mut self) -> BeatOut {
+        let windows = niri::windows().unwrap_or_else(|err| {
+            log::debug!("niri join unavailable this beat: {err:#}");
+            Vec::new()
+        });
+        let snap = self.sampler.beat(&windows);
+        let (vitals, cores) = self.stats.beat();
+        BeatOut { snap, vitals, cores }
+    }
+}
+
 /// A card sparkline's window: forty seconds of the recent past.
 const CARD_HIST: usize = 40;
 
@@ -109,8 +145,6 @@ enum Item {
 }
 
 pub(crate) struct MonitorView {
-    sampler: Sampler,
-    stats: Stats,
     history: Vec<f32>,
     vitals: Vitals,
     /// The cards' own windows: disk and network throughput, recent
@@ -172,8 +206,6 @@ impl MonitorView {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let mut view = Self {
-            sampler: Sampler::new(),
-            stats: Stats::new(),
             history: Vec::new(),
             vitals: Vitals::default(),
             disk_hist: Vec::new(),
@@ -202,19 +234,32 @@ impl MonitorView {
             focus,
         };
         view.sync_palette();
-        view.beat(cx);
-        sample::sort_groups(&mut view.groups, view.sort);
 
-        // The tick: sample, land, wait a second, again. The bar's
-        // loop shape (kuma-shell/src/bar.rs): update-or-die, then the
-        // executor's timer. A beat's failures degrade that beat, not
-        // the loop: the sampler keeps its deltas, niri's join drops
-        // to None for a beat and comes back.
+        // The tick: sample in the background, land on the UI thread,
+        // wait a second, again. The bar's loop shape (kuma-shell/src/
+        // bar.rs): update-or-die, then the executor's timer. The
+        // sampling itself lives OFF the UI thread: a beat's reads
+        // (niri's socket under its timeout, the /proc walks, the
+        // statm round) must never stall a paint, whatever the
+        // machine is doing to the disk. A beat's failures degrade
+        // that beat, not the loop: the sampler keeps its deltas, the
+        // niri join drops to None for a beat and comes back.
+        let mut beat = BeatState::new();
         cx.spawn(async move |this, cx| {
             loop {
+                // ownership ping-pongs through the pool: the state
+                // comes back with its deltas intact
+                let (next, out) =
+                    cx.background_executor()
+                        .spawn(async move {
+                            let out = beat.run();
+                            (beat, out)
+                        })
+                        .await;
+                beat = next;
                 let alive = this
                     .update(cx, |this, cx| {
-                        this.beat(cx);
+                        this.apply_beat(out, cx);
                     })
                     .is_ok();
                 if !alive {
@@ -239,14 +284,9 @@ impl MonitorView {
         theme::apply_palette(&read_palette());
     }
 
-    fn beat(&mut self, cx: &mut Context<Self>) {
+    fn apply_beat(&mut self, out: BeatOut, cx: &mut Context<Self>) {
         self.sync_palette();
-        let windows = niri::windows().unwrap_or_else(|err| {
-            log::debug!("niri join unavailable this beat: {err:#}");
-            Vec::new()
-        });
-        let snap = self.sampler.beat(&windows);
-        self.apply_snapshot(snap);
+        self.apply_snapshot(out.snap, out.vitals, out.cores);
         cx.notify();
     }
 
@@ -254,7 +294,7 @@ impl MonitorView {
     /// the user clicks a header. A table that reshuffles every second
     /// cannot be read, and a hog announces itself by its number, not
     /// by jumping rows.
-    fn apply_snapshot(&mut self, snap: Snapshot) {
+    fn apply_snapshot(&mut self, snap: Snapshot, vitals: Vitals, cores: Vec<f32>) {
         if !snap.rows.is_empty() {
             sample::merge_groups(&mut self.groups, snap.rows);
             // the rows' rings: one cpu sample per beat, behind each
@@ -275,7 +315,6 @@ impl MonitorView {
         self.mem_total = snap.mem_total;
         self.swap_used = snap.swap_used;
         self.swap_total = snap.swap_total;
-        let (vitals, cores) = self.stats.beat();
         push_hist(
             &mut self.disk_hist,
             (vitals.io_read + vitals.io_write) as f32,
@@ -1822,7 +1861,11 @@ mod tests {
         };
         window.update(|view, _, _| {
             for beat in 0..(CARD_HIST + 5) {
-                view.apply_snapshot(snap(vec![snap_row(7, "sparky", beat as f32)]));
+                view.apply_snapshot(
+                    snap(vec![snap_row(7, "sparky", beat as f32)]),
+                    Vitals::default(),
+                    Vec::new(),
+                );
             }
             let ring = &view.group_hists["sparky"];
             assert_eq!(ring.len(), CARD_HIST);
@@ -1830,7 +1873,7 @@ mod tests {
             assert_eq!(ring[0], 5.);
             assert_eq!(ring[CARD_HIST - 1], (CARD_HIST + 4) as f32);
             // the group dies, its ring dies with it
-            view.apply_snapshot(snap(vec![snap_row(8, "other", 1.)]));
+            view.apply_snapshot(snap(vec![snap_row(8, "other", 1.)]), Vitals::default(), Vec::new());
             assert!(!view.group_hists.contains_key("sparky"));
             assert!(view.group_hists.contains_key("other"));
         });
@@ -1869,7 +1912,7 @@ mod tests {
                         focused: false,
                     }),
                 }],
-            });
+            }, Vitals::default(), Vec::new());
             cx.notify();
         });
         app.run_until_parked();

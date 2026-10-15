@@ -253,7 +253,8 @@ pub(crate) fn join(raw: Vec<RawRow>, windows: &[NiriWindow]) -> Vec<ProcRow> {
 /// first-seen groups join at the tail.
 pub(crate) fn merge_groups(groups: &mut Vec<AppGroup>, rows: Vec<ProcRow>) {
     // key first (the ancestor walk reads the whole table), consume after
-    let keys: Vec<String> = rows.iter().map(|row| group_key(&rows, row)).collect();
+    let index: HashMap<u32, &ProcRow> = rows.iter().map(|row| (row.pid, row)).collect();
+    let keys: Vec<String> = rows.iter().map(|row| group_key(&index, row)).collect();
     let mut by_key: HashMap<String, Vec<ProcRow>> = HashMap::new();
     for (key, row) in keys.into_iter().zip(rows.into_iter()) {
         by_key.entry(key).or_default().push(row);
@@ -276,8 +277,9 @@ pub(crate) fn merge_groups(groups: &mut Vec<AppGroup>, rows: Vec<ProcRow>) {
 
 /// A row's grouping key: its own app_id when windowed, else the
 /// app_id of the nearest windowed ancestor (walking ppid up to a
-/// bounded depth), else the process's own name.
-fn group_key(all: &[ProcRow], row: &ProcRow) -> String {
+/// bounded depth), else the process's own name. `index` is the beat's
+/// rows by pid, so each hop is a lookup, not a scan.
+fn group_key(index: &HashMap<u32, &ProcRow>, row: &ProcRow) -> String {
     if let Some(app) = row
         .window
         .as_ref()
@@ -292,7 +294,7 @@ fn group_key(all: &[ProcRow], row: &ProcRow) -> String {
             break;
         }
         hops += 1;
-        let Some(ancestor) = all.iter().find(|row| row.pid == ancestor_pid) else {
+        let Some(ancestor) = index.get(&ancestor_pid) else {
             break;
         };
         if let Some(app) = ancestor
