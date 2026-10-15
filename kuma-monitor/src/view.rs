@@ -472,8 +472,9 @@ impl Render for MonitorView {
 impl MonitorView {
     /// The vitals row: five quiet cards, label over value over
     /// detail. The CPU, NET and DISK cards are the click surfaces
-    /// (each opens a drop-down under the strip: per-core,
-    /// per-interface, per-device); the rest read and stay still.
+    /// (each opens a card: the cores detail between rows one and
+    /// two, the interfaces and disks below the lattice); the rest
+    /// read and stay still.
     fn vitals_area(&self, cpu_now: f32, this: &WeakEntity<MonitorView>) -> Div {
         let v = &self.vitals;
         let mem_pct = if self.mem_total > 0 {
@@ -760,6 +761,7 @@ impl MonitorView {
                     .child(cpu_card)
                     .child(temp_card),
             )
+            .children((self.show_cores && !self.core_usage.is_empty()).then(|| self.cores_row()))
             .child(
                 div()
                     .grid()
@@ -780,38 +782,126 @@ impl MonitorView {
                     .child(disk_card)
                     .child(net_card),
             )
-            // the per-core bars sit between rows one and two: they
-            // belong to the cpu card above them, not to the bottom
-            // of the area
-            .children((self.show_cores && !self.core_usage.is_empty()).then(|| self.cores_row()))
             .children((self.show_nets && !self.vitals.nets.is_empty()).then(|| {
-                devices_row(&self.vitals.nets, self.vitals.net_rx + self.vitals.net_tx)
+                self.devices_card(
+                    "INTERFACES",
+                    &self.vitals.nets,
+                    self.vitals.net_rx + self.vitals.net_tx,
+                )
             }))
             .children((self.show_disks && !self.vitals.disks.is_empty()).then(|| {
-                devices_row(&self.vitals.disks, self.vitals.io_read + self.vitals.io_write)
+                self.devices_card(
+                    "DISKS",
+                    &self.vitals.disks,
+                    self.vitals.io_read + self.vitals.io_write,
+                )
             }))
     }
 
-    /// The per-core drop-down: one thin bar per core, under the
-    /// strip, opened by clicking the CPU card.
+    /// The per-core drop-down: the cards' chrome at full width, one
+    /// column per core, the bar lit accent past sixty percent (the
+    /// LOAD card's lit language: busy is worth finding), the core's
+    /// index under it. Opened by clicking the CPU card and hung
+    /// directly beneath it, so it reads as that card's own detail.
     fn cores_row(&self) -> Div {
-        div()
-            .h(px(20.))
-            .flex()
-            .items_end()
-            .children(self.core_usage.iter().map(|pct| {
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_end()
-                    .justify_center()
-                    .child(
+        self.dropdown_base("CORES")
+            .h(px(96.))
+            .child(
+                div().flex_1().flex().items_end().children(
+                    self.core_usage.iter().enumerate().map(|(ix, pct)| {
                         div()
-                            .w(px(4.))
-                            .h(px((pct / 100. * 18.).clamp(1., 18.)))
-                            .bg(theme::ghost()),
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_end()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w(px(6.))
+                                    .h(px((pct / 100. * 48.).clamp(1., 48.)))
+                                    .bg(if *pct >= 60. {
+                                        theme::accent()
+                                    } else {
+                                        theme::ghost()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(8.))
+                                    .text_color(theme::text_dim())
+                                    .child(ix.to_string()),
+                            )
+                    }),
+                ),
+            )
+    }
+
+    /// A drop-down's frame: the cards' chrome at full width, the
+    /// height content-sized (it hangs below the lattice, so the
+    /// strips' ninety-six rhythm does not bind it; the cores card
+    /// pins its own).
+    fn dropdown_base(&self, label: &str) -> Div {
+        div()
+            .w_full()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_2()
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::border())
+            .rounded_sm()
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .child(label.to_string()),
+            )
+    }
+
+    /// The per-device drop-down: the cards' chrome full width, one
+    /// meter row per interface or disk in the meter rows' language:
+    /// dim nine-pixel label, a ghost meter of the device's share of
+    /// the beat's total, the down and up figures closing the line.
+    fn devices_card(&self, label: &str, devs: &[(String, f64, f64)], total: f64) -> Div {
+        self.dropdown_base(label).children(devs.iter().map(|(name, down, up)| {
+            div()
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(72.))
+                        .truncate()
+                        .text_size(px(9.))
+                        .text_color(theme::text_dim())
+                        .child(name.clone()),
+                )
+                .child(
+                    meter(
+                        if total > 0. { ((down + up) / total) as f32 } else { 0. },
+                        theme::ghost(),
+                        None,
                     )
-            }))
+                    .flex_1()
+                    .min_w(px(0.)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .text_size(px(9.))
+                        .text_color(theme::text_dim())
+                        .truncate()
+                        .child(format!("\u{2193} {} \u{b7} \u{2191} {}", rate(*down), rate(*up))),
+                )
+        }))
     }
 
     /// One vitals card's frame: rounded, hairline border, dim label,
@@ -1227,41 +1317,7 @@ fn meter(frac: f32, fill: Rgba, fill_sel: Option<&str>) -> Div {
 /// of the device's share of the beat's total, the down and up
 /// figures closing the line. The meter answers "where is the
 /// traffic" at a glance; the figures carry the split.
-fn devices_row(devs: &[(String, f64, f64)], total: f64) -> Div {
-    div().flex().flex_col().children(devs.iter().map(|(name, down, up)| {
-        div()
-            .h(px(20.))
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .w(px(72.))
-                    .truncate()
-                    .text_size(px(9.))
-                    .text_color(theme::text_dim())
-                    .child(name.clone()),
-            )
-            .child(
-                meter(
-                    if total > 0. { ((down + up) / total) as f32 } else { 0. },
-                    theme::ghost(),
-                    None,
-                )
-                .flex_1()
-                .min_w(px(0.)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .text_size(px(9.))
-                    .text_color(theme::text_dim())
-                    .truncate()
-                    .child(format!("\u{2193} {} \u{b7} \u{2191} {}", rate(*down), rate(*up))),
-            )
-    }))
-}
+
 
 /// The pressure card's one row: a three-letter label, a meter whose
 /// fill lights when this resource stalls tasks, the avg10 figure.
