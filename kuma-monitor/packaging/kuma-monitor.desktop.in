@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Kamuy
+GenericName=System Monitor
+Comment=Watch the session's processes and vitals
+Keywords=monitor;processes;cpu;memory;kuma;kamuy;
+Exec=@BIN@/kuma-monitor
+Icon=kuma-monitor
+Terminal=false
+Categories=System;Monitor;
+StartupNotify=true
