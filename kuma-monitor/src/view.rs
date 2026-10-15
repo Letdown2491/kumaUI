@@ -1217,12 +1217,12 @@ fn push_group_rows(
 }
 
 /// The app's row: its sums, its process count, and the fold for the
-/// roster. The name carries the group's recent cpu as a spark laid
-/// behind it (absolute, so the row's height never moves): a fixed
-/// width at the cell's right end, and full bar is one core's worth,
-/// so sparks are comparable row to row and a hog's row reads busy
-/// before its number does. Clicking anywhere in it unfolds the
-/// members in place.
+/// roster. The cpu figure carries the group's recent history as a
+/// spark laid behind it, in the figure's own column, like the cards
+/// pair a value with its spark: full bar is one core's worth, fixed
+/// rather than peak-scaled, so sparks are comparable row to row and
+/// a hog's row reads busy before its number does. Clicking anywhere
+/// in it unfolds the members in place.
 fn group_row(
     group: &AppGroup,
     key: &str,
@@ -1257,26 +1257,6 @@ fn group_row(
                 .child(active),
         );
     }
-    // the ring behind the name: absolute, so the text keeps its
-    // layout and the spark costs none, pinned to the cell's right
-    // end at a fixed width: the cpu figure's shadow, not wallpaper
-    let name = div()
-        .relative()
-        .truncate()
-        .children(hist.map(|ring| {
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .right_0()
-                .w(px(72.))
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .debug_selector(|| "row-spark".into())
-                .child(spark(ring, Some(100.)))
-        }))
-        .child(name);
     div()
         .id(SharedString::from(key.to_string()))
         .h(px(26.))
@@ -1299,14 +1279,28 @@ fn group_row(
         })
         .child(apply_spec(name, Col::Name))
         .child(apply_spec(div(), Col::Pid))
-        .child(
-            apply_spec(
-                div()
-                    .child(format!("{:.1}", group.cpu))
-                    .text_color(text),
-                Col::Cpu,
-            ),
-        )
+        .child(apply_spec(
+            // the ring behind the figure: the spark lives in the
+            // column it explains, absolute so the number keeps its
+            // layout, the cell's own 72px its width
+            div()
+                .relative()
+                .children(hist.map(|ring| {
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .debug_selector(|| "row-spark".into())
+                        .child(spark(ring, Some(100.)))
+                }))
+                .child(div().child(format!("{:.1}", group.cpu)).text_color(text)),
+            Col::Cpu,
+        ))
         .child(
             apply_spec(
                 div()
@@ -1821,13 +1815,20 @@ mod tests {
             (row, spark)
         });
         let (row, spark) = bounds;
-        // the spark is a shadow of the cpu figure, not wallpaper: a
-        // fixed small width, never the cell's own
+        // the spark lives in the cpu column (72px, left of the mem
+        // column's 104): its own small width, its right edge no
+        // further left than the column's
         assert!(
             spark.size.width <= px(73.),
             "spark is {:?} wide, the cell is {:?}",
             spark.size,
             row.size
+        );
+        let row_right = row.origin.x + row.size.width;
+        assert!(
+            spark.origin.x >= row_right - px(177.5),
+            "spark at {:?} strays out of the cpu column (row {row:?})",
+            spark.origin
         );
         assert!(
             spark.origin.x >= row.origin.x - px(0.5)
