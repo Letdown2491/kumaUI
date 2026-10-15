@@ -2,7 +2,7 @@
 
 A Wayland desktop shell built on [gpui](https://github.com/zed-industries/zed) (Zed's GPU-accelerated UI framework), written for kumaOS, an atomic Fedora-based system running the [niri](https://github.com/YaLTeR/niri) compositor.
 
-The binary is `kuma-shell`: a top bar, an app launcher, drawer panels, and a session lock screen, all of them layer-shell surfaces rendered by gpui. Beside it, `kuma-files` (Koguma) is the desktop's own file manager.
+The binary is `kuma-shell`: a top bar, an app launcher, drawer panels, and a session lock screen, all of them layer-shell surfaces rendered by gpui. Beside it, `kuma-files` (Koguma) is the desktop's own file manager, `kuma-term` (Higuma) the terminal, and `kuma-monitor` (Kamuy) the system monitor.
 
 ![The kuma-shell bar (workspaces, clock, widget cluster) and the app dock over the wallpaper](docs/kumaUI.png)
 
@@ -32,6 +32,12 @@ Koguma (`kuma-files`) is the workspace's second app: kuma's own file manager, re
 
 
 A fresh start opens at 125% zoom with the info rail docked at the bottom; the state file keeps whatever you change.
+
+## What's in the monitor
+
+Kamuy (`kuma-monitor`) is the desktop's own system monitor, observation only: it kills nothing and renices nothing ([issue #71](https://github.com/Letdown2491/kumaUI/issues/71)). One window: the CPU graph, a row of vitals cards (cpu, memory, temperature when a sensor exists, runnable tasks), and the process table under them. The table speaks in apps, not processes: every process an app owns folds under one row (the windowed process and its helpers together), a click unfolds the member roster in place, and the session's background plumbing hides behind one summary line. The memory column is private pages, not RSS. Type-to-filter, sparklines behind the rows, and drop-down cards for per-core bars, memory anatomy, disks, and interfaces fill it out. Like the terminal it wears the shell's published palette and a translucent background, recoloring when the wallpaper changes.
+
+The titlebar says Kamuy, the Ainu spirit that dwells in the bear: the family's watcher. The binary and app id stay `kuma-monitor`, and `build.sh` does not install it yet: it is running its week in the dock first.
 
 ## Building
 
@@ -65,9 +71,11 @@ kuma-shell depends on gpui via a path dependency into `vendor/zed/` (gitignored,
 - [`CONTEXT.md`](CONTEXT.md): domain glossary (the names of the seams in the code, one line each) and the four-rule ethos that governs them.
 - [`docs/adr/`](docs/adr/): architecture decision records, including two about lock-screen failure modes that only ever show up as "PAM rejects the password the user typed correctly".
 - [`AGENTS.md`](AGENTS.md): how AI agents should build, run, and debug in this repo.
+- [`kuma-platform/`](kuma-platform/): the shared crate: version reporting, the shell's palette handshake, the HSL color space, and the niri IPC envelope ([ADR-0017](docs/adr/0017-kuma-platform-crate.md)).
 - `kuma-shell/icons/`: the widget and panel icons, hand-made SVGs.
 - `kuma-files/icons/`: the in-app icons, hand-made SVGs (16px stroke style).
 - `kuma-files/packaging/`: the menu entry, the app icon generator, and the app icon.
+- `kuma-monitor/packaging/`: the same trio for Kamuy (48-unit grid, drawn at 4x, downscaled to the committed 256px PNG).
 
 ## Status
 

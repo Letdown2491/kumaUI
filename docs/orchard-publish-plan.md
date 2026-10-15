@@ -30,7 +30,9 @@ distribution channel is the kumaOS image.
   resolve), MIT licensed, has 256px PNG icons in packaging (usable as listing
   icons; a 512px re-export is optional), and has no GitHub workflows yet, so
   the publish workflow is also kumaUI's first CI. Desktop file ids today are
-  `kuma-files` and `kuma-term` (Name=Koguma and Name=Higuma).
+  `kuma-files` and `kuma-term` (Name=Koguma and Name=Higuma). Kamuy
+  (`kuma-monitor`) stays out of this plan until it graduates its dock week;
+  its entry joins then as Name=Kamuy.
 - **Secrets.** `ORCHARD_NSEC` exists as a secret in the orchard repo; it must
   also be added to `Letdown2491/kumaUI` for a kumaUI workflow to read it.
   Ghcr credentials ride on `GITHUB_TOKEN` with `github.actor` as the user.
