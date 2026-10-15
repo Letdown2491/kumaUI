@@ -125,6 +125,7 @@ pub(crate) struct MonitorView {
     show_cores: bool,
     show_nets: bool,
     show_disks: bool,
+    show_mem: bool,
     swap_used: u64,
     swap_total: u64,
     /// The app groups, persistent across beats: existing groups keep
@@ -171,6 +172,7 @@ impl MonitorView {
             show_cores: false,
             show_nets: false,
             show_disks: false,
+            show_mem: false,
             swap_used: 0,
             swap_total: 0,
             groups: Vec::new(),
@@ -471,10 +473,10 @@ impl Render for MonitorView {
 
 impl MonitorView {
     /// The vitals row: five quiet cards, label over value over
-    /// detail. The CPU, NET and DISK cards are the click surfaces
-    /// (each opens a card: the cores detail between rows one and
-    /// two, the interfaces and disks below the lattice); the rest
-    /// read and stay still.
+    /// detail. The CPU, MEM, NET and DISK cards are the click
+    /// surfaces (each opens a card: the cores detail between rows
+    /// one and two, memory's anatomy and the interfaces and disks
+    /// below the lattice); the rest read and stay still.
     fn vitals_area(&self, cpu_now: f32, this: &WeakEntity<MonitorView>) -> Div {
         let v = &self.vitals;
         let mem_pct = if self.mem_total > 0 {
@@ -673,9 +675,20 @@ impl MonitorView {
                                 sample::human_mem(self.swap_used)
                             ));
                         }
+                        text.push_str(" \u{b7} click for detail");
                         text
                     }),
             )
+            .id("card-mem")
+            .on_click({
+                let this = this.clone();
+                move |_, _, app| {
+                    let _ = this.update(app, |this, cx| {
+                        this.show_mem = !this.show_mem;
+                        cx.notify();
+                    });
+                }
+            })
             .debug_selector(|| "card-mem".into());
 
         let disk_card = self
@@ -782,6 +795,7 @@ impl MonitorView {
                     .child(disk_card)
                     .child(net_card),
             )
+            .children((self.show_mem && self.vitals.mem.total > 0).then(|| self.mem_detail()))
             .children((self.show_disks && !self.vitals.disks.is_empty()).then(|| {
                 self.devices_card(
                     "DISKS",
@@ -804,7 +818,7 @@ impl MonitorView {
     /// index under it. Opened by clicking the CPU card and hung
     /// directly beneath it, so it reads as that card's own detail.
     fn cores_row(&self) -> Div {
-        self.dropdown_base("CORES")
+        self.dropdown_base("CORES", None)
             .h(px(96.))
             .child(
                 div().flex_1().flex().items_end().children(
@@ -841,8 +855,8 @@ impl MonitorView {
     /// A drop-down's frame: the cards' chrome at full width, the
     /// height content-sized (it hangs below the lattice, so the
     /// strips' ninety-six rhythm does not bind it; the cores card
-    /// pins its own).
-    fn dropdown_base(&self, label: &str) -> Div {
+    /// pins its own). A note rides the label row's right end.
+    fn dropdown_base(&self, label: &str, note: Option<String>) -> Div {
         div()
             .w_full()
             .min_w(px(0.))
@@ -858,10 +872,73 @@ impl MonitorView {
             .rounded_sm()
             .child(
                 div()
-                    .text_size(px(9.))
-                    .text_color(theme::text_dim())
-                    .child(label.to_string()),
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(9.))
+                            .text_color(theme::text_dim())
+                            .child(label.to_string()),
+                    )
+                    .children(note.map(|note| {
+                        div()
+                            .flex_1()
+                            .flex()
+                            .justify_end()
+                            .text_size(px(9.))
+                            .text_color(theme::text_dim())
+                            .truncate()
+                            .child(note)
+                    })),
             )
+    }
+
+    /// The memory drop-down: the cards' chrome full width, one meter
+    /// row per bucket of RAM's anatomy, every fill ghost: nothing in
+    /// this card is distress (the pressure card owns that), the
+    /// shares just say where the memory went, and the buckets plus
+    /// other close to one hundred.
+    fn mem_detail(&self) -> Div {
+        let mem = &self.vitals.mem;
+        let total = mem.total as f32;
+        let bucket = |label: &str, bytes: u64| {
+            div()
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(48.))
+                        .text_size(px(9.))
+                        .text_color(theme::text_dim())
+                        .child(label.to_string()),
+                )
+                .child(
+                    meter(if total > 0. { bytes as f32 / total } else { 0. }, theme::ghost(), None)
+                        .flex_1()
+                        .min_w(px(0.)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .text_size(px(9.))
+                        .text_color(theme::text_dim())
+                        .truncate()
+                        .child(sample::human_mem(bytes)),
+                )
+        };
+        self.dropdown_base(
+            "MEMORY",
+            Some(format!("available {}", sample::human_mem(mem.available))),
+        )
+        .child(bucket("APPS", mem.apps))
+        .child(bucket("SHARED", mem.shared))
+        .child(bucket("CACHE", mem.cache))
+        .child(bucket("KERNEL", mem.kernel))
+        .child(bucket("FREE", mem.free))
+        .child(bucket("OTHER", mem.other))
     }
 
     /// The per-device drop-down: the cards' chrome full width, one
@@ -869,7 +946,7 @@ impl MonitorView {
     /// dim nine-pixel label, a ghost meter of the device's share of
     /// the beat's total, the down and up figures closing the line.
     fn devices_card(&self, label: &str, devs: &[(String, f64, f64)], total: f64) -> Div {
-        self.dropdown_base(label).children(devs.iter().map(|(name, down, up)| {
+        self.dropdown_base(label, None).children(devs.iter().map(|(name, down, up)| {
             div()
                 .h(px(20.))
                 .flex()

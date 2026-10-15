@@ -35,6 +35,34 @@ pub(crate) struct Vitals {
     pub procs_blocked: u32,
     /// How many cpuN lines the kernel reports.
     pub core_count: usize,
+    /// The anatomy of RAM at this beat: disjoint buckets that close
+    /// to the total.
+    pub mem: MemInfo,
+}
+
+/// The anatomy of RAM, in bytes: where the memory went, with the
+/// overlaps removed (Cached carries Shmem and SReclaimable in
+/// /proc/meminfo, so the parser subtracts to keep the buckets
+/// disjoint). Other is what the counters do not account, so the
+/// column closes to one hundred instead of lying by omission.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MemInfo {
+    pub total: u64,
+    /// Programs' anonymous pages: what apps actually hold.
+    pub apps: u64,
+    /// tmpfs and other shared memory.
+    pub shared: u64,
+    /// Page cache and buffers, reclaimable on demand.
+    pub cache: u64,
+    /// Slab minus its reclaimable part, page tables, kernel stacks.
+    pub kernel: u64,
+    /// Unallocated.
+    pub free: u64,
+    /// Boot reservations, gpu dma buffers, zram pools: counted
+    /// against the total by no counter above.
+    pub other: u64,
+    /// The honest headroom: MemAvailable, never above total.
+    pub available: u64,
 }
 
 pub(crate) struct Stats {
@@ -91,6 +119,10 @@ impl Stats {
         let cpu_temp = self.temp_chip.as_ref().and_then(|chip| read_temp(chip));
         let stat_text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
         let (procs_running, procs_blocked) = parse_procs(&stat_text);
+        let mem = std::fs::read_to_string("/proc/meminfo")
+            .as_deref()
+            .map(parse_meminfo)
+            .unwrap_or_default();
 
         let net_devs = std::fs::read_to_string("/proc/net/dev")
             .as_deref()
@@ -136,6 +168,7 @@ impl Stats {
                 procs_running,
                 procs_blocked,
                 core_count,
+                mem,
             },
             core_usage,
         )
@@ -324,6 +357,54 @@ fn sum_devs(devs: &[(String, u64, u64)]) -> (u64, u64) {
     })
 }
 
+/// /proc/meminfo into the disjoint bucket set, kilobytes grown to
+/// bytes. The kernel's format is fixed and the buckets subtract
+/// their overlaps, so the six close to the total (other takes the
+/// residue). Counters new this kernel read as zero.
+fn parse_meminfo(text: &str) -> MemInfo {
+    let kb = |wanted: &str| {
+        // the first line that starts with the counter: the kernel's
+        // fixed order keeps "Slab:" ahead of "SlabUnreclaimable"
+        text.lines()
+            .find_map(|line| line.strip_prefix(wanted))
+            .and_then(|rest| {
+                rest.trim_start_matches(':')
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+            * 1024
+    };
+    let total = kb("MemTotal");
+    let free = kb("MemFree");
+    let available = kb("MemAvailable");
+    let buffers = kb("Buffers");
+    let cached = kb("Cached");
+    let sreclaimable = kb("SReclaimable");
+    let shmem = kb("Shmem");
+    let slab = kb("Slab");
+    let apps = kb("AnonPages");
+    let stacks = kb("KernelStack");
+    let tables = kb("PageTables");
+    let cache = (buffers + cached).saturating_sub(shmem + sreclaimable);
+    let kernel = slab
+        .saturating_sub(sreclaimable)
+        .saturating_add(stacks)
+        .saturating_add(tables);
+    let accounted = apps + shmem + cache + kernel + free;
+    MemInfo {
+        total,
+        apps,
+        shared: shmem,
+        cache,
+        kernel,
+        free,
+        other: total.saturating_sub(accounted),
+        available,
+    }
+}
+
 /// Per-device rates against the previous beat's counters, matched by
 /// name; a device new this beat reads zero, like the first beat.
 fn dev_rates(
@@ -457,6 +538,39 @@ mod tests {
         assert!(!is_disk("dm-0"));
     }
 
+    #[test]
+    fn parses_meminfo_into_buckets_that_close_to_total() {
+        // the real shape of this machine's meminfo, with the prefix
+        // traps present (SwapCached must not answer to Cached, nor
+        // SlabUnreclaimable to Slab)
+        let text = "MemTotal:       14868776 kB\n\
+                    MemFree:         758992 kB\n\
+                    MemAvailable:   10430340 kB\n\
+                    Buffers:            2336 kB\n\
+                    Cached:          9636296 kB\n\
+                    SwapCached:            0 kB\n\
+                    Shmem:             48716 kB\n\
+                    Slab:              713164 kB\n\
+                    SReclaimable:      435288 kB\n\
+                    SUnreclaim:        277876 kB\n\
+                    KernelStack:        17504 kB\n\
+                    PageTables:         41612 kB\n\
+                    AnonPages:       2742076 kB\n";
+        let mem = parse_meminfo(text);
+        assert_eq!(mem.total, 14868776u64 * 1024);
+        assert_eq!(mem.apps, 2742076u64 * 1024);
+        assert_eq!(mem.shared, 48716u64 * 1024);
+        // buffers + cached - shmem - sreclaimable
+        assert_eq!(mem.cache, (2336 + 9636296 - 48716 - 435288) as u64 * 1024);
+        // slab - sreclaimable + stacks + page tables
+        assert_eq!(mem.kernel, (713164 - 435288 + 17504 + 41612) as u64 * 1024);
+        assert_eq!(mem.free, 758992u64 * 1024);
+        assert!(mem.available <= mem.total, "headroom is never more ram");
+        // the column closes: buckets plus other land on the total
+        let sum = mem.apps + mem.shared + mem.cache + mem.kernel + mem.free + mem.other;
+        assert_eq!(sum, mem.total);
+    }
+
     /// A live vitals beat: uptime and cores are real, throughput is
     /// finite, pressure reads or reads as absent.
     #[test]
@@ -475,6 +589,8 @@ mod tests {
             .is_none_or(|t| (0. ..=150.).contains(&t)));
         assert!(vitals.procs_running >= 1, "this test itself is running");
         assert!(vitals.core_count >= 1);
+        assert!(vitals.mem.total > 0);
+        assert!(vitals.mem.available <= vitals.mem.total);
         // the first beat has no delta baseline: usage comes empty,
         // like the throughput rates
         assert!(cores.is_empty());
