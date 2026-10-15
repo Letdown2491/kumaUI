@@ -37,18 +37,7 @@ pub fn connect(state: &Entity<SessionState>, cx: &mut App) {
 }
 
 pub(crate) fn socket_path() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("NIRI_SOCKET") {
-        return Ok(PathBuf::from(path));
-    }
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
-    std::fs::read_dir(&runtime_dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("niri.") && name.ends_with(".sock"))
-        })
-        .context("no niri IPC socket found in XDG_RUNTIME_DIR")
+    kuma_platform::niri::socket_path()
 }
 
 async fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
@@ -122,24 +111,11 @@ fn parse_event(line: &str) -> Result<Option<SessionEvent>> {
 
 /// Send one request line and return niri's Ok payload. The error path
 /// keeps niri's own answer text, which is what makes IPC failures
-/// diagnosable in the journal.
+/// diagnosable in the journal. The envelope lives in the platform
+/// crate; this stays the app's seam (nothing above this module
+/// mentions niri).
 pub(crate) fn request(request: Value) -> Result<Value> {
-    let path = socket_path()?;
-    let stream = UnixStream::connect(&path).context("failed to connect to niri IPC socket")?;
-
-    let mut writer = &stream;
-    writer.write_all(request.to_string().as_bytes())?;
-    writer.write_all(b"\n")?;
-
-    let mut reader = BufReader::new(stream);
-    let mut reply = String::new();
-    reader.read_line(&mut reply)?;
-    if !reply.starts_with("{\"Ok\"") {
-        bail!("niri request failed: {reply}");
-    }
-    let envelope: Value = serde_json::from_str(reply.trim())
-        .with_context(|| format!("niri reply not JSON: {reply}"))?;
-    Ok(envelope["Ok"].clone())
+    kuma_platform::niri::request(&request)
 }
 
 /// Send one action request and check niri's reply envelope.

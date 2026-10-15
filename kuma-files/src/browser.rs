@@ -2270,20 +2270,12 @@ impl Browser {
     /// colors, published for any app that wants them. Absent means we
     /// are not running under kuma-shell (or adaptive is off) and the
     /// built-ins stand.
-    fn palette_path() -> Option<PathBuf> {
-        Some(PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("kuma-shell/palette"))
-    }
-
     fn palette_mtime() -> Option<std::time::SystemTime> {
-        fs::metadata(Self::palette_path()?)
-            .ok()?
-            .modified()
-            .ok()
+        kuma_platform::palette::mtime()
     }
 
-    fn read_palette() -> Option<theme::Palette> {
-        let text = fs::read_to_string(Self::palette_path()?).ok()?;
-        Some(parse_palette(&text))
+    fn read_palette() -> Option<kuma_platform::palette::Palette> {
+        kuma_platform::palette::read()
     }
 
     /// Accent precedence: an explicit color wins over the wallpaper;
@@ -2293,7 +2285,7 @@ impl Browser {
         if let Some(palette) = Self::read_palette() {
             theme::apply_palette(&palette);
         } else {
-            theme::apply_palette(&theme::Palette::default());
+            theme::apply_palette(&kuma_platform::palette::Palette::default());
         }
         if let Some(hex) = self.accent {
             theme::set_accent(hex);
@@ -3984,7 +3976,7 @@ impl Browser {
                 ("inspector-lock", "bottom") => self.inspector_lock = Some(true),
                 ("inspector-lock", "right") => self.inspector_lock = Some(false),
                 ("accent", "auto") => self.accent = None,
-                ("accent", _) => self.accent = parse_hex_color(value),
+                ("accent", _) => self.accent = kuma_platform::palette::parse_hex_color(value),
                 // "keys" (once an open flag for a sidebar cheatsheet)
                 // is a modal now: the line parses as unknown and dies
                 // in the _ arm
@@ -10166,51 +10158,6 @@ fn auto_dock_for(width: f32, current_bottom: bool) -> Option<bool> {
     .filter(|bottom| *bottom != current_bottom)
 }
 
-/// Parse the shell's palette file: key=value hex lines, unknown or
-/// broken lines ignored, missing keys keep the built-ins.
-fn parse_palette(text: &str) -> theme::Palette {
-    let mut palette = theme::Palette::default();
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let Some(hex) = parse_hex_color(value) else {
-            continue;
-        };
-        // the shell's panel colors arrive as RRGGBBAA (alpha in the
-        // low byte); our surfaces are opaque, so keep the top 24 bits.
-        // Pure RGB values pass through untouched.
-        let hex = if hex > 0xFFFFFF { hex >> 8 } else { hex };
-        match key.trim() {
-            "panel_bg" => palette.panel_bg = hex,
-            "surface" => palette.surface = hex,
-            "surface_hover" => palette.surface_hover = hex,
-            "inset" => palette.inset = hex,
-            "divider" => palette.divider = hex,
-            "divider_soft" => palette.divider_soft = hex,
-            "text" => palette.text = hex,
-            "text_dim" => palette.text_dim = hex,
-            "accent" => palette.accent = hex,
-            "accent_text" => palette.accent_text = hex,
-            _ => {}
-        }
-    }
-    palette
-}
-
-/// A color out of "#rrggbb", "rrggbb", "0xrrggbb", or the 8-digit
-/// alpha-carrying form the shell publishes for panel colors.
-fn parse_hex_color(value: &str) -> Option<u32> {
-    let text = value.trim().trim_start_matches('#').trim_start_matches("0x");
-    if text.len() != 6 && text.len() != 8 {
-        return None;
-    }
-    if !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return None;
-    }
-    u32::from_str_radix(text, 16).ok()
-}
-
 /// The accent presets in the picker: the built-in blue first, then
 /// hues that hold up on a dark surface.
 const ACCENT_PRESETS: [u32; 8] = [
@@ -11655,38 +11602,14 @@ sftp://remote/share skip-me
     }
 
     #[test]
-    fn palette_parses_shell_key_values() {
-        let text = "panel_bg=16151ef2\naccent=#89b4fa\ntext=e0e0e8\nbogus=zz\nfuture=0x123456\n";
-        let palette = parse_palette(text);
-        // alpha-carrying panel color: RGB is the top 24 bits, not the
-        // bottom (the low-end mask once produced a bright blue rail)
-        assert_eq!(palette.panel_bg, 0x16151e);
-        assert_eq!(palette.accent, 0x89b4fa);
-        assert_eq!(palette.text, 0xe0e0e8);
-        // untouched keys keep the defaults
-        assert_eq!(palette.text_dim, theme::Palette::default().text_dim);
-    }
-
-    #[test]
-    fn hex_colors_accept_the_common_spellings() {
-        assert_eq!(parse_hex_color("#89b4fa"), Some(0x89b4fa));
-        assert_eq!(parse_hex_color("89b4fa"), Some(0x89b4fa));
-        assert_eq!(parse_hex_color("0x89B4FA"), Some(0x89b4fa));
-        assert_eq!(parse_hex_color("181825f2"), Some(0x181825f2), "the shell's alpha-carrying panel colors");
-        assert_eq!(parse_hex_color("auto"), None);
-        assert_eq!(parse_hex_color("#89b4"), None);
-        assert_eq!(parse_hex_color("#89b4faa"), None);
-    }
-
-    #[test]
     fn accent_change_drags_the_tints_along() {
         // green accent: the selection tints keep the accent's hue
         theme::set_accent(0xa6da95);
-        let tint = theme::rgb_to_hsl(theme::row_selected_hex() & 0xFFFFFF);
+        let tint = kuma_platform::color::rgb_to_hsl(theme::row_selected_hex() & 0xFFFFFF);
         assert!((tint.0 - 100.0).abs() < 30.0, "green hue, got {}", tint.0);
         // back to the default accent, the original blues return
         theme::set_accent(0x4f8cc9);
-        let tint = theme::rgb_to_hsl(theme::row_selected_hex() & 0xFFFFFF);
+        let tint = kuma_platform::color::rgb_to_hsl(theme::row_selected_hex() & 0xFFFFFF);
         assert!((tint.0 - 215.0).abs() < 8.0, "blue hue, got {}", tint.0);
     }
 

@@ -6,7 +6,6 @@
 //! (the daemons nothing recognizes) hides behind one summary line.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
@@ -232,7 +231,7 @@ impl MonitorView {
     /// moved (wallpaper changed, accent picked); a vanished file
     /// reverts to the built-ins once.
     fn sync_palette(&mut self) {
-        let mtime = palette_mtime();
+        let mtime = kuma_platform::palette::mtime();
         if mtime == self.palette_mtime {
             return;
         }
@@ -1639,86 +1638,16 @@ fn human_uptime(secs: f64) -> String {
     }
 }
 
-// ---------- the shell's palette handshake (from kuma-files) ----------
-
-fn palette_path() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("kuma-shell/palette"))
-}
-
-fn palette_mtime() -> Option<SystemTime> {
-    std::fs::metadata(palette_path()?).ok()?.modified().ok()
-}
+// ---------- the shell's palette handshake ----------
 
 /// Read the shell's published palette, or the built-ins when absent.
-fn read_palette() -> theme::Palette {
-    let Some(path) = palette_path() else {
-        return theme::Palette::default();
-    };
-    match std::fs::read_to_string(path) {
-        Ok(text) => parse_palette(&text),
-        Err(_) => theme::Palette::default(),
-    }
-}
-
-fn parse_palette(text: &str) -> theme::Palette {
-    let mut palette = theme::Palette::default();
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let Some(hex) = parse_hex_color(value) else {
-            continue;
-        };
-        // the shell's panel colors arrive as RRGGBBAA (alpha in the
-        // low byte); our surfaces are opaque, so keep the top 24 bits.
-        // Pure RGB values pass through untouched.
-        let hex = if hex > 0xFFFFFF { hex >> 8 } else { hex };
-        match key.trim() {
-            "panel_bg" => palette.panel_bg = hex,
-            "surface" => palette.surface = hex,
-            "surface_hover" => palette.surface_hover = hex,
-            "inset" => palette.inset = hex,
-            "divider" => palette.divider = hex,
-            "divider_soft" => palette.divider_soft = hex,
-            "text" => palette.text = hex,
-            "text_dim" => palette.text_dim = hex,
-            "accent" => palette.accent = hex,
-            "accent_text" => palette.accent_text = hex,
-            _ => {}
-        }
-    }
-    palette
-}
-
-/// A color out of "#rrggbb", "rrggbb", "0xrrggbb", or the 8-digit
-/// alpha-carrying form the shell publishes for panel colors.
-fn parse_hex_color(value: &str) -> Option<u32> {
-    let text = value.trim().trim_start_matches('#').trim_start_matches("0x");
-    if text.len() != 6 && text.len() != 8 {
-        return None;
-    }
-    if !text.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return None;
-    }
-    u32::from_str_radix(text, 16).ok()
+fn read_palette() -> kuma_platform::palette::Palette {
+    kuma_platform::palette::read().unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_the_palette_handshake() {
-        let text = "panel_bg=0x181b21\naccent=#89b4fa\ntext=d8dce3ff\njunk=no\ntext_dim=zzz";
-        let palette = parse_palette(text);
-        assert_eq!(palette.panel_bg, 0x181b21);
-        assert_eq!(palette.accent, 0x89b4fa);
-        // the alpha-carrying form folds to the top 24 bits (alpha is
-        // the low byte the shell publishes)
-        assert_eq!(palette.text, 0xd8dce3);
-        // a bad value keeps the default
-        assert_eq!(palette.text_dim, theme::Palette::default().text_dim);
-    }
 
     #[test]
     fn member_leads_with_the_title_then_the_name() {

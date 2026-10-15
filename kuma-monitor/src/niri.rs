@@ -1,18 +1,15 @@
-//! The minimal niri IPC client: one request, one reply line, the Ok
-//! envelope unwrapped. Copied per the freeze (#33): the shell's
-//! adapter (kuma-shell/src/niri.rs) is the original; the spike adds
-//! only the pid field the shell's SessionWindow never needed.
+//! The monitor's half of the niri join: the window list request and
+//! the response type. The envelope (connect, one line, the Ok unwrap)
+//! lives in kuma-platform's niri module; the shell's adapter is the
+//! original (ADR-0003). The spike adds only the pid field the shell's
+//! SessionWindow never needed.
 
-use std::{
-    io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
-    path::PathBuf,
-    time::Duration,
-};
+use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
+use kuma_platform::niri;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// One window niri knows about: the join's right half. The window's
 /// own id drops out: the join keys on pid, and nothing here focuses
@@ -29,46 +26,15 @@ pub(crate) struct NiriWindow {
     pub is_focused: bool,
 }
 
-pub(crate) fn socket_path() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("NIRI_SOCKET") {
-        return Ok(PathBuf::from(path));
-    }
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
-    std::fs::read_dir(&runtime_dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("niri.") && name.ends_with(".sock"))
-        })
-        .context("no niri IPC socket found in XDG_RUNTIME_DIR")
-}
-
 /// Ask niri for its window list. The reply's shape is
-/// `{"Ok":{"Windows":[...]}}`, the Response enum nested in the Ok
-/// envelope. Read timeouts keep a stuck socket from stalling the
-/// sample tick: a beat that cannot ask degrades to unjoined rows
-/// instead of freezing the view.
+/// `{"Ok":{"Windows":[...]}}`; the envelope lives in the platform.
+/// The timeout keeps a stuck socket from stalling the sample loop
+/// for good: a beat that cannot ask degrades to unjoined rows
+/// instead of freezing the table.
 pub(crate) fn windows() -> Result<Vec<NiriWindow>> {
-    let path = socket_path()?;
-    let stream = UnixStream::connect(&path).context("failed to connect to niri IPC socket")?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-
-    let mut writer = &stream;
-    writer.write_all(json!("Windows").to_string().as_bytes())?;
-    writer.write_all(b"\n")?;
-
-    let mut reader = BufReader::new(stream);
-    let mut reply = String::new();
-    reader.read_line(&mut reply)?;
-    if !reply.starts_with("{\"Ok\"") {
-        bail!("niri request failed: {reply}");
-    }
-    let envelope: Value = serde_json::from_str(reply.trim())
-        .with_context(|| format!("niri reply not JSON: {reply}"))?;
-    let windows = envelope["Ok"]["Windows"].clone();
-    Ok(serde_json::from_value(windows)?)
+    let payload = niri::request_with_timeout(&json!("Windows"), Duration::from_secs(2))?;
+    serde_json::from_value(payload["Windows"].clone())
+        .context("niri's Windows reply did not parse")
 }
 
 #[cfg(test)]
@@ -76,11 +42,13 @@ mod tests {
     use super::*;
 
     /// The envelope the live socket answers: one line, Ok wrapping
-    /// the Response enum's tagged variant.
+    /// the Response enum's tagged variant. The envelope's unwrap is
+    /// the platform's; this pins that the reply's own shape feeds
+    /// the monitor's window type.
     #[test]
     fn parses_the_windows_reply() {
         let reply = r#"{"Ok":{"Windows":[{"id":2,"pid":2298,"app_id":"kuma-term","title":"kuma-term","workspace_id":{"Id":1},"is_focused":true,"is_urgent":false,"layout":null}]}}"#;
-        let envelope: Value = serde_json::from_str(reply).unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(reply).unwrap();
         let windows: Vec<NiriWindow> =
             serde_json::from_value(envelope["Ok"]["Windows"].clone()).unwrap();
         assert_eq!(windows.len(), 1);

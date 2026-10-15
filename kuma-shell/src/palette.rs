@@ -4,6 +4,8 @@
 //! wallpaper picks a seed color, and the whole palette is tone-mapped
 //! off the seed's hue with WCAG contrast pulling the text values.
 
+use kuma_platform::color::{hsl_to_rgb, rgb_to_hsl};
+
 /// The palette's accent seed, in HSL (h in degrees, s and l 0..1).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Seed {
@@ -31,57 +33,7 @@ const K: usize = 8;
 /// recognizable rather than washed out.
 pub const FALLBACK_ACCENT: u32 = 0x89B4FA;
 
-// ---------- color space ----------
-
-/// sRGB u32 (0xRRGGBB) to HSL.
-pub fn rgb_to_hsl(rgb: u32) -> (f32, f32, f32) {
-    let r = ((rgb >> 16) & 0xFF) as f32 / 255.;
-    let g = ((rgb >> 8) & 0xFF) as f32 / 255.;
-    let b = (rgb & 0xFF) as f32 / 255.;
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let l = (max + min) / 2.;
-    if max == min {
-        return (0., 0., l);
-    }
-    let d = max - min;
-    let s = if l > 0.5 { d / (2. - max - min) } else { d / (max + min) };
-    let h = if max == r {
-        (g - b) / d + if g < b { 6. } else { 0. }
-    } else if max == g {
-        (b - r) / d + 2.
-    } else {
-        (r - g) / d + 4.
-    } * 60.;
-    (h, s, l)
-}
-
-/// HSL to sRGB u32 (0xRRGGBB), clamped.
-pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> u32 {
-    let h = h.rem_euclid(360.) / 360.;
-    let s = s.clamp(0., 1.);
-    let l = l.clamp(0., 1.);
-    if s == 0. {
-        let v = (l * 255. + 0.5) as u32;
-        return (v << 16) | (v << 8) | v;
-    }
-    let q = if l < 0.5 { l * (1. + s) } else { l + s - l * s };
-    let p = 2. * l - q;
-    let channel = |mut t: f32| {
-        t = t.rem_euclid(1.);
-        let v = if t < 1. / 6. {
-            p + (q - p) * 6. * t
-        } else if t < 0.5 {
-            q
-        } else if t < 2. / 3. {
-            p + (q - p) * (2. / 3. - t) * 6.
-        } else {
-            p
-        };
-        ((v * 255.) + 0.5) as u32
-    };
-    (channel(h + 1. / 3.) << 16) | (channel(h) << 8) | channel(h - 1. / 3.)
-}
+// ---------- color space: kuma-platform::color is the original ----------
 
 /// WCAG relative luminance of an sRGB u32.
 fn luminance(rgb: u32) -> f32 {

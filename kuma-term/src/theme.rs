@@ -121,16 +121,14 @@ impl Theme {
 
     /// The wallpaper palette kuma-shell publishes for session neighbors,
     /// with its file's mtime so a two second tick can spot republishes.
+    /// The locate and the read live in kuma-platform; the term folds
+    /// the text into its own Theme.
     pub fn shell_palette_text() -> Option<String> {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-        let path = std::path::PathBuf::from(dir).join("kuma-shell/palette");
-        std::fs::read_to_string(path).ok()
+        kuma_platform::palette::read_text()
     }
 
     pub fn palette_mtime() -> Option<std::time::SystemTime> {
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
-        let path = std::path::PathBuf::from(dir).join("kuma-shell/palette");
-        std::fs::metadata(path).ok()?.modified().ok()
+        kuma_platform::palette::mtime()
     }
 
     /// The fallback chain the grid's font carries: the config's list (or
