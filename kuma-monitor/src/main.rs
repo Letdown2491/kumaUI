@@ -57,7 +57,10 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 app_id: Some("kuma-monitor".into()),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from("kuma-monitor")),
+                    // the display name is Kamuy, the Ainu spirit that
+                    // dwells in the bear: the family's watcher (the
+                    // binary and app id keep kuma-monitor)
+                    title: Some(SharedString::from("Kamuy")),
                     ..Default::default()
                 }),
                 ..Default::default()
