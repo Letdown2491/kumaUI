@@ -283,8 +283,10 @@ impl MonitorView {
     /// decides the members), a group matched through a member or pid
     /// pulls its header along and shows just the matches, and
     /// matching background groups surface past the fold. The
-    /// summary's sums stay machine-wide regardless: a filtered view
-    /// must not shrink the plumbing.
+    /// summary itself obeys the same hide rule: it shows only when
+    /// the filter found something in the background (it is then the
+    /// surfaced rows' fold header), and its sums stay machine-wide
+    /// whenever it shows.
     fn visible_items(&self) -> Vec<Item> {
         let q = self.filter.to_lowercase();
         let filtering = !q.is_empty();
@@ -323,7 +325,12 @@ impl MonitorView {
             .iter()
             .map(|(index, _)| self.groups[*index].members.iter().map(|row| row.mem).sum::<u64>())
             .sum();
-        if !background.is_empty() {
+        // the summary is a table row like any other: with a filter
+        // active it shows only when the filter found something in
+        // the background, and then the miss line in render can
+        // speak; unfiltered, it always shows
+        let bg_matches = background.iter().any(|(_, hit)| hit.is_some());
+        if !background.is_empty() && (!filtering || bg_matches) {
             items.push(Item::BgSummary {
                 open: self.show_background,
                 count: bg_count,
@@ -1689,10 +1696,12 @@ mod tests {
             // (the background group itself sits behind the closed fold)
             assert_eq!(view.visible_items().len(), 3);
 
-            // a member match pulls its header along, narrowed to the matches
+            // a member match pulls its header along, narrowed to the
+            // matches; the summary hides, nothing in the background
+            // matched "content"
             view.filter = "content".into();
             let items = view.visible_items();
-            assert_eq!(items.len(), 3, "firefox header, the match, the summary");
+            assert_eq!(items.len(), 2, "firefox header and the match");
             match &items[0] {
                 Item::Group { index, open, .. } => {
                     assert_eq!(*index, 0);
@@ -1707,7 +1716,6 @@ mod tests {
                 }
                 _ => panic!("expected the matched member"),
             }
-            assert!(matches!(items[2], Item::BgSummary { .. }));
 
             // a background match surfaces past the fold: "pipe" hits
             // the group's name, so the expand state governs (closed
@@ -1724,10 +1732,9 @@ mod tests {
                 _ => panic!("expected the surfaced background group"),
             }
 
-            // a miss hides everything, and the empty state with it
+            // a miss hides everything, summary included, so the
+            // table goes quiet and the miss line speaks
             view.filter = "qqq".into();
-            assert_eq!(view.visible_items().len(), 1, "the summary alone");
-            view.groups.clear();
             assert!(view.visible_items().is_empty());
         });
     }
