@@ -28,7 +28,7 @@ fast, and the platform crate is where they come home.
 
 One workspace crate, `kuma-platform`, path-dependency of every app. A
 module lands when a second app needs it; apps declare what they are, the
-platform owns how. The crate carries four modules:
+platform owns how. The crate carries five modules:
 
 - `version`: the line, the in-app tag, the changelog guard helper, and
   the flag predicate. The shell's CLI dispatcher keeps its bare-word
@@ -45,9 +45,23 @@ platform owns how. The crate carries four modules:
   Events, actions, and response types stay in the apps: the platform
   carries no session policy, and each app's adapter remains the only
   module above the wire that names niri.
+- `titlebar`: the family's client-side title bar (added 2026-10-15).
+  gpui claims client-side decorations on Wayland and draws nothing
+  itself; every app was left to invent its own bar or live with a bare
+  window. The platform owns the behavior and the geometry (the drag via
+  `start_window_move`, double-click maximize, right-click
+  `show_window_menu`, the buttons wired to `minimize_window`,
+  `zoom_window`, and close, the cluster trimmed to what the
+  compositor's `wm_capabilities` backs). The app owns the look: it
+  hands over its theme colors and its glyph asset paths, so the bar
+  wears each app's skin without the platform growing a palette or an
+  asset set. A module may add `pub fn` seams later (content slots
+  beside the title, a fold-away when the compositor tiles the window);
+  those land when an app asks.
 
-Dependencies stay in the stratum the apps already carried: `serde_json`
-and `anyhow`, nothing else.
+Dependencies stay in the stratum the apps already carried: `serde_json`,
+`anyhow`, and now `gpui` (the titlebar's primitives: every app depends
+on it already, so the tree grows nothing).
 
 ## Alternatives
 
@@ -62,7 +76,7 @@ and `anyhow`, nothing else.
 ## Consequences
 
 - A contract fix lands once. The palette parse, the HSL math, and the
-  envelope unwrap are tested in one place (12 platform tests) and the
+  envelope unwrap are tested in one place (13 platform tests) and the
   apps test their own mapping on top.
 - Adding a dependency to kuma-platform adds it to every app's tree. The
   crate stays dependency-light on purpose; a module that wants a heavy

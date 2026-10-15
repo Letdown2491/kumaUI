@@ -200,6 +200,9 @@ impl MonitorView {
         // paints, and subpixel AA is wrong over a translucent
         // background (kuma-term/src/view.rs, same stack)
         window.set_background_appearance(gpui::WindowBackgroundAppearance::Transparent);
+        // the titlebar trims its buttons to this: worth a line in the
+        // log when a button the user expects is missing
+        log::info!("window controls: {:?}", window.window_controls());
         // the filter rides the window's focus: the view takes it at
         // birth and nothing in the table steals it, so plain typing
         // always lands in the buffer
@@ -493,6 +496,27 @@ impl Render for MonitorView {
             .bg(theme::bg())
             .text_color(theme::text())
             .text_size(px(13.))
+            .child(
+                // the CSD bar: the platform's behavior, the monitor's
+                // colors (always visible for this review round; the
+                // fold-away-when-tiled lands after the look is settled)
+                kuma_platform::titlebar::bar(
+                    "Kamuy".into(),
+                    window.window_controls(),
+                    kuma_platform::titlebar::TitlebarIcons {
+                        minimize: "icons/titlebar_minimize.svg".into(),
+                        maximize: "icons/titlebar_maximize.svg".into(),
+                        close: "icons/titlebar_close.svg".into(),
+                    },
+                    kuma_platform::titlebar::TitlebarColors {
+                        background: theme::surface(),
+                        border: theme::border(),
+                        title: theme::text_dim(),
+                        ink: theme::text_dim(),
+                        hover: theme::row_hover(),
+                    },
+                ),
+            )
             .child(self.vitals_area(cpu_now, &this))
             .child(
                 // the header floats: no rule above or below, its dim
@@ -2296,5 +2320,68 @@ mod tests {
             view.filter = "qqq".into();
             assert!(view.visible_items().is_empty());
         });
+    }
+
+    /// The CSD bar renders above the vitals: the drag zone starts at
+    /// the window's top, the button cluster stays inside the bar's
+    /// height, and the glyphs resolve from the app's asset source.
+    #[test]
+    fn the_titlebar_renders_over_the_vitals() {
+        use std::sync::Arc;
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(crate::icons::Assets),
+        );
+        let mut window = app.open_window(|window, cx| MonitorView::new(window, cx));
+        app.run_until_parked();
+        // one fresh frame so the bar's paint records its bounds
+        window.update(|_, _, cx| cx.notify());
+        app.run_until_parked();
+        let (drag, close) = window.update(|_, window, _| {
+            (
+                window.debug_element_bounds("kuma-titlebar-drag").unwrap(),
+                window.debug_element_bounds("kuma-titlebar-close").unwrap(),
+            )
+        });
+        assert_eq!(drag.origin.y, px(0.), "the bar is the window's first child");
+        // the bar's hairline is inset of its 34px, so the children
+        // stop one pixel short
+        assert_eq!(close.bottom(), px(kuma_platform::titlebar::BAR_HEIGHT - 1.));
+        assert!(drag.right() < close.origin.x, "drag zone left of the buttons");
+    }
+
+    /// The titlebar's glyphs must rasterize to actual ink: a path the
+    /// SVG parser drops paints nothing and the button goes blind (the
+    /// missing minus, caught here).
+    #[test]
+    fn the_titlebar_glyphs_rasterize() {
+        use gpui::AssetSource;
+        use std::sync::Arc;
+
+        let assets = Arc::new(crate::icons::Assets);
+        let renderer = gpui::SvgRenderer::new(assets.clone());
+        for (name, path) in [
+            ("minimize", "icons/titlebar_minimize.svg"),
+            ("maximize", "icons/titlebar_maximize.svg"),
+            ("close", "icons/titlebar_close.svg"),
+        ] {
+            let bytes = assets
+                .load(path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: nothing at {path}"));
+            let image = renderer
+                .render_single_frame(bytes.as_ref(), 1.0)
+                .unwrap_or_else(|err| panic!("{name}: did not parse: {err}"));
+            let ink = image
+                .as_bytes(0)
+                .unwrap()
+                .iter()
+                .skip(3)
+                .step_by(4)
+                .filter(|&alpha| *alpha > 0)
+                .count();
+            assert!(ink > 20, "{name}: only {ink} inked pixels rasterized");
+        }
     }
 }

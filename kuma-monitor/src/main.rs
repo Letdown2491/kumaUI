@@ -8,6 +8,7 @@ use std::io::Write as _;
 use gpui::{App, AppContext, TitlebarOptions, WindowBounds, WindowOptions, px, size, SharedString};
 use gpui_platform::application;
 
+mod icons;
 mod niri;
 mod sample;
 mod stats;
@@ -50,7 +51,9 @@ fn main() {
         std::process::exit(1);
     }
 
-    application().run(move |cx: &mut App| {
+    application()
+        .with_assets(icons::Assets)
+        .run(move |cx: &mut App| {
         let bounds = gpui::Bounds::centered(None, size(px(860.), px(640.)), cx);
         let _ = cx.open_window(
             WindowOptions {
