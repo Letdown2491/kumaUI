@@ -13,6 +13,12 @@ rides unchanged.
 
 ### Fixed
 
+- kuma-files: overwriting an image in place (same path, new contents) now
+  refreshes Koguma's grid thumbnail on the next paint; before, the
+  in-memory thumb cache keyed by path alone and served the old decode
+  until the app restarted. Each cached thumb now carries the mtime it
+  decoded from, the same stamp the disk cache's key already had.
+
 - kuma-shell: the polkit agent's auth prompt now survives polkitd restarts
   and registers for the logind display session instead of trusting the
   inherited `XDG_SESSION_ID`, which carries greetd's stale session id for

@@ -42,6 +42,34 @@ const THUMB_POOL: usize = 3;
 /// again anyway and are pure disk weight.
 const THUMB_CACHE_SWEEP_SECS: u64 = 30 * 24 * 3600;
 
+/// One in-memory grid thumb: the decoded image plus the file version
+/// (mtime seconds) it decoded from. The stamp is what the disk cache
+/// key already carries, applied to the memory side too, so a file
+/// overwritten in place re-decodes on the next paint instead of
+/// serving old pixels until restart.
+struct ThumbHit {
+    mtime: u64,
+    image: Arc<RenderImage>,
+}
+
+/// mtime as seconds since the epoch: the stamp every thumb cache
+/// keys on, the disk hash and the in-memory hit and the listing's
+/// `Entry::modified` alike.
+fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The listing's view of a file's version. A missing mtime (the
+/// walker's stat failed) stamps 0, matching only a decode that also
+/// saw no mtime.
+fn entry_stamp(entry: &Entry) -> u64 {
+    u64::try_from(entry.modified.unwrap_or(0)).unwrap_or(0)
+}
+
 /// Insertion-order trim for the thumb cache: evicts down to the cap,
 /// oldest first (dropping the oldest keeps the visible window's thumbs
 /// warm, where a wholesale clear re-decoded everything at once), and
@@ -50,17 +78,17 @@ const THUMB_CACHE_SWEEP_SECS: u64 = 30 * 24 * 3600;
 /// eviction would leave every thumbnail ever scrolled past painted
 /// until the window closed (ADR-0016).
 fn trim_thumbs(
-    thumbs: &mut HashMap<PathBuf, Arc<RenderImage>>,
+    thumbs: &mut HashMap<PathBuf, ThumbHit>,
     order: &mut VecDeque<PathBuf>,
 ) -> Vec<Arc<RenderImage>> {
     let mut droplets = Vec::new();
     while thumbs.len() >= THUMB_CACHE_MAX {
         let Some(oldest) = order.pop_front() else {
-            droplets.extend(thumbs.drain().map(|(_, image)| image));
+            droplets.extend(thumbs.drain().map(|(_, hit)| hit.image));
             break;
         };
-        if let Some(image) = thumbs.remove(&oldest) {
-            droplets.push(image);
+        if let Some(hit) = thumbs.remove(&oldest) {
+            droplets.push(hit.image);
         }
     }
     droplets
@@ -1506,8 +1534,10 @@ pub(crate) struct Browser {
     free_space: Option<(PathBuf, u64)>,
     free_inflight: Option<PathBuf>,
     show_hidden: bool,
-    /// Decoded thumbnails keyed by path; cleared wholesale when large.
-    thumbs: HashMap<PathBuf, Arc<RenderImage>>,
+    /// Decoded thumbnails keyed by path, each stamped with the mtime
+    /// it decoded from: a hit whose stamp no longer matches the
+    /// listing's file version re-decodes (request_thumb retires it).
+    thumbs: HashMap<PathBuf, ThumbHit>,
     thumbs_inflight: HashSet<PathBuf>,
     /// Pending thumb kicks, FIFO: the pool pops from here as slots
     /// free, and pops die for paths the last paint stopped asking
@@ -1958,20 +1988,34 @@ impl Browser {
     }
 
     /// Kick off a background decode for a thumbable file; the result
-    /// arrives with a notify. Safe to call every render: cached,
-    /// inflight, and queued paths are no-ops. The kick marks the path
-    /// wanted (this paint is asking) and queues it; the pool pops the
-    /// queue up to THUMB_POOL concurrent decodes, and a queued path
-    /// the paints stopped asking about dies at pop time instead of
-    /// spending a decode. Results go through the disk cache keyed
-    /// (path, mtime, size), so a restart or a re-scroll past an
-    /// evicted entry reads the PNG instead of the source.
-    fn request_thumb(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.thumbs.contains_key(&path)
-            || self.thumbs_inflight.contains(&path)
-            || self.thumbs_queue.contains(&path)
-        {
-            return;
+    /// arrives with a notify. `mtime` is the file version the caller
+    /// sees (the listing entry's stamp). Safe to call every render:
+    /// a matching cached decode, an inflight job, and a queued path
+    /// are no-ops; a cached decode whose stamp no longer matches
+    /// retires (dropping its atlas tile, ADR-0016) and re-queues.
+    /// The kick marks the path wanted (this paint is asking) and
+    /// queues it; the pool pops the queue up to THUMB_POOL concurrent
+    /// decodes, and a queued path the paints stopped asking about
+    /// dies at pop time instead of spending a decode. Results go
+    /// through the disk cache keyed (path, mtime, size), so a restart
+    /// or a re-scroll past an evicted entry reads the PNG instead of
+    /// the source.
+    fn request_thumb(&mut self, path: PathBuf, mtime: u64, cx: &mut Context<Self>) {
+        match self.thumbs.get(&path) {
+            Some(hit) if hit.mtime == mtime => return,
+            // a decode of an older file version: retire it below
+            Some(_) => {}
+            None => {
+                if self.thumbs_inflight.contains(&path)
+                    || self.thumbs_queue.contains(&path)
+                {
+                    return;
+                }
+            }
+        }
+        if let Some(hit) = self.thumbs.remove(&path) {
+            self.thumb_order.retain(|ordered| ordered != &path);
+            cx.drop_image(hit.image, None);
         }
         self.thumb_wanted.insert(path.clone());
         let Ok(meta) = fs::symlink_metadata(&path) else {
@@ -1999,7 +2043,7 @@ impl Browser {
             if !self.thumb_wanted.contains(&path) {
                 continue; // off-screen since it was queued: dies here
             }
-            let cache_path = self.cache_path_for(&path);
+            let (cache_path, stamp) = self.cache_path_for(&path);
             self.thumbs_inflight.insert(path.clone());
             cx.spawn(async move |this, cx| {
                 let bg_path = path.clone();
@@ -2023,7 +2067,13 @@ impl Browser {
                             cx.drop_image(image, None);
                         }
                         this.thumb_order.push_back(path.clone());
-                        this.thumbs.insert(path, Arc::new(render));
+                        this.thumbs.insert(
+                            path,
+                            ThumbHit {
+                                mtime: stamp,
+                                image: Arc::new(render),
+                            },
+                        );
                         cx.notify();
                     }
                     this.pump_thumbs(cx);
@@ -2037,23 +2087,26 @@ impl Browser {
     }
 
     /// The disk cache entry for a thumbable path, keyed by the
-    /// (path, mtime, size) triple. The metadata is read fresh here:
-    /// the kick already stat'ed the file, but this stays correct for
-    /// any path handed in later.
-    fn cache_path_for(&self, path: &Path) -> PathBuf {
-        let key = match fs::symlink_metadata(path) {
-            Ok(meta) => {
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                thumb_cache_key(path, mtime, meta.len())
-            }
-            Err(_) => thumb_cache_key(path, 0, 0),
+    /// (path, mtime, size) triple, plus the mtime stamp the landed
+    /// decode files under. The metadata is read fresh here: the kick
+    /// already stat'ed the file, but this stays correct for any path
+    /// handed in later.
+    fn cache_path_for(&self, path: &Path) -> (PathBuf, u64) {
+        let (mtime, len) = match fs::symlink_metadata(path) {
+            Ok(meta) => (mtime_secs(&meta), meta.len()),
+            Err(_) => (0, 0),
         };
-        self.thumb_cache.join(format!("{key}.png"))
+        let key = thumb_cache_key(path, mtime, len);
+        (self.thumb_cache.join(format!("{key}.png")), mtime)
+    }
+
+    /// The cached thumb for a listing entry, when the decode's file
+    /// version still matches the entry's mtime. A stale decode paints
+    /// the kind glyph while request_thumb (kicked from the same
+    /// paint) re-decodes it.
+    fn thumb_hit(&self, entry: &Entry) -> Option<Arc<RenderImage>> {
+        let hit = self.thumbs.get(&entry.path)?;
+        (hit.mtime == entry_stamp(entry)).then(|| hit.image.clone())
     }
 
     /// New folder in the current directory, named to not collide.
@@ -6219,8 +6272,8 @@ impl Browser {
         let show_thumb =
             !in_trash && !entry.is_dir && (icons::is_thumbable(&entry.name) || icons::is_epub(&entry.name));
         let thumb = if show_thumb {
-            self.request_thumb(entry.path.clone(), cx);
-            self.thumbs.get(&entry.path).cloned()
+            self.request_thumb(entry.path.clone(), entry_stamp(entry), cx);
+            self.thumb_hit(entry)
         } else {
             None
         };
@@ -6821,7 +6874,7 @@ impl Browser {
                     )
                     .into_any_element(),
             }
-        } else if let Some(render) = entry.and_then(|e| self.thumbs.get(&e.path).cloned()) {
+        } else if let Some(render) = entry.and_then(|e| self.thumb_hit(e)) {
             img(ImageSource::Render(render))
                 .size_full()
                 .object_fit(ObjectFit::Contain)
@@ -8647,7 +8700,11 @@ impl Render for Browser {
                                 && (icons::is_thumbable(&entry.name)
                                     || icons::is_epub(&entry.name))
                             {
-                                self.request_thumb(entry.path.clone(), cx);
+                                self.request_thumb(
+                                    entry.path.clone(),
+                                    entry_stamp(&entry),
+                                    cx,
+                                );
                             } else if !entry.is_dir {
                                 self.request_text_preview(entry.path.clone(), cx);
                             }
@@ -11174,11 +11231,17 @@ mod tests {
 
     #[test]
     fn thumb_eviction_drops_the_oldest_and_reports_the_droplets() {
-        let mut thumbs: HashMap<PathBuf, Arc<RenderImage>> = HashMap::new();
+        let mut thumbs: HashMap<PathBuf, ThumbHit> = HashMap::new();
         let mut order: VecDeque<PathBuf> = VecDeque::new();
         for i in 0..THUMB_CACHE_MAX {
             let path = PathBuf::from(format!("/tmp/thumb-{i}.png"));
-            thumbs.insert(path.clone(), Arc::new(render_image()));
+            thumbs.insert(
+                path.clone(),
+                ThumbHit {
+                    mtime: 0,
+                    image: Arc::new(render_image()),
+                },
+            );
             order.push_back(path);
         }
         let oldest_key = order.front().unwrap().clone();
@@ -11187,7 +11250,13 @@ mod tests {
         // droplet whose tile the caller must release
         let new_key = PathBuf::from("/tmp/thumb-new.png");
         let droplets = trim_thumbs(&mut thumbs, &mut order);
-        thumbs.insert(new_key.clone(), Arc::new(render_image()));
+        thumbs.insert(
+            new_key.clone(),
+            ThumbHit {
+                mtime: 0,
+                image: Arc::new(render_image()),
+            },
+        );
         order.push_back(new_key);
 
         assert_eq!(droplets.len(), 1);
@@ -11200,10 +11269,16 @@ mod tests {
     fn thumb_trim_drains_stray_entries_when_the_order_lags() {
         // the defensive path: thumbs populated without order entries
         // (should not happen) must still come back under the cap
-        let mut thumbs: HashMap<PathBuf, Arc<RenderImage>> = HashMap::new();
+        let mut thumbs: HashMap<PathBuf, ThumbHit> = HashMap::new();
         let mut order: VecDeque<PathBuf> = VecDeque::new();
         for i in 0..THUMB_CACHE_MAX {
-            thumbs.insert(PathBuf::from(format!("/tmp/stray-{i}.png")), Arc::new(render_image()));
+            thumbs.insert(
+                PathBuf::from(format!("/tmp/stray-{i}.png")),
+                ThumbHit {
+                    mtime: 0,
+                    image: Arc::new(render_image()),
+                },
+            );
         }
         let droplets = trim_thumbs(&mut thumbs, &mut order);
         assert_eq!(droplets.len(), THUMB_CACHE_MAX);
@@ -11904,6 +11979,12 @@ mod browser_ux_keys {
         window
     }
 
+    /// The file's current stamp, for tests that call request_thumb
+    /// directly with paths rather than listing entries.
+    fn stamp_of(path: &Path) -> u64 {
+        mtime_secs(&fs::symlink_metadata(path).unwrap())
+    }
+
     #[test]
     fn paste_into_folder_targets_the_given_dir() {
         let lab = Lab::new("paste-into");
@@ -12327,7 +12408,7 @@ mod browser_ux_keys {
         // until the next paint hands it back
         window.update(|browser, _, cx| browser.route_key(&key("escape"), cx));
         window.update(|_, window, cx| window.simulate_next_frame(cx));
-        window.update(|browser, _, cx| {
+        window.update(|browser, _, _cx| {
             assert!(browser.quicklook.is_none());
             assert!(!browser.ql_fullscreen, "the paint restored the window");
         });
@@ -13304,7 +13385,7 @@ mod browser_ux_keys {
             browser.thumbs_queue.clear();
             browser.thumb_wanted.clear();
             for path in &paths {
-                browser.request_thumb(path.clone(), cx);
+                browser.request_thumb(path.clone(), stamp_of(path), cx);
             }
             // the pool bounds concurrency no matter how many kicks,
             // whatever landed or started before these
@@ -13325,7 +13406,7 @@ mod browser_ux_keys {
             // wanted again: fresh kicks re-enqueue, and the pump
             // starts at most three
             for path in &paths {
-                browser.request_thumb(path.clone(), cx);
+                browser.request_thumb(path.clone(), stamp_of(path), cx);
             }
             assert_eq!(browser.thumbs_inflight.len(), 3);
         });
@@ -13524,7 +13605,7 @@ mod browser_ux_keys {
             browser.thumbs_inflight.clear();
             browser.thumbs_queue.clear();
             browser.thumb_wanted.clear();
-            browser.request_thumb(path.clone(), cx);
+            browser.request_thumb(path.clone(), stamp_of(&path), cx);
         });
         app.run_until_parked();
         window.update(|browser, _, _| {
@@ -13561,15 +13642,83 @@ mod browser_ux_keys {
             browser.thumbs_inflight.clear();
             browser.thumbs_queue.clear();
             browser.thumb_wanted.clear();
-            browser.request_thumb(path.clone(), cx);
+            browser.request_thumb(path.clone(), stamp_of(&path), cx);
         });
         app.run_until_parked();
         window2.update(|browser, _, _| {
             assert!(browser.thumbs.contains_key(&path));
-            let bytes = browser.thumbs[&path].as_bytes(0).unwrap().to_vec();
+            let bytes = browser.thumbs[&path].image.as_bytes(0).unwrap().to_vec();
             assert!(bytes.iter().any(|b| *b != 0));
         });
         let _ = fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn thumb_request_retires_a_stale_decode() {
+        let lab = Lab::new("thumb-stale");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let path = lab.dir.join("photo.png");
+        fs::write(&path, &png).unwrap();
+        let stamp = stamp_of(&path);
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // the first draw's paint kicks may have queued, started,
+            // or landed jobs: clear every slot so this request is the
+            // whole experiment
+            browser.thumbs.clear();
+            browser.thumbs_inflight.clear();
+            browser.thumbs_queue.clear();
+            browser.thumb_wanted.clear();
+            browser.request_thumb(path.clone(), stamp, cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, cx| {
+            assert!(browser.thumbs.contains_key(&path));
+            // the same stamp again: a fresh hit is a no-op
+            browser.request_thumb(path.clone(), stamp, cx);
+            assert!(browser.thumbs_inflight.is_empty());
+            assert!(browser.thumbs_queue.is_empty());
+
+            // overwrite in place with a later mtime, as an editor
+            // would: the listing reloads, the next paint passes the
+            // new stamp, and the cached decode of the old bytes must
+            // retire and re-decode, never serve the old pixels
+            let old = fs::symlink_metadata(&path).unwrap().modified().unwrap();
+            fs::write(&path, &png).unwrap();
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(old + std::time::Duration::from_secs(60)),
+            )
+            .unwrap();
+            drop(file);
+            let stamp2 = stamp_of(&path);
+            assert_ne!(stamp2, stamp, "the overwrite moved the mtime");
+            browser.request_thumb(path.clone(), stamp2, cx);
+            assert!(
+                !browser.thumbs.contains_key(&path),
+                "the stale decode left the cache"
+            );
+            assert!(
+                !browser.thumb_order.contains(&path),
+                "the stale decode left the order"
+            );
+            assert_eq!(browser.thumbs_inflight.len(), 1, "the file re-decodes");
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            // the re-decode lands stamped with the file's new version,
+            // so the following paints are fresh hits again
+            let hit = browser.thumbs.get(&path).expect("the re-decode landed");
+            assert_eq!(hit.mtime, stamp_of(&path));
+        });
     }
 
     #[test]
@@ -13585,8 +13734,8 @@ mod browser_ux_keys {
         );
         let mut window = open_browser(&mut app, &lab.dir);
         window.update(|browser, _, cx| {
-            browser.request_thumb(lab.dir.join("a.mp4"), cx);
-            browser.request_thumb(lab.dir.join("b.mp4"), cx);
+            browser.request_thumb(lab.dir.join("a.mp4"), stamp_of(&lab.dir.join("a.mp4")), cx);
+            browser.request_thumb(lab.dir.join("b.mp4"), stamp_of(&lab.dir.join("b.mp4")), cx);
             assert!(icons::is_thumbable("a.mp4"));
         });
         app.run_until_parked();
@@ -13594,6 +13743,7 @@ mod browser_ux_keys {
             assert!(browser.thumbs.contains_key(&lab.dir.join("a.mp4")));
             assert!(browser.thumbs.contains_key(&lab.dir.join("b.mp4")));
             let bytes = browser.thumbs[&lab.dir.join("a.mp4")]
+                .image
                 .as_bytes(0)
                 .unwrap();
             assert!(bytes.iter().any(|b| *b != 0));
