@@ -33,6 +33,13 @@ pub fn changelog_version(changelog: &str, app: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The `--version` flag in the spellings the apps share. The shell's
+/// CLI dispatcher also accepts the bare word `version`, which stays
+/// its own; binaries that only take a flag ask this.
+pub fn is_version_flag(arg: &str) -> bool {
+    arg == "--version" || arg == "-V"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +75,13 @@ mod tests {
         // no line in the newest section, no release section at all
         assert_eq!(changelog_version(md, "kuma-term"), None);
         assert_eq!(changelog_version("no sections", "kuma-shell"), None);
+    }
+
+    #[test]
+    fn the_flag_reads_both_spellings() {
+        assert!(is_version_flag("--version"));
+        assert!(is_version_flag("-V"));
+        assert!(!is_version_flag("version"), "the bare word is the shell's own");
+        assert!(!is_version_flag("--verbose"));
     }
 }

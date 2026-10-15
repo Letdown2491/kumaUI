@@ -5,3 +5,7 @@ edition = "2024"
 description = "Shared wiring for the kuma apps: the setup every app would otherwise copy-paste (starts with version reporting and the changelog guard)"
 license = "MIT"
 repository = "https://github.com/Letdown2491/kumaUI"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
