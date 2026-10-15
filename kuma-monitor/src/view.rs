@@ -5,7 +5,7 @@
 //! the member roster in place, and the session's background plumbing
 //! (the daemons nothing recognizes) hides behind one summary line.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -132,6 +132,10 @@ pub(crate) struct MonitorView {
     /// their position, the dead drop out, first-seen apps join at the
     /// tail, and only a header click reorders any of it.
     groups: Vec<AppGroup>,
+    /// Each group's recent cpu, one sample per beat, keyed by the
+    /// group key: the spark behind the row's name. Rings die with
+    /// their group, so the map never gathers dead keys.
+    group_hists: HashMap<String, Vec<f32>>,
     /// Which app groups are unfolded, keyed by the group key so the
     /// state survives the members churning underneath it.
     expanded_apps: HashSet<String>,
@@ -176,6 +180,7 @@ impl MonitorView {
             swap_used: 0,
             swap_total: 0,
             groups: Vec::new(),
+            group_hists: HashMap::new(),
             expanded_apps: HashSet::new(),
             show_background: false,
             sort: SortKey::Cpu,
@@ -242,6 +247,17 @@ impl MonitorView {
     fn apply_snapshot(&mut self, snap: Snapshot) {
         if !snap.rows.is_empty() {
             sample::merge_groups(&mut self.groups, snap.rows);
+            // the rows' rings: one cpu sample per beat, behind each
+            // name. Rings of groups the merge dropped die here too.
+            for group in &self.groups {
+                push_hist(
+                    self.group_hists.entry(group.key.clone()).or_default(),
+                    group.cpu,
+                    CARD_HIST,
+                );
+            }
+            let live: HashSet<&str> = self.groups.iter().map(|g| g.key.as_str()).collect();
+            self.group_hists.retain(|key, _| live.contains(key.as_str()));
         }
 
         push_hist(&mut self.history, snap.cpu_total, CPU_HIST);
@@ -412,6 +428,7 @@ impl Render for MonitorView {
         let count = items.len();
         let total_procs: usize = self.groups.iter().map(|group| group.members.len()).sum();
         let groups = self.groups.clone();
+        let group_hists = self.group_hists.clone();
         let this2 = this.clone();
 
         div()
@@ -459,7 +476,7 @@ impl Render for MonitorView {
                             uniform_list("proc-rows", count, move |range, _, _| {
                                 items[range.clone()]
                                     .iter()
-                                    .map(|item| list_item(item, &groups, &this2))
+                                    .map(|item| list_item(item, &groups, &group_hists, &this2))
                                     .collect()
                             })
                             .flex_1()
@@ -499,7 +516,7 @@ impl MonitorView {
                     .debug_selector(|| "val-cpu".into())
                     .child(format!("{cpu_now:.1}%")),
             )
-            .child(self.spark(&self.history, None))
+            .child(spark(&self.history, None))
             .child(
                 div()
                     .text_size(px(9.))
@@ -537,7 +554,7 @@ impl MonitorView {
                         None => "\u{2014}".to_string(),
                     }),
             )
-            .children((!self.temp_hist.is_empty()).then(|| self.spark(&self.temp_hist, Some(100.))))
+            .children((!self.temp_hist.is_empty()).then(|| spark(&self.temp_hist, Some(100.))))
             .child(
                 div()
                     .text_size(px(9.))
@@ -617,7 +634,7 @@ impl MonitorView {
                     .truncate()
                     .child(format!("{} running", v.procs_running)),
             )
-            .child(self.spark(&self.procs_hist, None))
+            .child(spark(&self.procs_hist, None))
             .child(
                 div()
                     .text_size(px(9.))
@@ -656,7 +673,7 @@ impl MonitorView {
                             .debug_selector(|| "mem-track".into()),
                     ),
             )
-            .child(self.spark(&self.mem_hist, Some(100.)))
+            .child(spark(&self.mem_hist, Some(100.)))
             .child(
                 div()
                     .text_size(px(9.))
@@ -700,7 +717,7 @@ impl MonitorView {
                     .debug_selector(|| "val-disk".into())
                     .child(rate(v.io_read + v.io_write)),
             )
-            .child(self.spark(&self.disk_hist, None))
+            .child(spark(&self.disk_hist, None))
             .child(
                 div()
                     .text_size(px(9.))
@@ -733,7 +750,7 @@ impl MonitorView {
                     .debug_selector(|| "val-net".into())
                     .child(rate(v.net_rx + v.net_tx)),
             )
-            .child(self.spark(&self.net_hist, None))
+            .child(spark(&self.net_hist, None))
             .child(
                 div()
                     .text_size(px(9.))
@@ -1026,27 +1043,6 @@ impl MonitorView {
             )
     }
 
-    /// A micro history: the buffer's samples as one quiet line of
-    /// bars (each history vec is already capped to its card's
-    /// window). Scaled to the window's own peak (never the global
-    /// 100%, or an idle line would be invisible) unless a fixed
-    /// ceiling is given, as the temperature needs: its drama lives in
-    /// single degrees, and peak-scaling would lie about the slope.
-    fn spark(&self, history: &[f32], ceiling: Option<f32>) -> Div {
-        let peak = ceiling.unwrap_or_else(|| history.iter().copied().fold(1.0_f32, f32::max));
-        let bars = history
-            .iter()
-            .map(|v| {
-                div()
-                    .flex_1()
-                    .min_w(px(1.))
-                    .h(px((v / peak * 18.).clamp(1., 18.)))
-                    .bg(theme::ghost())
-            })
-            .collect::<Vec<_>>();
-        div().h(px(18.)).w_full().flex().items_end().children(bars)
-    }
-
     /// The column title, from the same Col spec the rows use: the
     /// same width, the same px_2, the same right-setting. Every
     /// column sorts; the active one wears the accent.
@@ -1119,6 +1115,27 @@ impl Focusable for MonitorView {
     }
 }
 
+/// A micro history: the buffer's samples as one quiet line of
+/// bars (each history vec is already capped to its card's
+/// window). Scaled to the window's own peak (never the global
+/// 100%, or an idle line would be invisible) unless a fixed
+/// ceiling is given, as the temperature needs: its drama lives in
+/// single degrees, and peak-scaling would lie about the slope.
+fn spark(history: &[f32], ceiling: Option<f32>) -> Div {
+    let peak = ceiling.unwrap_or_else(|| history.iter().copied().fold(1.0_f32, f32::max));
+    let bars = history
+        .iter()
+        .map(|v| {
+            div()
+                .flex_1()
+                .min_w(px(1.))
+                .h(px((v / peak * 18.).clamp(1., 18.)))
+                .bg(theme::ghost())
+        })
+        .collect::<Vec<_>>();
+    div().h(px(18.)).w_full().flex().items_end().children(bars)
+}
+
 /// The shared cell spec: width, padding, right-setting. The header
 /// builds its own cells (stateful, clickable) but every row kind
 /// passes through this one function, so the extents cannot drift.
@@ -1139,6 +1156,7 @@ fn apply_spec(cell: Div, col: Col) -> Div {
 fn list_item(
     item: &Item,
     groups: &[AppGroup],
+    hists: &HashMap<String, Vec<f32>>,
     this: &WeakEntity<MonitorView>,
 ) -> Stateful<Div> {
     match item {
@@ -1147,7 +1165,14 @@ fn list_item(
             key,
             open,
             dim,
-        } => group_row(&groups[*index], key, *open, *dim, this),
+        } => group_row(
+            &groups[*index],
+            key,
+            *open,
+            *dim,
+            hists.get(key).map(|ring| ring.as_slice()),
+            this,
+        ),
         Item::Member { group, member } => member_row(&groups[*group].members[*member]),
         Item::BgSummary {
             open,
@@ -1192,12 +1217,17 @@ fn push_group_rows(
 }
 
 /// The app's row: its sums, its process count, and the fold for the
-/// roster. Clicking anywhere in it unfolds the members in place.
+/// roster. The name carries the group's recent cpu as a spark laid
+/// behind it (absolute, so the row's height never moves): full bar
+/// is one core's worth, so sparks are comparable row to row and a
+/// hog's row reads busy before its number does. Clicking anywhere
+/// in it unfolds the members in place.
 fn group_row(
     group: &AppGroup,
     key: &str,
     open: bool,
     dim: bool,
+    hist: Option<&[f32]>,
     this: &WeakEntity<MonitorView>,
 ) -> Stateful<Div> {
     let click_key = key.to_string();
@@ -1226,6 +1256,25 @@ fn group_row(
                 .child(active),
         );
     }
+    // the ring behind the name: absolute over the whole cell, so the
+    // text keeps its layout and the spark costs none
+    let name = div()
+        .relative()
+        .truncate()
+        .children(hist.map(|ring| {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .debug_selector(|| "row-spark".into())
+                .child(spark(ring, Some(100.)))
+        }))
+        .child(name);
     div()
         .id(SharedString::from(key.to_string()))
         .h(px(26.))
@@ -1246,7 +1295,7 @@ fn group_row(
                 cx.notify();
             });
         })
-        .child(apply_spec(name.flex_1(), Col::Name))
+        .child(apply_spec(name, Col::Name))
         .child(apply_spec(div(), Col::Pid))
         .child(
             apply_spec(
@@ -1676,6 +1725,107 @@ mod tests {
             let all: u64 = rows.iter().filter(|r| !r.3).map(|r| r.1).sum();
             assert_eq!(all, view.mem_total);
         });
+    }
+
+    /// The row sparks' rings: one sample per beat capped at the
+    /// cards' window, and a ring dies with its group, so the map
+    /// never gathers dead keys.
+    #[test]
+    fn the_row_spark_rings_cap_and_die_with_their_group() {
+        use std::sync::Arc;
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| MonitorView::new(window, cx));
+        app.run_until_parked();
+        let snap_row = |pid: u32, name: &str, cpu: f32| ProcRow {
+            pid,
+            parent: None,
+            name: name.into(),
+            cpu,
+            mem: 10,
+            disk: 0,
+            window: None,
+        };
+        let snap = |rows: Vec<ProcRow>| Snapshot {
+            cpu_total: 0.,
+            mem_used: 0,
+            mem_total: 0,
+            swap_used: 0,
+            swap_total: 0,
+            rows,
+        };
+        window.update(|view, _, _| {
+            for beat in 0..(CARD_HIST + 5) {
+                view.apply_snapshot(snap(vec![snap_row(7, "sparky", beat as f32)]));
+            }
+            let ring = &view.group_hists["sparky"];
+            assert_eq!(ring.len(), CARD_HIST);
+            // the window slides: the first five beats are gone
+            assert_eq!(ring[0], 5.);
+            assert_eq!(ring[CARD_HIST - 1], (CARD_HIST + 4) as f32);
+            // the group dies, its ring dies with it
+            view.apply_snapshot(snap(vec![snap_row(8, "other", 1.)]));
+            assert!(!view.group_hists.contains_key("sparky"));
+            assert!(view.group_hists.contains_key("other"));
+        });
+    }
+
+    /// The row spark paints behind the name: inside the row's box,
+    /// never taller than the row.
+    #[test]
+    fn the_row_spark_paints_behind_the_name() {
+        use std::sync::Arc;
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| MonitorView::new(window, cx));
+        app.run_until_parked();
+        window.update(|view, _, cx| {
+            view.apply_snapshot(Snapshot {
+                cpu_total: 0.,
+                mem_used: 0,
+                mem_total: 0,
+                swap_used: 0,
+                swap_total: 0,
+                rows: vec![ProcRow {
+                    pid: 7,
+                    parent: None,
+                    name: "sparky".into(),
+                    cpu: 40.,
+                    mem: 10,
+                    disk: 0,
+                    window: Some(sample::WindowRef {
+                        app_id: Some("Sparky".into()),
+                        title: "main".into(),
+                        focused: false,
+                    }),
+                }],
+            });
+            cx.notify();
+        });
+        app.run_until_parked();
+        let bounds = window.update(|_, window, _| {
+            let row = window
+                .debug_element_bounds("row-line")
+                .expect("the group row never painted");
+            let spark = window
+                .debug_element_bounds("row-spark")
+                .expect("the row spark never painted");
+            (row, spark)
+        });
+        let (row, spark) = bounds;
+        assert!(
+            spark.origin.x >= row.origin.x - px(0.5)
+                && spark.origin.y >= row.origin.y - px(0.5)
+                && spark.origin.x + spark.size.width <= row.origin.x + row.size.width + px(0.5)
+                && spark.origin.y + spark.size.height <= row.origin.y + row.size.height + px(0.5),
+            "spark {spark:?} escaped its row {row:?}"
+        );
     }
 
     /// The overflow the first strip died of: cards that refused to
