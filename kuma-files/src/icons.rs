@@ -19,6 +19,15 @@ impl AssetSource for Assets {
             "icons/arrow_left.svg" => Some(include_bytes!("../icons/arrow_left.svg")),
             "icons/arrow_right.svg" => Some(include_bytes!("../icons/arrow_right.svg")),
             "icons/arrow_up.svg" => Some(include_bytes!("../icons/arrow_up.svg")),
+            // the titlebar's window controls (family-made, same bytes
+            // as the monitor's set)
+            "icons/titlebar_minimize.svg" => {
+                Some(include_bytes!("../icons/titlebar_minimize.svg"))
+            }
+            "icons/titlebar_maximize.svg" => {
+                Some(include_bytes!("../icons/titlebar_maximize.svg"))
+            }
+            "icons/titlebar_close.svg" => Some(include_bytes!("../icons/titlebar_close.svg")),
             "icons/chevron_down.svg" => Some(include_bytes!("../icons/chevron_down.svg")),
             "icons/chevron_right.svg" => Some(include_bytes!("../icons/chevron_right.svg")),
             "icons/chevron_up.svg" => Some(include_bytes!("../icons/chevron_up.svg")),
@@ -367,6 +376,36 @@ mod tests {
     fn svg_decode_fails_soft() {
         // garbage bytes: no panic, just None
         assert!(decode_svg_bytes_dynamic(b"not an svg", 256).is_none());
+    }
+
+    #[test]
+    fn titlebar_glyphs_rasterize() {
+        use gpui::SvgRenderer;
+
+        let assets = std::sync::Arc::new(Assets);
+        let renderer = SvgRenderer::new(assets.clone());
+        for (name, path) in [
+            ("minimize", "icons/titlebar_minimize.svg"),
+            ("maximize", "icons/titlebar_maximize.svg"),
+            ("close", "icons/titlebar_close.svg"),
+        ] {
+            let bytes = assets
+                .load(path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: nothing at {path}"));
+            let image = renderer
+                .render_single_frame(bytes.as_ref(), 1.0)
+                .unwrap_or_else(|err| panic!("{name}: did not parse: {err}"));
+            let ink = image
+                .as_bytes(0)
+                .unwrap()
+                .iter()
+                .skip(3)
+                .step_by(4)
+                .filter(|&alpha| *alpha > 0)
+                .count();
+            assert!(ink > 20, "{name}: only {ink} inked pixels rasterized");
+        }
     }
 
     #[test]

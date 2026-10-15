@@ -51,6 +51,28 @@ fn hsla_of(c: Rgb8) -> gpui::Hsla {
     gpui::rgb(hex).into()
 }
 
+/// How far the titlebar's backing sits above the grid's background,
+/// as a pull toward the foreground. The family's number: Koguma's
+/// sidebar and Kamuy's surface both sit about this far above their
+/// window floors (the palette's panel_bg over its inset).
+const BAR_LIFT: f32 = 0.04;
+
+/// One step above the terminal background, pulled toward the
+/// foreground: the titlebar's backing. Theme-relative on purpose, so
+/// the lift follows whatever theme is pasted in (a dark theme bars
+/// slightly lighter, a light theme slightly darker) on any desktop,
+/// with or without the shell's wallpaper palette.
+fn bar_background(background: Rgb8, foreground: Rgb8) -> Rgb8 {
+    let mix = |b: u8, f: u8| {
+        (b as f32 + (f as f32 - b as f32) * BAR_LIFT).round() as u8
+    };
+    Rgb8(
+        mix(background.0, foreground.0),
+        mix(background.1, foreground.1),
+        mix(background.2, foreground.2),
+    )
+}
+
 /// Scrollback-search state, present only while the search bar is open.
 /// Matches are buffer coordinates (the engine's own currency); the paint
 /// pass projects them into viewport spans each frame, so scrolling and
@@ -126,7 +148,13 @@ pub struct TerminalView {
     /// mirrored from the window each render; the blink task stays quiet
     /// while the window cannot see the cursor
     window_active: bool,
+    /// niri's own answer to "am I tiled": true while the IPC reports
+    /// every window of this process inside the tiling layout. The
+    /// xdg tiled states never carry it (on niri they are a CSD hint,
+    /// and this client negotiates CSD), so the IPC is the only voice
+    niri_tiled: bool,
     _palette_tick: Task<()>,
+    _niri_tick: Task<()>,
     _blink: Task<()>,
 }
 
@@ -188,7 +216,7 @@ impl TerminalView {
 
         // the cursor blink: one task for the view's life. It advances
         // the phase and wakes the paint only while a blinking style is
-        // live and the window can see the cursor; typing resets the
+        // live and the window can see it; typing resets the
         // phase through last_input, so the cursor holds lit under it
         let blink = cx.spawn(async move |this, cx| {
             loop {
@@ -211,6 +239,41 @@ impl TerminalView {
             }
         });
 
+        // the fold's niri half, on the palette's beat. niri's xdg
+        // tiled states are a CSD hint (set for server-decorated
+        // clients, and we negotiate CSD), never a tiling signal, so
+        // the truth arrives over the IPC: every window of this pid
+        // outside the floating set means the bar folds. No niri (any
+        // other desktop) never answers, and the bar stays
+        let niri_tick = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                let own = cx
+                    .background_spawn(async move { kuma_platform::niri::own_windows() })
+                    .await;
+                if let Ok(own) = own {
+                    let tiled = own.iter().any(|w| w.is_floating == Some(false));
+                    if this
+                        .update(cx, |this, cx| {
+                            if this.niri_tiled != tiled {
+                                this.niri_tiled = tiled;
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // seed before the first paint: niri tiles a window at birth,
+        // and the window is not in niri's list until it maps, so the
+        // best pre-paint answer is "tiled while niri is there". A
+        // window a rule floats at birth corrects within one tick
+        let niri_tiled = kuma_platform::niri::own_windows().is_ok();
+
         Self {
             tabs: vec![tab],
             active: 0,
@@ -229,7 +292,9 @@ impl TerminalView {
             last_input: Instant::now(),
             cursor_blinking: false,
             window_active: false,
+            niri_tiled,
             _palette_tick: palette_tick,
+            _niri_tick: niri_tick,
             _blink: blink,
         }
     }
@@ -985,9 +1050,13 @@ impl Render for TerminalView {
         // first tab reflows the grid like a window resize would
         let tab_bar_h = (self.tabs.len() > 1).then_some(TAB_BAR_H);
         // fit the grid to the viewport: rounded-down cell counts, so the
-        // last row and column never clip
+        // last row and column never clip. The titlebar rides the total
+        // too: its height comes out of the grid's viewport like the tab
+        // bar's does, unless it folded away for the tile
         let viewport = window.viewport_size();
-        let bar_total = tab_bar_h.map(|h| h + 2.0).unwrap_or(0.0);
+        let tiled = kuma_platform::titlebar::window_is_tiled(window) || self.niri_tiled;
+        let bar_total = tab_bar_h.map(|h| h + 2.0).unwrap_or(0.0)
+            + (!tiled).then_some(kuma_platform::titlebar::BAR_HEIGHT).unwrap_or(0.0);
         let usable_w = (viewport.width - px(PADDING * 2.0)).as_f32().max(1.0);
         let usable_h = (viewport.height - px(PADDING * 2.0 + bar_total)).as_f32().max(1.0);
         let want_cols = ((usable_w / self.cell_w).floor() as u16).max(2);
@@ -1105,6 +1174,38 @@ impl Render for TerminalView {
         let mut bg = hsla_of(self.theme.background);
         bg.a *= opacity;
 
+        // the bar lifts one step above the grid: the same relationship
+        // Koguma's sidebar and Kamuy's surface have to their window
+        // floors, but pulled toward this theme's own foreground, so a
+        // pasted kitty theme dresses the whole window, bar included.
+        // The translucency rides along: the lifted bar keeps the
+        // grid's alpha, so the one-step relationship holds over the
+        // wallpaper too. The hairline and dim inks still derive from
+        // the foreground at the tab bar's alphas
+        let bar_bg = {
+            let mut color = hsla_of(bar_background(
+                self.theme.background,
+                self.theme.foreground,
+            ));
+            color.a *= opacity;
+            color
+        };
+        let bar_ink = {
+            let mut color = hsla_of(self.theme.foreground);
+            color.a *= 0.55;
+            color
+        };
+        let bar_border = {
+            let mut color = hsla_of(self.theme.foreground);
+            color.a *= 0.15;
+            color
+        };
+        let bar_hover = {
+            let mut color = hsla_of(self.theme.foreground);
+            color.a *= 0.07;
+            color
+        };
+
         let bar = self.active().search.as_ref().map(|search| {
             search_bar(search, &self.theme, &self.font.family)
         });
@@ -1168,15 +1269,42 @@ impl Render for TerminalView {
                 }))
         });
 
+        // the CSD bar, when the window floats: a tile frames the
+        // window already and the grid gets the bar's row back
+        let titlebar = (!tiled).then(|| {
+            kuma_platform::titlebar::bar(
+                "Higuma".into(),
+                window.window_controls(),
+                kuma_platform::titlebar::TitlebarIcons {
+                    minimize: "icons/titlebar_minimize.svg".into(),
+                    maximize: "icons/titlebar_maximize.svg".into(),
+                    close: "icons/titlebar_close.svg".into(),
+                },
+                kuma_platform::titlebar::TitlebarColors {
+                    background: bar_bg.into(),
+                    border: bar_border.into(),
+                    title: bar_ink.into(),
+                    ink: bar_ink.into(),
+                    hover: bar_hover.into(),
+                },
+            )
+        });
+
         div()
-            .id("terminal")
             .size_full()
             .relative()
             .flex()
             .flex_col()
-            .p(px(PADDING))
             .bg(bg)
-            .track_focus(&self.focus)
+            .children(titlebar)
+            .child(
+                div()
+                    .id("terminal")
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .p(px(PADDING))
+                    .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .on_scroll_wheel(cx.listener(Self::on_wheel))
             // all three buttons: local selection only ever uses the
@@ -1203,7 +1331,8 @@ impl Render for TerminalView {
                     .w(px(grid_w))
                     .h(px(grid_h)),
             )
-            .when_some(bar, |root, bar| root.child(bar))
+            .when_some(bar, |root, bar| root.child(bar)),
+            )
     }
 }
 
@@ -2468,5 +2597,54 @@ mod tests {
             assert_eq!(view.tabs.len(), 1, "ctrl+shift+w closed the session");
             assert_eq!(view.active, 0, "the neighbor takes focus");
         });
+    }
+
+    #[test]
+    fn bar_background_lifts_toward_the_foreground() {
+        let t = theme();
+        let lifted = bar_background(t.background, t.foreground);
+        // every channel sits between the two poles: the lift is a
+        // convex blend, never an overshoot
+        for (b, l, f) in [
+            (t.background.0, lifted.0, t.foreground.0),
+            (t.background.1, lifted.1, t.foreground.1),
+            (t.background.2, lifted.2, t.foreground.2),
+        ] {
+            assert!(l >= b.min(f) && l <= b.max(f), "{l} outside {b}..{f}");
+            assert!(l != b, "the lift moved the channel off the background");
+        }
+        // a dark theme bars lighter (Koguma's sidebar relationship)
+        assert!(lifted.0 > t.background.0, "dark theme lifts upward");
+    }
+
+    #[test]
+    fn bar_background_lifts_a_light_theme_downward() {
+        // a pasted light theme: the bar must follow it, not the
+        // palette, so the lift runs the other way and the bar stays
+        // in the theme's family
+        let bg = Rgb8(0xfa, 0xfa, 0xfa);
+        let fg = Rgb8(0x38, 0x3a, 0x42);
+        let lifted = bar_background(bg, fg);
+        assert!(lifted.0 < bg.0, "light theme lifts downward");
+        assert!(lifted.0 > fg.0, "the lift stays near the background");
+    }
+
+    #[test]
+    fn bar_background_matches_the_builtins_expected_step() {
+        // the shipped theme lifts to a color in Koguma's sidebar and
+        // Kamuy's surface neighborhood: one visible step above the
+        // floor, not a jump to the panel color
+        let t = theme();
+        let lifted = bar_background(t.background, t.foreground);
+        let channel_gap = |c: u8, b: u8| (i32::from(c) - i32::from(b)).abs();
+        for (l, b) in [
+            (lifted.0, t.background.0),
+            (lifted.1, t.background.1),
+            (lifted.2, t.background.2),
+        ] {
+            let gap = channel_gap(l, b);
+            assert!(gap > 2, "the step is visible, not a rounding nudge");
+            assert!(gap < 20, "the step stays subtle, not a panel color");
+        }
     }
 }

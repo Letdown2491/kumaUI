@@ -1579,6 +1579,11 @@ pub(crate) struct Browser {
     search_gen: u64,
     /// A search walker is in flight; drives the banner's indicator.
     searching: bool,
+    /// Whether niri has the browser window inside the tiling layout:
+    /// the titlebar folds on it. The xdg tiled states never carry it
+    /// (on niri they are a CSD hint, and this client negotiates CSD),
+    /// so the IPC is the only voice
+    niri_tiled: bool,
 }
 
 impl Focusable for Browser {
@@ -1678,6 +1683,7 @@ impl Browser {
             places_refresh: Instant::now(),
             search_gen: 0,
             searching: false,
+            niri_tiled: false,
         };
         // the epub reading pane's indicator follows the wheel: the
         // chapter under the visible top becomes the position, so the
@@ -1706,6 +1712,16 @@ impl Browser {
         browser.apply_theme();
         browser.places = browser.ordered_places();
         browser.start_dir_watch(cx);
+        // the fold's niri half, seeded before the first paint: niri
+        // tiles a window at birth and the window is not in niri's
+        // list until it maps, so the best pre-paint answer is "tiled
+        // while niri is there"; a rule-floated birth corrects within
+        // one tick. The states themselves never carry it (on niri
+        // they are a CSD hint), so the IPC is the only voice. The
+        // browser's windows are titled Koguma or Koguma: <dir>; the
+        // viewer's titles are file names, and it draws no bar. No
+        // niri (any other desktop) never answers, and the bar stays
+        browser.niri_tiled = kuma_platform::niri::own_windows().is_ok();
         // the gvfs-FUSE bridge, so mounts made anywhere in the session
         // (ours or gio's CLI) turn into browsable folders
         ensure_gvfs_fuse();
@@ -1717,6 +1733,11 @@ impl Browser {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_secs(2))
+                    .await;
+                // the fold's niri half, fresh each tick; a failed ask
+                // (no niri, restart) keeps the last answer
+                let own = cx
+                    .background_spawn(async move { kuma_platform::niri::own_windows() })
                     .await;
                 let update = this.update(cx, |this, cx| {
                     let palette = this.refresh_palette(cx);
@@ -1733,6 +1754,18 @@ impl Browser {
                                     format!("connecting to {uri}… {}s", since.elapsed().as_secs());
                                 connect_tick = true;
                             }
+                        }
+                    }
+                    if let Ok(own) = own {
+                        let tiled = own.iter().any(|w| {
+                            w.is_floating == Some(false)
+                                && w.title
+                                    .as_deref()
+                                    .is_some_and(|t| t == "Koguma" || t.starts_with("Koguma: "))
+                        });
+                        if this.niri_tiled != tiled {
+                            this.niri_tiled = tiled;
+                            cx.notify();
                         }
                     }
                     if palette || places || connect_tick {
@@ -8985,7 +9018,37 @@ impl Render for Browser {
             .size_full()
             .relative()
             .flex()
-            .track_focus(&self.focus)
+            .flex_col()
+            // the titlebar folds away while the window is tiled: the
+            // tile frames the window, and the folder wants the row.
+            // niri tells it through the IPC (its xdg tiled states are
+            // a CSD hint only); other compositors answer through the
+            // states where they send them
+            .children(
+                (!(kuma_platform::titlebar::window_is_tiled(window) || self.niri_tiled)).then(|| {
+                    kuma_platform::titlebar::bar(
+                        "Koguma".into(),
+                        window.window_controls(),
+                        kuma_platform::titlebar::TitlebarIcons {
+                            minimize: "icons/titlebar_minimize.svg".into(),
+                            maximize: "icons/titlebar_maximize.svg".into(),
+                            close: "icons/titlebar_close.svg".into(),
+                        },
+                        kuma_platform::titlebar::TitlebarColors {
+                            background: theme::sidebar(),
+                            border: theme::border(),
+                            title: theme::text_dim(),
+                            ink: theme::text_dim(),
+                            hover: theme::row_hover(),
+                        },
+                    )
+                }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let keystroke = &event.keystroke;
                 // Shift+F10 / the Menu key: context menu at the
@@ -9626,7 +9689,8 @@ impl Render for Browser {
             .children(self.quicklook_overlay(window, cx))
             .children(self.accent_overlay(cx))
             .children(self.keys_overlay(cx))
-            .children(self.menu_overlay(window, cx))
+            .children(self.menu_overlay(window, cx)),
+            )
     }
 }
 

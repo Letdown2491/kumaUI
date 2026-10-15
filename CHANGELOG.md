@@ -5,11 +5,33 @@ section as its release notes. Say what changed and what a reader has to
 do differently. Why it changed belongs in the commit that made it.
 Bullets land under Added, Changed, or Fixed; `scripts/release.sh` reads
 those headings to infer the bump (any Added or Removed: minor; only
-Changed and Fixed: patch). The three lines under a release heading name
-each binary's version in that release: an app whose line did not move
-rides unchanged.
+Changed and Fixed: patch). The version lines under a release heading
+name each binary's version in that release: an app whose line did not
+move rides unchanged.
 
 ## Unreleased
+
+### Added
+
+- kuma-term, kuma-files: Higuma and Koguma wear the family's titlebar
+  now, the one Kamuy piloted: the drag region, the centered name
+  (Higuma is the terminal's display name; the binary and app id stay
+  kuma-term), and the minimize, maximize, and close buttons the
+  compositor backs.
+
+### Changed
+
+- kuma-term: Higuma's titlebar now sits one step above the terminal
+  background instead of wearing it outright, pulled toward the theme's
+  own foreground so a pasted kitty theme dresses the bar too. This is
+  the bar treatment Koguma and Kamuy already use, and it reads as a
+  distinct strip on desktops without the wallpaper palette. Nothing to
+  do differently; the lift follows your theme either way.
+
+- kuma-term, kuma-files, kuma-monitor: the titlebar now folds away
+  while the window is tiled and returns when it floats; fullscreen and
+  maximize report the same way and fold too. Nothing to do
+  differently.
 
 ### Fixed
 
@@ -30,6 +52,7 @@ rides unchanged.
 kuma-shell 0.3.0
 kuma-files 0.3.0
 kuma-term 0.2.0
+kuma-monitor 0.1.0
 
 ### Added
 

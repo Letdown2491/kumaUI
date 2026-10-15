@@ -34,6 +34,9 @@ struct BeatOut {
     snap: Snapshot,
     vitals: Vitals,
     cores: Vec<f32>,
+    /// whether niri has this process's own window inside the tiling
+    /// layout: the titlebar's fold reads it
+    niri_tiled: bool,
 }
 
 impl BeatState {
@@ -49,9 +52,17 @@ impl BeatState {
             log::debug!("niri join unavailable this beat: {err:#}");
             Vec::new()
         });
+        let niri_tiled = windows.iter().any(|w| {
+            w.pid == Some(std::process::id()) && w.is_floating == Some(false)
+        });
         let snap = self.sampler.beat(&windows);
         let (vitals, cores) = self.stats.beat();
-        BeatOut { snap, vitals, cores }
+        BeatOut {
+            snap,
+            vitals,
+            cores,
+            niri_tiled,
+        }
     }
 }
 
@@ -191,6 +202,10 @@ pub(crate) struct MonitorView {
     /// The row the user last copied: its name and when, so the
     /// footer can confirm the copy for a couple of seconds.
     copied_flash: Option<(String, Instant)>,
+    /// Whether niri has this process's own window inside the tiling
+    /// layout: the titlebar folds on it. niri's xdg tiled states are
+    /// a CSD hint, not a tiling signal, so the IPC is the only voice
+    niri_tiled: bool,
     focus: FocusHandle,
 }
 
@@ -234,6 +249,11 @@ impl MonitorView {
             scroll: UniformListScrollHandle::new(),
             filter: String::new(),
             copied_flash: None,
+            // the fold's niri half, seeded: a window is not in niri's
+            // list until it maps, so until the first beat the best
+            // answer is "tiled while niri is there"; niri tiles at
+            // birth. The beat's own answer replaces it
+            niri_tiled: kuma_platform::niri::own_windows().is_ok(),
             focus,
         };
         view.sync_palette();
@@ -289,6 +309,7 @@ impl MonitorView {
 
     fn apply_beat(&mut self, out: BeatOut, cx: &mut Context<Self>) {
         self.sync_palette();
+        self.niri_tiled = out.niri_tiled;
         self.apply_snapshot(out.snap, out.vitals, out.cores);
         cx.notify();
     }
@@ -496,24 +517,31 @@ impl Render for MonitorView {
             .bg(theme::bg())
             .text_color(theme::text())
             .text_size(px(13.))
-            .child(
+            .children(
                 // the CSD bar: the platform's behavior, the monitor's
-                // colors (always visible for this review round; the
-                // fold-away-when-tiled lands after the look is settled)
-                kuma_platform::titlebar::bar(
-                    "Kamuy".into(),
-                    window.window_controls(),
-                    kuma_platform::titlebar::TitlebarIcons {
-                        minimize: "icons/titlebar_minimize.svg".into(),
-                        maximize: "icons/titlebar_maximize.svg".into(),
-                        close: "icons/titlebar_close.svg".into(),
-                    },
-                    kuma_platform::titlebar::TitlebarColors {
-                        background: theme::surface(),
-                        border: theme::border(),
-                        title: theme::text_dim(),
-                        ink: theme::text_dim(),
-                        hover: theme::row_hover(),
+                // colors. It folds away while the window is tiled: the
+                // tile frames the window, and the vitals want the row.
+                // niri tells it through the IPC (its xdg tiled states
+                // are a CSD hint only); other compositors answer
+                // through the states where they send them
+                (!(kuma_platform::titlebar::window_is_tiled(window) || self.niri_tiled)).then(
+                    || {
+                        kuma_platform::titlebar::bar(
+                            "Kamuy".into(),
+                            window.window_controls(),
+                            kuma_platform::titlebar::TitlebarIcons {
+                                minimize: "icons/titlebar_minimize.svg".into(),
+                                maximize: "icons/titlebar_maximize.svg".into(),
+                                close: "icons/titlebar_close.svg".into(),
+                            },
+                            kuma_platform::titlebar::TitlebarColors {
+                                background: theme::surface(),
+                                border: theme::border(),
+                                title: theme::text_dim(),
+                                ink: theme::text_dim(),
+                                hover: theme::row_hover(),
+                            },
+                        )
                     },
                 ),
             )

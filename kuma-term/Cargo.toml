@@ -16,6 +16,7 @@ gpui = { workspace = true }
 gpui_platform = { workspace = true }
 kuma-platform = { workspace = true }
 alacritty_terminal = "0.26"
+anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 futures = "0.3"

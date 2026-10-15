@@ -16,7 +16,8 @@ use std::{
 
 use gpui::{
     div, px, svg, Div, InteractiveElement, MouseButton, MouseDownEvent, ParentElement, Point,
-    Pixels, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, WindowControls,
+    Pixels, Rgba, SharedString, Stateful, StatefulInteractiveElement, Styled, Tiling, Window,
+    WindowControls,
 };
 
 /// The bar's height: Zed's own Linux bar number, 1.75rem floored at
@@ -80,6 +81,22 @@ pub fn buttons_for(controls: WindowControls) -> Vec<Control> {
     }
     buttons.push(Control::Close);
     buttons
+}
+
+/// Whether the window is currently edge-tiled, fullscreened, or
+/// maximized. Read off the xdg-toplevel states the compositor sends
+/// on every configure: a floating window carries none of the tiled
+/// edges, and the backend reports fullscreen and maximize the same
+/// way (there is no separate signal to read). The family folds its
+/// bars on this: a tile frames the window already, the drag region
+/// has nothing to do there, and the content wants the row. Platforms
+/// without the signal report server decorations, which reads as
+/// never tiled, so the bar stays.
+pub fn window_is_tiled(window: &Window) -> bool {
+    match window.window_decorations() {
+        gpui::Decorations::Client { tiling } => tiling != Tiling::default(),
+        gpui::Decorations::Server => false,
+    }
 }
 
 /// The bar: a full-width strip, the app's name dead center (the

@@ -5,8 +5,8 @@
 # any Added or Removed infers a minor bump (at 0.x that is also where
 # breaking changes ride); only Changed and Fixed infer a patch. Kind
 # decides, not amount. The script asks which apps move, bumps their
-# Cargo.tomls, inserts the release heading with the three version
-# lines, refreshes the lock and installs through build.sh, and commits.
+# Cargo.tomls, inserts the release heading with the version lines,
+# refreshes the lock and installs through build.sh, and commits.
 # kumaOS is atomic (no host toolchain), so cargo only runs in the
 # container.
 #
@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-APPS=(kuma-shell kuma-files kuma-term)
+APPS=(kuma-shell kuma-files kuma-term kuma-monitor)
 DATE=$(date +%F)
 TAG=0
 [ "${1:-}" = "--tag" ] && TAG=1
@@ -67,7 +67,7 @@ if [ -z "$train" ]; then
   exit 1
 fi
 
-# the three version lines name every app's version as of this release
+# the version lines name every app's version as of this release
 lines=""
 for app in "${APPS[@]}"; do
   v=$(grep -m1 '^version = ' "$app/Cargo.toml" | cut -d'"' -f2)

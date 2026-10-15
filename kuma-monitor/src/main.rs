@@ -73,3 +73,26 @@ fn main() {
         cx.activate(true);
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_line_names_the_binary() {
+        let line = version_line();
+        assert!(line.starts_with("kuma-monitor "));
+        assert!(line.contains("(g"));
+    }
+
+    #[test]
+    fn the_changelog_names_this_version() {
+        // bumping Cargo.toml without writing the changelog fails here;
+        // the parser lives in the platform crate
+        let md = include_str!("../../CHANGELOG.md");
+        assert_eq!(
+            kuma_platform::version::changelog_version(md, "kuma-monitor").as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+}

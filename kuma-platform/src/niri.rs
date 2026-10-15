@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use serde::Deserialize;
 use serde_json::Value;
 
 /// The socket's path: NIRI_SOCKET when the session set it, else the
@@ -74,6 +75,40 @@ fn unwrap_envelope(reply: &str) -> Result<Value> {
     Ok(envelope["Ok"].clone())
 }
 
+/// One niri window, the fields the family's own-window checks need.
+/// `is_floating` stays an Option twice over: a niri older than the
+/// field parses as None, and None means unknown, which every caller
+/// reads as not tiled (the bar stays).
+#[derive(Debug, Deserialize)]
+pub struct OwnWindow {
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub is_floating: Option<bool>,
+}
+
+/// The niri windows this process owns: niri tags every window with
+/// the pid that opened its Wayland connection, and an app's windows
+/// are exactly the ones carrying its own. Err when there is no niri
+/// to ask (any other desktop): callers treat that as unknown and
+/// leave their bars alone.
+pub fn own_windows() -> Result<Vec<OwnWindow>> {
+    let payload = request_with_timeout(&serde_json::json!("Windows"), Duration::from_secs(2))?;
+    own_from_payload(&payload)
+}
+
+fn own_from_payload(payload: &Value) -> Result<Vec<OwnWindow>> {
+    let windows: Vec<OwnWindow> = serde_json::from_value(payload["Windows"].clone())
+        .context("niri's Windows reply did not parse")?;
+    let pid = std::process::id();
+    Ok(windows
+        .into_iter()
+        .filter(|window| window.pid == Some(pid))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +127,30 @@ mod tests {
         assert!(err.to_string().contains("some mistake"), "{err:#}");
         assert!(unwrap_envelope("not json at all").is_err());
         assert!(unwrap_envelope("").is_err());
+    }
+
+    #[test]
+    fn own_windows_keeps_this_pids_windows_only() {
+        let mine = std::process::id();
+        let payload = serde_json::json!({"Windows": [
+            {"id": 1, "pid": mine, "title": "Higuma", "is_floating": false},
+            {"id": 2, "pid": 2298, "title": "other", "is_floating": true},
+            {"id": 3, "pid": mine, "title": "Koguma", "is_floating": true},
+        ]});
+        let own = own_from_payload(&payload).unwrap();
+        assert_eq!(own.len(), 2, "only this process's windows");
+        assert!(own.iter().all(|w| w.pid == Some(mine)));
+    }
+
+    #[test]
+    fn own_windows_reads_a_reply_without_the_floating_field() {
+        // an older niri: the field is absent, the parse holds, and the
+        // unknown reads as not tiled
+        let payload = serde_json::json!({"Windows": [
+            {"id": 2, "pid": std::process::id(), "title": "kuma-term"},
+        ]});
+        let own = own_from_payload(&payload).unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].is_floating, None);
     }
 }

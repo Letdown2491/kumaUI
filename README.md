@@ -37,7 +37,7 @@ A fresh start opens at 125% zoom with the info rail docked at the bottom; the st
 
 Kamuy (`kuma-monitor`) is the desktop's own system monitor, observation only: it kills nothing and renices nothing ([issue #71](https://github.com/Letdown2491/kumaUI/issues/71)). One window: the CPU graph, a row of vitals cards (cpu, memory, temperature when a sensor exists, runnable tasks), and the process table under them. The table speaks in apps, not processes: every process an app owns folds under one row (the windowed process and its helpers together), a click unfolds the member roster in place, and the session's background plumbing hides behind one summary line. The memory column is private pages, not RSS. Type-to-filter, sparklines behind the rows, and drop-down cards for per-core bars, memory anatomy, disks, and interfaces fill it out. Like the terminal it wears the shell's published palette and a translucent background, recoloring when the wallpaper changes.
 
-The titlebar says Kamuy, the Ainu spirit that dwells in the bear: the family's watcher. The binary and app id stay `kuma-monitor`, and `build.sh` does not install it yet: it is running its week in the dock first.
+The titlebar says Kamuy, the Ainu spirit that dwells in the bear: the family's watcher. The binary and app id stay `kuma-monitor`; `build.sh` installs it like the rest, binary, menu entry, and app icon.
 
 ## Building
 
@@ -45,7 +45,7 @@ The titlebar says Kamuy, the Ainu spirit that dwells in the bear: the family's w
 ./scripts/build.sh build --release
 ```
 
-kumaOS is atomic and has no host toolchain, so the script builds inside a podman container (`localhost/kuma-dev-rust`, built on first use from `containers/`) and installs: the shell binary to `~/.local/bin/kuma-shell`, and Koguma to `~/.local/bin/kuma-files` plus its menu entry, app icon, and directory-handler binding in the user XDG dirs. Builds are incremental; rustup and the cargo registry live in named podman volumes.
+kumaOS is atomic and has no host toolchain, so the script builds inside a podman container (`localhost/kuma-dev-rust`, built on first use from `containers/`) and installs: the shell binary to `~/.local/bin/kuma-shell`, Higuma to `~/.local/bin/kuma-term`, and Koguma and Kamuy to `~/.local/bin` when their binaries were built, each with its menu entry and app icon in the user XDG dirs, plus Koguma's directory-handler binding. Builds are incremental; rustup and the cargo registry live in named podman volumes.
 
 On a regular Linux box, a plain `cargo build --release` works too; you need a Rust toolchain (see `rust-toolchain.toml`) and the dev headers the containerfile installs: `pkgconf-pkg-config fontconfig-devel freetype-devel libxkbcommon-devel pam-devel`.
 

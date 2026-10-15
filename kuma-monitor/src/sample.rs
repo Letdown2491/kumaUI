@@ -416,6 +416,7 @@ mod tests {
             app_id: Some(app_id.to_string()),
             title: Some(format!("{app_id} title")),
             is_focused: focused,
+            is_floating: None,
         }
     }
 
@@ -488,6 +489,7 @@ mod tests {
             app_id: Some("mystery".into()),
             title: None,
             is_focused: false,
+            is_floating: None,
         }];
         let rows = join(vec![raw(1, "init")], &windows);
         assert!(rows[0].window.is_none());

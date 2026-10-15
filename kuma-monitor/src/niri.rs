@@ -13,7 +13,10 @@ use serde_json::json;
 
 /// One window niri knows about: the join's right half. The window's
 /// own id drops out: the join keys on pid, and nothing here focuses
-/// or closes windows.
+/// or closes windows. `is_floating` rides for the titlebar's fold:
+/// niri's xdg tiled states are a CSD hint, not a tiling signal, so
+/// the IPC is the only voice; a niri older than the field reads as
+/// None, which answers not tiled.
 #[derive(Deserialize)]
 pub(crate) struct NiriWindow {
     #[serde(default)]
@@ -24,6 +27,8 @@ pub(crate) struct NiriWindow {
     pub title: Option<String>,
     #[serde(default)]
     pub is_focused: bool,
+    #[serde(default)]
+    pub is_floating: Option<bool>,
 }
 
 /// Ask niri for its window list. The reply's shape is
@@ -47,7 +52,7 @@ mod tests {
     /// the monitor's window type.
     #[test]
     fn parses_the_windows_reply() {
-        let reply = r#"{"Ok":{"Windows":[{"id":2,"pid":2298,"app_id":"kuma-term","title":"kuma-term","workspace_id":{"Id":1},"is_focused":true,"is_urgent":false,"layout":null}]}}"#;
+        let reply = r#"{"Ok":{"Windows":[{"id":2,"pid":2298,"app_id":"kuma-term","title":"kuma-term","workspace_id":{"Id":1},"is_focused":true,"is_urgent":false,"is_floating":false,"layout":null}]}}"#;
         let envelope: serde_json::Value = serde_json::from_str(reply).unwrap();
         let windows: Vec<NiriWindow> =
             serde_json::from_value(envelope["Ok"]["Windows"].clone()).unwrap();
@@ -55,6 +60,7 @@ mod tests {
         assert_eq!(windows[0].pid, Some(2298));
         assert_eq!(windows[0].app_id.as_deref(), Some("kuma-term"));
         assert!(windows[0].is_focused);
+        assert_eq!(windows[0].is_floating, Some(false));
     }
 
     #[test]
@@ -68,6 +74,7 @@ mod tests {
         assert_eq!(windows[0].pid, None);
         assert_eq!(windows[0].app_id, None);
         assert!(!windows[0].is_focused);
+        assert_eq!(windows[0].is_floating, None);
         assert!(windows[1].is_focused);
     }
 }

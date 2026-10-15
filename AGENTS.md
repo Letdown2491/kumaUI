@@ -8,9 +8,11 @@ kumaOS is atomic: **there is no host toolchain**. Always build with:
 
 This runs cargo inside the `localhost/kuma-dev-rust` podman container
 (built on first use from `containers/`). It installs `kuma-shell` to
-`~/.local/bin/kuma-shell`; when `target/release/kuma-files` exists it
-also installs Koguma: the binary, the menu entry, the app icon, and
-the directory-handler binding (all user-local).
+`~/.local/bin/kuma-shell` and `kuma-term` to `~/.local/bin/kuma-term`;
+when `target/release/kuma-files` exists it also installs Koguma: the
+binary, the menu entry, the app icon, and the directory-handler
+binding, and when `target/release/kuma-monitor` exists, Kamuy: the
+binary, the menu entry, and the app icon (all user-local).
 
 Do not build on the host and do not try to shim a toolchain: there is no
 `cc`, and brew's gcc-16 fails at link time (`rust-lld` cannot find
@@ -94,8 +96,8 @@ work earns no bullet). Cut a release when the owner asks for one:
 
 The script infers the bump from the subsections (any Added or Removed:
 minor; only Changed and Fixed: patch), asks which apps move, bumps
-their Cargo.tomls, inserts the release heading and the three version
-lines, refreshes the lock and installs through the build, and commits
+their Cargo.tomls, inserts the release heading and the version lines,
+refreshes the lock and installs through the build, and commits
 (`--tag` also tags vN). A test in each crate fails when Cargo.toml and
 the changelog's newest version line disagree, so a version bump
 without changelog bullets will not go green.

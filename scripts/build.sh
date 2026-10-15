@@ -65,4 +65,12 @@ if [ "${1:-}" = "build" ]; then
       xdg-mime default kuma-files.desktop inode/directory
     fi
   fi
+  if [ -f target/release/kuma-monitor ]; then
+    cp target/release/kuma-monitor ~/.local/bin/kuma-monitor.new
+    mv -f ~/.local/bin/kuma-monitor.new ~/.local/bin/kuma-monitor
+    sed "s|@BIN@|$HOME/.local/bin|" kuma-monitor/packaging/kuma-monitor.desktop.in \
+      > ~/.local/share/applications/kuma-monitor.desktop
+    cp kuma-monitor/packaging/kuma-monitor.png \
+      ~/.local/share/icons/hicolor/256x256/apps/kuma-monitor.png
+  fi
 fi
