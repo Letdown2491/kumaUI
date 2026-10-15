@@ -780,6 +780,9 @@ impl MonitorView {
                     .child(disk_card)
                     .child(net_card),
             )
+            // the per-core bars sit between rows one and two: they
+            // belong to the cpu card above them, not to the bottom
+            // of the area
             .children((self.show_cores && !self.core_usage.is_empty()).then(|| self.cores_row()))
             .children((self.show_nets && !self.vitals.nets.is_empty()).then(|| {
                 devices_row(&self.vitals.nets, self.vitals.net_rx + self.vitals.net_tx)
@@ -1219,14 +1222,15 @@ fn meter(frac: f32, fill: Rgba, fill_sel: Option<&str>) -> Div {
 }
 
 /// The per-device drop-down: one slim line per interface or disk
-/// under the strip, opened by clicking the NET or DISK card. The
-/// meter is the device's share of the beat's total, so the column
-/// answers "where is the traffic" at a glance; the figures carry
-/// the split.
+/// under the strip, opened by clicking the NET or DISK card. Built
+/// in the meter rows' language: dim nine-pixel label, a ghost meter
+/// of the device's share of the beat's total, the down and up
+/// figures closing the line. The meter answers "where is the
+/// traffic" at a glance; the figures carry the split.
 fn devices_row(devs: &[(String, f64, f64)], total: f64) -> Div {
     div().flex().flex_col().children(devs.iter().map(|(name, down, up)| {
         div()
-            .h(px(16.))
+            .h(px(20.))
             .flex()
             .items_center()
             .gap_2()
@@ -1234,18 +1238,26 @@ fn devices_row(devs: &[(String, f64, f64)], total: f64) -> Div {
                 div()
                     .w(px(72.))
                     .truncate()
-                    .text_size(px(10.))
+                    .text_size(px(9.))
                     .text_color(theme::text_dim())
                     .child(name.clone()),
             )
-            .child(div().flex_1().child(meter(
-                if total > 0. { ((down + up) / total) as f32 } else { 0. },
-                theme::accent(),
-                None,
-            )))
+            .child(
+                meter(
+                    if total > 0. { ((down + up) / total) as f32 } else { 0. },
+                    theme::ghost(),
+                    None,
+                )
+                .flex_1()
+                .min_w(px(0.)),
+            )
             .child(
                 div()
-                    .text_size(px(10.))
+                    .flex()
+                    .justify_end()
+                    .text_size(px(9.))
+                    .text_color(theme::text_dim())
+                    .truncate()
                     .child(format!("\u{2193} {} \u{b7} \u{2191} {}", rate(*down), rate(*up))),
             )
     }))
