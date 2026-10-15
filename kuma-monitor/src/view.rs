@@ -1218,10 +1218,11 @@ fn push_group_rows(
 
 /// The app's row: its sums, its process count, and the fold for the
 /// roster. The name carries the group's recent cpu as a spark laid
-/// behind it (absolute, so the row's height never moves): full bar
-/// is one core's worth, so sparks are comparable row to row and a
-/// hog's row reads busy before its number does. Clicking anywhere
-/// in it unfolds the members in place.
+/// behind it (absolute, so the row's height never moves): a fixed
+/// width at the cell's right end, and full bar is one core's worth,
+/// so sparks are comparable row to row and a hog's row reads busy
+/// before its number does. Clicking anywhere in it unfolds the
+/// members in place.
 fn group_row(
     group: &AppGroup,
     key: &str,
@@ -1256,8 +1257,9 @@ fn group_row(
                 .child(active),
         );
     }
-    // the ring behind the name: absolute over the whole cell, so the
-    // text keeps its layout and the spark costs none
+    // the ring behind the name: absolute, so the text keeps its
+    // layout and the spark costs none, pinned to the cell's right
+    // end at a fixed width: the cpu figure's shadow, not wallpaper
     let name = div()
         .relative()
         .truncate()
@@ -1266,8 +1268,8 @@ fn group_row(
                 .absolute()
                 .top_0()
                 .bottom_0()
-                .left_0()
                 .right_0()
+                .w(px(72.))
                 .flex()
                 .items_center()
                 .overflow_hidden()
@@ -1819,6 +1821,14 @@ mod tests {
             (row, spark)
         });
         let (row, spark) = bounds;
+        // the spark is a shadow of the cpu figure, not wallpaper: a
+        // fixed small width, never the cell's own
+        assert!(
+            spark.size.width <= px(73.),
+            "spark is {:?} wide, the cell is {:?}",
+            spark.size,
+            row.size
+        );
         assert!(
             spark.origin.x >= row.origin.x - px(0.5)
                 && spark.origin.y >= row.origin.y - px(0.5)
