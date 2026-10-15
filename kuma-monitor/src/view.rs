@@ -123,6 +123,8 @@ pub(crate) struct MonitorView {
     /// opens.
     core_usage: Vec<f32>,
     show_cores: bool,
+    show_nets: bool,
+    show_disks: bool,
     swap_used: u64,
     swap_total: u64,
     /// The app groups, persistent across beats: existing groups keep
@@ -167,6 +169,8 @@ impl MonitorView {
             mem_hist: Vec::new(),
             core_usage: Vec::new(),
             show_cores: false,
+            show_nets: false,
+            show_disks: false,
             swap_used: 0,
             swap_total: 0,
             groups: Vec::new(),
@@ -467,8 +471,9 @@ impl Render for MonitorView {
 
 impl MonitorView {
     /// The vitals row: five quiet cards, label over value over
-    /// detail. The CPU card is the one click surface (it opens the
-    /// per-core row); the rest read and stay still.
+    /// detail. The CPU, NET and DISK cards are the click surfaces
+    /// (each opens a drop-down under the strip: per-core,
+    /// per-interface, per-device); the rest read and stay still.
     fn vitals_area(&self, cpu_now: f32, this: &WeakEntity<MonitorView>) -> Div {
         let v = &self.vitals;
         let mem_pct = if self.mem_total > 0 {
@@ -688,11 +693,21 @@ impl MonitorView {
                     .text_color(theme::text_dim())
                     .truncate()
                     .child(format!(
-                        "R {} \u{b7} W {}",
+                        "R {} \u{b7} W {} \u{b7} click for devices",
                         rate(v.io_read),
                         rate(v.io_write)
                     )),
             )
+            .id("card-disk")
+            .on_click({
+                let this = this.clone();
+                move |_, _, app| {
+                    let _ = this.update(app, |this, cx| {
+                        this.show_disks = !this.show_disks;
+                        cx.notify();
+                    });
+                }
+            })
             .debug_selector(|| "card-disk".into());
 
         let net_card = self
@@ -711,11 +726,21 @@ impl MonitorView {
                     .text_color(theme::text_dim())
                     .truncate()
                     .child(format!(
-                        "\u{2193} {} \u{b7} \u{2191} {}",
+                        "\u{2193} {} \u{b7} \u{2191} {} \u{b7} click for devices",
                         rate(v.net_rx),
                         rate(v.net_tx)
                     )),
             )
+            .id("card-net")
+            .on_click({
+                let this = this.clone();
+                move |_, _, app| {
+                    let _ = this.update(app, |this, cx| {
+                        this.show_nets = !this.show_nets;
+                        cx.notify();
+                    });
+                }
+            })
             .debug_selector(|| "card-net".into());
 
         div()
@@ -756,6 +781,12 @@ impl MonitorView {
                     .child(net_card),
             )
             .children((self.show_cores && !self.core_usage.is_empty()).then(|| self.cores_row()))
+            .children((self.show_nets && !self.vitals.nets.is_empty()).then(|| {
+                devices_row(&self.vitals.nets, self.vitals.net_rx + self.vitals.net_tx)
+            }))
+            .children((self.show_disks && !self.vitals.disks.is_empty()).then(|| {
+                devices_row(&self.vitals.disks, self.vitals.io_read + self.vitals.io_write)
+            }))
     }
 
     /// The per-core drop-down: one thin bar per core, under the
@@ -1185,6 +1216,39 @@ fn meter(frac: f32, fill: Rgba, fill_sel: Option<&str>) -> Div {
         .overflow_hidden()
         .child(fill_div)
         .child(div().h_full().flex_grow(1. - frac).min_w(px(0.)))
+}
+
+/// The per-device drop-down: one slim line per interface or disk
+/// under the strip, opened by clicking the NET or DISK card. The
+/// meter is the device's share of the beat's total, so the column
+/// answers "where is the traffic" at a glance; the figures carry
+/// the split.
+fn devices_row(devs: &[(String, f64, f64)], total: f64) -> Div {
+    div().flex().flex_col().children(devs.iter().map(|(name, down, up)| {
+        div()
+            .h(px(16.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(72.))
+                    .truncate()
+                    .text_size(px(10.))
+                    .text_color(theme::text_dim())
+                    .child(name.clone()),
+            )
+            .child(div().flex_1().child(meter(
+                if total > 0. { ((down + up) / total) as f32 } else { 0. },
+                theme::accent(),
+                None,
+            )))
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .child(format!("\u{2193} {} \u{b7} \u{2191} {}", rate(*down), rate(*up))),
+            )
+    }))
 }
 
 /// The pressure card's one row: a three-letter label, a meter whose

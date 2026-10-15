@@ -21,6 +21,11 @@ pub(crate) struct Vitals {
     pub net_tx: f64,
     pub io_read: f64,
     pub io_write: f64,
+    /// The same throughput per interface (lo excluded) and per
+    /// whole disk, name-sorted: the drop-downs' raw material. The
+    /// first beat reads zeros like the sums.
+    pub nets: Vec<(String, f64, f64)>,
+    pub disks: Vec<(String, f64, f64)>,
     /// The cpu's temperature in degrees celsius. None where no
     /// known sensor chip exists (containers, some VMs).
     pub cpu_temp: Option<f32>,
@@ -35,6 +40,10 @@ pub(crate) struct Vitals {
 pub(crate) struct Stats {
     net: Option<Counters>,
     io: Option<Counters>,
+    /// The previous beat's per-device counters, so the drop-downs'
+    /// deltas match by name.
+    net_devs: Vec<(String, u64, u64)>,
+    io_devs: Vec<(String, u64, u64)>,
     cores: Vec<(u64, u64)>,
     /// The hwmon chip to read the temperature from, discovered once:
     /// the sensor does not move between beats.
@@ -53,6 +62,8 @@ impl Stats {
         Self {
             net: None,
             io: None,
+            net_devs: Vec::new(),
+            io_devs: Vec::new(),
             cores: Vec::new(),
             temp_chip: discover_temp_chip(),
             last: Instant::now(),
@@ -81,25 +92,31 @@ impl Stats {
         let stat_text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
         let (procs_running, procs_blocked) = parse_procs(&stat_text);
 
-        let net = std::fs::read_to_string("/proc/net/dev")
+        let net_devs = std::fs::read_to_string("/proc/net/dev")
             .as_deref()
-            .map(parse_net_dev)
-            .unwrap_or((0, 0));
-        let (net_rx, net_tx) = Self::rates(self.net.as_ref(), &net, dt);
+            .map(parse_net_devs)
+            .unwrap_or_default();
+        let net_sums = sum_devs(&net_devs);
+        let (net_rx, net_tx) = Self::rates(self.net.as_ref(), &net_sums, dt);
         self.net = Some(Counters {
-            rx: net.0,
-            tx: net.1,
+            rx: net_sums.0,
+            tx: net_sums.1,
         });
+        let nets = dev_rates(&net_devs, &self.net_devs, dt);
+        self.net_devs = net_devs;
 
-        let io = std::fs::read_to_string("/proc/diskstats")
+        let io_devs = std::fs::read_to_string("/proc/diskstats")
             .as_deref()
-            .map(parse_diskstats)
-            .unwrap_or((0, 0));
-        let (io_read, io_write) = Self::rates(self.io.as_ref(), &io, dt);
+            .map(parse_disk_devs)
+            .unwrap_or_default();
+        let io_sums = sum_devs(&io_devs);
+        let (io_read, io_write) = Self::rates(self.io.as_ref(), &io_sums, dt);
         self.io = Some(Counters {
-            rx: io.0,
-            tx: io.1,
+            rx: io_sums.0,
+            tx: io_sums.1,
         });
+        let disks = dev_rates(&io_devs, &self.io_devs, dt);
+        self.io_devs = io_devs;
 
         let core_usage = self.core_beat(&stat_text);
         let core_count = self.cores.len();
@@ -113,6 +130,8 @@ impl Stats {
                 net_tx,
                 io_read,
                 io_write,
+                nets,
+                disks,
                 cpu_temp,
                 procs_running,
                 procs_blocked,
@@ -253,9 +272,9 @@ fn read_temp(chip: &std::path::Path) -> Option<f32> {
     hottest.map(|milli| milli / 1000.)
 }
 
-/// Summed rx/tx byte counters over every interface but lo.
-fn parse_net_dev(text: &str) -> (u64, u64) {
-    let mut totals = (0, 0);
+/// Per-interface rx/tx byte counters, lo excluded, name-sorted.
+fn parse_net_devs(text: &str) -> Vec<(String, u64, u64)> {
+    let mut devs = Vec::new();
     for line in text.lines() {
         let Some((name, fields)) = line.split_once(':') else {
             continue;
@@ -268,26 +287,65 @@ fn parse_net_dev(text: &str) -> (u64, u64) {
             .filter_map(|f| f.parse().ok())
             .collect();
         // rx bytes then seven fields, then tx bytes
-        totals.0 += fields.first().copied().unwrap_or(0);
-        totals.1 += fields.get(8).copied().unwrap_or(0);
+        devs.push((
+            name.trim().to_string(),
+            fields.first().copied().unwrap_or(0),
+            fields.get(8).copied().unwrap_or(0),
+        ));
     }
-    totals
+    devs.sort_by(|a, b| a.0.cmp(&b.0));
+    devs
 }
 
-/// Summed read/write sectors over whole disks only (partitions would
-/// double-count their parent's sectors; loops and zram are not disk
-/// throughput). Sectors are 512 bytes in practice.
-fn parse_diskstats(text: &str) -> (u64, u64) {
-    let mut totals = (0, 0);
+/// Per-whole-disk read/write sector counters, name-sorted.
+/// Partitions would double-count their parent's sectors; loops and
+/// zram are not disk throughput. Sectors are 512 bytes in practice.
+fn parse_disk_devs(text: &str) -> Vec<(String, u64, u64)> {
+    let mut devs = Vec::new();
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 10 || !is_disk(fields[2]) {
             continue;
         }
-        totals.0 += fields.get(5).and_then(|f| f.parse().ok()).unwrap_or(0);
-        totals.1 += fields.get(9).and_then(|f| f.parse().ok()).unwrap_or(0);
+        devs.push((
+            fields[2].to_string(),
+            fields.get(5).and_then(|f| f.parse().ok()).unwrap_or(0),
+            fields.get(9).and_then(|f| f.parse().ok()).unwrap_or(0),
+        ));
     }
-    totals
+    devs.sort_by(|a, b| a.0.cmp(&b.0));
+    devs
+}
+
+/// Byte totals across a device list.
+fn sum_devs(devs: &[(String, u64, u64)]) -> (u64, u64) {
+    devs.iter().fold((0, 0), |(read, written), (_, a, b)| {
+        (read + a, written + b)
+    })
+}
+
+/// Per-device rates against the previous beat's counters, matched by
+/// name; a device new this beat reads zero, like the first beat.
+fn dev_rates(
+    current: &[(String, u64, u64)],
+    prev: &[(String, u64, u64)],
+    dt: f64,
+) -> Vec<(String, f64, f64)> {
+    current
+        .iter()
+        .map(|(name, a, b)| {
+            let prev = prev.iter().find(|(n, _, _)| n == name);
+            let rate = |now: u64, was: Option<u64>| match was {
+                Some(was) if dt > 0. => now.saturating_sub(was) as f64 / dt,
+                _ => 0.,
+            };
+            (
+                name.clone(),
+                rate(*a, prev.map(|(_, a, _)| *a)),
+                rate(*b, prev.map(|(_, _, b)| *b)),
+            )
+        })
+        .collect()
 }
 
 /// Whole disks: sdX, hdX, vdX, mmcblkN, nvmeNnM. Partitions carry a
@@ -341,7 +399,7 @@ mod tests {
         let text = "lo: 100 1 0 0 0 0 0 0 200 1 0 0 0 0 0 0\n\
                     wlan0: 1000 2 0 0 0 0 0 0 3000 3 0 0 0 0 0 0\n\
                     eth0: 10 1 0 0 0 0 0 0 20 1 0 0 0 0 0 0";
-        assert_eq!(parse_net_dev(text), (1010, 3020));
+        assert_eq!(sum_devs(&parse_net_devs(text)), (1010, 3020));
     }
 
     #[test]
@@ -351,7 +409,39 @@ mod tests {
                     259       0 nvme0n1 200 0 4096 0 10 0 2048 0 0 0 0 0 0 0 0 0 0\n\
                     259       1 nvme0n1p1 100 0 2048 0 5 0 1024 0 0 0 0 0 0 0 0 0 0\n\
                     7       0 loop0 999 0 999 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
-        assert_eq!(parse_diskstats(text), (2048 + 4096, 1024 + 2048));
+        assert_eq!(sum_devs(&parse_disk_devs(text)), (2048 + 4096, 1024 + 2048));
+    }
+
+    #[test]
+    fn parses_devices_per_interface_sorted_without_loopback() {
+        let text = "wlan0: 1000 2 0 0 0 0 0 0 3000 3 0 0 0 0 0 0\n\
+                    lo: 100 1 0 0 0 0 0 0 200 1 0 0 0 0 0 0\n\
+                    eth0: 10 1 0 0 0 0 0 0 20 1 0 0 0 0 0 0";
+        let devs = parse_net_devs(text);
+        assert_eq!(
+            devs.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["eth0", "wlan0"],
+            "lo excluded, the rest name-sorted"
+        );
+        assert_eq!(devs[0], ("eth0".to_string(), 10u64, 20u64));
+        assert_eq!(devs[1], ("wlan0".to_string(), 1000u64, 3000u64));
+        // the sums ride the same parse
+        assert_eq!(sum_devs(&parse_net_devs(text)), (1010, 3020));
+    }
+
+    #[test]
+    fn parses_disks_per_device_sorted_whole_only() {
+        let text = "   8       0 sda 100 0 2048 0 5 0 1024 0 0 0 0 0 0 0 0 0 0\n\
+                    259       0 nvme0n1 200 0 4096 0 10 0 2048 0 0 0 0 0 0 0 0 0 0\n\
+                    8       1 sda1 50 0 1024 0 3 0 512 0 0 0 0 0 0 0 0 0 0";
+        let devs = parse_disk_devs(text);
+        assert_eq!(
+            devs.iter().map(|(n, _, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["nvme0n1", "sda"],
+            "partitions dropped, the rest name-sorted"
+        );
+        assert_eq!(devs[0], ("nvme0n1".to_string(), 4096u64, 2048u64));
+        assert_eq!(devs[1], ("sda".to_string(), 2048u64, 1024u64));
     }
 
     #[test]
