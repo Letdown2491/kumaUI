@@ -782,18 +782,18 @@ impl MonitorView {
                     .child(disk_card)
                     .child(net_card),
             )
-            .children((self.show_nets && !self.vitals.nets.is_empty()).then(|| {
-                self.devices_card(
-                    "INTERFACES",
-                    &self.vitals.nets,
-                    self.vitals.net_rx + self.vitals.net_tx,
-                )
-            }))
             .children((self.show_disks && !self.vitals.disks.is_empty()).then(|| {
                 self.devices_card(
                     "DISKS",
                     &self.vitals.disks,
                     self.vitals.io_read + self.vitals.io_write,
+                )
+            }))
+            .children((self.show_nets && !self.vitals.nets.is_empty()).then(|| {
+                self.devices_card(
+                    "INTERFACES",
+                    &self.vitals.nets,
+                    self.vitals.net_rx + self.vitals.net_tx,
                 )
             }))
     }
