@@ -103,7 +103,7 @@ fn thumb_job(path: &Path, cache_path: &Path) -> Option<gpui::RenderImage> {
     if let Ok(bytes) = fs::read(cache_path)
         && let Some(image) = image::load_from_memory(&bytes).ok()
     {
-        return Some(icons::decode_to_render(image, 256, 256));
+        return Some(kuma_platform::imaging::fit(image, 256, 256));
     }
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let dynamic = if icons::is_pdf(&name) {
@@ -138,7 +138,7 @@ fn thumb_job(path: &Path, cache_path: &Path) -> Option<gpui::RenderImage> {
     };
     // best effort: the cache is a durability win, not a dependency
     let _ = write_thumb_cache(cache_path, &fitted);
-    Some(icons::decode_to_render(fitted, 256, 256))
+    Some(kuma_platform::imaging::fit(fitted, 256, 256))
 }
 
 /// PNG the fitted pixels into the cache root, creating it as needed.
@@ -4736,7 +4736,7 @@ impl Browser {
                         } else if is_svg {
                             (
                                 icons::decode_svg_dynamic(&bg_path, QL_DECODE_MAX).map(|image| {
-                                    icons::decode_to_render(image, QL_DECODE_MAX, QL_DECODE_MAX)
+                                    kuma_platform::imaging::fit(image, QL_DECODE_MAX, QL_DECODE_MAX)
                                 }),
                                 None,
                                 None,

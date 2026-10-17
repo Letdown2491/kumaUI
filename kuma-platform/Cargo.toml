@@ -2,12 +2,14 @@
 name = "kuma-platform"
 version = "0.1.0"
 edition = "2024"
-description = "Shared wiring for the kuma apps: the setup every app would otherwise copy-paste (version reporting, the shell's palette handshake, the HSL color space, the niri IPC envelope)"
+description = "Shared wiring for the kuma apps: the setup every app would otherwise copy-paste (version reporting, the shell's palette handshake, the HSL color space, the decode-to-RenderImage family, the niri IPC envelope)"
 license = "MIT"
 repository = "https://github.com/Letdown2491/kumaUI"
 
 [dependencies]
 anyhow = "1"
 gpui = { workspace = true }
+image = "0.25"
+smallvec = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

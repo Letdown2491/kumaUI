@@ -248,7 +248,7 @@ mod imp {
     /// comes up empty. `Err(CodecMissing)` when this system's libav
     /// parses the container but has no decoder for the codec.
     pub(crate) fn decode_poster(path: &Path, max: u32) -> Result<gpui::RenderImage, PosterFail> {
-        poster_dynamic(path, max).map(|image| crate::icons::decode_to_render(image, max, max))
+        poster_dynamic(path, max).map(|image| kuma_platform::imaging::fit(image, max, max))
     }
 
     /// The details pane's preview budget: at most this many frames

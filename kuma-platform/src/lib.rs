@@ -8,12 +8,15 @@
 //! - `palette`: the shell's published palette, located, read, and
 //!   parsed (the theme application stays per app)
 //! - `color`: the HSL space the palettes derive from
+//! - `imaging`: the decode-to-`RenderImage` family, the BGRA byte
+//!   order gpui expects in one place
 //! - `niri`: the IPC envelope, ADR-0003's hand-rolled client (events,
 //!   actions, and response types stay per app)
 //! - `titlebar`: the family's client-side title bar, behavior and
 //!   geometry shared, colors and glyphs per app
 
 pub mod color;
+pub mod imaging;
 pub mod niri;
 pub mod palette;
 pub mod titlebar;

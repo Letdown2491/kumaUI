@@ -8,7 +8,6 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
 use gpui::{AssetSource, SharedString};
-use smallvec::SmallVec;
 
 pub struct Assets;
 
@@ -159,8 +158,8 @@ pub(crate) fn is_video(name: &str) -> bool {
 
 /// Decode a file into a BGRA `RenderImage` no larger than the bounds, the
 /// byte order gpui expects. Same contract as kuma-shell's imaging module.
-pub(crate) fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<gpui::RenderImage> {    let image = image::ImageReader::open(path).ok()?.decode().ok()?;
-    Some(decode_to_render(image, max_width, max_height))
+pub(crate) fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<gpui::RenderImage> {
+    kuma_platform::imaging::decode_fit(path, max_width, max_height)
 }
 
 /// An image file decoded into a plain `DynamicImage`, uncapped and
@@ -174,7 +173,7 @@ pub(crate) fn decode_thumbnail_dynamic(path: &Path) -> Option<image::DynamicImag
 /// as the other decoders.
 pub(crate) fn decode_cover(bytes: &[u8], max: u32) -> Option<gpui::RenderImage> {
     let image = image::load_from_memory(bytes).ok()?;
-    Some(decode_to_render(image, max, max))
+    Some(kuma_platform::imaging::fit(image, max, max))
 }
 
 /// The epub cover's dynamic twin, same split as images.
@@ -190,7 +189,7 @@ pub(crate) fn decode_pdf_thumbnail(
     page: usize,
     max: u32,
 ) -> Option<gpui::RenderImage> {
-    decode_pdf_dynamic(path, page, max).map(|image| decode_to_render(image, max, max))
+    decode_pdf_dynamic(path, page, max).map(|image| kuma_platform::imaging::fit(image, max, max))
 }
 
 /// The pdf thumb's dynamic twin: raw pdftocairo PNG bytes decoded,
@@ -332,19 +331,6 @@ fn demultiply(pixmap: resvg::tiny_skia::Pixmap) -> Option<image::DynamicImage> {
     }
     let buffer = image::ImageBuffer::from_raw(width, height, data)?;
     Some(image::DynamicImage::ImageRgba8(buffer))
-}
-
-/// Convert a decoded image into the BGRA `RenderImage` gpui expects.
-pub(crate) fn decode_to_render(
-    image: image::DynamicImage,
-    max_width: u32,
-    max_height: u32,
-) -> gpui::RenderImage {
-    let mut thumb = image.thumbnail(max_width, max_height).to_rgba8();
-    for pixel in thumb.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    gpui::RenderImage::new(SmallVec::from_buf([image::Frame::new(thumb)]))
 }
 
 #[cfg(test)]

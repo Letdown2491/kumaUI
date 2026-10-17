@@ -1,9 +1,9 @@
 //! The image registry: every path into a `RenderImage` goes through here, so
-//! the BGRA byte order gpui expects is handled in exactly one place, and tile
-//! lifetime has an owner (ADR-0016). `resolve` hands out stable shared images
+//! tile lifetime has an owner (ADR-0016). `resolve` hands out stable shared images
 //! (one repaintable `image_id`, so one atlas tile per live asset), `release`
 //! drops tiles when an asset leaves. The theme index and the LRU cache are
-//! implementation details behind those two verbs.
+//! implementation details behind those two verbs; the byte-order conversion
+//! itself lives in the platform's imaging module.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -109,20 +109,11 @@ pub fn argb_to_render_image(
 }
 
 pub fn decode_rgba(bytes: &[u8]) -> Option<gpui::RenderImage> {
-    let image = image::load_from_memory(bytes).ok()?;
-    Some(rgba_to_bgra_render_image(image.to_rgba8()))
-}
-
-fn open_image(path: &Path) -> Option<image::DynamicImage> {
-    image::ImageReader::open(path).ok()?.decode().ok()
-}
-
-fn image_fit(path: &Path, max_width: u32, max_height: u32) -> Option<image::DynamicImage> {
-    Some(open_image(path)?.thumbnail(max_width, max_height))
+    kuma_platform::imaging::decode_bytes(bytes)
 }
 
 pub fn decode_file(path: &Path) -> Option<gpui::RenderImage> {
-    Some(rgba_to_bgra_render_image(open_image(path)?.to_rgba8()))
+    kuma_platform::imaging::decode_file(path)
 }
 
 /// Decode a wallpaper and squash it to exactly 112x112 RGB (37,632
@@ -130,7 +121,7 @@ pub fn decode_file(path: &Path) -> Option<gpui::RenderImage> {
 /// distorts, which is fine for color statistics.
 pub fn decode_sampled(path: &Path) -> Option<Vec<u8>> {
     Some(
-        open_image(path)?
+        kuma_platform::imaging::open(path)?
             .resize_exact(112, 112, image::imageops::FilterType::Triangle)
             .to_rgb8()
             .into_raw(),
@@ -138,21 +129,7 @@ pub fn decode_sampled(path: &Path) -> Option<Vec<u8>> {
 }
 
 pub fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<gpui::RenderImage> {
-    let mut thumb = image_fit(path, max_width, max_height)?.to_rgba8();
-    for pixel in thumb.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    Some(gpui::RenderImage::new(SmallVec::from_buf([
-        image::Frame::new(thumb),
-    ])))
-}
-
-fn rgba_to_bgra_render_image(rgba: image::RgbaImage) -> gpui::RenderImage {
-    let mut bgra = rgba;
-    for pixel in bgra.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    gpui::RenderImage::new(SmallVec::from_buf([image::Frame::new(bgra)]))
+    kuma_platform::imaging::decode_fit(path, max_width, max_height)
 }
 
 /// One walk of the themed trees: the name→path index (preferring larger
@@ -471,10 +448,11 @@ mod tests {
     fn rasters_decode_to_the_requested_size() {
         // the source stands in for a theme png: big enough that the
         // downscale has to bite
-        let original = open_image(Path::new(&raster_key())).expect("raster asset should open");
+        let original = kuma_platform::imaging::open(Path::new(&raster_key()))
+            .expect("raster asset should open");
         assert!(original.width() > 48 && original.height() > 48);
 
-        let fit = image_fit(Path::new(&raster_key()), 48, 48).expect("raster asset should fit");
+        let fit = original.thumbnail(48, 48);
         assert!(
             fit.width() <= 48 && fit.height() <= 48,
             "raster should downscale to the paint size at decode"

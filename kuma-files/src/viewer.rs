@@ -380,7 +380,7 @@ impl Viewer {
                                     _ => image,
                                 })
                                 .map(|image| {
-                                    icons::decode_to_render(
+                                    kuma_platform::imaging::fit(
                                         image,
                                         VIEWER_DECODE_MAX,
                                         VIEWER_DECODE_MAX,
