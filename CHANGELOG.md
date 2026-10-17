@@ -11,6 +11,13 @@ move rides unchanged.
 
 ## Unreleased
 
+## v0.4.0 (2026-10-17)
+
+kuma-shell 0.4.0
+kuma-files 0.4.0
+kuma-term 0.3.0
+kuma-monitor 0.2.0
+
 ### Added
 
 - kuma-monitor: Kamuy is single-instance now, the family's convention:
