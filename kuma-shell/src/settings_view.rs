@@ -2480,12 +2480,20 @@ impl SettingsView {
                 )
             })
             // the column's own stretch appends at the end; its capture
-            // listener fires before the chips', so a chip overwrites it
+            // listener fires before the chips', so a chip overwrites it.
+            // The bounds check keeps other columns' moves from claiming
+            // this stretch: drag move handlers run for every move on the
+            // drag path, hovered or not
             .on_drag_move(
-                cx.listener(move |this, _: &DragMoveEvent<WidgetDrag>, _, cx| {
-                    this.drop_preview = Some((section, count));
-                    cx.notify();
-                }),
+                cx.listener(
+                    move |this, event: &DragMoveEvent<WidgetDrag>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        this.drop_preview = Some((section, count));
+                        cx.notify();
+                    },
+                ),
             )
             .on_drop(cx.listener(move |this, drag: &WidgetDrag, _, cx| {
                 this.settings.update(cx, |settings, cx| {
@@ -2529,6 +2537,13 @@ impl SettingsView {
             )
             .on_drag_move(
                 cx.listener(move |this, event: &DragMoveEvent<WidgetDrag>, _, cx| {
+                    // gpui delivers drag moves to every element on the drag
+                    // path in paint order, hovered or not, so the last chip
+                    // painted (in the right section) would own the preview on
+                    // every move unless each chip vouches for its own bounds
+                    if !event.bounds.contains(&event.event.position) {
+                        return;
+                    }
                     // the chip's lower half means "land after it"
                     let midline = event.bounds.origin.y + event.bounds.size.height / 2.;
                     let after = event.event.position.y > midline;

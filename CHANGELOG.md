@@ -42,6 +42,14 @@ move rides unchanged.
 
 ### Fixed
 
+- kuma-shell: the settings Ordering page now lets you reorder widgets in
+  every section, left and center included; before, the right column
+  claimed every drop. gpui delivers drag-move events to all three
+  columns' handlers on each move regardless of hover, and the
+  rightmost handler ran last, so it kept overwriting the insertion
+  preview. Each handler now only answers when the cursor is inside its
+  own bounds.
+
 - kuma-files: overwriting an image in place (same path, new contents) now
   refreshes Koguma's grid thumbnail on the next paint; before, the
   in-memory thumb cache keyed by path alone and served the old decode
