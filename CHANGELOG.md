@@ -13,6 +13,13 @@ move rides unchanged.
 
 ### Added
 
+- kuma-monitor: Kamuy is single-instance now, the family's convention:
+  launching it while it runs hands a bare poke over the activation
+  socket and exits, and the running window comes forward instead of a
+  twin. The socket itself (the handoff, the stale-socket recovery, the
+  activation pump) graduated into kuma-platform, Koguma's same
+  machinery keyed by app id; Koguma rides it unchanged.
+
 - kuma-term, kuma-files: Higuma and Koguma wear the family's titlebar
   now, the one Kamuy piloted: the drag region, the centered name
   (Higuma is the terminal's display name; the binary and app id stay

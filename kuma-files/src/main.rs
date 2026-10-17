@@ -18,52 +18,6 @@ mod viewer;
 use browser::Browser;
 use viewer::Hosts;
 
-/// The activation socket in the session runtime dir: the first
-/// instance listens here, later ones hand over their dir and exit.
-fn socket_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(runtime) => PathBuf::from(runtime).join("kuma-files.sock"),
-        None => PathBuf::from(format!("/tmp/kuma-files-{}.sock", unsafe { libc::getuid() })),
-    }
-}
-
-/// A path that arrived over the activation socket: a file opens in
-/// the viewer, a dir lists in the manager, none (a bare poke) just
-/// brings the manager forward.
-struct Activation {
-    dir: Option<PathBuf>,
-}
-
-/// Either we own the single-instance socket or another instance
-/// already does. In the handed-over case this process exits after
-/// sending the request, so the return value is always Some here.
-fn become_single_instance(dir: Option<PathBuf>) -> Option<std::os::unix::net::UnixListener> {
-    let path = socket_path();
-
-    // someone else's session: send the request over and leave
-    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
-        let dir = dir.unwrap_or_default();
-        let _ = writeln!(stream, "{}", dir.display());
-        std::process::exit(0);
-    }
-
-    // stale socket from a crashed instance (connect refused): remove
-    // and rebind
-    let _ = std::fs::remove_file(&path);
-    match std::os::unix::net::UnixListener::bind(&path) {
-        Ok(listener) => {
-            log::info!("single instance: listening on {}", path.display());
-            Some(listener)
-        }
-        Err(err) => {
-            // cannot listen and cannot hand over: run anyway, the
-            // worst case is two instances like before
-            log::error!("single instance bind {}: {err}", path.display());
-            None
-        }
-    }
-}
-
 /// The version line `--version` prints and the boot log carries: the
 /// crate version plus the commit build.sh stamped in (unstamped builds
 /// read unknown), so a running instance pins to an exact build. The
@@ -120,8 +74,14 @@ fn main() {
     let file = dir.take_if(|path| path.is_file());
 
     // second launch while one is already up: hand the request over
-    // and exit before any GPU work happens
-    let listener = become_single_instance(dir.clone().or(file.clone()));
+    // and exit before any GPU work happens. The request line is the
+    // dir or file to open, bare for "bring me forward".
+    let request = dir
+        .clone()
+        .or(file.clone())
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let listener = kuma_platform::activation::become_single_instance("kuma-files", &request);
 
     application()
         .with_assets(icons::Assets)
@@ -170,75 +130,29 @@ fn main() {
             cx.activate(true);
 
             if let Some(listener) = listener {
-                pump_activations(listener, cx);
+                // a file lands in the viewer, a dir opens in a new
+                // tab of the manager, a bare poke brings it forward
+                kuma_platform::activation::pump(listener, cx, |text, cx| {
+                    let path = (!text.is_empty()).then(|| PathBuf::from(text));
+                    match path {
+                        Some(path) if path.is_file() => viewer::open_or_focus(path, cx),
+                        Some(dir) => {
+                            if let Some(handle) = viewer::ensure_browser(cx) {
+                                let _ = handle.update(cx, |browser, window, cx| {
+                                    browser.open_dir_in_new_tab(dir, cx);
+                                    window.activate_window();
+                                });
+                            }
+                        }
+                        None => {
+                            if let Some(handle) = viewer::ensure_browser(cx) {
+                                let _ = handle.update(cx, |_, window, _| window.activate_window());
+                            }
+                        }
+                    }
+                });
             }
         });
-}
-
-/// Accept loop on a plain thread (blocking is fine there), forwarded
-/// through an async channel so the UI only wakes per activation. A
-/// file activation opens the viewer, a dir activation opens the
-/// manager (growing it lazily in a viewer-only process), a bare poke
-/// brings the manager forward.
-fn pump_activations(listener: std::os::unix::net::UnixListener, cx: &mut App) {
-    let (tx, mut rx) = futures::channel::mpsc::unbounded::<Activation>();
-    std::thread::Builder::new()
-        .name("kuma-files-activate".into())
-        .spawn(move || {
-            for stream in listener.incoming() {
-                let mut stream = match stream {
-                    Ok(stream) => stream,
-                    Err(_) => return,
-                };
-                use std::io::Read as _;
-                // one small message per connection: a client that
-                // connects and never writes would otherwise stall
-                // every later activation, and an unbounded read would
-                // let it balloon the pump's memory
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                let mut line = String::new();
-                if (&mut stream).take(4096).read_to_string(&mut line).is_err() {
-                    continue;
-                }
-                let text = line.trim();
-                let dir = (!text.is_empty()).then(|| PathBuf::from(text));
-                if tx.unbounded_send(Activation { dir }).is_err() {
-                    return;
-                }
-            }
-        })
-        .expect("spawn activation pump");
-
-    cx.spawn(async move |cx| {
-        use futures::StreamExt;
-        while let Some(activation) = rx.next().await {
-            cx.update(|cx| {
-                match activation.dir {
-                    // a file lands in the viewer, replacing whatever
-                    // it showed
-                    Some(path) if path.is_file() => viewer::open_or_focus(path, cx),
-                    // a dir request opens in a new tab of the
-                    // manager (created here if this process is
-                    // viewer-only)
-                    Some(dir) => {
-                        if let Some(handle) = viewer::ensure_browser(cx) {
-                            let _ = handle.update(cx, |browser, window, cx| {
-                                browser.open_dir_in_new_tab(dir, cx);
-                                window.activate_window();
-                            });
-                        }
-                    }
-                    // a bare poke brings the manager forward
-                    None => {
-                        if let Some(handle) = viewer::ensure_browser(cx) {
-                            let _ = handle.update(cx, |_, window, _| window.activate_window());
-                        }
-                    }
-                }
-            });
-        }
-    })
-    .detach();
 }
 
 /// The argv contract: `%u` hands over a plain path or a `file://`

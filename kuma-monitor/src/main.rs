@@ -51,11 +51,15 @@ fn main() {
         std::process::exit(1);
     }
 
+    // second launch while one is already up: a bare poke over the
+    // activation socket and exit; the first window comes forward.
+    let listener = kuma_platform::activation::become_single_instance("kuma-monitor", "");
+
     application()
         .with_assets(icons::Assets)
         .run(move |cx: &mut App| {
         let bounds = gpui::Bounds::centered(None, size(px(860.), px(640.)), cx);
-        let _ = cx.open_window(
+        let handle = match cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 app_id: Some("kuma-monitor".into()),
@@ -69,8 +73,23 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| view::MonitorView::new(window, cx)),
-        );
+        ) {
+            Ok(handle) => handle,
+            Err(err) => {
+                log::error!("open_window failed: {err:#}");
+                return;
+            }
+        };
         cx.activate(true);
+
+        if let Some(listener) = listener {
+            // every later launch pokes: the running window comes
+            // forward, no second Kamuy
+            kuma_platform::activation::pump(listener, cx, move |_, cx| {
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
+                cx.activate(true);
+            });
+        }
     });
 }
 

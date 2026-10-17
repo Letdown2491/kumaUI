@@ -10,11 +10,14 @@
 //! - `color`: the HSL space the palettes derive from
 //! - `imaging`: the decode-to-`RenderImage` family, the BGRA byte
 //!   order gpui expects in one place
+//! - `activation`: the single-instance activation socket, keyed by
+//!   app id; a second launch hands its request over and exits
 //! - `niri`: the IPC envelope, ADR-0003's hand-rolled client (events,
 //!   actions, and response types stay per app)
 //! - `titlebar`: the family's client-side title bar, behavior and
 //!   geometry shared, colors and glyphs per app
 
+pub mod activation;
 pub mod color;
 pub mod imaging;
 pub mod niri;

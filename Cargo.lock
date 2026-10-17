@@ -3121,9 +3121,14 @@ name = "kuma-platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui",
+ "image",
+ "libc",
+ "log",
  "serde",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]
