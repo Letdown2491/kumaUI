@@ -1520,6 +1520,16 @@ pub(crate) struct Browser {
     /// Cells in the first grid row, captured at paint time; 0 means
     /// unknown (list view, or nothing rendered yet).
     grid_row_len: Arc<AtomicUsize>,
+    /// The listing's scroll, tracked so keyboard cursor moves can
+    /// bring the cursor row into view and the icon grid can gate its
+    /// thumbnail requests to the rows the viewport actually shows.
+    list_scroll: gpui::ScrollHandle,
+    /// Painted bounds of the listing's rows (list view) or cells
+    /// (icon view) in visible order, captured at paint time in window
+    /// coordinates. Keyboard scroll-into-view reads the cursor's row
+    /// here: it needs the row's on-screen position, which only paint
+    /// knows.
+    painted_rows: Arc<Mutex<Vec<Bounds<Pixels>>>>,
     status: String,
     progress: String,
     busy: bool,
@@ -1649,6 +1659,8 @@ impl Browser {
             ql_scroll: gpui::ScrollHandle::new(),
             menu: None,
             grid_row_len: Arc::new(AtomicUsize::new(0)),
+            list_scroll: gpui::ScrollHandle::new(),
+            painted_rows: Arc::new(Mutex::new(Vec::new())),
             status: String::new(),
             progress: String::new(),
             busy: false,
@@ -2591,6 +2603,8 @@ impl Browser {
     /// respect the new filter and nothing flashes.
     fn filter_changed(&mut self, cx: &mut Context<Self>) {
         self.search_gen += 1;
+        // typing shows matches from the top
+        self.reset_list_scroll();
         if self.filter.is_empty() {
             self.searching = false;
             self.prune_deep();
@@ -2821,10 +2835,20 @@ impl Browser {
         tab.reload(show_hidden);
         self.status.clear();
         self.disarm();
+        // a new folder reads from its top; the handle persists across
+        // renders, so the stale offset must go explicitly
+        self.reset_list_scroll();
         // the filter survives navigation; search the new tree too
         self.filter_changed(cx);
         self.save_state();
         cx.notify();
+    }
+
+    /// The listing reads from its top whenever the active folder
+    /// changes: the scroll handle outlives the render, so the stale
+    /// offset must go explicitly.
+    fn reset_list_scroll(&self) {
+        self.list_scroll.set_offset(point(px(0.), px(0.)));
     }
 
     /// Ctrl+Tab / Ctrl+Shift+Tab: rotate through the tabs.
@@ -2836,6 +2860,7 @@ impl Browser {
         let next = (self.active as isize + step).rem_euclid(count);
         self.active = next as usize;
         // the incoming tab needs its own deep rows for a live filter
+        self.reset_list_scroll();
         self.filter_changed(cx);
         self.save_state();
         cx.notify();
@@ -2852,6 +2877,7 @@ impl Browser {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.tabs.last_mut().unwrap().reload(self.show_hidden);
+        self.reset_list_scroll();
         self.status.clear();
         self.save_state();
         cx.notify();
@@ -2873,6 +2899,7 @@ impl Browser {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.tabs.last_mut().unwrap().reload(self.show_hidden);
+        self.reset_list_scroll();
         self.save_state();
         cx.notify();
     }
@@ -2888,6 +2915,7 @@ impl Browser {
             tab.sort_asc = current.sort_asc;
             self.tabs[0] = tab;
             self.tabs[0].reload(self.show_hidden);
+            self.reset_list_scroll();
         } else {
             self.tabs.remove(ix);
             if self.active >= self.tabs.len() {
@@ -2895,6 +2923,7 @@ impl Browser {
             } else if ix < self.active {
                 self.active -= 1;
             }
+            self.reset_list_scroll();
         }
         self.save_state();
         cx.notify();
@@ -5787,6 +5816,88 @@ impl Browser {
         }
     }
 
+    /// The half-open range of visible-order positions the scroll
+    /// viewport wants thumbnails for: the rows it shows plus two rows
+    /// of margin on each side. `offset_y` is the gpui scroll offset
+    /// (negative when scrolled down), `view_height` and `pitch` the
+    /// viewport height and the per-cell vertical step, `per_line` the
+    /// cells per grid row. An unknown shape (first paint, list view)
+    /// ungates everything.
+    fn thumb_window(
+        offset_y: f32,
+        view_height: f32,
+        pitch: f32,
+        per_line: usize,
+        count: usize,
+    ) -> std::ops::Range<usize> {
+        if per_line <= 1 || pitch <= 0.0 || view_height <= 0.0 {
+            return 0..count;
+        }
+        let scrolled_rows = (-offset_y / pitch).max(0.0).floor();
+        let shown_rows = (view_height / pitch).ceil();
+        let start = scrolled_rows as usize - 2.min(scrolled_rows as usize);
+        let end = ((scrolled_rows + shown_rows + 2.0) as usize) * per_line;
+        (start * per_line).min(count)..end.min(count)
+    }
+
+    /// Whether the cell at this visible-order position sits inside the
+    /// scroll viewport's thumbnail window. Reads the tracked scroll
+    /// handle and the grid shape from the last paint.
+    fn thumb_window_contains(&self, vis_pos: usize) -> bool {
+        let offset_y = f32::from(self.list_scroll.offset().y);
+        let view_height = f32::from(self.list_scroll.bounds().size.height);
+        let pitch = 120. * self.scale;
+        let per_line = self.grid_per_line();
+        Self::thumb_window(offset_y, view_height, pitch, per_line, usize::MAX)
+            .contains(&vis_pos)
+    }
+
+    /// Scroll the keyboard cursor's row into view. The row's on-screen
+    /// bounds come from the last paint (painted_rows), so the fix is a
+    /// straight delta against the scroll viewport's own bounds; the
+    /// offset's clamp on the next paint absorbs any overshoot. Home
+    /// and End land exactly at the top and bottom of the content.
+    fn scroll_cursor_into_view(&mut self, cx: &mut Context<Self>) {
+        let Some(entry_ix) = self.tab().cursor else {
+            return;
+        };
+        let visible = self.visible_indices();
+        let Some(pos) = visible.iter().position(|&v| v == entry_ix) else {
+            return;
+        };
+        let Some(row) = self.painted_rows.lock().ok().and_then(|rows| rows.get(pos).copied())
+        else {
+            return;
+        };
+        let view = self.list_scroll.bounds();
+        if view.size.width <= px(0.) || view.size.height <= px(0.) {
+            return;
+        }
+        let mut offset = self.list_scroll.offset();
+        if pos == 0 {
+            offset = point(px(0.), px(0.));
+        } else if pos + 1 == visible.len() {
+            offset.y = -self.list_scroll.max_offset().y;
+        } else {
+            let view_top: f32 = view.origin.y.into();
+            let view_bottom = view_top + f32::from(view.size.height);
+            let row_top: f32 = row.origin.y.into();
+            let row_bottom = row_top + f32::from(row.size.height);
+            let mut moved = 0.0f32;
+            if row_top < view_top {
+                moved = view_top - row_top;
+            } else if row_bottom > view_bottom {
+                moved = view_bottom - row_bottom;
+            }
+            if moved == 0.0 {
+                return;
+            }
+            offset.y += px(moved);
+        }
+        self.list_scroll.set_offset(offset);
+        cx.notify();
+    }
+
     /// Grid navigation for icon view. Horizontal steps stay inside the
     /// row; vertical steps jump a full row and clamp at the ends.
     fn move_cursor_grid(
@@ -5831,6 +5942,7 @@ impl Browser {
         tab.selection.clear();
         tab.selection.insert(key);
         cx.notify();
+        self.scroll_cursor_into_view(cx);
     }
 
     /// Home/End: jump to first/last entry. A no-op on an empty listing.
@@ -5845,6 +5957,7 @@ impl Browser {
         tab.selection.clear();
         tab.selection.insert(key);
         cx.notify();
+        self.scroll_cursor_into_view(cx);
     }
 
     fn open_selection(&mut self, cx: &mut Context<Self>) {
@@ -5962,6 +6075,7 @@ impl Browser {
         tab.cursor = None;
         tab.renaming = None;
         tab.reload(show_hidden);
+        self.reset_list_scroll();
         self.save_state();
         cx.notify();
     }
@@ -5978,6 +6092,7 @@ impl Browser {
         tab.cursor = None;
         tab.renaming = None;
         tab.reload(show_hidden);
+        self.reset_list_scroll();
         self.save_state();
         cx.notify();
     }
@@ -6270,7 +6385,13 @@ impl Browser {
 
     /// One cell in the icon grid: preview (thumbnail when decodable),
     /// name underneath.
-    fn icon_cell(&mut self, ix: usize, entry: &Entry, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn icon_cell(
+        &mut self,
+        ix: usize,
+        vis_pos: usize,
+        entry: &Entry,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         // pinned, scaled geometry: 8 pad + 80 preview + 4 gap + 16 name
         // + 8 pad = 116; the rubber band's hit math depends on this
         let s = self.scale;
@@ -6293,11 +6414,18 @@ impl Browser {
         });
 
         // thumbnails only for local image files: trash entries point at
-        // paths that no longer exist
+        // paths that no longer exist. Decodes are asked for only by the
+        // viewport's neighborhood (thumb_window, below): the paint shows
+        // every entry, but queuing a decode per cell in a ten-thousand
+        // image folder would keep the pool busy forever on cells the
+        // user may never scroll to. Cells outside the window keep any
+        // thumb the cache still holds, so a slow scroll never flickers.
         let show_thumb =
             !in_trash && !entry.is_dir && (icons::is_thumbable(&entry.name) || icons::is_epub(&entry.name));
         let thumb = if show_thumb {
-            self.request_thumb(entry.path.clone(), entry_stamp(entry), cx);
+            if self.thumb_window_contains(vis_pos) {
+                self.request_thumb(entry.path.clone(), entry_stamp(entry), cx);
+            }
             self.thumb_hit(entry)
         } else {
             None
@@ -8765,15 +8893,18 @@ impl Render for Browser {
 
         // owned so the icon cells can kick off thumbnail decodes (which
         // need &mut self) while iterating; rows keep their entry index
-        // so element state and cursor stay entry-keyed
+        // so element state and cursor stay entry-keyed. The cell's
+        // visible-order position rides along for the icon grid's thumb
+        // gating: the paint shows every entry, but only the viewport's
+        // neighborhood asks for decodes.
         let entries: Vec<Entry> = self.tab().entries.clone();
         let visible = self.visible_indices();
         let mut rows: Vec<Stateful<Div>> = Vec::new();
-        for &entry_ix in visible.iter().take(200) {
+        for (vis_pos, &entry_ix) in visible.iter().enumerate() {
             let entry = &entries[entry_ix];
             match self.tab().view_mode {
                 ViewMode::List => rows.push(self.row(entry_ix, entry, cx)),
-                ViewMode::Icons => rows.push(self.icon_cell(entry_ix, entry, cx)),
+                ViewMode::Icons => rows.push(self.icon_cell(entry_ix, vis_pos, entry, cx)),
             }
         }
 
@@ -9047,6 +9178,7 @@ impl Render for Browser {
             .child(
                 div()
                     .flex_1()
+                    .min_h_0()
                     .flex()
                     .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -9459,7 +9591,8 @@ impl Render for Browser {
                             .id("list")
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll();
+                            .overflow_y_scroll()
+                            .track_scroll(&self.list_scroll);
                         let clear_on_click = cx.listener(
                             |this, event: &ClickEvent, _, cx| {
                                 if event.click_count() >= 2 {
@@ -9500,7 +9633,26 @@ impl Render for Browser {
                                     .gap_px()
                                     .p_2()
                                     .child(header)
-                                    .children(rows)
+                                    .child(
+                                        // the rows' own container: the
+                                        // prepaint capture needs a plain
+                                        // div (list_box is stateful), and
+                                        // its children are the rows in
+                                        // visible order
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_px()
+                                            .on_children_prepainted({
+                                                let painted_rows = self.painted_rows.clone();
+                                                move |children, _, _| {
+                                                    if let Ok(mut rows) = painted_rows.lock() {
+                                                        *rows = children;
+                                                    }
+                                                }
+                                            })
+                                            .children(rows),
+                                    )
                                     .child(empty_space)
                             }
                             ViewMode::Icons => {
@@ -9592,9 +9744,13 @@ impl Render for Browser {
                                             .gap(px(4. * s))
                                             // count the first row at paint
                                             // time: arrow-key navigation
-                                            // uses the real grid shape
+                                            // uses the real grid shape;
+                                            // every child is a cell, so
+                                            // the same paint feeds the
+                                            // cursor scroll-into-view
                                             .on_children_prepainted({
                                                 let row_len = self.grid_row_len.clone();
+                                                let painted_rows = self.painted_rows.clone();
                                                 move |children, _, _| {
                                                     let Some(first) = children.first() else {
                                                         return;
@@ -9608,6 +9764,9 @@ impl Render for Browser {
                                                         count as usize,
                                                         Ordering::Relaxed,
                                                     );
+                                                    if let Ok(mut cells) = painted_rows.lock() {
+                                                        *cells = children;
+                                                    }
                                                 }
                                             })
                                             .children(rows),
@@ -14619,5 +14778,245 @@ mod connect_tests {
         handle.join().unwrap();
         assert_eq!(answered, 2);
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// A regression test for the dead-scroll bug: the row above the
+/// listing (the flex_1 row wrapping sidebar and folder column) had no
+/// min_h_0, so as a flex item in the root column it could not shrink
+/// below its content height. The listing grew to its full content
+/// height instead of the viewport, nothing overflowed the scroll
+/// container, and the wheel did nothing: folders with more rows than
+/// fit the window could not be scrolled at all. The minimal control
+/// below proves a plain overflow_y_scroll div scrolls in this harness.
+#[cfg(test)]
+mod browser_scroll_repro {
+    use super::*;
+    use gpui::point;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    // the ux-keys module's key builder and browser opener
+    use browser_ux_keys::{key, open_browser};
+
+    #[test]
+    fn wheel_scrolls_the_listing() {
+        // enough rows to overflow the window several times over
+        let dir =
+            std::env::temp_dir().join(format!("koguma-scroll-repro-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..100 {
+            fs::write(dir.join(format!("file-{i:03}.txt")), "x").unwrap();
+        }
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window =
+            app.open_window(|window, cx| Browser::new(Some(dir.clone()), window, cx));
+        app.run_until_parked();
+
+        // the spot sits on a row whether or not anything scrolled
+        // (rows start around y=140 in a 1080 viewport and run 36.5px
+        // tall); hover first: on_click needs both ends of the gesture
+        let spot = point(px(400.), px(400.));
+        window.simulate_mouse_move(spot);
+        window.simulate_mouse_down(spot, MouseButton::Left);
+        window.simulate_mouse_up(spot, MouseButton::Left);
+        app.run_until_parked();
+        let baseline = window.update(|browser, _, _| browser.tab().cursor);
+        assert!(
+            baseline.is_some_and(|ix| ix < 20),
+            "unscrolled click at the top of the listing must land on an early row, got {baseline:?}"
+        );
+
+        window.update(|browser, _, cx| {
+            browser.tab_mut().cursor = None;
+            browser.tab_mut().selection.clear();
+            cx.notify();
+        });
+        app.run_until_parked();
+
+        // ten notches of -300px: the same spot must now hit a row
+        // hundreds of pixels down the listing
+        for _ in 0..10 {
+            window.simulate_scroll(spot, point(px(0.), px(-300.)));
+        }
+        app.run_until_parked();
+        window.simulate_mouse_move(spot);
+        window.simulate_mouse_down(spot, MouseButton::Left);
+        window.simulate_mouse_up(spot, MouseButton::Left);
+        app.run_until_parked();
+        let after = window.update(|browser, _, _| browser.tab().cursor);
+        assert!(
+            after.is_some_and(|ix| ix > baseline.unwrap() + 20),
+            "clicking the same spot after scrolling must reach a later row, baseline {baseline:?} after {after:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Minimal control: a plain overflow_y_scroll div scrolls under
+    /// the wheel in this harness. Guards against the harness itself
+    /// losing wheel dispatch, which would let the regression above
+    /// pass for the wrong reason.
+    #[test]
+    fn minimal_overflow_div_scrolls_on_wheel() {
+        let hit = Rc::new(Cell::new(usize::MAX));
+        struct Tall {
+            hit: Rc<Cell<usize>>,
+        }
+        impl Render for Tall {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let hit = self.hit.clone();
+                div()
+                    .id("outer")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div().flex().flex_col().children((0..100).map(move |i| {
+                            let hit = hit.clone();
+                            div()
+                                .id(i)
+                                .h(px(50.))
+                                .w(px(400.))
+                                .bg(rgb(0x222222))
+                                .on_click(move |_, _, _| hit.set(i))
+                                .child(format!("row {i}"))
+                        })),
+                    )
+            }
+        }
+        let mut app = gpui::TestApp::new();
+        let mut window = app.open_window(|_, _| Tall { hit: hit.clone() });
+        app.run_until_parked();
+        let pos = point(px(200.), px(100.));
+        window.simulate_mouse_move(pos);
+        window.simulate_mouse_down(pos, MouseButton::Left);
+        window.simulate_mouse_up(pos, MouseButton::Left);
+        app.run_until_parked();
+        assert_eq!(hit.get(), 2, "unscrolled click must hit row 2");
+        for _ in 0..5 {
+            window.simulate_scroll(pos, point(px(0.), px(-300.)));
+        }
+        app.run_until_parked();
+        window.simulate_mouse_move(pos);
+        window.simulate_mouse_down(pos, MouseButton::Left);
+        window.simulate_mouse_up(pos, MouseButton::Left);
+        app.run_until_parked();
+        assert!(
+            hit.get() > 2,
+            "wheel scroll never moved the content: still hitting row {}",
+            hit.get()
+        );
+    }
+
+    /// The old 200-row render cap hid everything past entry 200 even
+    /// with scrolling fixed; End must reach the last entry of a larger
+    /// folder and bring it into view.
+    #[test]
+    fn end_key_reaches_past_the_old_cap_and_scrolls() {
+        let dir = std::env::temp_dir()
+            .join(format!("koguma-cap-repro-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..300 {
+            fs::write(dir.join(format!("file-{i:03}.txt")), "x").unwrap();
+        }
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &dir);
+
+        window.update(|browser, _, cx| browser.route_key(&key("end"), cx));
+        app.run_until_parked();
+        let (cursor, count, offset) = window.update(|browser, _, _| {
+            (
+                browser.tab().cursor,
+                browser.visible_indices().len(),
+                browser.list_scroll.offset(),
+            )
+        });
+        assert_eq!(count, 300, "the listing must render past the old 200 cap");
+        assert_eq!(cursor, Some(299), "End must reach the last entry");
+        assert!(
+            offset.y < px(-1000.),
+            "End must scroll the cursor row into view, offset {offset:?}"
+        );
+
+        window.update(|browser, _, cx| browser.route_key(&key("home"), cx));
+        app.run_until_parked();
+        let (cursor, offset) = window.update(|browser, _, _| {
+            (browser.tab().cursor, browser.list_scroll.offset())
+        });
+        assert_eq!(cursor, Some(0), "Home must return to the first entry");
+        assert_eq!(
+            offset,
+            point(px(0.), px(0.)),
+            "Home must land the scroll at the top"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Same jump in icon view: the cells' painted bounds drive the
+    /// scroll-into-view there.
+    #[test]
+    fn end_key_scrolls_the_icon_grid() {
+        let dir = std::env::temp_dir()
+            .join(format!("koguma-grid-repro-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..300 {
+            fs::write(dir.join(format!("file-{i:03}.txt")), "x").unwrap();
+        }
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &dir);
+        window.update(|browser, _, cx| {
+            browser.set_view_mode(ViewMode::Icons, cx);
+        });
+        app.run_until_parked();
+
+        window.update(|browser, _, cx| browser.route_key(&key("end"), cx));
+        app.run_until_parked();
+        let (cursor, offset) = window.update(|browser, _, _| {
+            (browser.tab().cursor, browser.list_scroll.offset())
+        });
+        assert_eq!(cursor, Some(299));
+        assert!(
+            offset.y < px(-1000.),
+            "End must scroll the icon grid, offset {offset:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thumb_window_tracks_the_viewport() {
+        // unknown shape: ungate everything
+        assert_eq!(
+            Browser::thumb_window(0., 950., 120., 0, 1000),
+            0..1000
+        );
+        // at the top: the viewport rows plus two rows of margin
+        assert_eq!(
+            Browser::thumb_window(0., 950., 120., 14, 1000),
+            0..140
+        );
+        // scrolled down: the window slides with the offset
+        assert_eq!(
+            Browser::thumb_window(-1200., 950., 120., 14, 1000),
+            112..280
+        );
+        // the window clamps to the count near the bottom
+        assert_eq!(
+            Browser::thumb_window(-1800., 950., 120., 14, 350),
+            182..350
+        );
     }
 }

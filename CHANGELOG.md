@@ -11,6 +11,21 @@ move rides unchanged.
 
 ## Unreleased
 
+### Fixed
+
+- kuma-files: Koguma's listing scrolls with the wheel again. The row
+  wrapping the sidebar and the folder column had no min-height floor
+  of zero, so it grew to the folder's full content height instead of
+  the window's: the listing never overflowed and a folder with more
+  files than fit the window had no way to reach the rest.
+
+- kuma-files: folders render in full now. The old 200-entry render
+  cap hid everything past entry 200 even with scrolling working (the
+  icon grid queues thumbnail decodes only for the viewport's
+  neighborhood, so a huge folder no longer queues a decode per cell),
+  and the keyboard cursor (arrows, Home, End) brings its row into
+  view.
+
 ## v0.4.0 (2026-10-17)
 
 kuma-shell 0.4.0
