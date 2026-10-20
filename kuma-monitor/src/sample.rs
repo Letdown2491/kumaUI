@@ -32,7 +32,7 @@ pub(crate) struct WindowRef {
 
 /// One process row: sysinfo's numbers plus whatever window niri
 /// attributes to the pid.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProcRow {
     pub pid: u32,
     pub parent: Option<u32>,
@@ -47,7 +47,7 @@ pub(crate) struct ProcRow {
 /// One app, however many processes carry it: the windowed process and
 /// its helpers under one row, with the sums the user actually reasons
 /// about (what does this app cost, what does closing it return).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AppGroup {
     /// The stable identity beats merge on: the app_id lowercased,
     /// or the binary's name lowercased for background groups.
@@ -71,6 +71,7 @@ pub(crate) struct AppGroup {
 
 /// One beat of the whole table: totals for the graph and the rows
 /// for the list.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Snapshot {
     pub cpu_total: f32,
     pub mem_used: u64,

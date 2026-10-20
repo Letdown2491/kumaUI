@@ -6,6 +6,7 @@
 //! (the daemons nothing recognizes) hides behind one summary line.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
@@ -207,6 +208,20 @@ pub(crate) struct MonitorView {
     /// a CSD hint, not a tiling signal, so the IPC is the only voice
     niri_tiled: bool,
     focus: FocusHandle,
+    /// The last beat that reached the state: an equal beat applies
+    /// nothing, so an idle machine stops repainting once a second.
+    last_beat: Option<Snapshot>,
+    /// The groups and rings as Arc snapshots for the render closure:
+    /// the uniform list's items closure is 'static, and a per-render
+    /// deep clone of the whole table was its price. Refreshed by
+    /// `refresh_snapshots` wherever the sources mutate.
+    groups_snap: Arc<Vec<AppGroup>>,
+    hists_snap: Arc<HashMap<String, Vec<f32>>>,
+    /// Set by every paint, cleared by every notified beat: the
+    /// repaint gate. An occluded surface stops paying for repaints
+    /// it cannot show; sampling never stops, so the rings stay
+    /// continuous for when it returns.
+    painted: bool,
 }
 
 impl MonitorView {
@@ -255,6 +270,10 @@ impl MonitorView {
             // birth. The beat's own answer replaces it
             niri_tiled: kuma_platform::niri::own_windows().is_ok(),
             focus,
+            last_beat: None,
+            groups_snap: Arc::new(Vec::new()),
+            hists_snap: Arc::new(HashMap::new()),
+            painted: true,
         };
         view.sync_palette();
 
@@ -310,8 +329,21 @@ impl MonitorView {
     fn apply_beat(&mut self, out: BeatOut, cx: &mut Context<Self>) {
         self.sync_palette();
         self.niri_tiled = out.niri_tiled;
+        // an equal beat applies nothing: the table, the rings, and
+        // the repaint are all skipped, so an idle machine stops
+        // repainting once a second
+        if self.last_beat.as_ref() == Some(&out.snap) {
+            return;
+        }
+        self.last_beat = Some(out.snap.clone());
         self.apply_snapshot(out.snap, out.vitals, out.cores);
-        cx.notify();
+        // the repaint gate: an occluded surface drops the beat
+        // instead of queueing a paint nobody can see (sampling never
+        // stops, so the rings stay continuous for when it returns)
+        if self.painted {
+            self.painted = false;
+            cx.notify();
+        }
     }
 
     /// Land a beat. Values move in place; the order only moves when
@@ -367,11 +399,21 @@ impl MonitorView {
         if !cores.is_empty() {
             self.core_usage = cores;
         }
+        self.refresh_snapshots();
+    }
+
+    /// Re-stamp the render's Arc snapshots after any mutation of the
+    /// table or its rings: the render closure is 'static and used to
+    /// pay a full deep clone of both per frame instead.
+    fn refresh_snapshots(&mut self) {
+        self.groups_snap = Arc::new(self.groups.clone());
+        self.hists_snap = Arc::new(self.group_hists.clone());
     }
 
     fn set_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
         self.sort = key;
         sample::sort_groups(&mut self.groups, key);
+        self.refresh_snapshots();
         cx.notify();
     }
 
@@ -504,8 +546,11 @@ impl Render for MonitorView {
         let filtering = !self.filter.is_empty();
         let count = items.len();
         let total_procs: usize = self.groups.iter().map(|group| group.members.len()).sum();
-        let groups = self.groups.clone();
-        let group_hists = self.group_hists.clone();
+        // the 'static list closure moves these in: Arc snapshots, not
+        // a per-render deep clone of the whole table
+        let groups = self.groups_snap.clone();
+        let group_hists = self.hists_snap.clone();
+        self.painted = true;
         let this2 = this.clone();
 
         div()
@@ -1363,8 +1408,7 @@ fn group_row(
     let click_key = key.to_string();
     let this = this.clone();
     let copy_this = this.clone();
-    let line = group_line(group);
-    let flash = group.name.clone();
+    let copy_key = click_key.clone();
     let text = if dim { theme::text_dim() } else { theme::text() };
     let mut name = div().flex().gap_2().truncate()
         .child(
@@ -1410,8 +1454,14 @@ fn group_row(
         })
         .on_mouse_down(MouseButton::Right, move |_, _, app| {
             let _ = copy_this.update(app, |this, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(line.clone()));
-                this.copied_flash = Some((flash.clone(), Instant::now()));
+                // the copy line is built here, on the click, not per
+                // render per row: it was the only consumer of a
+                // string built for every visible row every beat
+                let Some(group) = this.groups.iter().find(|group| group.key == copy_key) else {
+                    return;
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(group_line(group)));
+                this.copied_flash = Some((group.name.clone(), Instant::now()));
                 cx.notify();
             });
         })
@@ -1520,8 +1570,7 @@ fn background_row(
 /// name when not; indented a step under its app.
 fn member_row(row: &ProcRow, this: &WeakEntity<MonitorView>) -> Stateful<Div> {
     let this = this.clone();
-    let line = member_line(row);
-    let flash = member_lead(row);
+    let copy_pid = row.pid;
     let windowed = row.window.is_some();
     let focused = row.window.as_ref().is_some_and(|w| w.focused);
     let lead = member_lead(row);
@@ -1542,8 +1591,15 @@ fn member_row(row: &ProcRow, this: &WeakEntity<MonitorView>) -> Stateful<Div> {
         })
         .on_mouse_down(MouseButton::Right, move |_, _, app| {
             let _ = this.update(app, |this, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(line.clone()));
-                this.copied_flash = Some((flash.clone(), Instant::now()));
+                // same shape as the group row: the copy line is the
+                // click's work, not every beat's
+                let Some(row) = this.groups.iter().find_map(|group| {
+                    group.members.iter().find(|member| member.pid == copy_pid)
+                }) else {
+                    return;
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(member_line(row)));
+                this.copied_flash = Some((member_lead(row), Instant::now()));
                 cx.notify();
             });
         })
