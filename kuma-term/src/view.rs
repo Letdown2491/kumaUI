@@ -37,6 +37,11 @@ const PADDING: f32 = 8.0;
 /// uses it; steady shapes never wake the paint.
 const BLINK_PERIOD: Duration = Duration::from_millis(600);
 
+/// How long the OSC 52 confirm card waits for an answer: past this it
+/// denies itself and hands the keyboard back. The prompt only needs to
+/// be patient while someone is looking at it.
+const CLIPBOARD_ASK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Bound on the shaped-row cache: entries are small and a full clear on
 /// overflow just costs one rebuild burst after very long scrolls.
 const ROW_SHAPE_CACHE_CAP: usize = 4096;
@@ -139,8 +144,12 @@ pub struct TerminalView {
     /// a pending OSC 52 clipboard write, shown as a confirm prompt
     /// instead of applied silently: any output that reaches the screen
     /// (a curl, a compromised ssh hop) could otherwise poison the
-    /// clipboard while nobody watches
-    clipboard_ask: Option<String>,
+    /// clipboard while nobody watches. The id stamps which prompt a
+    /// keystroke or a deny timer belongs to, so a stale timer can
+    /// never slam a newer card shut.
+    clipboard_ask: Option<(u64, String)>,
+    /// the monotonic stamp source for `clipboard_ask`
+    clipboard_ask_seq: u64,
     /// where the current left-press started, to tell a ctrl+click (open
     /// URL) from a drag (selection)
     down_cell: Option<(usize, usize, CellEdge)>,
@@ -300,6 +309,7 @@ impl TerminalView {
             selecting: false,
             hover: None,
             clipboard_ask: None,
+            clipboard_ask_seq: 0,
             down_cell: None,
             row_shapes: FxHashMap::default(),
             blink_visible: true,
@@ -499,9 +509,25 @@ impl TerminalView {
             }
             UiEvent::ClipboardStore(text) => {
                 // kitty's ask: the write waits for a keystroke at the
-                // prompt, it never lands while nobody watches
-                self.clipboard_ask = Some(text);
+                // prompt, and the prompt denies itself after ten
+                // seconds, so a card nobody is looking at can never
+                // hold the keyboard hostage. The stamp is what keeps a
+                // spent timer from denying a newer prompt.
+                self.clipboard_ask_seq += 1;
+                let ask_id = self.clipboard_ask_seq;
+                self.clipboard_ask = Some((ask_id, text));
                 cx.notify();
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(CLIPBOARD_ASK_TIMEOUT).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.clipboard_ask.as_ref().is_some_and(|(id, _)| *id == ask_id) {
+                            this.clipboard_ask = None;
+                            log::info!("osc 52 clipboard write: denied by timeout");
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
             }
             UiEvent::PtyWrite(bytes) => self.tabs[index].engine.input(bytes),
         }
@@ -758,7 +784,7 @@ impl TerminalView {
         if self.clipboard_ask.is_some() {
             match k.key.as_str() {
                 "y" => {
-                    if let Some(text) = self.clipboard_ask.take() {
+                    if let Some((_, text)) = self.clipboard_ask.take() {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
                     cx.notify();
@@ -1461,8 +1487,8 @@ impl Render for TerminalView {
                     .w(px(grid_w))
                     .h(px(grid_h)),
             )
-            .when_some(self.clipboard_ask.clone(), |root, text| {
-                root.child(clipboard_prompt(&text, &self.theme))
+            .when_some(self.clipboard_ask.clone(), |root, ask| {
+                root.child(clipboard_prompt(&ask.1, &self.theme))
             })
             .when_some(bar, |root, bar| root.child(bar)),
             )

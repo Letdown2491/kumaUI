@@ -16,10 +16,11 @@ move rides unchanged.
 - kuma-term: OSC 52 clipboard writes now ask like kitty's, a small
   card at the prompt with a content preview, y to allow, n or escape
   to deny, where before any output reaching the screen could silently
-  rewrite the clipboard. URLs open on ctrl+click, matching kitty,
-  alacritty, and gnome-terminal; the underline and pointing-hand
-  cursor only show while ctrl is held, and a stray plain click no
-  longer fires the browser.
+  rewrite the clipboard. The card denies itself after ten seconds, so
+  an unanswered prompt never holds the keyboard hostage. URLs open on
+  ctrl+click, matching kitty, alacritty, and gnome-terminal; the
+  underline and pointing-hand cursor only show while ctrl is held,
+  and a stray plain click no longer fires the browser.
 
 ### Fixed
 
