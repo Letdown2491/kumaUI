@@ -158,6 +158,11 @@ pub struct TerminalView {
     /// gpui's hash-keyed layout cache) the shaper itself. Content-keyed,
     /// so tabs share it soundly
     row_shapes: FxHashMap<u64, Arc<RowRender>>,
+    /// Insertion order for `row_shapes`: eviction drops the oldest
+    /// half instead of clearing wholesale, so a full-screen burst
+    /// (cat a large file) cannot evict the prompt's own rows and
+    /// force a full reshape every keystroke.
+    shape_order: Vec<u64>,
     /// the blink phase for a blinking DECSCUSR style; typing forces it
     /// lit for one period, the blink task toggles it afterwards
     blink_visible: bool,
@@ -312,6 +317,7 @@ impl TerminalView {
             clipboard_ask_seq: 0,
             down_cell: None,
             row_shapes: FxHashMap::default(),
+            shape_order: Vec::new(),
             blink_visible: true,
             last_input: Instant::now(),
             cursor_blinking: false,
@@ -337,12 +343,45 @@ impl TerminalView {
         let engine = Engine::new(window_size, theme.clone(), tx, command)?;
         let pump = cx.spawn(async move |this, cx| {
             let mut rx = rx;
-            while let Some(event) = rx.next().await {
-                if this
-                    .update_in(cx, |this, window, cx| this.handle_event(id, event, window, cx))
-                    .is_err()
-                {
-                    break;
+            'pump: while let Some(first) = rx.next().await {
+                // drain everything already queued behind it and
+                // coalesce: the pty's reader forwards one Wakeup per
+                // 8 KiB read, so a fast burst (`cat` a large file,
+                // `yes`) used to mean one UI dispatch and one repaint
+                // request per chunk. One dispatch per batch, one
+                // Wakeup in it; the snapshot lands after the drain, so
+                // nothing is lost, only deferred into it. 64 events is
+                // the batch ceiling: past it the rest waits for the
+                // next pass and the UI thread still sees the pipe.
+                let mut batch = Vec::with_capacity(4);
+                batch.push(first);
+                while batch.len() < 64 {
+                    match rx.try_recv() {
+                        Ok(event) => batch.push(event),
+                        _ => break,
+                    }
+                }
+                let mut events: Vec<UiEvent> = Vec::with_capacity(batch.len());
+                let mut saw_wakeup = false;
+                for event in batch {
+                    match event {
+                        UiEvent::Wakeup if saw_wakeup => {}
+                        UiEvent::Wakeup => {
+                            saw_wakeup = true;
+                            events.push(UiEvent::Wakeup);
+                        }
+                        other => events.push(other),
+                    }
+                }
+                for event in events {
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            this.handle_event(id, event, window, cx)
+                        })
+                        .is_err()
+                    {
+                        break 'pump;
+                    }
                 }
             }
         });
@@ -560,9 +599,16 @@ impl TerminalView {
         };
         let built = Arc::new(built);
         if self.row_shapes.len() >= ROW_SHAPE_CACHE_CAP {
-            self.row_shapes.clear();
+            // drop the oldest half by insertion order: a wholesale
+            // clear let one scrolling burst wipe the idle screen's
+            // rows and reshape them all on the next paint
+            let evict = self.row_shapes.len() / 2;
+            for key in self.shape_order.drain(..evict) {
+                self.row_shapes.remove(&key);
+            }
         }
         self.row_shapes.insert(key, built.clone());
+        self.shape_order.push(key);
         built
     }
 

@@ -864,28 +864,17 @@ impl Engine {
             rows.push(Row { cells: Vec::with_capacity(columns) });
         }
 
-        // the cursor: decided up front (before the cell walk moves
-        // pieces of the content), baked after it. The block restyles the
-        // cell under it (cursor color behind, the theme's cursor text on
-        // the glyph); the bar, underline, and hollow shapes paint as
-        // overlays in the view so the cell's own colors survive. The
-        // spot carries the shape and blink flag either way, so the view
-        // can paint the overlays and gate them on the blink phase.
+        // the cursor: decided before the cell walk, baked after it
+        // (the bake below lands on the filled cells; before the walk
+        // the rows are empty, there is nothing to restyle yet). The
+        // block restyles the cell under it (cursor color behind, the
+        // theme's cursor text on the glyph); the bar, underline, and
+        // hollow shapes paint as overlays in the view so the cell's
+        // own colors survive. The spot carries the shape and blink
+        // flag either way, so the view can paint the overlays and
+        // gate them on the blink phase.
         let cursor = if offset == 0 {
-            let spot = cursor_spot(&term, &content);
-            if let Some(spot) = &spot {
-                if cursor_visible && spot.shape == CursorShape::Block {
-                    if spot.row < rows.len() && spot.col < rows[spot.row].cells.len() {
-                        let cell = &mut rows[spot.row].cells[spot.col];
-                        // cursor color behind, the theme's cursor text
-                        // color for the glyph, regardless of what the
-                        // cell wore
-                        cell.bg = self.theme.cursor;
-                        cell.fg = self.theme.cursor_text;
-                    }
-                }
-            }
-            spot
+            cursor_spot(&term, &content)
         } else {
             None
         };
