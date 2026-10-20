@@ -27,10 +27,14 @@ use crate::notifications::Notification;
 /// needs, and a count a few seconds stale is no count at all.
 const WIDGET_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The backoff cadence for the widget poll after two consecutive empty
+/// reads: the vault is not answering, so the ask queue cannot move.
+const WIDGET_IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// What `prompts --json` shows: one ask, enough to decide on. Field
 /// names mirror the CLI's `PromptView` (kuma's policy.rs); the shapes
 /// are a contract, pinned by the daemon's own tests.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Prompt {
     pub id: String,
     pub app: String,
@@ -297,35 +301,54 @@ fn fetch_cli(field: Field) -> Option<serde_json::Value> {
 
 /// The widget's poll: the ask queue every [`WIDGET_POLL`], a toast when
 /// the count rises. Runs for the shell's whole life; the bar's glyph
-/// is only as honest as this loop.
+/// is only as honest as this loop. Two consecutive empty reads (vault
+/// not running, CLI not installed) stretch the cadence to
+/// [`WIDGET_IDLE_POLL`], so an unused vault costs a poll a minute
+/// instead of seventeen thousand a day.
 pub fn run(state: &Entity<NostrState>, cx: &mut App) {
     let state = state.downgrade();
     cx.spawn(async move |cx| {
+        let mut misses = 0u32;
         loop {
             let doc = cx
                 .background_spawn(async { fetch_cli(Field::Prompts) })
                 .await;
             let alive = state.update(cx, |state, cx| {
-                if let Some(doc) = doc
-                    && let Ok(items) = serde_json::from_value::<Vec<Prompt>>(doc["prompts"].clone())
+                match doc.as_ref()
+                    .and_then(|doc| serde_json::from_value::<Vec<Prompt>>(doc["prompts"].clone()).ok())
                 {
-                    let count = items.len();
-                    if count > state.last_pending {
-                        let body = format!("{} waiting on you", ask_word(count));
-                        let notifications = state.notifications.clone();
-                        notifications.update(cx, |state, cx| {
-                            state.push(rise_notification(&body), cx);
-                        });
+                    Some(items) => {
+                        misses = 0;
+                        let count = items.len();
+                        if count > state.last_pending {
+                            let body = format!("{} waiting on you", ask_word(count));
+                            let notifications = state.notifications.clone();
+                            notifications.update(cx, |state, cx| {
+                                state.push(rise_notification(&body), cx);
+                            });
+                        }
+                        state.last_pending = count;
+                        // the widget reads this list: a poll that
+                        // found no change must not repaint the bar
+                        if state.prompts != items {
+                            state.prompts = items;
+                            cx.notify();
+                        }
                     }
-                    state.last_pending = count;
-                    state.prompts = items;
-                    cx.notify();
+                    None => {
+                        misses += 1;
+                    }
                 }
             });
             if alive.is_err() {
                 break;
             }
-            cx.background_executor().timer(WIDGET_POLL).await;
+            let wait = if misses >= 2 {
+                WIDGET_IDLE_POLL
+            } else {
+                WIDGET_POLL
+            };
+            cx.background_executor().timer(wait).await;
         }
     })
     .detach();

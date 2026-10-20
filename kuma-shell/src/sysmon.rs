@@ -8,7 +8,7 @@ use gpui::{App, AppContext, Context, Entity};
 
 use crate::settings::Settings;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Battery {
     pub percent: u8,
     pub charging: bool,
@@ -202,9 +202,9 @@ fn timed_output(
 }
 
 fn read_recording() -> Option<RecordingState> {
-    let out = Command::new("pgrep")
-        .args(["-x", "wf-recorder"])
-        .output()
+    // pgrep walks /proc: bounded like every other poll read, cheap as
+    // it normally is
+    let out = timed_output("pgrep", &["-x", "wf-recorder"], 5)
         .ok()?;
     if !out.status.success() {
         return None;
@@ -277,6 +277,10 @@ pub struct SysMon {
     pub power_profile: Option<PowerProfile>,
     pub media: Option<MediaState>,
     pub recording: Option<RecordingState>,
+    /// The last full pass that reached the state: the poll notifies
+    /// only when a pass differs from this, so an idle desktop never
+    /// repaints the bar on a two-second metronome.
+    last_full: Option<Snapshot>,
     /// When the last audio/brightness request was stamped: the fast
     /// poll skips those fields while one is still landing, so a
     /// mid-flight read can't revert the optimistic value.
@@ -1074,7 +1078,14 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
             previous = previous_next;
             let Ok(quick_recheck) = state.update(cx, |sysmon, cx| {
                 let moved = if full {
-                    sysmon.battery = snapshot.battery;
+                    // repaint only when something moved: the fields
+                    // are the render's inputs, and an equal snapshot
+                    // renders the identical bar
+                    if sysmon.last_full.as_ref() == Some(&snapshot) {
+                        false
+                    } else {
+                        sysmon.last_full = Some(snapshot.clone());
+                        sysmon.battery = snapshot.battery;
                     sysmon.cpu = snapshot.cpu;
                     sysmon.cpu_cores = snapshot.cpu_cores.clone();
                     sysmon.loadavg = snapshot.loadavg;
@@ -1124,6 +1135,7 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
                     // bypass it
                     sysmon.absorb_av(&snapshot);
                     true
+                    }
                 } else {
                     sysmon.absorb_av(&snapshot)
                 };
@@ -1145,7 +1157,7 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
     .detach();
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Snapshot {
     battery: Option<Battery>,
     volume: Option<Volume>,
@@ -1463,12 +1475,13 @@ fn read_bluetooth(scan_devices: bool) -> Option<BluetoothState> {
 
 /// One device's `bluetoothctl info` block: the connected/paired/
 /// trusted trio and the battery line when the device reports one.
-/// Bounded by `timeout` like the acts: this runs once per known device
-/// inside the poll the panel awaits, so one wedged call would stall
-/// every sysmon update while the panel is open.
+/// Bounded by `timeout` like the acts, and short: this runs once per
+/// known device, sequentially, inside the poll the panel awaits, so a
+/// five-second ceiling keeps ten paired devices from holding the poll
+/// for a minute.
 fn read_device_info(mac: &str, alias: &str) -> Option<BluetoothDevice> {
     let output = Command::new("timeout")
-        .args(["15", "bluetoothctl", "info", mac])
+        .args(["5", "bluetoothctl", "info", mac])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -1857,7 +1870,10 @@ fn parse_streams(text: &str) -> Vec<(u32, String, String)> {
 /// open: `wpctl status` dumps the whole graph, too heavy for the idle
 /// shell.
 fn read_streams() -> Vec<Stream> {
-    let Ok(output) = Command::new("wpctl").arg("status").output() else {
+    // the status dump is the heaviest call in the pass and runs once
+    // per stream for the volume: both bounded, or one wedged
+    // PipeWire stalls the whole panel pass
+    let Ok(output) = timed_output("wpctl", &["status"], 5) else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -1866,10 +1882,7 @@ fn read_streams() -> Vec<Stream> {
     parse_streams(&String::from_utf8_lossy(&output.stdout))
         .into_iter()
         .filter_map(|(id, name, binary)| {
-            let volume = Command::new("wpctl")
-                .args(["get-volume", &id.to_string()])
-                .output()
-                .ok()?;
+            let volume = timed_output("wpctl", &["get-volume", &id.to_string()], 2).ok()?;
             if !volume.status.success() {
                 return None;
             }
@@ -1891,10 +1904,9 @@ fn read_streams() -> Vec<Stream> {
 }
 
 fn read_volume() -> Option<Volume> {
-    let output = Command::new("wpctl")
-        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-        .output()
-        .ok()?;
+    // the fast pass reads this every 500 ms: the bound is what keeps a
+    // wedged PipeWire from freezing the single serial poll task
+    let output = timed_output("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"], 2).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1905,10 +1917,7 @@ fn read_volume() -> Option<Volume> {
 /// shape for the default source, muting is the only field the shell
 /// keeps.
 fn read_mic() -> Option<Mic> {
-    let output = Command::new("wpctl")
-        .args(["get-volume", "@DEFAULT_AUDIO_SOURCE@"])
-        .output()
-        .ok()?;
+    let output = timed_output("wpctl", &["get-volume", "@DEFAULT_AUDIO_SOURCE@"], 2).ok()?;
     if !output.status.success() {
         return None;
     }

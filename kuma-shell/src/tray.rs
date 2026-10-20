@@ -115,7 +115,22 @@ impl TrayState {
     /// however many polls repaint it). Returns the icons whose tiles must
     /// be released: a replaced pin, or an item that left. Pure list
     /// surgery, testable without a context; the caller does the dropping.
-    fn absorb_items(&mut self, items: Vec<TrayItem>) -> Vec<Option<IconImage>> {
+    /// `None` means the poll found nothing changed: the caller skips the
+    /// repaint instead of feeding the two-second dbus metronome straight
+    /// into the render.
+    fn absorb_items(&mut self, items: Vec<TrayItem>) -> Option<Vec<Option<IconImage>>> {
+        // same services in the same order, same visible fields, same
+        // icon identity: named icons are registry Arcs (pointer-equal),
+        // rasters are their content hashes
+        let unchanged = self.items.len() == items.len()
+            && self
+                .items
+                .iter()
+                .zip(&items)
+                .all(|(a, b)| a.same_snapshot(b));
+        if unchanged {
+            return None;
+        }
         self.items = items;
         let mut droplets = Vec::new();
         let alive: std::collections::HashSet<&str> = self
@@ -148,7 +163,33 @@ impl TrayState {
                 }
             }
         }
-        droplets
+        Some(droplets)
+    }
+}
+
+impl TrayItem {
+    /// Whether the snapshot would render identically: everything the
+    /// tray shows, with the icon compared by identity rather than
+    /// pixels (rasters hash their bytes in `pixmap_hash`).
+    fn same_snapshot(&self, other: &TrayItem) -> bool {
+        let same_icon = match (&self.icon, &other.icon) {
+            // a raster's identity is its content hash: the poll
+            // re-converts the bytes every time, so the Arcs never match
+            (Some(IconImage::Raster(_)), Some(IconImage::Raster(_))) => {
+                self.pixmap_hash == other.pixmap_hash && self.pixmap_hash != 0
+            }
+            // svg and named icons ride the registry's stable Arcs
+            (Some(IconImage::Svg(a)), Some(IconImage::Svg(b))) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        self.service == other.service
+            && self.title == other.title
+            && self.status == other.status
+            && self.tooltip == other.tooltip
+            && self.has_menu == other.has_menu
+            && self.pixmap_hash == other.pixmap_hash
+            && same_icon
     }
 }
 
@@ -453,10 +494,12 @@ pub fn start(cx: &mut App) -> Entity<TrayState> {
     cx.spawn(async move |cx| {
         while let Ok(items) = update_rx.recv().await {
             let _ = event_state.update(cx, |state, cx| {
-                for icon in state.absorb_items(items) {
-                    imaging::release_icon(&icon, cx);
+                if let Some(droplets) = state.absorb_items(items) {
+                    for icon in droplets {
+                        imaging::release_icon(&icon, cx);
+                    }
+                    cx.notify();
                 }
-                cx.notify();
             });
         }
     })
@@ -516,31 +559,58 @@ mod tests {
         // poll 1: a pixmap item lands, its icon is pinned
         let first = render_image();
         let first_arc = pinned_raster(&first);
-        let droplets = state.absorb_items(vec![pixmap_item(":1000", 7, first)]);
+        let droplets = state
+            .absorb_items(vec![pixmap_item(":1000", 7, first)])
+            .expect("a first poll is always a change");
         assert!(droplets.is_empty(), "a first pin has nothing to release");
         assert_eq!(state.pixmap_rasters[":1000"].0, 7);
 
         // poll 2: the same pixmap hash keeps the pinned Arc serving the
-        // item, even though the poll converted a fresh raster
+        // item, even though the poll converted a fresh raster. The
+        // title changes so the snapshot is a change (an unchanged poll
+        // short-circuits before the pin logic); the pin must still hold
         let fresh = render_image();
         let fresh_arc = pinned_raster(&fresh);
         assert!(!Arc::ptr_eq(&first_arc, &fresh_arc));
-        let droplets = state.absorb_items(vec![pixmap_item(":1000", 7, fresh)]);
+        let mut polled = pixmap_item(":1000", 7, fresh);
+        polled.title = "renamed".into();
+        let droplets = state
+            .absorb_items(vec![polled])
+            .expect("a title change is a change");
         assert!(droplets.is_empty(), "an unchanged pixmap releases nothing");
         let served = pinned_raster(&state.items[0].icon);
         assert!(
             Arc::ptr_eq(&served, &first_arc),
             "the item serves the pinned Arc, not the poll's fresh one"
         );
+        assert_eq!(state.items[0].title, "renamed");
 
         // poll 3: the item died; its pin leaves with a droplet to release
-        let droplets = state.absorb_items(Vec::new());
+        let droplets = state
+            .absorb_items(Vec::new())
+            .expect("an item leaving is a change");
         assert_eq!(droplets.len(), 1);
         assert!(
             Arc::ptr_eq(&pinned_raster(&droplets[0]), &first_arc),
             "the droplet is the pinned Arc whose tile must drop"
         );
         assert!(state.pixmap_rasters.is_empty());
+    }
+
+    #[test]
+    fn an_unchanged_poll_reports_no_change() {
+        let mut state = TrayState {
+            items: Vec::new(),
+            pixmap_rasters: HashMap::new(),
+            input: smol::channel::unbounded().0,
+        };
+        let first = render_image();
+        let item = pixmap_item(":1000", 7, first);
+        state.absorb_items(vec![item.clone()]).unwrap();
+        // the poll rebuilt the item from dbus: identical fields, fresh
+        // raster — the state must answer None, not repaint the tray
+        let again = pixmap_item(":1000", 7, render_image());
+        assert!(state.absorb_items(vec![again]).is_none());
     }
 
     #[test]
@@ -554,7 +624,9 @@ mod tests {
         item.icon = Some(IconImage::Svg(std::sync::Arc::from(
             &b"<svg/>"[..],
         )));
-        let droplets = state.absorb_items(vec![item]);
+        let droplets = state
+            .absorb_items(vec![item])
+            .expect("a first poll is always a change");
         assert!(droplets.is_empty());
         assert!(state.pixmap_rasters.is_empty(), "hash 0 never pins");
         assert!(matches!(state.items[0].icon, Some(IconImage::Svg(_))));

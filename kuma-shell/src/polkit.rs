@@ -595,23 +595,59 @@ fn prompt_window_options() -> WindowOptions {
 /// registration fails with "already exists" and we keep retrying: that is
 /// the transition state the OS image resolves by dropping the package.
 async fn run_agent(events: Sender<AgentEvent>) -> anyhow::Result<()> {
+    // one system-bus connection for the shell's life: the old shape
+    // minted a fresh one per retry (plus a second inside the session
+    // lookup), churning zbus executor tasks every RETRY seconds on
+    // every failure path
+    let mut connection = loop {
+        match system_connection().await {
+            Ok(connection) => break connection,
+            Err(err) => {
+                log::error!("polkit agent: {err:#}");
+                smol::Timer::after(RETRY).await;
+            }
+        }
+    };
     loop {
-        if let Err(err) = bring_up(&events).await {
+        if let Err(err) = bring_up(&connection, &events).await {
             log::error!("polkit agent: {err:#}");
+        }
+        if connection.is_closed() {
+            connection = loop {
+                match system_connection().await {
+                    Ok(connection) => break connection,
+                    Err(err) => {
+                        log::error!("polkit agent: {err:#}");
+                        smol::Timer::after(RETRY).await;
+                    }
+                }
+            };
         }
         smol::Timer::after(RETRY).await;
     }
 }
 
-async fn bring_up(events: &Sender<AgentEvent>) -> anyhow::Result<()> {
-    let Some(session_id) = resolve_session_id().await else {
+async fn system_connection() -> anyhow::Result<zbus::Connection> {
+    Ok(zbus::connection::Builder::system()?.build().await?)
+}
+
+async fn bring_up(
+    connection: &zbus::Connection,
+    events: &Sender<AgentEvent>,
+) -> anyhow::Result<()> {
+    let Some(session_id) = resolve_session_id(connection).await else {
         anyhow::bail!("no logind session to register for");
     };
-    let connection = zbus::connection::Builder::system()?
-        .serve_at(AGENT_PATH, AgentService {
+    // a polkitd restart lands here with the agent interface still
+    // served on the shared connection: re-serve from clean
+    let object_server = connection.object_server();
+    let _ = object_server
+        .remove::<AgentService, _>(AGENT_PATH)
+        .await;
+    object_server
+        .at(AGENT_PATH, AgentService {
             events: events.clone(),
-        })?
-        .build()
+        })
         .await?;
     let authority =
         zbus::Proxy::new(&connection, AUTHORITY_DEST, AUTHORITY_PATH, AUTHORITY_IFACE).await?;
@@ -735,14 +771,9 @@ impl AgentService {
 /// inherited env var is the last resort (for user services it
 /// carries greetd's vestigial session id; it only agrees with the
 /// display session by accident).
-async fn resolve_session_id() -> Option<String> {
-    let connection = zbus::connection::Builder::system()
-        .ok()?
-        .build()
-        .await
-        .ok()?;
+async fn resolve_session_id(connection: &zbus::Connection) -> Option<String> {
     let manager = zbus::Proxy::new(
-        &connection,
+        connection,
         "org.freedesktop.login1",
         "/org/freedesktop/login1",
         "org.freedesktop.login1.Manager",
