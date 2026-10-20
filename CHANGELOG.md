@@ -13,6 +13,26 @@ move rides unchanged.
 
 ### Fixed
 
+- kuma-term: a tab whose shell is gone no longer crashes or freezes
+  the terminal. An orphaned background process holding the terminal
+  kept its reader alive after the tab closed, and its events indexed a
+  removed tab (a panic) or landed on the tab that slid into the old
+  slot; events are routed by session identity now, and closing a tab
+  whose child ignores SIGHUP waits for that child on a reaper thread
+  instead of the UI thread, so every tab no longer freezes with it.
+
+- kuma-files: extracting a short-named archive (say, a file called
+  `1.tgz`) crashed with an arithmetic underflow in the folder-name
+  computation, and names like `abc.tgz` extracted into the listing
+  directory itself; the extraction now strips the suffix that actually
+  matched.
+
+- kuma-shell: the keybind socket could be wedged or drained by one
+  local peer. The listener read request lines with no timeout and no
+  length ceiling, so a process that connected and sent nothing (or
+  bytes without a newline) hung every keybind verb until the shell
+  restarted; reads are bounded in time and in size now.
+
 - kuma-shell: the session mirror survives a dead compositor stream. A
   dropped socket, a restarting compositor, or a reshaped event payload
   used to end the mirror for the rest of the session (frozen

@@ -9912,37 +9912,55 @@ fn write_mimeapps(path: &Path, mime: &str, desktop_id: &str) -> std::io::Result<
     fs::write(path, out)
 }
 
+/// (file-name suffix, archive kind), longest first: a name classifies
+/// by the first suffix that matches, so ".tar.gz" must sit before
+/// ".gz" in the table.
+const ARCHIVE_SUFFIXES: [(&str, &str); 16] = [
+    (".tar.gz", "tar.gz"),
+    (".tgz", "tar.gz"),
+    (".tar.bz2", "tar.bz2"),
+    (".tbz2", "tar.bz2"),
+    (".tar.xz", "tar.xz"),
+    (".txz", "tar.xz"),
+    (".tar.zst", "tar.zst"),
+    (".tzst", "tar.zst"),
+    (".tar", "tar"),
+    (".zip", "zip"),
+    (".7z", "7z"),
+    (".rar", "rar"),
+    (".gz", "gz"),
+    (".bz2", "bz2"),
+    (".xz", "xz"),
+    (".zst", "zst"),
+];
+
 /// What kind of archive is this file name, if any?
 fn archive_kind(name: &str) -> Option<&'static str> {
     let lower = name.to_lowercase();
-    let ends = |suffix: &str| lower.ends_with(suffix);
-    if ends(".tar.gz") || ends(".tgz") {
-        Some("tar.gz")
-    } else if ends(".tar.bz2") || ends(".tbz2") {
-        Some("tar.bz2")
-    } else if ends(".tar.xz") || ends(".txz") {
-        Some("tar.xz")
-    } else if ends(".tar.zst") || ends(".tzst") {
-        Some("tar.zst")
-    } else if ends(".tar") {
-        Some("tar")
-    } else if ends(".zip") {
-        Some("zip")
-    } else if ends(".7z") {
-        Some("7z")
-    } else if ends(".rar") {
-        Some("rar")
-    } else if ends(".gz") {
-        Some("gz")
-    } else if ends(".bz2") {
-        Some("bz2")
-    } else if ends(".xz") {
-        Some("xz")
-    } else if ends(".zst") {
-        Some("zst")
-    } else {
-        None
-    }
+    archive_suffix(&lower).map(|(_, kind)| kind)
+}
+
+/// The (suffix, kind) pair whose suffix the name ends with. Used by
+/// both the kind lookup and the stem strip, so the strip always takes
+/// the suffix that actually matched.
+fn archive_suffix(lower: &str) -> Option<(&'static str, &'static str)> {
+    ARCHIVE_SUFFIXES
+        .iter()
+        .find(|(suffix, _)| lower.ends_with(suffix))
+        .copied()
+}
+
+/// The file name with its archive suffix stripped, for the folder an
+/// extraction unpacks into.
+fn archive_stem(name: &str) -> Option<String> {
+    let lower = name.to_lowercase();
+    let (suffix, _) = archive_suffix(&lower)?;
+    // The suffix is ASCII, so it is the same byte length in the
+    // original name and the slice lands on a char boundary. Stripping
+    // the kind's long spelling instead is how "1.tgz" used to compute
+    // 5 - 7 and panic.
+    let stem_end = name.len().checked_sub(suffix.len())?;
+    Some(name[..stem_end].to_string())
 }
 
 /// How far below the tab's directory the search walks.
@@ -10052,28 +10070,6 @@ fn best_first(mut scored: Vec<(u32, Entry)>) -> Vec<Entry> {
 
 fn is_archive(name: &str) -> bool {
     archive_kind(name).is_some()
-}
-
-/// The file name with its archive suffix stripped, for the folder an
-/// extraction unpacks into.
-fn archive_stem(name: &str) -> Option<String> {
-    let kind = archive_kind(name)?;
-    let suffix = match kind {
-        "tar.gz" => ".tar.gz",
-        "tar.bz2" => ".tar.bz2",
-        "tar.xz" => ".tar.xz",
-        "tar.zst" => ".tar.zst",
-        "tar" => ".tar",
-        "zip" => ".zip",
-        "7z" => ".7z",
-        "rar" => ".rar",
-        "gz" => ".gz",
-        "bz2" => ".bz2",
-        "xz" => ".xz",
-        "zst" => ".zst",
-        _ => return None,
-    };
-    Some(name[..name.len() - suffix.len()].to_string())
 }
 
 /// The mime type for a common extension; the fallback is the
@@ -11515,6 +11511,14 @@ mod tests {
         assert_eq!(archive_stem("backup.tar.gz").as_deref(), Some("backup"));
         assert_eq!(archive_stem("site.tar.xz").as_deref(), Some("site"));
         assert_eq!(archive_stem("notes.zip").as_deref(), Some("notes"));
+        // short names: the short suffixes map to long kind spellings,
+        // and stripping the kind's spelling instead of the matched
+        // suffix used to underflow ("1.tgz" is 5 bytes minus 7) or
+        // mangle the stem ("abc.tgz" stripped to "")
+        assert_eq!(archive_stem("1.tgz").as_deref(), Some("1"));
+        assert_eq!(archive_stem("abc.tgz").as_deref(), Some("abc"));
+        assert_eq!(archive_stem("SHOT.TGZ").as_deref(), Some("SHOT"));
+        assert_eq!(archive_stem("b.tbz2").as_deref(), Some("b"));
     }
 
     #[test]

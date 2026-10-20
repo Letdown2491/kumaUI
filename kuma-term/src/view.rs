@@ -96,6 +96,10 @@ struct SearchState {
 /// state. Everything the grid owns lives here; window-level state
 /// (font, cell metrics, pointer gestures, blink) stays on the view.
 struct Tab {
+    /// stable session identity: pumps tag events with it, so a close
+    /// reshuffling tab indexes cannot misroute an event onto the tab
+    /// that slid into the old slot
+    id: u64,
     engine: Engine,
     /// the shell's OSC 0/2 title, if it set one; the tab bar's label
     title: Option<String>,
@@ -117,6 +121,9 @@ pub struct TerminalView {
     tabs: Vec<Tab>,
     /// the focused tab
     active: usize,
+    /// never reused, never reordered: the session ids the tab bar
+    /// hands out (see `Tab::id`)
+    next_tab_id: u64,
     theme: Theme,
     focus: FocusHandle,
     font: gpui::Font,
@@ -188,7 +195,7 @@ impl TerminalView {
             cell_width: cell_w as u16,
             cell_height: cell_h as u16,
         };
-        let tab = Self::start_session(&theme, 0, window_size, cx, command)
+        let tab = Self::start_session(&theme, 1, window_size, cx, command)
             .unwrap_or_else(|err| {
                 // without a shell there is no terminal
                 panic!("kuma-term: cannot spawn the shell: {err}")
@@ -277,6 +284,7 @@ impl TerminalView {
         Self {
             tabs: vec![tab],
             active: 0,
+            next_tab_id: 2,
             theme,
             focus,
             font,
@@ -300,11 +308,11 @@ impl TerminalView {
     }
 
     /// Spawn a session (engine + its PTY pump task) sized for the
-    /// window; the caller places it in `tabs`. `index` is where it will
-    /// land: the pump tags every event with it.
+    /// window; the caller places it in `tabs`. `id` is the session's
+    /// stable identity: the pump tags every event with it.
     fn start_session(
         theme: &Theme,
-        index: usize,
+        id: u64,
         window_size: alacritty_terminal::event::WindowSize,
         cx: &mut Context<Self>,
         command: Option<Vec<String>>,
@@ -315,7 +323,7 @@ impl TerminalView {
             let mut rx = rx;
             while let Some(event) = rx.next().await {
                 if this
-                    .update_in(cx, |this, window, cx| this.handle_event(index, event, window, cx))
+                    .update_in(cx, |this, window, cx| this.handle_event(id, event, window, cx))
                     .is_err()
                 {
                     break;
@@ -323,6 +331,7 @@ impl TerminalView {
             }
         });
         Ok(Tab {
+            id,
             engine,
             title: None,
             search: None,
@@ -352,13 +361,15 @@ impl TerminalView {
             cell_height: self.cell_h as u16,
         };
         // a new tab is a fresh shell: `-e` seeds the initial tab only
-        let tab = match Self::start_session(&self.theme, self.tabs.len(), window_size, cx, None) {
+        let id = self.next_tab_id;
+        let tab = match Self::start_session(&self.theme, id, window_size, cx, None) {
             Ok(tab) => tab,
             Err(err) => {
                 log::warn!("kuma-term: cannot spawn a tab: {err}");
                 return;
             }
         };
+        self.next_tab_id += 1;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         cx.notify();
@@ -426,53 +437,64 @@ impl TerminalView {
 
     fn handle_event(
         &mut self,
-        tab: usize,
+        id: u64,
         event: UiEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A session's pump outlives its tab whenever an orphaned
+        // process holds the pty open: events keep arriving after
+        // close_tab, and surviving tabs shift indexes on every close.
+        // Route by the session id, not the index, so a stale event is
+        // dropped (tab gone) or lands on the tab that actually owns
+        // the session; indexing by a stale index both panicked
+        // (self.tabs[tab] on a removed tab) and answered one tab's
+        // query replies into another tab's pty.
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
         match event {
             UiEvent::Wakeup => {
                 // a background tab's output waits for its turn: the
                 // snapshot picks the grid up whenever it is focused
-                if tab != self.active {
+                if index != self.active {
                     return;
                 }
                 // while the search bar is open, output shifts the buffer:
                 // rescan (debounced) so the count and highlights follow
                 let needs_rescan = self
-                    .tabs[tab]
+                    .tabs[index]
                     .search
                     .as_ref()
                     .is_some_and(|search| !search.query.is_empty() && !search.stale);
                 if needs_rescan {
-                    if let Some(search) = self.tabs[tab].search.as_mut() {
+                    if let Some(search) = self.tabs[index].search.as_mut() {
                         search.stale = true;
                     }
                     self.schedule_search(false, cx);
                 }
                 cx.notify();
             }
-            UiEvent::Title(title) => self.tabs[tab].title = Some(title),
-            UiEvent::ResetTitle => self.tabs[tab].title = None,
+            UiEvent::Title(title) => self.tabs[index].title = Some(title),
+            UiEvent::ResetTitle => self.tabs[index].title = None,
             UiEvent::Bell => log::info!("bell"),
             UiEvent::Exit => {
                 // one session's shell exiting closes that tab; the last
                 // one closes the window
-                self.close_tab(tab, window, cx);
+                self.close_tab(index, window, cx);
             }
-            UiEvent::ColorRequest(index, format) => {
-                let color = self.tabs[tab].engine.resolve_index(index);
-                self.tabs[tab].engine.input(format(color));
+            UiEvent::ColorRequest(index_, format) => {
+                let color = self.tabs[index].engine.resolve_index(index_);
+                self.tabs[index].engine.input(format(color));
             }
             UiEvent::TextAreaSizeRequest(format) => {
-                let size = self.tabs[tab].engine.window_size();
-                self.tabs[tab].engine.input(format(size));
+                let size = self.tabs[index].engine.window_size();
+                self.tabs[index].engine.input(format(size));
             }
             UiEvent::ClipboardStore(text) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
-            UiEvent::PtyWrite(bytes) => self.tabs[tab].engine.input(bytes),
+            UiEvent::PtyWrite(bytes) => self.tabs[index].engine.input(bytes),
         }
     }
 

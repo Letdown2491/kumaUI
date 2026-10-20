@@ -167,6 +167,27 @@ pub fn send_quiet(request: &Request) -> anyhow::Result<()> {
     transmit(request).map(|_| ())
 }
 
+/// How long the listener waits for one peer's request line. The accept
+/// loop is single-threaded, so a peer that connects and sends nothing
+/// must cost a bounded wait, not the socket forever.
+const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How many bytes one request line may grow to. A peer that floods
+/// bytes without a newline hits this ceiling instead of growing the
+/// String without bound.
+const MAX_REQUEST_LINE: u64 = 64 * 1024;
+
+/// One capped, timed read of a request line.
+fn read_request_line(
+    stream: &std::os::unix::net::UnixStream,
+    line: &mut String,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader, Read};
+    let _ = stream.set_read_timeout(Some(timeout));
+    let mut reader = BufReader::new(stream).take(MAX_REQUEST_LINE);
+    reader.read_line(line).map(|_| ())
+}
+
 /// The server half: one thread, accept loop, parse, reply, forward.
 /// The channel hands the request to the GUI main loop, which owns the
 /// entities; the accept thread never touches state.
@@ -175,7 +196,7 @@ pub fn spawn_listener(txs: smol::channel::Sender<Request>) {
         return;
     };
     std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::Write;
 
         let path = std::path::PathBuf::from(runtime_dir).join("kuma-shell.sock");
         let _ = std::fs::remove_file(&path);
@@ -186,9 +207,8 @@ pub fn spawn_listener(txs: smol::channel::Sender<Request>) {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let mut writer = &stream;
-            let mut reader = BufReader::new(&stream);
             let mut line = String::new();
-            if reader.read_line(&mut line).is_err() {
+            if read_request_line(&stream, &mut line, REQUEST_READ_TIMEOUT).is_err() {
                 continue;
             }
             let request = parse(&line);
@@ -203,6 +223,38 @@ pub fn spawn_listener(txs: smol::channel::Sender<Request>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_flooded_line_stops_at_the_cap() {
+        let (mine, peers) = std::os::unix::net::UnixStream::pair().unwrap();
+        use std::io::Write;
+        // 70k of bytes with no newline in sight: past the 64k cap
+        (&peers).write_all(&[b'x'; 70_000]).unwrap();
+        let mut line = String::new();
+        read_request_line(&mine, &mut line, std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(line.len() as u64, MAX_REQUEST_LINE);
+    }
+
+    #[test]
+    fn a_silent_peer_hits_the_timeout_not_a_wedge() {
+        let (mine, _peers) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut line = String::new();
+        let started = std::time::Instant::now();
+        assert!(
+            read_request_line(&mine, &mut line, std::time::Duration::from_millis(50)).is_err()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_healthy_line_reads_whole() {
+        let (mine, peers) = std::os::unix::net::UnixStream::pair().unwrap();
+        use std::io::Write;
+        (&peers).write_all(b"{\"Launcher\":\"Toggle\"}\n").unwrap();
+        let mut line = String::new();
+        read_request_line(&mine, &mut line, std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(parse(&line), Some(Request::Launcher));
+    }
 
     #[test]
     fn the_wire_round_trips_through_the_first_verbs_exact_bytes() {

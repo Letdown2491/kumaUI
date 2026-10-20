@@ -545,8 +545,12 @@ pub(crate) fn encode_mouse(
 pub struct Engine {
     term: Arc<FairMutex<Term<UiProxy>>>,
     /// alacritty's Pty handle, kept for its Drop: it sends SIGHUP to the
-    /// child and reaps it when the view (and with it the Engine) goes away
-    _pty: tty::Pty,
+    /// child and reaps it when the view (and with it the Engine) goes
+    /// away. Held as an Option so Drop can hand it to a reaper thread:
+    /// the wait inside blocks until the child exits, and a child that
+    /// traps SIGHUP would freeze the dropping thread (the UI thread,
+    /// on tab close) for as long as the child lives.
+    pty: Option<tty::Pty>,
     /// the PTY master: input writes here, the pump thread reads a clone
     master: std::fs::File,
     window_size: WindowSize,
@@ -625,7 +629,7 @@ impl Engine {
             .spawn(move || pump_thread(pump_master, pump_term, pump_proxy))
             .expect("spawn the PTY pump");
 
-        Ok(Self { term, _pty: pty, master, window_size, theme, selection_mode: None })
+        Ok(Self { term, pty: Some(pty), master, window_size, theme, selection_mode: None })
     }
 
     /// Swap the chrome colors for a republished shell palette; the next
@@ -875,6 +879,23 @@ impl Engine {
             cursor,
             display_offset: offset,
             selection,
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // The pty's drop sends SIGHUP and then blocks in wait() until
+        // the child is gone. A child that traps or ignores SIGHUP
+        // would block whichever thread drops the Engine, which is the
+        // UI thread on a tab close: every tab frozen, no repaint, no
+        // input, until the child exits. A throwaway reaper thread
+        // takes the blocking wait instead.
+        if let Some(pty) = self.pty.take() {
+            std::thread::Builder::new()
+                .name("kuma-term-reaper".into())
+                .spawn(move || drop(pty))
+                .expect("spawn the pty reaper");
         }
     }
 }
