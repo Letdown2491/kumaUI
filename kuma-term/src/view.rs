@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight,
+    App, Bounds, ClipboardItem, Context, Div, FocusHandle, Focusable, FontStyle, FontWeight,
     KeyDownEvent, Keystroke, MouseButton, ParentElement, Pixels, Render, ScrollDelta,
     ScrollWheelEvent, SharedString, Task, TextRun, UnderlineStyle, Window, WindowTextSystem,
     canvas, div, fill, point, prelude::*, px, size, underline_y_offset,
@@ -136,8 +136,13 @@ pub struct TerminalView {
     /// the cell the pointer is over, viewport coordinates: drives the URL
     /// hover underline and pointing-hand cursor
     hover: Option<(usize, usize)>,
-    /// where the current left-press started, to tell a click (open URL)
-    /// from a drag (selection)
+    /// a pending OSC 52 clipboard write, shown as a confirm prompt
+    /// instead of applied silently: any output that reaches the screen
+    /// (a curl, a compromised ssh hop) could otherwise poison the
+    /// clipboard while nobody watches
+    clipboard_ask: Option<String>,
+    /// where the current left-press started, to tell a ctrl+click (open
+    /// URL) from a drag (selection)
     down_cell: Option<(usize, usize, CellEdge)>,
     /// shaped rows keyed on the row's cell-content hash: a row the grid
     /// did not change skips the cell walk, the string build, and (through
@@ -294,6 +299,7 @@ impl TerminalView {
             lines: 24,
             selecting: false,
             hover: None,
+            clipboard_ask: None,
             down_cell: None,
             row_shapes: FxHashMap::default(),
             blink_visible: true,
@@ -492,7 +498,10 @@ impl TerminalView {
                 self.tabs[index].engine.input(format(size));
             }
             UiEvent::ClipboardStore(text) => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                // kitty's ask: the write waits for a keystroke at the
+                // prompt, it never lands while nobody watches
+                self.clipboard_ask = Some(text);
+                cx.notify();
             }
             UiEvent::PtyWrite(bytes) => self.tabs[index].engine.input(bytes),
         }
@@ -742,6 +751,28 @@ impl TerminalView {
         // exactly what the platform handed the view
         log::debug!("key: {:?} modifiers {:?}", k.key, k.modifiers);
 
+        // the OSC 52 prompt eats the keyboard until answered: y allows,
+        // n or escape denies, everything else is swallowed, not
+        // forwarded, so the shell never reacts to a keystroke the user
+        // made while looking at the security question
+        if self.clipboard_ask.is_some() {
+            match k.key.as_str() {
+                "y" => {
+                    if let Some(text) = self.clipboard_ask.take() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                    cx.notify();
+                },
+                "n" | "escape" => {
+                    self.clipboard_ask = None;
+                    cx.notify();
+                },
+                _ => {},
+            }
+            cx.stop_propagation();
+            return;
+        }
+
         // tab management, kitty's chords: the shell never sees these
         if k.modifiers.control && k.modifiers.shift {
             match k.key.as_str() {
@@ -894,7 +925,7 @@ impl TerminalView {
             return;
         }
         let (row, col, edge) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
-        self.hover = Some((row, col));
+        self.hover = event.modifiers.control.then_some((row, col));
         self.down_cell = Some((row, col, edge));
         let mode = match event.click_count {
             2 => SelectMode::Word,
@@ -943,10 +974,12 @@ impl TerminalView {
             return;
         }
         let (row, col, edge) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
-        // only repaint on cell changes: the underline appears when the
-        // pointer crosses onto a URL, not per pixel
-        if self.hover != Some((row, col)) {
-            self.hover = Some((row, col));
+        let previous_hover = self.hover;
+        // the link affordance rides the modifier: the underline and hand
+        // cursor only show while ctrl is held, so a plain drag or stray
+        // click never looks like a fireable link
+        self.hover = event.modifiers.control.then_some((row, col));
+        if self.hover != previous_hover {
             cx.notify();
         }
         if self.selecting {
@@ -977,9 +1010,15 @@ impl TerminalView {
         }
         self.selecting = false;
         let (row, col, edge) = self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
-        // a plain click that stayed on one cell is an open when that cell
-        // sits in a URL; double and triple clicks are word/line selection
-        if event.click_count == 1 && self.down_cell == Some((row, col, edge)) {
+        // a ctrl+click that stayed on one cell opens when that cell sits
+        // in a URL: the modifier matches kitty, alacritty, and
+        // gnome-terminal, and keeps a stray plain click from firing a
+        // browser at whatever the screen printed; double and triple
+        // clicks are word/line selection
+        if event.click_count == 1
+            && event.modifiers.control
+            && self.down_cell == Some((row, col, edge))
+        {
             if let Some(url) = self.url_at(row, col) {
                 open_url(&url);
             }
@@ -1074,6 +1113,63 @@ fn open_url(url: &str) {
             });
         },
         Err(err) => warn!("opening {url}: {err}"),
+    }
+}
+
+/// The OSC 52 confirm card, kitty's prompt in this terminal's own
+/// skins: y allows the clipboard write, n or escape denies. A short
+/// content preview rides along, so an informed click is possible
+/// before the keystroke is.
+fn clipboard_prompt(text: &str, theme: &Theme) -> Div {
+    let mut bg = hsla_of(theme.background);
+    bg.a = 0.97;
+    let ink = hsla_of(theme.foreground);
+    let mut dim = ink;
+    dim.a *= 0.55;
+    let mut border = ink;
+    border.a *= 0.15;
+    let preview = clipboard_preview(text);
+    div()
+        .absolute()
+        .bottom(px(12.))
+        .right(px(12.))
+        .max_w(px(420.))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .p(px(10.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(ink)
+                .child("A program asked to set the clipboard"),
+        )
+        .when(!preview.is_empty(), |card| {
+            card.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(dim)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(preview),
+            )
+        })
+        .child(div().text_size(px(12.)).text_color(dim).child("y: allow, n: deny"))
+}
+
+/// The prompt's content preview: control characters out, a head's
+/// worth in, an ellipsis when cut.
+fn clipboard_preview(text: &str) -> String {
+    let head: String = text.chars().filter(|c| !c.is_control()).take(48).collect();
+    if text.chars().filter(|c| !c.is_control()).count() > 48 {
+        format!("{head}…")
+    } else {
+        head
     }
 }
 
@@ -1365,6 +1461,9 @@ impl Render for TerminalView {
                     .w(px(grid_w))
                     .h(px(grid_h)),
             )
+            .when_some(self.clipboard_ask.clone(), |root, text| {
+                root.child(clipboard_prompt(&text, &self.theme))
+            })
             .when_some(bar, |root, bar| root.child(bar)),
             )
     }
@@ -2132,12 +2231,27 @@ mod tests {
         assert_eq!(
             paste_payload("legit note\x1b[201~rm -rf ~\r"),
             "legit noterm -rf ~\r".as_bytes()
-        );
-        // both directions stripped, whatever their position
+        );        // both directions stripped, whatever their position
         assert_eq!(paste_payload("\x1b[200~a\x1b[201~b\x1b[200~"), b"ab".to_vec());
         // newlines to carriage returns, CRLF collapsed to one
         assert_eq!(paste_payload("one\ntwo\r\nthree"), b"one\rtwo\rthree".to_vec());
         assert_eq!(paste_payload("plain"), b"plain".to_vec());
+    }
+
+    #[test]
+    fn clipboard_preview_truncates_and_sanitizes() {
+        // the OSC 52 prompt's preview: control characters never reach
+        // the card, a cut shows an ellipsis, a short text shows whole
+        assert_eq!(clipboard_preview("just a link"), "just a link");
+        assert_eq!(
+            clipboard_preview("https://x.example/\u{1b}]0;evil\u{7}"),
+            "https://x.example/]0;evil"
+        );
+        let long = "y".repeat(60);
+        assert_eq!(
+            clipboard_preview(&long),
+            format!("{}…", "y".repeat(48))
+        );
     }
 
     fn cell(c: char) -> RenderCell {
