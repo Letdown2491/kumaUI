@@ -13,6 +13,19 @@ move rides unchanged.
 
 ### Changed
 
+- Idle cost, all four apps: the shell's bar no longer repaints on a
+  sysmon, tray, or vault poll that found nothing moved, and a wedged
+  PipeWire can no longer stall the shell's poll for the session (the
+  volume and stream reads ride timeout now, and the vault widget's
+  poll backs off to a minute when nothing answers). Kamuy skips its
+  repaint while an equal beat applies and while the window cannot
+  paint. Koguma renders the listing from a shared snapshot instead of
+  deep-cloning every entry each frame, memoizes the filter order per
+  keystroke, and lands epub chapters without recopying the chapters
+  before them. kuma-term coalesces a pty output burst into one
+  repaint, and its row cache can no longer be wiped by one scroll
+  burst.
+
 - kuma-term: OSC 52 clipboard writes now ask like kitty's, a small
   card at the prompt with a content preview, y to allow, n or escape
   to deny, where before any output reaching the screen could silently
