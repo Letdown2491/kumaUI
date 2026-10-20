@@ -350,7 +350,7 @@ impl Source {
 
 struct Tab {
     source: Source,
-    entries: Vec<Entry>,
+    entries: std::sync::Arc<Vec<Entry>>,
     selection: HashSet<PathBuf>,
     cursor: Option<usize>,
     history: Vec<Source>,
@@ -1455,6 +1455,14 @@ pub(crate) struct Browser {
     keys_modal: bool,
     /// Text snippet for the rail, when the focused entry is textual.
     text_preview: Option<TextPreview>,
+    /// The visible-order index cache: the tab's listing Arc (the
+    /// generation check), the filter it scored, the order. See
+    /// `visible_indices`.
+    visible_cache: std::cell::RefCell<Option<(
+        std::sync::Arc<Vec<Entry>>,
+        String,
+        std::sync::Arc<Vec<usize>>,
+    )>>,
     preview_key: Option<PathBuf>,
     preview_inflight: HashSet<PathBuf>,
     /// Quick Look's whole-file read for text-ish entries (capped;
@@ -1528,10 +1536,15 @@ pub(crate) struct Browser {
     sel_video_gen: usize,
     /// The open epub's reading pane: spine chapters decoded in order
     /// by one background chain, blocks appending as each lands.
-    /// Plain data, no tile.
-    ql_text_blocks: Arc<Vec<epub::ChapterBlock>>,
-    /// Block index where each decoded chapter starts (chapter k is
-    /// starts[k - 1]); a failed chapter's marker gets one too.
+    /// One Arc per landed chapter: the append is an Arc push, not a
+    /// deep clone of everything landed so far (which was O(chapters²)
+    /// of copying on the UI thread). Plain data, no tile.
+    ql_text_blocks: Arc<Vec<Arc<Vec<epub::ChapterBlock>>>>,
+    /// Total flat block count across the landed chapters: the list
+    /// state's item count and the flat-index space.
+    ql_text_len: usize,
+    /// Flat block index where each decoded chapter starts (chapter k
+    /// is starts[k - 1]); a failed chapter's marker gets one too.
     ql_text_starts: Vec<usize>,
     /// The book the accumulation belongs to; set once starts the
     /// chain, cleared on flip kills it.
@@ -1657,6 +1670,7 @@ impl Browser {
             accent_picker: false,
             keys_modal: false,
             text_preview: None,
+            visible_cache: std::cell::RefCell::new(None),
             preview_key: None,
             preview_inflight: HashSet::new(),
             ql_text: None,
@@ -1680,6 +1694,7 @@ impl Browser {
             sel_video_kick: None,
             sel_video_gen: 0,
             ql_text_blocks: Arc::new(Vec::new()),
+            ql_text_len: 0,
             ql_text_starts: Vec::new(),
             ql_text_for: None,
             ql_book_at: 0,
@@ -2568,7 +2583,29 @@ impl Browser {
 
     /// The listing the user sees: all entries, or the nucleo matches
     /// for the type-in filter, best score first.
-    fn visible_indices(&self) -> Vec<usize> {
+    fn visible_indices(&self) -> std::sync::Arc<Vec<usize>> {
+        let entries = self.tab().entries.clone();
+        // memoized: with a filter live this recomputed a full nucleo
+        // score of the whole listing three to five times per
+        // keystroke (render, banner, quicklook, cursor moves), each
+        // pass re-allocating a Utf32String per entry. Every listing
+        // mutation lands on a fresh Arc (make_mut or a new Arc), so a
+        // pointer compare is the generation check — and the cache's
+        // own clone keeps refcounts above one, so no make_mut can
+        // ever mutate in place under it.
+        let mut cache = self.visible_cache.borrow_mut();
+        if let Some((cached_entries, cached_filter, cached)) = cache.as_ref()
+            && std::sync::Arc::ptr_eq(cached_entries, &entries)
+            && *cached_filter == self.filter
+        {
+            return cached.clone();
+        }
+        let list = std::sync::Arc::new(self.score_visible_indices());
+        *cache = Some((entries, self.filter.clone(), list.clone()));
+        list
+    }
+
+    fn score_visible_indices(&self) -> Vec<usize> {
         if self.filter.is_empty() {
             return (0..self.tab().entries.len()).collect();
         }
@@ -2604,13 +2641,13 @@ impl Browser {
     fn prune_deep(&mut self) -> bool {
         let tab = self.tab_mut();
         let before = tab.entries.len();
-        tab.entries.retain(|entry| entry.rel.is_none());
+        std::sync::Arc::make_mut(&mut tab.entries).retain(|entry| entry.rel.is_none());
         before != tab.entries.len()
     }
 
     /// Append a walker's results to the listing.
     fn extend_deep(&mut self, matches: Vec<Entry>) {
-        self.tab_mut().entries.extend(matches);
+        std::sync::Arc::make_mut(&mut self.tab_mut().entries).extend(matches);
     }
 
     /// After a filter edit the cursor must sit on a visible entry.
@@ -4432,6 +4469,7 @@ impl Browser {
                 // sees a foreign book and stops
                 self.ql_text_for = None;
                 self.ql_text_blocks = Arc::new(Vec::new());
+                self.ql_text_len = 0;
                 self.ql_text_starts = Vec::new();
                 self.ql_book_at = 0;
                 self.ql_book_state.reset(0);
@@ -4966,9 +5004,10 @@ impl Browser {
                         stop = true;
                         let marker = format!("… chapter {chapter} failed to read");
                         let len = marker.len();
-                        let mut grown = (*this.ql_text_blocks).clone();
-                        this.ql_text_starts.push(grown.len());
-                        grown.push(epub::ChapterBlock::Para {
+                        this.ql_text_starts.push(this.ql_text_len);
+                        this.ql_text_len += 1;
+                        let mut chapters = (*this.ql_text_blocks).clone();
+                        chapters.push(Arc::new(vec![epub::ChapterBlock::Para {
                             text: marker,
                             runs: vec![epub::ChapterRun {
                                 len,
@@ -4976,25 +5015,29 @@ impl Browser {
                                 bold: false,
                             }],
                             quote: true,
-                        });
-                        this.ql_text_blocks = Arc::new(grown);
-                        this.ql_book_state.reset(this.ql_text_blocks.len());
+                        }]));
+                        this.ql_text_blocks = Arc::new(chapters);
+                        this.ql_book_state.reset(this.ql_text_len);
                         cx.notify();
                         return;
                     };
-                    // append the chapter's blocks and remember where
-                    // it starts so jumps can land on it
-                    let mut all = (*this.ql_text_blocks).clone();
-                    this.ql_text_starts.push(all.len());
+                    // append the chapter as its own Arc and remember
+                    // where it starts so jumps can land on it: the
+                    // landing is an Arc push, not a copy of every
+                    // chapter landed so far
+                    this.ql_text_starts.push(this.ql_text_len);
                     grown_budget += text.iter().map(epub::chapter_block_bytes).sum::<usize>();
-                    all.extend(text);
+                    this.ql_text_len += text.len();
+                    let mut chapters = (*this.ql_text_blocks).clone();
+                    chapters.push(Arc::new(text));
                     // past the budget, one quoted marker ends the book
                     // and the chain
                     if grown_budget > BOOK_TEXT_BUDGET {
                         let marker = "… the book preview ends here".to_string();
                         let len = marker.len();
-                        this.ql_text_starts.push(all.len());
-                        all.push(epub::ChapterBlock::Para {
+                        this.ql_text_starts.push(this.ql_text_len);
+                        this.ql_text_len += 1;
+                        chapters.push(Arc::new(vec![epub::ChapterBlock::Para {
                             text: marker,
                             runs: vec![epub::ChapterRun {
                                 len,
@@ -5002,15 +5045,15 @@ impl Browser {
                                 bold: false,
                             }],
                             quote: true,
-                        });
-                        this.ql_text_blocks = Arc::new(all);
-                        this.ql_book_state.reset(this.ql_text_blocks.len());
+                        }]));
+                        this.ql_text_blocks = Arc::new(chapters);
+                        this.ql_book_state.reset(this.ql_text_len);
                         cx.notify();
                         stop = true;
                         return;
                     }
-                    this.ql_text_blocks = Arc::new(all);
-                    this.ql_book_state.reset(this.ql_text_blocks.len());
+                    this.ql_text_blocks = Arc::new(chapters);
+                    this.ql_book_state.reset(this.ql_text_len);
                     // honor a pending jump onto not-yet-decoded text
                     if this.ql_book_at >= 1 {
                         this.jump_book_chapter(this.ql_book_at);
@@ -5232,7 +5275,7 @@ impl Tab {
     fn new(source: Source) -> Self {
         Self {
             source,
-            entries: Vec::new(),
+            entries: std::sync::Arc::new(Vec::new()),
             selection: HashSet::new(),
             cursor: None,
             history: Vec::new(),
@@ -5284,11 +5327,11 @@ impl Tab {
                         });
                     }
                     sort_entries(&mut entries, self.sort_key, self.sort_asc);
-                    self.entries = entries;
+                    self.entries = std::sync::Arc::new(entries);
                 }
                 Err(err) => {
                     log::error!("read_dir {}: {err}", dir.display());
-                    self.entries.clear();
+                    self.entries = std::sync::Arc::new(Vec::new());
                 }
             },
             Source::Recent => {
@@ -5322,14 +5365,14 @@ impl Tab {
                         rel: None,
                     });
                 }
-                self.entries = entries;
+                self.entries = std::sync::Arc::new(entries);
             }
             Source::Trash => {
                 let items = match os_limited::list() {
                     Ok(items) => items,
                     Err(err) => {
                         log::error!("trash list: {err}");
-                        self.entries.clear();
+                        self.entries = std::sync::Arc::new(Vec::new());
                         return;
                     }
                 };
@@ -5357,14 +5400,16 @@ impl Tab {
                     });
                 }
                 entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                self.entries = entries;
+                self.entries = std::sync::Arc::new(entries);
             }
         }
-        self.selection.retain(|key| {
-            self.entries
-                .iter()
-                .any(|entry| &entry.key == key)
-        });
+        // the selection survives a reload only where the entry does:
+        // a set lookup, not a scan of every entry per selected key
+        // (select-all plus one watcher event was O(selection ×
+        // entries) of PathBuf compares on this thread)
+        let live: std::collections::HashSet<&Path> =
+            self.entries.iter().map(|entry| entry.key.as_path()).collect();
+        self.selection.retain(|key| live.contains(key.as_path()));
         if let Some(ix) = self.cursor
             && self.entries.get(ix).is_none()
         {
@@ -5806,7 +5851,7 @@ impl Browser {
                 }
             }
             "end" => {
-                let last = self.visible_indices().into_iter().next_back();
+                let last = self.visible_indices().iter().next_back().copied();
                 if let Some(entry_ix) = last {
                     self.jump_cursor(entry_ix, cx);
                 }
@@ -6006,7 +6051,12 @@ impl Browser {
     }
 
     /// Put the cursor on `visible[target]`, selecting just that entry.
-    fn focus_visible(&mut self, visible: Vec<usize>, target: usize, cx: &mut Context<Self>) {
+    fn focus_visible(
+        &mut self,
+        visible: std::sync::Arc<Vec<usize>>,
+        target: usize,
+        cx: &mut Context<Self>,
+    ) {
         let entry_ix = visible[target];
         let tab = self.tab_mut();
         tab.cursor = Some(entry_ix);
@@ -6119,7 +6169,11 @@ impl Browser {
                 self.status = format!("renamed to {target_name}");
                 let tab = self.tab_mut();
                 tab.selection.retain(|key| *key != renaming);
-                if let Some(entry) = tab.entries.iter_mut().find(|e| e.path == renaming) {
+                if let Some(entry) =
+                    std::sync::Arc::make_mut(&mut tab.entries)
+                        .iter_mut()
+                        .find(|e| e.path == renaming)
+                {
                     entry.path = dest;
                     entry.name = target_name;
                     entry.key = entry.path.clone();
@@ -7814,7 +7868,7 @@ impl Browser {
         // the next page decodes; file flips drop the tile in sync,
         // so a foreign file never shows here
         let ql_page = self.quicklook.as_ref().map(|ql| ql.page).unwrap_or(0);
-        let reading = is_epub && self.ql_book_at >= 1 && !self.ql_text_blocks.is_empty();
+        let reading = is_epub && self.ql_book_at >= 1 && self.ql_text_len > 0;
         let image = self.ql_render.as_ref().and_then(|(path, _, render)| {
             // on an epub only the cover (page 0) shows as an image
             (path == &entry.path && !entry.is_dir && (!is_epub || ql_page == 0))
@@ -7841,6 +7895,7 @@ impl Browser {
             // list into a definite height: Auto-sized deferred
             // elements are zero-content divs to taffy
             let blocks = self.ql_text_blocks.clone();
+            let starts = self.ql_text_starts.clone();
             div()
                 .flex_1()
                 .overflow_hidden()
@@ -7848,7 +7903,11 @@ impl Browser {
                 .flex()
                 .flex_col()
                 .child(list(self.ql_book_state.clone(), move |ix, _, _| {
-                    chapter_block_view(&blocks[ix])
+                    // flat index to (chapter, within): the chapters'
+                    // starts are sorted, one binary search
+                    let chapter = starts.partition_point(|&start| start <= ix) - 1;
+                    let block = &blocks[chapter][ix - starts[chapter]];
+                    chapter_block_view(block)
                         .debug_selector(|| "ql-chapter-block".into())
                         .into_any_element()
                 })
@@ -8969,7 +9028,9 @@ impl Render for Browser {
         // visible-order position rides along for the icon grid's thumb
         // gating: the paint shows every entry, but only the viewport's
         // neighborhood asks for decodes.
-        let entries: Vec<Entry> = self.tab().entries.clone();
+        // the Arc is the cheap copy now: one refcount instead of a
+        // deep clone of every path, name, and trash item per frame
+        let entries: std::sync::Arc<Vec<Entry>> = self.tab().entries.clone();
         let visible = self.visible_indices();
         let mut rows: Vec<Stateful<Div>> = Vec::new();
         for (vis_pos, &entry_ix) in visible.iter().enumerate() {
@@ -13161,8 +13222,13 @@ mod browser_ux_keys {
             assert_eq!(ql.pages, Some(2));
             assert_eq!(browser.ql_book_at, 0);
             // the chain decoded the whole spine while the cover showed
-            let blocks = browser.ql_text_blocks.clone();
-            assert_eq!(blocks.len(), 3, "h1 + para, then the second para");
+            assert_eq!(browser.ql_text_len, 3, "h1 + para, then the second para");
+            let blocks: Vec<crate::epub::ChapterBlock> = browser
+                .ql_text_blocks
+                .iter()
+                .flat_map(|chapter| chapter.iter().cloned())
+                .collect();
+            assert_eq!(blocks.len(), 3);
             assert_eq!(browser.ql_text_starts, vec![0, 2]);
             let text = crate::epub::tests::blocks_text(&blocks);
             assert!(text.contains("alpha body text"));
@@ -13207,6 +13273,7 @@ mod browser_ux_keys {
         app.run_until_parked();
         window.update(|browser, _, _| {
             assert!(browser.ql_text_blocks.is_empty());
+            assert_eq!(browser.ql_text_len, 0);
             assert!(browser.ql_text_starts.is_empty());
             assert_eq!(browser.ql_text_for, None);
             assert_eq!(browser.ql_book_at, 0);
@@ -13250,7 +13317,11 @@ mod browser_ux_keys {
         });
         app.run_until_parked(); // the chain runs and hits the gap
         window.update(|browser, _, _| {
-            let blocks = browser.ql_text_blocks.clone();
+            let blocks: Vec<crate::epub::ChapterBlock> = browser
+                .ql_text_blocks
+                .iter()
+                .flat_map(|chapter| chapter.iter().cloned())
+                .collect();
             let text = crate::epub::tests::blocks_text(&blocks);
             assert!(text.contains("alpha body text"));
             assert!(text.contains("chapter 2 failed to read"));
