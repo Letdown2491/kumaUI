@@ -220,6 +220,20 @@ const UNDO_MAX_OPS: usize = 1000;
 /// scope (see #34).
 pub(crate) const QL_DECODE_MAX: u32 = 2048;
 
+/// The ceiling on archive tool runs, in seconds: a wedged child (a
+/// FIFO in the archive is the classic) must not hold the op queue
+/// forever. A legitimate extract of this appliance's scale finishes
+/// well inside.
+const ARCHIVE_TIMEOUT_SECS: &str = "600";
+
+/// How many tabs a state-file restore may reopen: the file is
+/// user-editable, and each tab is a walker and a surface of state.
+const TAB_RESTORE_MAX: usize = 32;
+
+/// The book glance chain's total text budget, in bytes: a chapter
+/// caps its own blocks, but the spine decides how many chapters.
+const BOOK_TEXT_BUDGET: usize = 8 * 1024 * 1024;
+
 /// Quick Look's video loop scale: motion rides the same bounded head
 /// loop as the details pane, at glance scale (a 2048 loop would blow
 /// the byte budget in a handful of frames). The static poster keeps
@@ -495,7 +509,9 @@ impl Op {
                     let file = fs::File::create(&inner)
                         .map_err(|err| format!("extract: {err}"))?;
                     waited(
-                        Command::new(tool)
+                        Command::new("timeout")
+                            .arg(ARCHIVE_TIMEOUT_SECS)
+                            .arg(tool)
                             .arg("-dc")
                             .arg(&archive)
                             .stdout(file)
@@ -504,7 +520,9 @@ impl Op {
                     )?;
                 } else if have_tool("file-roller") {
                     waited(
-                        Command::new("file-roller")
+                        Command::new("timeout")
+                            .arg(ARCHIVE_TIMEOUT_SECS)
+                            .arg("file-roller")
                             .arg(format!("--extract-to={}", dest.display()))
                             .arg("--force")
                             .arg(&archive)
@@ -517,7 +535,9 @@ impl Op {
             }
             kind if kind.starts_with("tar") && have_tool("tar") => {
                 waited(
-                    Command::new("tar")
+                    Command::new("timeout")
+                        .arg(ARCHIVE_TIMEOUT_SECS)
+                        .arg("tar")
                         .arg("-xf")
                         .arg(&archive)
                         .arg("-C")
@@ -528,7 +548,9 @@ impl Op {
             }
             "zip" if have_tool("unzip") => {
                 waited(
-                    Command::new("unzip")
+                    Command::new("timeout")
+                        .arg(ARCHIVE_TIMEOUT_SECS)
+                        .arg("unzip")
                         .args(["-oq"])
                         .arg(&archive)
                         .arg("-d")
@@ -540,7 +562,9 @@ impl Op {
             _ => {
                 if have_tool("file-roller") {
                     waited(
-                        Command::new("file-roller")
+                        Command::new("timeout")
+                            .arg(ARCHIVE_TIMEOUT_SECS)
+                            .arg("file-roller")
                             .arg(format!("--extract-to={}", dest.display()))
                             .arg("--force")
                             .arg(&archive)
@@ -577,7 +601,9 @@ impl Op {
             if !have_tool("file-roller") {
                 return Err("creating zip needs file-roller".into());
             }
-            Command::new("file-roller")
+            Command::new("timeout")
+                .arg(ARCHIVE_TIMEOUT_SECS)
+                .arg("file-roller")
                 .arg(format!("--add-to={}", archive.display()))
                 .args(&files)
                 .output()
@@ -592,7 +618,9 @@ impl Op {
             // run from the target dir so both the archive name and the
             // source basenames resolve there: tar opens the archive
             // relative to its own cwd before any -C takes effect
-            Command::new("tar")
+            Command::new("timeout")
+                .arg(ARCHIVE_TIMEOUT_SECS)
+                .arg("tar")
                 .arg("-czf")
                 .arg(archive.file_name().unwrap_or_default())
                 .args(basenames)
@@ -2682,30 +2710,38 @@ impl Browser {
             }
         }
 
-        let (batch_tx, mut batch_rx) = futures::channel::mpsc::unbounded();
+        // bounded: a stalled UI thread applies backpressure at the
+        // pump instead of growing a queue without bound. notify's own
+        // channel holds the line meanwhile; a forever-stalled UI is a
+        // dead app either way, the difference is only who holds the
+        // memory.
+        let (mut batch_tx, mut batch_rx) = futures::channel::mpsc::channel(256);
         std::thread::Builder::new()
             .name("kuma-files-watch".into())
-            .spawn(move || loop {
+            .spawn(move || {
+                use futures::SinkExt as _;
                 // the channel carries Result<Event, Error>; notify
                 // errors are per-event noise, skip them
-                let first = match rx.recv() {
-                    Ok(Ok(event)) => event,
-                    Ok(Err(_)) => continue,
-                    Err(_) => return,
-                };
-                let mut batch = vec![first];
-                // events arrive in bursts (create + metadata + writes);
-                // wait out the burst, then deliver once
                 loop {
-                    match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(Ok(event)) => batch.push(event),
+                    let first = match rx.recv() {
+                        Ok(Ok(event)) => event,
                         Ok(Err(_)) => continue,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(_) => return,
+                    };
+                    let mut batch = vec![first];
+                    // events arrive in bursts (create + metadata +
+                    // writes); wait out the burst, then deliver once
+                    loop {
+                        match rx.recv_timeout(Duration::from_millis(50)) {
+                            Ok(Ok(event)) => batch.push(event),
+                            Ok(Err(_)) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
                     }
-                }
-                if batch_tx.unbounded_send(batch).is_err() {
-                    return;
+                    if futures::executor::block_on(batch_tx.send(batch)).is_err() {
+                        return;
+                    }
                 }
             })
             .expect("spawn watch pump");
@@ -4065,8 +4101,14 @@ impl Browser {
         }
 
         // an explicit CLI dir always wins; otherwise reopen the folders
-        // that were open last time (trash tabs are not persisted)
+        // that were open last time (trash tabs are not persisted). The
+        // state file is user-editable, so the restore is capped and
+        // deduped: a thousand tabs, or the same dir a hundred times,
+        // is a corrupted file, not a session.
         saved_tabs.sort_by_key(|(index, _)| *index);
+        let mut seen = std::collections::HashSet::new();
+        saved_tabs.retain(|(_, dir)| seen.insert(dir.clone()));
+        saved_tabs.truncate(TAB_RESTORE_MAX);
         saved_places.sort_by_key(|(index, _)| *index);
         self.place_order = saved_places.into_iter().map(|(_, path)| path).collect();
         if cli_dir.is_none() && !saved_tabs.is_empty() {
@@ -4570,7 +4612,11 @@ impl Browser {
             let pages = cx
                 .background_spawn(async move {
                     if icons::is_pdf(&bg_path.file_name().unwrap_or_default().to_string_lossy()) {
-                        let out = std::process::Command::new("pdfinfo")
+                        // a wedged pdfinfo must not hold the pane's
+                        // page count hostage forever
+                        let out = std::process::Command::new("timeout")
+                            .arg("30")
+                            .arg("pdfinfo")
                             .arg(&bg_path)
                             .output()
                             .ok()?;
@@ -4897,6 +4943,10 @@ impl Browser {
         };
         self.ql_text_for = Some(path.clone());
         cx.spawn(async move |this, cx| {
+            // the chain's running text budget: each chapter caps its
+            // own blocks, but a spine with thousands of them would
+            // still grow the pane without end
+            let mut grown_budget: usize = 0;
             for chapter in 1..=pages {
                 let bg_path = path.clone();
                 let blocks = cx
@@ -4936,7 +4986,29 @@ impl Browser {
                     // it starts so jumps can land on it
                     let mut all = (*this.ql_text_blocks).clone();
                     this.ql_text_starts.push(all.len());
+                    grown_budget += text.iter().map(epub::chapter_block_bytes).sum::<usize>();
                     all.extend(text);
+                    // past the budget, one quoted marker ends the book
+                    // and the chain
+                    if grown_budget > BOOK_TEXT_BUDGET {
+                        let marker = "… the book preview ends here".to_string();
+                        let len = marker.len();
+                        this.ql_text_starts.push(all.len());
+                        all.push(epub::ChapterBlock::Para {
+                            text: marker,
+                            runs: vec![epub::ChapterRun {
+                                len,
+                                italic: true,
+                                bold: false,
+                            }],
+                            quote: true,
+                        });
+                        this.ql_text_blocks = Arc::new(all);
+                        this.ql_book_state.reset(this.ql_text_blocks.len());
+                        cx.notify();
+                        stop = true;
+                        return;
+                    }
                     this.ql_text_blocks = Arc::new(all);
                     this.ql_book_state.reset(this.ql_text_blocks.len());
                     // honor a pending jump onto not-yet-decoded text

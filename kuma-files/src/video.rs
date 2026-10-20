@@ -529,7 +529,10 @@ mod imp {
 
     impl PaSimple {
         fn open(lib: &PaLib, rate: u32) -> Option<PaSimple> {
-            let rate = rate.max(8_000);
+            // the rate comes from the file's header: clamped to what
+            // audio hardware can mean, so the buffer math below cannot
+            // wrap on a hostile container
+            let rate = rate.clamp(8_000, 192_000);
             let spec = PaSampleSpec {
                 format: PA_SAMPLE_S16NE,
                 rate,

@@ -13,6 +13,15 @@ move rides unchanged.
 
 ### Fixed
 
+- kuma-files: epub internals are bounded now, so a hostile or
+  oversized book cannot own the RAM: each zip entry stops reading at
+  32 MiB, the glance text chain stops at a budget with a marker, and
+  a chapter entity split across a multi-byte character no longer
+  panics the scanner. Archive extraction, compression, and the PDF
+  page-count and preview tools ride `timeout` as well, so a wedged
+  child cannot hold the op queue forever, and a corrupted state file
+  restores at most 32 deduplicated tabs.
+
 - kuma-shell: every subprocess read the poll and panel paths make
   (volume, media, network, bluetooth, power, brightness, the nostr
   CLI) is bounded by `timeout` now, so one hung CLI costs seconds

@@ -274,7 +274,13 @@ pub(crate) fn chapter_blocks(bytes: &[u8]) -> Vec<ChapterBlock> {
             continue;
         }
         if rest.starts_with('&') {
-            let up_to = rest.len().min(12);
+            // a window for the entity's terminator, floored to a char
+            // boundary: the raw byte offset lands mid-character on
+            // ordinary Unicode text and panics the slice
+            let mut up_to = rest.len().min(12);
+            while up_to > 0 && !rest.is_char_boundary(up_to) {
+                up_to -= 1;
+            }
             if let Some(end) = rest[..up_to].find(';').filter(|d| *d > 0) {
                 if let Some(text) = decode_entity(&rest[1..end]) {
                     b.flush_space();
@@ -486,20 +492,43 @@ fn decode_entity(inner: &str) -> Option<String> {
     Some(named)
 }
 
+/// One entry, capped: a zip bomb's decompressed stream stops here
+/// instead of owning the RAM. Truncated output fails the downstream
+/// decode, which the callers already treat as "no cover" / "no
+/// chapter" honestly.
+const ENTRY_MAX: u64 = 32 * 1024 * 1024;
+
 fn read_entry<R: std::io::Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     name: &str,
 ) -> Option<Vec<u8>> {
-    let mut entry = zip.by_name(name).ok()?;
+    let entry = zip.by_name(name).ok()?;
     let mut buf = Vec::new();
-    entry.read_to_end(&mut buf).ok()?;
+    entry.take(ENTRY_MAX).read_to_end(&mut buf).ok()?;
     Some(buf)
+}
+
+/// The block's text size, for the glance chain's budget.
+pub(crate) fn chapter_block_bytes(block: &ChapterBlock) -> usize {
+    match block {
+        ChapterBlock::Para { text, .. } | ChapterBlock::Heading { text, .. } => text.len(),
+        ChapterBlock::Rule => 0,
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn entity_window_is_char_boundary_safe() {
+        // byte 12 of "&amp;你你你…" lands inside a character: the
+        // entity window must floor to a boundary, not panic the slice
+        let html = "<html><body><p>&amp;你你你你你</p></body></html>";
+        let blocks = chapter_blocks(html.as_bytes());
+        assert!(matches!(blocks.first(), Some(ChapterBlock::Para { .. })));
+    }
 
     /// A minimal but real epub, written in-memory with the same zip
     /// crate the reader uses.

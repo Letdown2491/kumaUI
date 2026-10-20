@@ -440,7 +440,14 @@ impl Viewer {
             let bg_path = path.clone();
             let pages = cx
                 .background_spawn(async move {
-                    let out = Command::new("pdfinfo").arg(&bg_path).output().ok()?;
+                    // a wedged pdfinfo must not hold the page count
+                    // hostage forever
+                    let out = Command::new("timeout")
+                        .arg("30")
+                        .arg("pdfinfo")
+                        .arg(&bg_path)
+                        .output()
+                        .ok()?;
                     parse_pdf_pages(&String::from_utf8_lossy(&out.stdout))
                 })
                 .await;

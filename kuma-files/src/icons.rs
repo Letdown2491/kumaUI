@@ -200,7 +200,10 @@ pub(crate) fn decode_pdf_dynamic(
     max: u32,
 ) -> Option<image::DynamicImage> {
     let page = page.to_string();
-    let out = std::process::Command::new("pdftocairo")
+    // a wedged pdftocairo must not hold the preview thread forever
+    let out = std::process::Command::new("timeout")
+        .arg("60")
+        .arg("pdftocairo")
         .args(["-png", "-f", &page, "-l", &page, "-singlefile", "-scale-to"])
         .arg(max.to_string())
         .arg(path)
