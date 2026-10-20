@@ -234,6 +234,14 @@ const TAB_RESTORE_MAX: usize = 32;
 /// caps its own blocks, but the spine decides how many chapters.
 const BOOK_TEXT_BUDGET: usize = 8 * 1024 * 1024;
 
+/// The list row's estimated pitch (content height plus the row gap),
+/// scaled: the windowing math's unit. Real heights come from paint;
+/// the estimate only chooses which rows build and how tall the
+/// window's stand-in spacers are, where a few percent of error costs
+/// a hair of scrollbar width and nothing else. The window margin
+/// absorbs the rest.
+const LIST_ROW_PITCH: f32 = 28.;
+
 /// Quick Look's video loop scale: motion rides the same bounded head
 /// loop as the details pane, at glance scale (a 2048 loop would blow
 /// the byte budget in a handful of frames). The static poster keeps
@@ -1467,6 +1475,10 @@ pub(crate) struct Browser {
     /// the landing checks it, so a superseded scan drops whole
     /// instead of overwriting a newer listing.
     rescan_seq: u64,
+    /// The first visible-order position the list window built as real
+    /// elements this frame: the prepaint capture skips the window's
+    /// top spacer, so painted rows stay indexed by visible position.
+    list_window_start: Arc<AtomicUsize>,
     preview_key: Option<PathBuf>,
     preview_inflight: HashSet<PathBuf>,
     /// Quick Look's whole-file read for text-ish entries (capped;
@@ -1676,6 +1688,7 @@ impl Browser {
             text_preview: None,
             visible_cache: std::cell::RefCell::new(None),
             rescan_seq: 0,
+            list_window_start: Arc::new(AtomicUsize::new(0)),
             preview_key: None,
             preview_inflight: HashSet::new(),
             ql_text: None,
@@ -2960,6 +2973,7 @@ impl Browser {
     /// offset must go explicitly.
     fn reset_list_scroll(&self) {
         self.list_scroll.set_offset(point(px(0.), px(0.)));
+        self.list_window_start.store(0, Ordering::Relaxed);
     }
 
     /// Ctrl+Tab / Ctrl+Shift+Tab: rotate through the tabs.
@@ -6014,6 +6028,25 @@ impl Browser {
         (start * per_line).min(count)..end.min(count)
     }
 
+    /// The list view's window: the viewport's rows plus two rows of
+    /// margin on each side, in visible-order positions. Unlike the
+    /// thumb window, the pitch is single-column and known, so a
+    /// degenerate shape means "build nothing" is never right: a
+    /// zero-size viewport (first paint) builds nothing yet, a real
+    /// one builds its own rows.
+    fn list_window(&self, pitch: f32, count: usize) -> std::ops::Range<usize> {
+        let offset_y = f32::from(self.list_scroll.offset().y);
+        let view_height = f32::from(self.list_scroll.bounds().size.height);
+        if pitch <= 0.0 || view_height <= 0.0 || count == 0 {
+            return 0..count;
+        }
+        let scrolled = (-offset_y / pitch).max(0.0).floor() as usize;
+        let shown = (view_height / pitch).ceil() as usize;
+        let start = scrolled.saturating_sub(2);
+        let end = (scrolled + shown + 2).min(count);
+        start..end
+    }
+
     /// Whether the cell at this visible-order position sits inside the
     /// scroll viewport's thumbnail window. Reads the tracked scroll
     /// handle and the grid shape from the last paint.
@@ -6039,10 +6072,6 @@ impl Browser {
         let Some(pos) = visible.iter().position(|&v| v == entry_ix) else {
             return;
         };
-        let Some(row) = self.painted_rows.lock().ok().and_then(|rows| rows.get(pos).copied())
-        else {
-            return;
-        };
         let view = self.list_scroll.bounds();
         if view.size.width <= px(0.) || view.size.height <= px(0.) {
             return;
@@ -6052,7 +6081,12 @@ impl Browser {
             offset = point(px(0.), px(0.));
         } else if pos + 1 == visible.len() {
             offset.y = -self.list_scroll.max_offset().y;
-        } else {
+        } else if let Some(row) = self
+            .painted_rows
+            .lock()
+            .ok()
+            .and_then(|rows| rows.get(pos - self.list_window_start.load(Ordering::Relaxed)).copied())
+        {
             let view_top: f32 = view.origin.y.into();
             let view_bottom = view_top + f32::from(view.size.height);
             let row_top: f32 = row.origin.y.into();
@@ -6067,6 +6101,13 @@ impl Browser {
                 return;
             }
             offset.y += px(moved);
+        } else {
+            // the cursor row is not painted this frame: a jump far
+            // outside the window lands on the estimated pitch, and the
+            // window already includes the cursor, so the next paint
+            // corrects with real bounds
+            let pitch = LIST_ROW_PITCH * self.scale;
+            offset.y = -px((pos as f32) * pitch).min(self.list_scroll.max_offset().y);
         }
         self.list_scroll.set_offset(offset);
         cx.notify();
@@ -6334,6 +6375,7 @@ impl Browser {
 
         let mut base = div()
             .id(ix)
+            .debug_selector(move || format!("list-row/{ix}"))
             .flex()
             .items_center()
             .justify_between()
@@ -9089,13 +9131,65 @@ impl Render for Browser {
         // deep clone of every path, name, and trash item per frame
         let entries: std::sync::Arc<Vec<Entry>> = self.tab().entries.clone();
         let visible = self.visible_indices();
+
+        // List view is windowed: a 20k listing builds the viewport's
+        // neighborhood (plus margin, plus the cursor's row) instead of
+        // twenty thousand element trees per frame. The two spacers
+        // stand in for the rows above and below the window, so the
+        // scroll extent and the scrollbar stay the listing's real
+        // size. Icon view still paints every cell: its wrap-grid
+        // geometry is pinned and its thumbnail decodes are already
+        // viewport-gated.
+        let pitch = LIST_ROW_PITCH * self.scale;
+        let vis_count = visible.len();
+        let (win_start, win_end) = match self.tab().view_mode {
+            ViewMode::List => {
+                let window = self.list_window(pitch, vis_count);
+                // the cursor is always a real element: keyboard moves
+                // land on it the same frame, renames render its field
+                let cursor_pos = self
+                    .tab()
+                    .cursor
+                    .and_then(|ix| visible.iter().position(|&v| v == ix));
+                let (start, end) = match cursor_pos {
+                    Some(pos) => (
+                        window.start.min(pos.saturating_sub(4)),
+                        window.end.max((pos + 5).min(vis_count)),
+                    ),
+                    None => (window.start, window.end),
+                };
+                self.list_window_start.store(start, Ordering::Relaxed);
+                (start, end)
+            }
+            ViewMode::Icons => {
+                self.list_window_start.store(0, Ordering::Relaxed);
+                (0, vis_count)
+            }
+        };
         let mut rows: Vec<Stateful<Div>> = Vec::new();
-        for (vis_pos, &entry_ix) in visible.iter().enumerate() {
+        if win_start > 0 {
+            rows.push(
+                div()
+                    .id("list-window-top")
+                    .w_full()
+                    .h(px(win_start as f32 * pitch)),
+            );
+        }
+        for (i, &entry_ix) in visible[win_start..win_end].iter().enumerate() {
+            let vis_pos = win_start + i;
             let entry = &entries[entry_ix];
             match self.tab().view_mode {
                 ViewMode::List => rows.push(self.row(entry_ix, entry, cx)),
                 ViewMode::Icons => rows.push(self.icon_cell(entry_ix, vis_pos, entry, cx)),
             }
+        }
+        if win_end < vis_count {
+            rows.push(
+                div()
+                    .id("list-window-bottom")
+                    .w_full()
+                    .h(px((vis_count - win_end) as f32 * pitch)),
+            );
         }
 
         // the sidebar groups into sections: Home with Recent and
@@ -9827,17 +9921,32 @@ impl Render for Browser {
                                         // the rows' own container: the
                                         // prepaint capture needs a plain
                                         // div (list_box is stateful), and
-                                        // its children are the rows in
-                                        // visible order
+                                        // its children are the window's
+                                        // rows in visible order behind
+                                        // the top spacer. The capture
+                                        // skips the spacer, so painted
+                                        // rows stay indexed by visible
+                                        // position
                                         div()
                                             .flex()
                                             .flex_col()
                                             .gap_px()
                                             .on_children_prepainted({
                                                 let painted_rows = self.painted_rows.clone();
+                                                let window_start =
+                                                    self.list_window_start.clone();
                                                 move |children, _, _| {
                                                     if let Ok(mut rows) = painted_rows.lock() {
-                                                        *rows = children;
+                                                        let skip =
+                                                            if window_start.load(Ordering::Relaxed)
+                                                                > 0
+                                                            {
+                                                                1
+                                                            } else {
+                                                                0
+                                                            };
+                                                        *rows =
+                                                            children.into_iter().skip(skip).collect();
                                                     }
                                                 }
                                             })
@@ -15002,6 +15111,87 @@ mod browser_scroll_repro {
 
     // the ux-keys module's key builder and browser opener
     use browser_ux_keys::{key, open_browser};
+
+    #[test]
+    fn list_view_windows_to_the_viewport() {
+        // 400 entries: a full build paints 400 row trees a frame; the
+        // window builds the viewport's neighborhood plus the cursor's
+        // row, and the spacers keep the whole listing reachable
+        let dir =
+            std::env::temp_dir().join(format!("koguma-list-window-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..400 {
+            fs::write(dir.join(format!("file-{i:03}.txt")), "x").unwrap();
+        }
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window =
+            app.open_window(|window, cx| Browser::new(Some(dir.clone()), window, cx));
+        app.run_until_parked();
+        // the first paint's window math reads a zero-size viewport (no
+        // bounds yet); one repaint later the window math is real
+        window.update(|_, _, cx| cx.notify());
+        app.run_until_parked();
+
+        window.update(|browser, _, cx| {
+            // the state file may have saved icon view: the windowing
+            // under test is list view's
+            browser.set_view_mode(ViewMode::List, cx);
+        });
+        app.run_until_parked();
+
+        window.update(|browser, window, _| {
+            // rows far outside the viewport must not exist as elements
+            assert!(
+                window.debug_element_bounds("list-row/0").is_some(),
+                "the first row starts in view at the top of the listing"
+            );
+            assert!(
+                window.debug_element_bounds("list-row/395").is_none(),
+                "rows below the viewport must not be built"
+            );
+        });
+
+        // jump deep into the listing: the cursor's row becomes a real
+        // element and lands inside the viewport
+        window.update(|browser, _, cx| {
+            let visible = browser.visible_indices();
+            let entry_ix = visible[350];
+            browser.jump_cursor(entry_ix, cx);
+        });
+        app.run_until_parked();
+        window.update(|_, window, _| {
+            let far = window.debug_element_bounds("list-row/350").expect(
+                "the jumped-to row must be a real element after the jump",
+            );
+            assert!(
+                far.origin.y >= px(0.) && far.origin.y < px(1080.),
+                "the jumped-to row must sit inside the viewport, got {far:?}"
+            );
+            assert!(
+                window.debug_element_bounds("list-row/0").is_none(),
+                "rows scrolled far above the window must not be built"
+            );
+        });
+
+        // End reaches the true bottom of the listing: the bottom
+        // spacer keeps the full extent scrollable
+        window.update(|browser, _, cx| {
+            browser.route_key(&browser_ux_keys::key("end"), cx);
+        });
+        app.run_until_parked();
+        window.update(|_, window, _| {
+            assert!(
+                window.debug_element_bounds("list-row/399").is_some(),
+                "End must bring the listing's last row into the window"
+            );
+        });
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn wheel_scrolls_the_listing() {
