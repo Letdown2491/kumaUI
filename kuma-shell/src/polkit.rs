@@ -826,11 +826,18 @@ const HELPER_BINARIES: [&str; 2] = [
 /// socket) when the unit is up; otherwise the setuid spawn (username as
 /// argv[1], the cookie line on stdin), which is what kumaOS runs.
 /// Blocking on purpose: it runs on a background executor thread like
-/// every other subprocess read.
+/// every other subprocess read. Bounded too: a PAM stack that hangs
+/// (a wedged LDAP lookup) must not pin the thread forever, so the
+/// exchange rides `timeout` in spawn mode and socket timeouts in
+/// socket mode, like the bluetooth acts' `timeout` wrappers.
+const HELPER_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn run_pump(cookie: &str, user: &str, password: &str, notes: &Sender<PumpNote>) -> PumpEnd {
     if std::path::Path::new(HELPER_SOCKET).exists() {
         match UnixStream::connect(HELPER_SOCKET) {
             Ok(stream) => {
+                let _ = stream.set_read_timeout(Some(HELPER_EXCHANGE_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(HELPER_EXCHANGE_TIMEOUT));
                 let mut writer = match stream.try_clone() {
                     Ok(clone) => clone,
                     Err(err) => return PumpEnd::Broke(err.to_string()),
@@ -850,7 +857,9 @@ fn run_pump(cookie: &str, user: &str, password: &str, notes: &Sender<PumpNote>) 
     else {
         return PumpEnd::Broke("no polkit agent helper is available".into());
     };
-    let child = std::process::Command::new(helper)
+    let child = std::process::Command::new("timeout")
+        .arg(HELPER_EXCHANGE_TIMEOUT.as_secs().to_string())
+        .arg(helper)
         .arg(user)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

@@ -551,8 +551,12 @@ pub struct Engine {
     /// traps SIGHUP would freeze the dropping thread (the UI thread,
     /// on tab close) for as long as the child lives.
     pty: Option<tty::Pty>,
-    /// the PTY master: input writes here, the pump thread reads a clone
+    /// the PTY master: the resize ioctl rides its fd, input writes go
+    /// through the writer thread's clone
     master: std::fs::File,
+    /// input queued for the writer thread: the UI thread must never
+    /// block on a pty write (see `input`)
+    write_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     window_size: WindowSize,
     theme: Theme,
     /// how the current selection started, so the snapshot projects its
@@ -629,7 +633,33 @@ impl Engine {
             .spawn(move || pump_thread(pump_master, pump_term, pump_proxy))
             .expect("spawn the PTY pump");
 
-        Ok(Self { term, pty: Some(pty), master, window_size, theme, selection_mode: None })
+        // The writer thread. The pump cleared O_NONBLOCK on the shared
+        // open file description, so a pty write blocks until the child
+        // reads: a UI thread writing there freezes every tab on one
+        // paste into a stopped program. The writer takes the blocking
+        // write; the UI thread only queues.
+        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+        let writer_master = master.try_clone().expect("clone the PTY master for the writer");
+        thread::Builder::new()
+            .name("kuma-term-write".into())
+            .spawn(move || {
+                for bytes in write_rx {
+                    if let Err(err) = (&writer_master).write_all(&bytes) {
+                        log::warn!("pty write failed: {err}");
+                    }
+                }
+            })
+            .expect("spawn the pty writer");
+
+        Ok(Self {
+            term,
+            pty: Some(pty),
+            master,
+            write_tx,
+            window_size,
+            theme,
+            selection_mode: None,
+        })
     }
 
     /// Swap the chrome colors for a republished shell palette; the next
@@ -638,10 +668,15 @@ impl Engine {
         self.theme = theme;
     }
 
-    /// Write bytes to the PTY (user input, query replies).
+    /// Queue bytes for the PTY (user input, query replies). The write
+    /// happens on the writer thread: a child that is not reading (a
+    /// stopped program mid-paste) would otherwise hold the UI thread
+    /// in a blocking write, freezing every tab. A full queue drops the
+    /// input and says so in the journal; worse than a lost keystroke
+    /// is a frozen terminal.
     pub fn input(&self, bytes: Vec<u8>) {
-        if let Err(err) = (&self.master).write_all(&bytes) {
-            log::warn!("pty write failed: {err}");
+        if self.write_tx.try_send(bytes).is_err() {
+            log::warn!("pty input queue full; input dropped");
         }
     }
 

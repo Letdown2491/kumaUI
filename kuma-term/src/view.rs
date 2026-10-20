@@ -535,16 +535,13 @@ impl TerminalView {
     fn paste(&mut self, cx: &mut Context<Self>) {
         let Some(item) = cx.read_from_clipboard() else { return };
         let Some(text) = item.text() else { return };
-        // newlines become carriage returns: that is what the shell's line
-        // discipline expects from a paste
-        let text = text.replace("\r\n", "\r").replace('\n', "\r");
         let mut bytes = Vec::with_capacity(text.len() + 16);
         if self.active().engine.bracketed_paste() {
             bytes.extend_from_slice(b"\x1b[200~");
-            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(&paste_payload(&text));
             bytes.extend_from_slice(b"\x1b[201~");
         } else {
-            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(&paste_payload(&text));
         }
         self.active().engine.input(bytes);
     }
@@ -1044,6 +1041,21 @@ fn mouse_button_code(button: MouseButton) -> Option<u8> {
         MouseButton::Right => Some(MOUSE_RIGHT),
         _ => None,
     }
+}
+
+/// The bytes a paste sends: newlines become carriage returns (what the
+/// shell's line discipline expects from a paste), and the bracketed
+/// paste markers are stripped from the payload. The markers belong to
+/// the emulator, not the clipboard: clipboard text carrying ESC[201~
+/// would end the bracketed block mid-paste and run the rest as
+/// ordinary keystrokes, with the trailing \r executing it at the
+/// prompt. Kitty strips them for the same reason.
+fn paste_payload(text: &str) -> Vec<u8> {
+    text.replace("\r\n", "\r")
+        .replace('\n', "\r")
+        .replace("\x1b[201~", "")
+        .replace("\x1b[200~", "")
+        .into_bytes()
 }
 
 impl Focusable for TerminalView {
@@ -2094,6 +2106,22 @@ mod tests {
 
     fn theme() -> Theme {
         Theme::builtin()
+    }
+
+    #[test]
+    fn paste_payload_strips_the_bracket_markers() {
+        // the injection shape: a clipboard carrying the end-of-paste
+        // marker must not be able to close the bracketed block and run
+        // the rest as keystrokes at the prompt
+        assert_eq!(
+            paste_payload("legit note\x1b[201~rm -rf ~\r"),
+            "legit noterm -rf ~\r".as_bytes()
+        );
+        // both directions stripped, whatever their position
+        assert_eq!(paste_payload("\x1b[200~a\x1b[201~b\x1b[200~"), b"ab".to_vec());
+        // newlines to carriage returns, CRLF collapsed to one
+        assert_eq!(paste_payload("one\ntwo\r\nthree"), b"one\rtwo\rthree".to_vec());
+        assert_eq!(paste_payload("plain"), b"plain".to_vec());
     }
 
     fn cell(c: char) -> RenderCell {

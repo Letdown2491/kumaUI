@@ -627,6 +627,38 @@ impl SysMon {
             .detach();
     }
 
+    /// Write the PSK to a 0600 file in the runtime dir (tmpfs) for
+    /// nmcli's `passwd-file`: the password must not ride argv, where
+    /// any process can read it in /proc/<pid>/cmdline for the
+    /// connect's whole life. nmcli's file format is one
+    /// `setting.property:password` line; the caller removes the file
+    /// when nmcli exits.
+    fn write_wifi_passwd(password: &str) -> anyhow::Result<std::path::PathBuf> {
+        let dir = std::env::var("XDG_RUNTIME_DIR")
+            .context("no XDG_RUNTIME_DIR: nowhere private to put the wifi password")?;
+        Self::write_wifi_passwd_to(std::path::Path::new(&dir), password)
+    }
+
+    /// The write itself, `dir` factored out so tests can point it at a
+    /// scratch directory.
+    fn write_wifi_passwd_to(
+        dir: &std::path::Path,
+        password: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = dir.join(format!("kuma-wifi-psk-{}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?;
+        writeln!(file, "802-11-wireless-security.psk:{password}")?;
+        file.flush()?;
+        Ok(path)
+    }
+
     /// A trigger of the NIC's own scan, then a fresh list: the
     /// panel's rescan press. The rescan takes seconds; the list
     /// refreshes when it lands.
@@ -646,8 +678,10 @@ impl SysMon {
 
     /// Join a network: nmcli uses saved credentials on its own for a
     /// known SSID, so a password only rides along for a secured
-    /// unknown one. The next scan reconciles; a failure surfaces in
-    /// the panel as `wifi_error`.
+    /// unknown one. The PSK travels by nmcli's password file, never
+    /// argv: a cleartext argv is world-readable in /proc/<pid>/cmdline
+    /// for the connect's whole life. The next scan reconciles; a
+    /// failure surfaces in the panel as `wifi_error`.
     pub fn request_wifi_connect(
         &mut self,
         ssid: String,
@@ -661,11 +695,21 @@ impl SysMon {
                 .background_spawn(async move {
                     let mut command = Command::new("nmcli");
                     command.args(["dev", "wifi", "connect", &ssid]);
-                    if let Some(password) = &password {
-                        command.args(["password", password]);
+                    let passwd_path = match password {
+                        Some(password) => Some(Self::write_wifi_passwd(&password)?),
+                        None => None,
+                    };
+                    if let Some(path) = &passwd_path {
+                        command.args([
+                            "passwd-file",
+                            path.to_str().context("non-UTF-8 runtime dir")?,
+                        ]);
                     }
-                    let output = command.output()?;
-                    anyhow::ensure!(output.status.success(), "nmcli connect failed");
+                    let output = command.output();
+                    if let Some(path) = &passwd_path {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    anyhow::ensure!(output?.status.success(), "nmcli connect failed");
                     Ok(())
                 })
                 .await;
@@ -1416,8 +1460,14 @@ fn read_bluetooth(scan_devices: bool) -> Option<BluetoothState> {
 
 /// One device's `bluetoothctl info` block: the connected/paired/
 /// trusted trio and the battery line when the device reports one.
+/// Bounded by `timeout` like the acts: this runs once per known device
+/// inside the poll the panel awaits, so one wedged call would stall
+/// every sysmon update while the panel is open.
 fn read_device_info(mac: &str, alias: &str) -> Option<BluetoothDevice> {
-    let output = Command::new("bluetoothctl").args(["info", mac]).output().ok()?;
+    let output = Command::new("timeout")
+        .args(["15", "bluetoothctl", "info", mac])
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -2488,6 +2538,19 @@ mod tests {
         );
         assert_eq!(parse_wpctl_volume("Volume: nonsense"), None);
         assert_eq!(parse_wpctl_volume("garbage"), None);
+    }
+
+    #[test]
+    fn wifi_passwd_file_is_0600_and_nmcli_shaped() {
+        let dir = std::env::temp_dir().join(format!("kuma-psk-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = SysMon::write_wifi_passwd_to(&dir, "hunter2 but secret").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "802-11-wireless-security.psk:hunter2 but secret\n");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

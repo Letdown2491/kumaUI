@@ -13,6 +13,21 @@ move rides unchanged.
 
 ### Fixed
 
+- kuma-term: pasting clipboard text that carries the end-of-bracketed-
+  paste marker no longer hands the shell a command to run; the
+  markers are stripped from the payload. Input writes also moved to a
+  writer thread: a large paste into a program that is not reading
+  (a stopped job, a wedged ssh) used to freeze every tab on the UI
+  thread's blocking write.
+
+- kuma-shell: joining a Wi-Fi network no longer puts the network
+  password on nmcli's command line, where any process could read it
+  in /proc/<pid>/cmdline for the whole connect; it rides a 0600 file
+  in the runtime directory through nmcli's passwd-file. The polkit
+  PAM helper exchange and the per-device bluetoothctl reads are
+  bounded by timeout now, so a hung PAM stack or device cannot pin a
+  worker thread (and an unreaped setuid child) forever.
+
 - kuma-term: a tab whose shell is gone no longer crashes or freezes
   the terminal. An orphaned background process holding the terminal
   kept its reader alive after the tab closed, and its events indexed a
