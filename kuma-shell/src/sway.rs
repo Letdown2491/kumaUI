@@ -25,6 +25,10 @@ use smol::channel::Sender;
 use crate::session::{SessionEvent, SessionState, SessionWindow, Workspace};
 
 const MAGIC: &[u8; 6] = b"i3-ipc";
+/// A ceiling on the payload a length prefix may claim, so a corrupted
+/// or hostile header cannot demand a 4 GiB allocation before a single
+/// byte of it is read. Real sway payloads never approach this.
+const MAX_IPC_PAYLOAD: u32 = 2 * 1024 * 1024;
 const RUN_COMMAND: u32 = 0;
 const GET_WORKSPACES: u32 = 1;
 const SUBSCRIBE: u32 = 2;
@@ -92,6 +96,13 @@ impl Ipc {
         }
         let length = u32::from_le_bytes(header[6..10].try_into()?);
         let kind = u32::from_le_bytes(header[10..14].try_into()?);
+        // the peer is sway itself, so this is insurance and not a
+        // boundary: still refuse to allocate what a header alone
+        // claims, the way every length-prefix reader should
+        anyhow::ensure!(
+            length <= MAX_IPC_PAYLOAD,
+            "sway advertises a {length}-byte payload; refusing the allocation"
+        );
         let mut payload = vec![0u8; length as usize];
         self.reader.read_exact(&mut payload)?;
         let value = serde_json::from_slice(&payload).context("bad sway IPC payload")?;
@@ -323,7 +334,10 @@ pub fn focus_workspace(id: u64) -> Result<()> {
             .name
             .as_deref()
             .context("sway workspace has neither number nor name")?;
-        run_command(&mut ipc, &format!("workspace \"{name}\""))
+        // escape the name for sway's command language: a quote in a
+        // workspace name would otherwise break out of the quoted token
+        let quoted = name.replace('\\', "\\\\").replace('"', "\\\"");
+        run_command(&mut ipc, &format!("workspace \"{quoted}\""))
     }
 }
 

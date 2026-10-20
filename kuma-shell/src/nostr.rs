@@ -163,9 +163,14 @@ impl NostrState {
     }
 
     /// The keep-alive, fire and forget: answering a prompt four
-    /// minutes in must not race the vault's own lock.
+    /// minutes in must not race the vault's own lock. Bounded, so a
+    /// wedged CLI cannot linger: the reaper reaps whatever `timeout`
+    /// leaves.
     pub fn touch(&self) {
-        if let Ok(child) = Command::new("kuma-nostr").arg("touch").spawn() {
+        if let Ok(child) = Command::new("timeout")
+            .args(["15", "kuma-nostr", "touch"])
+            .spawn()
+        {
             crate::launcher::reap(child);
         }
     }
@@ -178,8 +183,15 @@ impl NostrState {
         args.insert(0, "kuma-nostr".into());
         let notifications = self.notifications.clone();
         cx.spawn(async move |this, cx| {
+            // the act runs the CLI against the daemon socket, which
+            // answers or refuses quickly; the bound is for a hung CLI,
+            // not for slow daemon work
+            let mut bounded = vec!["timeout".to_string(), "30".to_string()];
+            bounded.append(&mut args);
             let output = cx
-                .background_spawn(async move { Command::new(&args[0]).args(&args[1..]).output() })
+                .background_spawn(async move {
+                    Command::new(&bounded[0]).args(&bounded[1..]).output()
+                })
                 .await;
             let failure = match output {
                 Err(_) => Some("the act could not run".to_string()),
@@ -271,7 +283,11 @@ fn fetch_cli(field: Field) -> Option<serde_json::Value> {
         Field::Status => &["status", "--json"],
         Field::Log => &["log", "--json"],
     };
-    let output = Command::new("kuma-nostr").args(args).output().ok()?;
+    let output = std::process::Command::new("timeout")
+        .args(["15", "kuma-nostr"])
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -422,7 +438,15 @@ pub fn avatar_path(pubkey: &str) -> Option<std::path::PathBuf> {
         })?;
     Some(base.join("kuma-shell").join("nostr-icons").join(format!(
         "{}.img",
-        pubkey.chars().take(16).collect::<String>()
+        // the fragment becomes a filename: keep only hex characters,
+        // so a reshaped or hostile pubkey field cannot carry a path
+        // separator out of the icons dir (the daemon sends hex, this
+        // is the seatbelt)
+        pubkey
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .take(16)
+            .collect::<String>()
     )))
 }
 

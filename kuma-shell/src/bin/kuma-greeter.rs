@@ -85,9 +85,13 @@ fn headless(args: &[String]) -> i32 {
     };
     let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
 
-    // the password comes from stdin, one line, never echoed back
+    // the password comes from stdin, one line, never echoed back; a
+    // closed stdin is a usage error, not a panic
     let mut password = String::new();
-    std::io::stdin().lock().read_line(&mut password).unwrap();
+    if std::io::stdin().lock().read_line(&mut password).unwrap_or(0) == 0 {
+        eprintln!("kuma-greeter: no password on stdin");
+        return 2;
+    }
     let password = password.trim_end_matches(['\n', '\r']);
 
     let mut client = match GreetdClient::connect() {

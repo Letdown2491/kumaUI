@@ -13,6 +13,15 @@ move rides unchanged.
 
 ### Fixed
 
+- kuma-shell: every subprocess read the poll and panel paths make
+  (volume, media, network, bluetooth, power, brightness, the nostr
+  CLI) is bounded by `timeout` now, so one hung CLI costs seconds
+  instead of a subsystem's updates for the rest of the session. The
+  sway and greetd readers also refuse to allocate what a length
+  prefix alone claims, the greeter's auth exchange is capped, and a
+  workspace name with a quote can no longer break out of the sway
+  command it rides in.
+
 - kuma-monitor: one unreadable sensor entry under /sys/class/hwmon no
   longer wipes out temperature discovery for the whole session; the
   entry is skipped instead of aborting the search.

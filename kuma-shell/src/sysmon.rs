@@ -185,6 +185,22 @@ pub struct RecordingState {
     pub elapsed_secs: u64,
 }
 
+/// A subprocess read bounded by `timeout`, the bluetooth acts' idiom
+/// applied to every poll and verb: each of these is awaited in
+/// sequence by the poll or the panel, so one hung CLI must cost
+/// seconds, not that subsystem's updates for the rest of the session.
+fn timed_output(
+    program: &str,
+    args: &[&str],
+    secs: u32,
+) -> std::io::Result<std::process::Output> {
+    Command::new("timeout")
+        .arg(secs.to_string())
+        .arg(program)
+        .args(args)
+        .output()
+}
+
 fn read_recording() -> Option<RecordingState> {
     let out = Command::new("pgrep")
         .args(["-x", "wf-recorder"])
@@ -665,11 +681,7 @@ impl SysMon {
     pub fn request_wifi_rescan(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let _ = cx
-                .background_spawn(async move {
-                    Command::new("nmcli")
-                        .args(["dev", "wifi", "rescan"])
-                        .output()
-                })
+                .background_spawn(async move { timed_output("nmcli", &["dev", "wifi", "rescan"], 30) })
                 .await;
             self_scan(this, cx).await;
         })
@@ -693,12 +705,15 @@ impl SysMon {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let mut command = Command::new("nmcli");
-                    command.args(["dev", "wifi", "connect", &ssid]);
                     let passwd_path = match password {
                         Some(password) => Some(Self::write_wifi_passwd(&password)?),
                         None => None,
                     };
+                    // the connect waits on the whole association (DHCP
+                    // included), so its bound is the generous one
+                    let mut command = Command::new("timeout");
+                    command.arg("60").arg("nmcli");
+                    command.args(["dev", "wifi", "connect", &ssid]);
                     if let Some(path) = &passwd_path {
                         command.args([
                             "passwd-file",
@@ -729,9 +744,7 @@ impl SysMon {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let output = Command::new("nmcli")
-                        .args(["connection", "delete", &ssid])
-                        .output()?;
+                    let output = timed_output("nmcli", &["connection", "delete", &ssid], 15)?;
                     anyhow::ensure!(output.status.success(), "nmcli delete failed");
                     Ok(())
                 })
@@ -1240,9 +1253,11 @@ impl SysMon {
 }
 
 pub fn set_volume(percent: u8) -> anyhow::Result<()> {
-    let output = Command::new("wpctl")
-        .args(["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{percent}%")])
-        .output()?;
+    let output = timed_output(
+        "wpctl",
+        &["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{percent}%")],
+        5,
+    )?;
     anyhow::ensure!(output.status.success(), "wpctl set-volume failed");
     Ok(())
 }
@@ -1250,17 +1265,13 @@ pub fn set_volume(percent: u8) -> anyhow::Result<()> {
 /// A stream's absolute volume, same shape as the sink's: the id names
 /// the sink input, clamped to 100 so wpctl can't amplify.
 fn set_stream_volume(id: u32, percent: u8) -> anyhow::Result<()> {
-    let output = Command::new("wpctl")
-        .args(["set-volume", &id.to_string(), &format!("{percent}%")])
-        .output()?;
+    let output = timed_output("wpctl", &["set-volume", &id.to_string(), &format!("{percent}%")], 5)?;
     anyhow::ensure!(output.status.success(), "wpctl set-volume failed");
     Ok(())
 }
 
 fn toggle_stream_mute(id: u32) -> anyhow::Result<()> {
-    let output = Command::new("wpctl")
-        .args(["set-mute", &id.to_string(), "toggle"])
-        .output()?;
+    let output = timed_output("wpctl", &["set-mute", &id.to_string(), "toggle"], 5)?;
     anyhow::ensure!(output.status.success(), "wpctl set-mute failed");
     Ok(())
 }
@@ -1272,9 +1283,7 @@ fn clamp_percent(current: i32, delta: i32) -> u8 {
 
 pub fn change_volume(percent_delta: i32) -> anyhow::Result<()> {
     // read current and clamp: wpctl happily amplifies past 100% otherwise
-    let current = Command::new("wpctl")
-        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
-        .output()?;
+    let current = timed_output("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"], 5)?;
     anyhow::ensure!(current.status.success(), "wpctl get-volume failed");
     let current = parse_wpctl_volume(&String::from_utf8_lossy(&current.stdout))
         .context("unexpected wpctl volume output")?;
@@ -1295,9 +1304,7 @@ fn set_mute(target: &str, source: bool) -> anyhow::Result<()> {
     } else {
         "@DEFAULT_AUDIO_SINK@"
     };
-    let output = Command::new("wpctl")
-        .args(["set-mute", object, target])
-        .output()?;
+    let output = timed_output("wpctl", &["set-mute", object, target], 5)?;
     anyhow::ensure!(output.status.success(), "wpctl set-mute failed");
     Ok(())
 }
@@ -1309,9 +1316,7 @@ pub fn toggle_mic() -> anyhow::Result<()> {
 
 /// Absolute capture-gain set, the sink's `set_volume` for the source.
 pub fn set_mic_volume(percent: u8) -> anyhow::Result<()> {
-    let output = Command::new("wpctl")
-        .args(["set-volume", "@DEFAULT_AUDIO_SOURCE@", &format!("{percent}%")])
-        .output()?;
+    let output = timed_output("wpctl", &["set-volume", "@DEFAULT_AUDIO_SOURCE@", &format!("{percent}%")], 5)?;
     anyhow::ensure!(output.status.success(), "wpctl set-volume failed");
     Ok(())
 }
@@ -1340,19 +1345,21 @@ pub fn stop_track() -> anyhow::Result<()> {
 }
 
 fn playerctl<const N: usize>(args: [&str; N]) -> anyhow::Result<()> {
-    let output = Command::new("playerctl").args(args).output()?;
+    let output = timed_output("playerctl", &args, 5)?;
     anyhow::ensure!(output.status.success(), "playerctl {args:?} failed");
     Ok(())
 }
 
 fn read_media() -> Option<MediaState> {
-    let output = Command::new("playerctl")
-        .args([
+    let output = timed_output(
+        "playerctl",
+        &[
             "metadata",
             "--format",
             "{{status}}\t{{player}}\t{{artist}}\t{{title}}",
-        ])
-        .output()
+        ],
+        5,
+    )
         .ok()?;
     if !output.status.success() {
         return None;
@@ -1387,15 +1394,13 @@ fn parse_playback(status: &str) -> Option<Playback> {
 }
 
 pub fn set_bluetooth_power(enabled: bool) -> anyhow::Result<()> {
-    let output = Command::new("bluetoothctl")
-        .args(["power", if enabled { "on" } else { "off" }])
-        .output()?;
+    let output = timed_output("bluetoothctl", &["power", if enabled { "on" } else { "off" }], 10)?;
     anyhow::ensure!(output.status.success(), "bluetoothctl power failed");
     Ok(())
 }
 
 fn read_bluetooth(scan_devices: bool) -> Option<BluetoothState> {
-    let show = Command::new("bluetoothctl").arg("show").output().ok()?;
+    let show = timed_output("bluetoothctl", &["show"], 10).ok()?;
     if !show.status.success() {
         return None;
     }
@@ -1409,7 +1414,7 @@ fn read_bluetooth(scan_devices: bool) -> Option<BluetoothState> {
         // info block. Panel closed: the bar widget needs only who is
         // connected, and that is one cheap call instead of N+1.
         if scan_devices {
-            if let Ok(list) = Command::new("bluetoothctl").arg("devices").output()
+            if let Ok(list) = timed_output("bluetoothctl", &["devices"], 10)
                 && list.status.success()
             {
                 // "Device XX:XX:XX:XX:XX:XX Alias" for every known device,
@@ -1432,9 +1437,7 @@ fn read_bluetooth(scan_devices: bool) -> Option<BluetoothState> {
                     .then(b.paired.cmp(&a.paired))
                     .then(a.alias.to_lowercase().cmp(&b.alias.to_lowercase()))
             });
-        } else if let Ok(connected) = Command::new("bluetoothctl")
-            .args(["devices", "Connected"])
-            .output()
+        } else if let Ok(connected) = timed_output("bluetoothctl", &["devices", "Connected"], 10)
             && connected.status.success()
         {
             for line in String::from_utf8_lossy(&connected.stdout).lines() {
@@ -1564,10 +1567,7 @@ impl BluetoothAct {
 }
 
 fn read_network(scan_wifi: bool) -> Option<NetworkState> {
-    let connectivity = Command::new("nmcli")
-        .args(["networking", "connectivity"])
-        .output()
-        .ok()?;
+    let connectivity = timed_output("nmcli", &["networking", "connectivity"], 10).ok()?;
     if !connectivity.status.success() {
         return None;
     }
@@ -1581,10 +1581,11 @@ fn read_network(scan_wifi: bool) -> Option<NetworkState> {
         access_points: Vec::new(),
         saved: Vec::new(),
     };
-    if let Ok(status) = Command::new("nmcli")
-        .args(["-t", "-f", "TYPE,STATE,CONNECTION", "device", "status"])
-        .output()
-        && status.status.success()
+    if let Ok(status) = timed_output(
+        "nmcli",
+        &["-t", "-f", "TYPE,STATE,CONNECTION", "device", "status"],
+        10,
+    ) && status.status.success()
     {
         apply_device_status(&mut network, &String::from_utf8_lossy(&status.stdout));
     }
@@ -1603,17 +1604,18 @@ fn read_network(scan_wifi: bool) -> Option<NetworkState> {
 /// The visible access points: SSID, signal, security, and whether the
 /// machine is on it now. A missing SSID (a hidden network) drops out.
 fn read_access_points() -> Vec<AccessPoint> {
-    let Ok(output) = Command::new("nmcli")
-        .args([
+    let Ok(output) = timed_output(
+        "nmcli",
+        &[
             "-t",
             "-f",
             "SSID,SIGNAL,SECURITY,ACTIVE",
             "dev",
             "wifi",
             "list",
-        ])
-        .output()
-    else {
+        ],
+        15,
+    ) else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -1625,9 +1627,7 @@ fn read_access_points() -> Vec<AccessPoint> {
 /// The remembered wireless connections: names whose type is the
 /// wifi one in `nmcli -t -f NAME,TYPE connection show`.
 fn read_saved_wifi() -> Vec<String> {
-    let Ok(output) = Command::new("nmcli")
-        .args(["-t", "-f", "NAME,TYPE", "connection", "show"])
-        .output()
+    let Ok(output) = timed_output("nmcli", &["-t", "-f", "NAME,TYPE", "connection", "show"], 10)
     else {
         return Vec::new();
     };
@@ -1693,10 +1693,7 @@ fn parse_access_points(output: &str) -> Vec<AccessPoint> {
 
 /// `nmcli radio wifi` prints "enabled" / "disabled".
 fn read_wifi_radio() -> Option<bool> {
-    let output = Command::new("nmcli")
-        .args(["radio", "wifi"])
-        .output()
-        .ok()?;
+    let output = timed_output("nmcli", &["radio", "wifi"], 5).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1704,18 +1701,13 @@ fn read_wifi_radio() -> Option<bool> {
 }
 
 pub fn set_wifi_radio(enabled: bool) -> anyhow::Result<()> {
-    let output = Command::new("nmcli")
-        .args(["radio", "wifi", if enabled { "on" } else { "off" }])
-        .output()?;
+    let output = timed_output("nmcli", &["radio", "wifi", if enabled { "on" } else { "off" }], 10)?;
     anyhow::ensure!(output.status.success(), "nmcli radio wifi failed");
     Ok(())
 }
 
 fn read_power_profile() -> Option<PowerProfile> {
-    let output = Command::new("powerprofilesctl")
-        .args(["get"])
-        .output()
-        .ok()?;
+    let output = timed_output("powerprofilesctl", &["get"], 5).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1723,9 +1715,7 @@ fn read_power_profile() -> Option<PowerProfile> {
 }
 
 pub fn set_power_profile(profile: PowerProfile) -> anyhow::Result<()> {
-    let output = Command::new("powerprofilesctl")
-        .args(["set", profile.as_str()])
-        .output()?;
+    let output = timed_output("powerprofilesctl", &["set", profile.as_str()], 10)?;
     anyhow::ensure!(output.status.success(), "powerprofilesctl set failed");
     Ok(())
 }
@@ -1781,9 +1771,7 @@ fn brightness_percent(current: u32, max: u32) -> Option<u8> {
 }
 
 pub fn set_brightness(percent: u8) -> anyhow::Result<()> {
-    let output = Command::new("brightnessctl")
-        .args(["set", &format!("{percent}%")])
-        .output()?;
+    let output = timed_output("brightnessctl", &["set", &format!("{percent}%")], 10)?;
     anyhow::ensure!(output.status.success(), "brightnessctl set failed");
     Ok(())
 }

@@ -95,11 +95,17 @@ impl GreetdClient {
 
     /// Read one response: a 32-bit native-order length prefix, then
     /// that many bytes of JSON. Reading without sending is what the
-    /// auth flow needs between create_session and each answer.
+    /// auth flow needs between create_session and each answer. The
+    /// peer is greetd (root-owned socket), so the cap is insurance:
+    /// still refuse to allocate what a header alone claims.
     pub fn read_response(&mut self) -> anyhow::Result<Response> {
         let mut length = [0u8; 4];
         self.reader.read_exact(&mut length)?;
         let length = u32::from_ne_bytes(length) as usize;
+        anyhow::ensure!(
+            length <= MAX_RESPONSE,
+            "greetd advertises a {length}-byte response; refusing the allocation"
+        );
         let mut payload = vec![0u8; length];
         self.reader.read_exact(&mut payload)?;
         Ok(serde_json::from_slice(&payload)?)
@@ -107,6 +113,15 @@ impl GreetdClient {
 }
 
 // ---------- the login flow ----------
+
+/// A ceiling on the JSON payload a length prefix may claim (see
+/// `read_response`): real greetd messages are tiny.
+const MAX_RESPONSE: usize = 1024 * 1024;
+
+/// A real PAM exchange is a handful of messages; more is a broken or
+/// hostile peer, and every secret question would carry the password
+/// again.
+const MAX_AUTH_MESSAGES: usize = 16;
 
 /// How a login attempt ended: the session is running, or the auth
 /// failed with greetd's description (the greeter shows it).
@@ -128,7 +143,13 @@ pub fn login(
     cmd: &[&str],
 ) -> anyhow::Result<LoginOutcome> {
     let mut response = client.request(&Request::CreateSession { username })?;
+    let mut messages = 0;
     loop {
+        messages += 1;
+        anyhow::ensure!(
+            messages <= MAX_AUTH_MESSAGES,
+            "the greetd auth exchange never ended"
+        );
         match response {
             Response::Success => break,
             Response::Error { description, .. } => {
