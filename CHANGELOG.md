@@ -11,6 +11,13 @@ move rides unchanged.
 
 ## Unreleased
 
+## v0.4.1 (2026-10-19)
+
+kuma-shell 0.4.1
+kuma-files 0.4.1
+kuma-term 0.3.1
+kuma-monitor 0.2.1
+
 ### Changed
 
 - Idle cost, all four apps: the shell's bar no longer repaints on a
