@@ -416,9 +416,12 @@ fn pty_take_master(pty: &mut tty::Pty) -> std::fs::File {
 }
 
 /// The byte pump: the terminal's own read loop, replacing alacritty's
-/// EventLoop. Reads the PTY master in blocking mode, taps shell-integration
-/// markers from the raw bytes, then hands the same bytes to the vte parser
-/// (which updates the grid and fires UiProxy events for queries/titles).
+/// EventLoop. Reads the PTY master in blocking mode, hands the bytes to
+/// the vte parser (which updates the grid and fires UiProxy events for
+/// queries/titles). No shell-integration tap today: when the OSC 133/7
+/// tap arrives it will be a second hand-rolled parser over this same
+/// attacker-controllable stream and needs vte-grade care (UTF-8 state,
+/// OSC bounds, terminators).
 /// On Linux a PTY master read after child exit returns EIO once the
 /// kernel buffer drains, which is the drain-on-exit behavior alacritty's
 /// loop implemented: final output lands, then the Exit event closes the
@@ -617,11 +620,11 @@ impl Engine {
         );
         let term = Arc::new(FairMutex::new(term));
 
-        // The byte pump: read the PTY master, tap shell-integration
-        // markers, feed the vte parser, wake the UI. alacritty's own
-        // EventLoop is not used: its vte version has no hook for arbitrary
-        // OSC sequences, so OSC 133/7 must be tapped from the raw stream
-        // anyway, and once the tap exists the rest of the loop is a small
+        // The byte pump: read the PTY master, feed the vte parser, wake
+        // the UI. alacritty's own EventLoop is not used: its vte version
+        // has no hook for arbitrary OSC sequences, which a future
+        // shell-integration (OSC 133/7) tap will need; that tap is not
+        // wired yet, and until it is this loop stays a small
         // read-parse-wake cycle this module can own. The parser lives on
         // the pump thread only, so no lock is held while bytes decode.
         let pump_proxy = proxy.clone();
@@ -694,12 +697,17 @@ impl Engine {
         }
         self.window_size = ws;
         // the PTY first so SIGWINCH lands with the new size already set
+        // u32 intermediates: u16 cell widths times column counts wrap
+        // past ~6500 columns, and a clamped pixel size is a better
+        // answer than a wrapped one
         use std::os::fd::AsRawFd;
         let winsize = libc::winsize {
             ws_row: lines,
             ws_col: cols,
-            ws_xpixel: self.window_size.cell_width as u16 * cols,
-            ws_ypixel: self.window_size.cell_height as u16 * lines,
+            ws_xpixel: (self.window_size.cell_width as u32 * cols as u32).min(u16::MAX as u32)
+                as u16,
+            ws_ypixel: (self.window_size.cell_height as u32 * lines as u32)
+                .min(u16::MAX as u32) as u16,
         };
         let ok = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
         if ok != 0 {

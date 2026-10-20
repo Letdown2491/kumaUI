@@ -1370,12 +1370,28 @@ impl Render for TerminalView {
     }
 }
 
+/// A per-process random seed for the row hash: the row content is
+/// attacker-controllable screen text, and Fx collisions are cheap to
+/// construct offline. Seeding with an unpredictable value moves the
+/// construction online, and the cache only lives for this process, so
+/// nothing needs the seed stable across runs.
+fn row_hash_seed() -> u64 {
+    use std::hash::BuildHasher;
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    })
+}
+
 /// Content hash of a row's cells. Every input build_row reads lives in the
 /// cells (the engine resolves theme colors into them), so this is a sound
 /// key for the RowRender cache, and a fortiori for the text hash contract
 /// of gpui's line-layout cache: same hash implies the same text.
 fn hash_row(row: &Row) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write_u64(row_hash_seed());
     hasher.write_usize(row.cells.len());
     for cell in &row.cells {
         hasher.write_u32(cell.c as u32);
