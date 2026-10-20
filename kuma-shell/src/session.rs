@@ -4,13 +4,18 @@
 //! is the first adapter, and sway and hyprland slot in beside it (the
 //! adapters are picked at startup by which IPC socket exists).
 
-use std::{collections::HashMap, future::Future};
+use std::{collections::HashMap, future::Future, time::Duration};
 
 use anyhow::Result;
 use gpui::{App, AppContext, Entity};
 use log::{debug, error};
 use serde::Deserialize;
 use smol::channel::{Sender, unbounded};
+
+/// How long a terminated stream waits before reopening. Long enough
+/// that a restarting compositor is not hammered, short enough that a
+/// bar goes stale for seconds rather than for the rest of the session.
+const RECONNECT_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Workspace {
@@ -200,15 +205,25 @@ pub(crate) fn mirror<Stream, Fut>(
     cx: &mut App,
     stream: Stream,
 ) where
-    Stream: FnOnce(Sender<SessionEvent>) -> Fut + Send + 'static,
+    Stream: Fn(Sender<SessionEvent>) -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let state = state.downgrade();
     let (event_tx, event_rx) = unbounded::<SessionEvent>();
 
+    // One connection is one attempt, not the mirror's life: a
+    // compositor restart or a dropped socket ends the attempt, and the
+    // loop opens a fresh one. State survives the gap and heals on
+    // reconnect, because every attempt re-seeds it (niri snapshots on
+    // connect, sway fetches after subscribe).
     cx.background_spawn(async move {
-        if let Err(err) = stream(event_tx).await {
-            error!("{name} event stream terminated: {err:#}");
+        loop {
+            if let Err(err) = stream(event_tx.clone()).await {
+                error!("{name} event stream terminated: {err:#}; retrying in {RECONNECT_AFTER:?}");
+            } else {
+                error!("{name} event stream ended without error; retrying in {RECONNECT_AFTER:?}");
+            }
+            smol::Timer::after(RECONNECT_AFTER).await;
         }
     })
     .detach();

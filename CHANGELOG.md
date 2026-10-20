@@ -13,6 +13,13 @@ move rides unchanged.
 
 ### Fixed
 
+- kuma-shell: the session mirror survives a dead compositor stream. A
+  dropped socket, a restarting compositor, or a reshaped event payload
+  used to end the mirror for the rest of the session (frozen
+  workspaces and window titles until the shell restarted); the stream
+  now reconnects after three seconds, and an event it cannot parse is
+  skipped with a journal line instead of costing the stream.
+
 - kuma-files: Koguma's listing scrolls with the wheel again. The row
   wrapping the sidebar and the folder column had no min-height floor
   of zero, so it grew to the folder's full content height instead of

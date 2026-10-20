@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{App, Entity};
+use log::error;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use smol::channel::Sender;
@@ -60,8 +61,15 @@ async fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
         if reader.read_line(&mut line)? == 0 {
             bail!("niri closed the event stream");
         }
-        if let Some(event) = parse_event(&line)? {
-            event_tx.send(event).await?;
+        // One bad line must not cost the stream: a reshaped event in
+        // some future niri would otherwise end the mirror for the
+        // whole session. Skip it and let the next event re-sync. EOF
+        // and socket errors above still end the attempt; the mirror
+        // reconnects (session.rs).
+        match parse_event(&line) {
+            Ok(Some(event)) => event_tx.send(event).await?,
+            Ok(None) => {}
+            Err(err) => error!("niri event skipped, parse failed: {err:#}"),
         }
     }
 }
@@ -179,5 +187,16 @@ mod tests {
             None
         ));
         assert!(parse_event("not json").is_err());
+    }
+
+    #[test]
+    fn reshaped_payloads_are_parse_errors_the_stream_skips() {
+        // A missing required field in a known event (say, a future
+        // niri reshaping its payloads) parses as an error; the stream
+        // loop logs and moves on instead of ending the mirror. The
+        // niri #4044 class of breakage, one new event variant killing
+        // every strict client, must not happen here twice.
+        assert!(parse_event(r#"{"WorkspacesChanged":{"workspaces":{}}}"#).is_err());
+        assert!(parse_event(r#"{"WindowClosed":{}}"#).is_err());
     }
 }
