@@ -272,7 +272,13 @@ fn read_pressure(path: &str) -> Option<f32> {
 /// sensor and would read a nvme drive or a motherboard chipset.
 fn discover_temp_chip() -> Option<PathBuf> {
     for entry in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
-        let name = std::fs::read_to_string(entry.path().join("name")).ok()?;
+        // one flaky entry (a driver unbinding mid-enumeration, a
+        // device returning EIO) skips itself: this runs once at
+        // startup and the answer is kept for the process lifetime, so
+        // letting one bad read abort would mean no sensor all session
+        let Ok(name) = std::fs::read_to_string(entry.path().join("name")) else {
+            continue;
+        };
         if matches!(
             name.trim(),
             "k10temp" | "zenpower" | "coretemp" | "cpu_thermal"

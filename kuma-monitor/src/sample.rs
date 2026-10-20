@@ -311,11 +311,13 @@ fn group_key(index: &HashMap<u32, &ProcRow>, row: &ProcRow) -> String {
 
 impl AppGroup {
     fn build(key: String, mut members: Vec<ProcRow>) -> Self {
+        debug_assert!(!members.is_empty(), "a group is built from its members");
         members.sort_by_key(|row| row.pid);
         let name = members
             .iter()
             .find_map(|row| row.window.as_ref().and_then(|w| w.app_id.clone()))
-            .unwrap_or_else(|| members[0].name.clone());
+            .or_else(|| members.first().map(|row| row.name.clone()))
+            .unwrap_or_default();
         AppGroup {
             cpu: members.iter().map(|row| row.cpu).sum(),
             mem: members.iter().map(|row| row.mem).sum(),
@@ -352,12 +354,15 @@ impl SortKey {
 }
 
 pub(crate) fn sort_groups(groups: &mut [AppGroup], key: SortKey) {
+    // the members are the group's own rows, and a group is never
+    // built empty; sort on the first pid without indexing, so the
+    // invariant breaking is a sort-order oddity, not a panic
     match key {
         SortKey::Cpu => groups
             .sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)),
         SortKey::Mem => groups.sort_by(|a, b| b.mem.cmp(&a.mem)),
         SortKey::Name => groups.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-        SortKey::Pid => groups.sort_by(|a, b| a.members[0].pid.cmp(&b.members[0].pid)),
+        SortKey::Pid => groups.sort_by_key(|group| group.members.first().map(|m| m.pid)),
     }
 }
 

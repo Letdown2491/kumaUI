@@ -332,6 +332,10 @@ impl MonitorView {
             }
             let live: HashSet<&str> = self.groups.iter().map(|g| g.key.as_str()).collect();
             self.group_hists.retain(|key, _| live.contains(key.as_str()));
+            // unfolded state dies with its group too, like the rings:
+            // without this the set gathers the keys of every app ever
+            // expanded, forever
+            self.expanded_apps.retain(|key| live.contains(key.as_str()));
         }
 
         push_hist(&mut self.history, snap.cpu_total, CPU_HIST);
@@ -1247,6 +1251,9 @@ fn spark(history: &[f32], ceiling: Option<f32>, height: f32) -> Div {
     let bars = history
         .iter()
         .map(|v| {
+            // a non-finite sample has no length: collapse it to the
+            // floor rather than let NaN ride px() into layout
+            let v = if v.is_finite() { *v } else { 0. };
             div()
                 .flex_1()
                 .min_w(px(1.))
@@ -1383,7 +1390,10 @@ fn group_row(
         );
     }
     div()
-        .id(SharedString::from(key.to_string()))
+        // namespaced ids: the group key is user-influenced content (the
+        // app's name), and a bare `m-{pid}` on the member rows could
+        // collide with a group literally named that
+        .id(SharedString::from(format!("group/{key}")))
         .h(px(26.))
         .w_full()
         .flex()
@@ -1516,7 +1526,7 @@ fn member_row(row: &ProcRow, this: &WeakEntity<MonitorView>) -> Stateful<Div> {
     let focused = row.window.as_ref().is_some_and(|w| w.focused);
     let lead = member_lead(row);
     div()
-        .id(SharedString::from(format!("m-{}", row.pid)))
+        .id(SharedString::from(format!("member/{}", row.pid)))
         .h(px(26.))
         .w_full()
         .flex()

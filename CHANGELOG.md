@@ -13,6 +13,10 @@ move rides unchanged.
 
 ### Fixed
 
+- kuma-monitor: one unreadable sensor entry under /sys/class/hwmon no
+  longer wipes out temperature discovery for the whole session; the
+  entry is skipped instead of aborting the search.
+
 - kuma-term: pasting clipboard text that carries the end-of-bracketed-
   paste marker no longer hands the shell a command to run; the
   markers are stripped from the payload. Input writes also moved to a
