@@ -1574,9 +1574,6 @@ pub(crate) struct Browser {
     ql_scroll: gpui::ScrollHandle,
     /// Hand-rolled right-click menu: position plus a flat item list.
     menu: Option<ContextMenu>,
-    /// Cells in the first grid row, captured at paint time; 0 means
-    /// unknown (list view, or nothing rendered yet).
-    grid_row_len: Arc<AtomicUsize>,
     /// The listing's scroll, tracked so keyboard cursor moves can
     /// bring the cursor row into view and the icon grid can gate its
     /// thumbnail requests to the rows the viewport actually shows.
@@ -1719,7 +1716,6 @@ impl Browser {
             ql_book_state: gpui::ListState::new(0, gpui::ListAlignment::Top, px(256.)),
             ql_scroll: gpui::ScrollHandle::new(),
             menu: None,
-            grid_row_len: Arc::new(AtomicUsize::new(0)),
             list_scroll: gpui::ScrollHandle::new(),
             painted_rows: Arc::new(Mutex::new(Vec::new())),
             status: String::new(),
@@ -2073,6 +2069,12 @@ impl Browser {
         let pad = 8. * scale;
         let per_line = (((f32::from(bounds.size.width) - 2. * pad) / (cell_w + gap)).floor())
             .max(1.) as i32;
+        // the band is in the viewport's coords; the cells live in
+        // content coords, scrolled up by the handle's (negative)
+        // offset. The band must read the same space, or a band drawn
+        // below the first screen selects whatever the scrolled-away
+        // rows wear.
+        let scroll_y = f32::from(self.list_scroll.offset().y);
 
         let visible = self.visible_indices();
         let tab = self.tab_mut();
@@ -2085,7 +2087,7 @@ impl Browser {
             let row = (pos as i32 / per_line) as f32;
             let col = (pos as i32 % per_line) as f32;
             let x0 = pad + col * (cell_w + gap);
-            let y0 = pad + row * (cell_h + gap);
+            let y0 = pad + row * (cell_h + gap) + scroll_y;
             if x0 < right && x0 + cell_w > left && y0 < bottom && y0 + cell_h > top {
                 tab.selection.insert(tab.entries[entry_ix].key.clone());
             }
@@ -5996,12 +5998,24 @@ impl Browser {
         if self.tab().view_mode != ViewMode::Icons {
             return 0;
         }
-        let count = self.grid_row_len.load(Ordering::Relaxed);
-        if count > 1 {
-            count
+        self.grid_shape(usize::MAX).0
+    }
+
+    /// The icon grid's shape from the pinned cell geometry (112-wide
+    /// cells, 4 gap, 8 pad, scaled): cells per line and the listing's
+    /// row count. Deterministic, so keyboard navigation, the window
+    /// math, and the rubber band's hit test all read the same numbers
+    /// instead of paint-time feedback.
+    fn grid_shape(&self, count: usize) -> (usize, usize) {
+        let pad = 8. * self.scale;
+        let cell = (112. + 4.) * self.scale;
+        let w = f32::from(self.list_scroll.bounds().size.width);
+        let per_line = if w > 2. * pad {
+            (((w - 2. * pad) / cell).floor() as usize).max(1)
         } else {
-            0
-        }
+            1
+        };
+        (per_line, count.div_ceil(per_line))
     }
 
     /// The half-open range of visible-order positions the scroll
@@ -6106,8 +6120,14 @@ impl Browser {
             // outside the window lands on the estimated pitch, and the
             // window already includes the cursor, so the next paint
             // corrects with real bounds
-            let pitch = LIST_ROW_PITCH * self.scale;
-            offset.y = -px((pos as f32) * pitch).min(self.list_scroll.max_offset().y);
+            let y = match self.tab().view_mode {
+                ViewMode::Icons => {
+                    let per_line = self.grid_per_line().max(1);
+                    (pos / per_line) as f32 * (116. + 4.) * self.scale
+                }
+                ViewMode::List => pos as f32 * LIST_ROW_PITCH * self.scale,
+            };
+            offset.y = -px(y).min(self.list_scroll.max_offset().y);
         }
         self.list_scroll.set_offset(offset);
         cx.notify();
@@ -6614,6 +6634,7 @@ impl Browser {
         &mut self,
         ix: usize,
         vis_pos: usize,
+        place: (usize, usize),
         entry: &Entry,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -6686,6 +6707,10 @@ impl Browser {
 
         div()
             .id(ix)
+            .debug_selector(move || format!("grid-cell/{ix}"))
+            .absolute()
+            .left(px(place.0 as f32 * (112. + 4.) * s))
+            .top(px(place.1 as f32 * (116. + 4.) * s))
             .w(px(112. * s))
             .h(px(116. * s))
             .flex()
@@ -9142,7 +9167,8 @@ impl Render for Browser {
         // viewport-gated.
         let pitch = LIST_ROW_PITCH * self.scale;
         let vis_count = visible.len();
-        let (win_start, win_end) = match self.tab().view_mode {
+        let is_list = self.tab().view_mode == ViewMode::List;
+        let (win_start, win_end, grid_per) = match self.tab().view_mode {
             ViewMode::List => {
                 let window = self.list_window(pitch, vis_count);
                 // the cursor is always a real element: keyboard moves
@@ -9159,15 +9185,45 @@ impl Render for Browser {
                     None => (window.start, window.end),
                 };
                 self.list_window_start.store(start, Ordering::Relaxed);
-                (start, end)
+                (start, end, 0)
             }
             ViewMode::Icons => {
-                self.list_window_start.store(0, Ordering::Relaxed);
-                (0, vis_count)
+                let (per_line, total_rows) = self.grid_shape(vis_count);
+                // the window is whole grid rows: content y of row r is
+                // r * (cell + gap), and offset.y (<= 0) is how far the
+                // viewport has scrolled into it
+                let pitch = (116. + 4.) * self.scale;
+                let pad = 8. * self.scale;
+                let top_content = f32::from(-self.list_scroll.offset().y);
+                let view_h = f32::from(self.list_scroll.bounds().size.height);
+                let first = ((top_content - pad) / pitch).floor();
+                let first = if first < 0. { 0. } else { first };
+                let first = (first as usize).saturating_sub(1);
+                let last = (((top_content + view_h - pad) / pitch).ceil() as usize + 1)
+                    .min(total_rows);
+                // the cursor is always a real element: opening the
+                // inspector narrows the grid after the scroll landed,
+                // and the jumped-to row must survive the re-shape
+                let cursor_pos = self
+                    .tab()
+                    .cursor
+                    .and_then(|ix| visible.iter().position(|&v| v == ix));
+                let (first, last) = match cursor_pos {
+                    Some(pos) => {
+                        let row = pos / per_line;
+                        (first.min(row.saturating_sub(1)), last.max(row + 2).min(total_rows))
+                    }
+                    None => (first, last),
+                };
+                let start = first * per_line;
+                self.list_window_start.store(start, Ordering::Relaxed);
+                (start, (last * per_line).min(vis_count), per_line)
             }
         };
         let mut rows: Vec<Stateful<Div>> = Vec::new();
-        if win_start > 0 {
+        // the stand-in spacers are a flow-layout device: only the
+        // windowed list needs them, the absolute grid sizes itself
+        if is_list && win_start > 0 {
             rows.push(
                 div()
                     .id("list-window-top")
@@ -9180,10 +9236,13 @@ impl Render for Browser {
             let entry = &entries[entry_ix];
             match self.tab().view_mode {
                 ViewMode::List => rows.push(self.row(entry_ix, entry, cx)),
-                ViewMode::Icons => rows.push(self.icon_cell(entry_ix, vis_pos, entry, cx)),
+                ViewMode::Icons => {
+                    let place = (vis_pos % grid_per, vis_pos / grid_per);
+                    rows.push(self.icon_cell(entry_ix, vis_pos, place, entry, cx))
+                }
             }
         }
-        if win_end < vis_count {
+        if is_list && win_end < vis_count {
             rows.push(
                 div()
                     .id("list-window-bottom")
@@ -10035,41 +10094,34 @@ impl Render for Browser {
                                     .flex_col()
                                     .p(px(8. * s))
                                     .relative()
-                                    .child(
+                                    .child({
+                                        // the grid canvas: cells are
+                                        // absolutely placed on the pinned
+                                        // geometry (the rubber band's hit
+                                        // math reads the same numbers) and
+                                        // the canvas is the listing's full
+                                        // row count tall, so the scroll
+                                        // extent stays real. Only the
+                                        // viewport's rows build as
+                                        // elements.
+                                        let (_, total_rows) = self.grid_shape(vis_count);
+                                        let canvas_h =
+                                            total_rows as f32 * (116. + 4.) * self.scale;
                                         div()
-                                            .flex()
-                                            .flex_wrap()
-                                            .content_start()
-                                            .gap(px(4. * s))
-                                            // count the first row at paint
-                                            // time: arrow-key navigation
-                                            // uses the real grid shape;
-                                            // every child is a cell, so
-                                            // the same paint feeds the
-                                            // cursor scroll-into-view
+                                            .relative()
+                                            .flex_none()
+                                            .w_full()
+                                            .h(px(canvas_h))
                                             .on_children_prepainted({
-                                                let row_len = self.grid_row_len.clone();
                                                 let painted_rows = self.painted_rows.clone();
                                                 move |children, _, _| {
-                                                    let Some(first) = children.first() else {
-                                                        return;
-                                                    };
-                                                    let y = first.origin.y;
-                                                    let count = children
-                                                        .iter()
-                                                        .filter(|b| b.origin.y == y)
-                                                        .count();
-                                                    row_len.store(
-                                                        count as usize,
-                                                        Ordering::Relaxed,
-                                                    );
                                                     if let Ok(mut cells) = painted_rows.lock() {
                                                         *cells = children;
                                                     }
                                                 }
                                             })
-                                            .children(rows),
-                                    )
+                                            .children(rows)
+                                    })
                                     // the band paints after the grid so
                                     // selected-cell backgrounds do not
                                     // cover it; it has no hitbox, so
@@ -15385,6 +15437,18 @@ mod browser_scroll_repro {
         assert!(
             offset.y < px(-1000.),
             "End must scroll the icon grid, offset {offset:?}"
+        );
+        // the grid is windowed like the list: the last cell is a real
+        // element after End, the first is gone
+        assert!(
+            window
+                .update(|_, window, _| window.debug_element_bounds("grid-cell/299").is_some()),
+            "the last cell must be built after End"
+        );
+        assert!(
+            window
+                .update(|_, window, _| window.debug_element_bounds("grid-cell/0").is_none()),
+            "cells above the viewport must not be built"
         );
 
         let _ = fs::remove_dir_all(&dir);

@@ -19,10 +19,13 @@ move rides unchanged.
   volume and stream reads ride timeout now, and the vault widget's
   poll backs off to a minute when nothing answers). Kamuy skips its
   repaint while an equal beat applies and while the window cannot
-  paint. Koguma renders the listing from a shared snapshot instead of
-  deep-cloning every entry each frame, memoizes the filter order per
-  keystroke, and lands epub chapters without recopying the chapters
-  before them. kuma-term coalesces a pty output burst into one
+  paint. Koguma's listing is windowed to the viewport: a directory
+  with tens of thousands of entries builds the rows and cells on
+  screen instead of all of them every frame, renders from a shared
+  snapshot instead of deep-cloning every entry, memoizes the filter
+  order per keystroke, and lands epub chapters without recopying the
+  chapters before them; a rescanned directory reads its listing off
+  the UI thread. kuma-term coalesces a pty output burst into one
   repaint, and its row cache can no longer be wiped by one scroll
   burst.
 
