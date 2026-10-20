@@ -15143,7 +15143,7 @@ mod browser_scroll_repro {
         });
         app.run_until_parked();
 
-        window.update(|browser, window, _| {
+        window.update(|_, window, _| {
             // rows far outside the viewport must not exist as elements
             assert!(
                 window.debug_element_bounds("list-row/0").is_some(),
