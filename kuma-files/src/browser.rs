@@ -1463,6 +1463,10 @@ pub(crate) struct Browser {
         String,
         std::sync::Arc<Vec<usize>>,
     )>>,
+    /// Monotonic counter stamped on each background rescan request:
+    /// the landing checks it, so a superseded scan drops whole
+    /// instead of overwriting a newer listing.
+    rescan_seq: u64,
     preview_key: Option<PathBuf>,
     preview_inflight: HashSet<PathBuf>,
     /// Quick Look's whole-file read for text-ish entries (capped;
@@ -1671,6 +1675,7 @@ impl Browser {
             keys_modal: false,
             text_preview: None,
             visible_cache: std::cell::RefCell::new(None),
+            rescan_seq: 0,
             preview_key: None,
             preview_inflight: HashSet::new(),
             ql_text: None,
@@ -2803,16 +2808,49 @@ impl Browser {
                             matches!(&p.parent(), Some(parent) if Some(*parent) == current.as_deref())
                         });
                     if relevant {
-                        let show_hidden = this.show_hidden;
+                        let Some(dir) = current else {
+                            return;
+                        };
+                        let (show_hidden, sort_key, sort_asc) =
+                            (this.show_hidden, this.tab().sort_key, this.tab().sort_asc);
                         let filtering = !this.filter.is_empty();
-                        this.tab_mut().reload(show_hidden);
-                        // reload rebuilt the flat listing; deep rows
-                        // died with it, so re-run a live search
-                        if filtering {
-                            this.filter_changed(cx);
-                        }
-                        log::info!("dir changed externally, reloaded");
-                        cx.notify();
+                        this.rescan_seq = this.rescan_seq.wrapping_add(1);
+                        let seq = this.rescan_seq;
+                        // the read_dir + stat walk runs off the UI
+                        // thread; the land is an Arc swap guarded by
+                        // the scan's sequence number and the tab's
+                        // directory, so a stale scan (a navigation or a
+                        // newer event won) is dropped whole
+                        let guard_dir = dir.clone();
+                        cx.spawn(async move |this, cx| {
+                            let listing = cx
+                                .background_spawn(async move {
+                                    Tab::read_dir_listing(&dir, show_hidden, sort_key, sort_asc)
+                                })
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                if this.rescan_seq != seq
+                                    || this.tab().current_dir() != Some(guard_dir.as_path())
+                                {
+                                    return;
+                                }
+                                // the user may have re-sorted mid-scan
+                                let (key, asc) = (this.tab().sort_key, this.tab().sort_asc);
+                                let mut listing = listing;
+                                if (key, asc) != (sort_key, sort_asc) {
+                                    sort_entries(&mut listing, key, asc);
+                                }
+                                this.tab_mut().land_listing(listing);
+                                // the flat listing was rebuilt; deep rows
+                                // died with it, so re-run a live search
+                                if filtering {
+                                    this.filter_changed(cx);
+                                }
+                                log::info!("dir changed externally, rescanned off the ui thread");
+                                cx.notify();
+                            });
+                        })
+                        .detach();
                     }
                 });
                 if update.is_err() {
@@ -5289,51 +5327,9 @@ impl Tab {
     }
 
     fn reload(&mut self, show_hidden: bool) {
-        match &self.source {
-            Source::Dir(dir) => match fs::read_dir(dir) {
-                Ok(read) => {
-                    let mut entries = Vec::new();
-                    for entry in read.flatten() {
-                        let path = entry.path();
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        if !show_hidden && name.starts_with('.') {
-                            continue;
-                        }
-                        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-                        let meta = fs::symlink_metadata(&path).ok();
-                        let size = meta.as_ref().and_then(|meta| {
-                            if meta.is_dir() {
-                                None
-                            } else {
-                                Some(meta.len())
-                            }
-                        });
-                        let modified = meta
-                            .and_then(|meta| meta.modified().ok())
-                            .and_then(|time| {
-                                time.duration_since(std::time::UNIX_EPOCH)
-                                    .ok()
-                                    .map(|d| d.as_secs() as i64)
-                            });
-                        entries.push(Entry {
-                            key: path.clone(),
-                            path,
-                            name,
-                            is_dir,
-                            size,
-                            modified,
-                            item: None,
-                            rel: None,
-                        });
-                    }
-                    sort_entries(&mut entries, self.sort_key, self.sort_asc);
-                    self.entries = std::sync::Arc::new(entries);
-                }
-                Err(err) => {
-                    log::error!("read_dir {}: {err}", dir.display());
-                    self.entries = std::sync::Arc::new(Vec::new());
-                }
-            },
+        let (sort_key, sort_asc) = (self.sort_key, self.sort_asc);
+        let entries = match &self.source {
+            Source::Dir(dir) => Self::read_dir_listing(dir, show_hidden, sort_key, sort_asc),
             Source::Recent => {
                 // the xbel store is the listing, newest first; capped
                 // well below what the store may hold so we do not stat
@@ -5365,15 +5361,14 @@ impl Tab {
                         rel: None,
                     });
                 }
-                self.entries = std::sync::Arc::new(entries);
+                entries
             }
             Source::Trash => {
                 let items = match os_limited::list() {
                     Ok(items) => items,
                     Err(err) => {
                         log::error!("trash list: {err}");
-                        self.entries = std::sync::Arc::new(Vec::new());
-                        return;
+                        Vec::new()
                     }
                 };
                 let mut entries = Vec::new();
@@ -5400,13 +5395,20 @@ impl Tab {
                     });
                 }
                 entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                self.entries = std::sync::Arc::new(entries);
+                entries
             }
-        }
-        // the selection survives a reload only where the entry does:
-        // a set lookup, not a scan of every entry per selected key
-        // (select-all plus one watcher event was O(selection ×
-        // entries) of PathBuf compares on this thread)
+        };
+        self.land_listing(entries);
+    }
+
+    /// Swap in a freshly built flat listing. The Arc swap is the whole
+    /// render cost now; the selection survives only where the entry
+    /// does (a set lookup, not a scan of every entry per selected key;
+    /// select-all plus one watcher event was O(selection x entries) of
+    /// PathBuf compares on this thread), and the cursor dies when its
+    /// entry is gone.
+    fn land_listing(&mut self, entries: Vec<Entry>) {
+        self.entries = std::sync::Arc::new(entries);
         let live: std::collections::HashSet<&Path> =
             self.entries.iter().map(|entry| entry.key.as_path()).collect();
         self.selection.retain(|key| live.contains(key.as_path()));
@@ -5415,6 +5417,61 @@ impl Tab {
         {
             self.cursor = None;
         }
+    }
+
+    /// The flat listing of a directory, off-thread ready: read_dir,
+    /// stat per entry, hidden gated, sorted. This is the walk the
+    /// background rescan runs; the UI thread only ever lands its
+    /// result.
+    fn read_dir_listing(
+        dir: &Path,
+        show_hidden: bool,
+        sort_key: SortKey,
+        sort_asc: bool,
+    ) -> Vec<Entry> {
+        let mut entries = Vec::new();
+        let read = match fs::read_dir(dir) {
+            Ok(read) => read,
+            Err(err) => {
+                log::error!("read_dir {}: {err}", dir.display());
+                return entries;
+            }
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            let meta = fs::symlink_metadata(&path).ok();
+            let size = meta.as_ref().and_then(|meta| {
+                if meta.is_dir() {
+                    None
+                } else {
+                    Some(meta.len())
+                }
+            });
+            let modified = meta
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|time| {
+                    time.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs() as i64)
+                });
+            entries.push(Entry {
+                key: path.clone(),
+                path,
+                name,
+                is_dir,
+                size,
+                modified,
+                item: None,
+                rel: None,
+            });
+        }
+        sort_entries(&mut entries, sort_key, sort_asc);
+        entries
     }
 
     fn current_dir(&self) -> Option<&Path> {
