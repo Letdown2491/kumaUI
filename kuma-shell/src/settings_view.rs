@@ -2859,15 +2859,23 @@ impl SettingsView {
                                     .text_color(rgb(if active { crate::theme::current().accent_text } else { crate::theme::current().text_dim })),
                             )
                         })
-                        .when(mode != WidgetMode::Icon, |el| {
-                            el.child(
+                        .when(mode != WidgetMode::Icon, |el| match mode.pill_icon() {
+                            // a mode with a mark of its own wears it
+                            // instead of the Aa
+                            Some(path) => el.child(
+                                gpui::svg()
+                                    .path(path)
+                                    .size(px(12.))
+                                    .text_color(rgb(if active { crate::theme::current().accent_text } else { crate::theme::current().text_dim })),
+                            ),
+                            None => el.child(
                                 div()
                                     .text_size(px(10.))
                                     .line_height(px(12.))
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(rgb(if active { crate::theme::current().accent_text } else { crate::theme::current().text_dim }))
                                     .child("Aa"),
-                            )
+                            ),
                         })
                 }),
             )

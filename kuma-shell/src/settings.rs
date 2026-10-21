@@ -57,7 +57,8 @@ pub const MODES_DATA: &[WidgetMode] =
 /// shadow; the text alone ("5", "connected") is cryptic.
 pub const MODES_CHIP: &[WidgetMode] = &[WidgetMode::Icon, WidgetMode::IconText];
 /// The clock's dial: what it says, never how.
-pub const MODES_CLOCK: &[WidgetMode] = &[WidgetMode::DateTime, WidgetMode::Time];
+pub const MODES_CLOCK: &[WidgetMode] =
+    &[WidgetMode::DateTime, WidgetMode::Time, WidgetMode::Date];
 /// Widgets that render one way and know it: no dial, no pills.
 pub const MODES_NONE: &[WidgetMode] = &[];
 
@@ -249,6 +250,8 @@ pub enum WidgetMode {
     DateTime,
     /// The clock's bare face.
     Time,
+    /// The clock's date face: the day alone.
+    Date,
 }
 
 impl WidgetMode {
@@ -259,6 +262,20 @@ impl WidgetMode {
             WidgetMode::Text => "text",
             WidgetMode::DateTime => "date+time",
             WidgetMode::Time => "time",
+            WidgetMode::Date => "date",
+        }
+    }
+
+    /// The glyph a pill wears when the mode is not the icon grammar.
+    /// The clock's faces are text arrangements, not icon arrangements,
+    /// so its pills carry marks of their own: the Aa stands for the
+    /// fuller face, the clock for the time alone, the calendar for
+    /// the date alone. Every other text pill keeps the Aa.
+    pub fn pill_icon(self) -> Option<&'static str> {
+        match self {
+            WidgetMode::Time => Some("icons/clock.svg"),
+            WidgetMode::Date => Some("icons/calendar.svg"),
+            _ => None,
         }
     }
 }
@@ -1828,7 +1845,7 @@ kind = \"nostr\"
         assert_eq!(WidgetKind::Apps.modes(), &[WidgetMode::Icon]);
         assert_eq!(
             WidgetKind::Clock.modes(),
-            &[WidgetMode::DateTime, WidgetMode::Time]
+            &[WidgetMode::DateTime, WidgetMode::Time, WidgetMode::Date]
         );
         assert!(WidgetKind::Workspaces.modes().is_empty());
     }

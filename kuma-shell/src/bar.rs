@@ -456,7 +456,7 @@ impl ShellBar {
                     // never arrive on a readout: the load clamps a
                     // stray placement to its kind's default, but the
                     // arms stay honest to the enum
-                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time => {
+                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time | WidgetMode::Date => {
                         Some(format!("CPU: {percent}%"))
                     }
                     WidgetMode::IconText => Some(format!("{percent}%")),
@@ -592,7 +592,7 @@ impl ShellBar {
             WidgetKind::Ram => sysmon.ram.map(|ram| {
                 let percent = ram.percent;
                 let text = match widget.mode {
-                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time => {
+                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time | WidgetMode::Date => {
                         Some(format!("RAM: {percent}%"))
                     }
                     WidgetMode::IconText => Some(format!("{percent}%")),
@@ -629,7 +629,7 @@ impl ShellBar {
                 // are losing
                 let color = if temp >= 85 { crate::theme::URGENT } else { crate::theme::current().text };
                 let text = match widget.mode {
-                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time => {
+                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time | WidgetMode::Date => {
                         Some(format!("TEMP: {temp}°C"))
                     }
                     WidgetMode::IconText => Some(format!("{temp}°C")),
@@ -659,7 +659,7 @@ impl ShellBar {
             WidgetKind::Disk => sysmon.disk.clone().map(|disk| {
                 let percent = disk.percent;
                 let text = match widget.mode {
-                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time => {
+                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time | WidgetMode::Date => {
                         Some(format!("DISK: {percent}%"))
                     }
                     WidgetMode::IconText => Some(format!("{percent}%")),
@@ -882,7 +882,7 @@ impl ShellBar {
                             .trim_end_matches(['F', 'C'])
                             .to_string(),
                     ),
-                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time => {
+                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time | WidgetMode::Date => {
                         Some(WeatherState::format_temp(fahrenheit, current.temp_c))
                     }
                 };
@@ -934,9 +934,11 @@ impl ShellBar {
                 let date = Local::now().format("%A, %B %e").to_string();
                 // the dial is what the clock says: the fuller face
                 // carries the compact day beside the time, the bare
-                // face the time alone, and neither wears an icon
+                // face the time alone, the date face the day alone,
+                // and none of them wears an icon
                 let text = match widget.mode {
                     WidgetMode::Time => self.clock.clone(),
+                    WidgetMode::Date => Local::now().format("%a %b %e").to_string(),
                     _ => format!(
                         "{} · {}",
                         Local::now().format("%a %b %e"),

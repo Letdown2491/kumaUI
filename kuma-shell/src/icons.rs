@@ -10,6 +10,7 @@ impl AssetSource for KumaAssets {
             "icons/cpu.svg" => Some(include_bytes!("../icons/cpu.svg").as_slice()),
             "icons/volume.svg" => Some(include_bytes!("../icons/volume.svg").as_slice()),
             "icons/clock.svg" => Some(include_bytes!("../icons/clock.svg").as_slice()),
+            "icons/calendar.svg" => Some(include_bytes!("../icons/calendar.svg").as_slice()),
             "icons/gear.svg" => Some(include_bytes!("../icons/gear.svg").as_slice()),
             "icons/apps.svg" => Some(include_bytes!("../icons/apps.svg").as_slice()),
             "icons/media.svg" => Some(include_bytes!("../icons/media.svg").as_slice()),

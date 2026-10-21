@@ -53,7 +53,7 @@ move rides unchanged.
 ### Changed
 
 - The mode pills are per widget, named by the registry. The clock's
-  dial is date+time / time (and its default face now shows the
+  dial is date+time / time / date (and its default face now shows the
   weekday and month beside the time), the count chips drop bare text
   (a chip that reads "5" with no subject is noise), the apps button
   is icon-only (an action, not a readout), and workspaces and tray
