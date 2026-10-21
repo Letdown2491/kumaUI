@@ -2448,6 +2448,7 @@ impl SettingsView {
                 self.mode_segmented(
                     &format!("mode-custom-{}", manifest.id),
                     "icons/puzzle.svg",
+                    crate::settings::MODES_DATA,
                     mode,
                     section,
                     index,
@@ -2553,6 +2554,10 @@ impl SettingsView {
         let reference = crate::settings::WidgetRef::Builtin(kind);
         let position = self.settings.read(cx).position(&reference);
         let enabled = position.is_some();
+        let icon_path = match kind.icon_spec() {
+            Some(crate::settings::WidgetIconSpec::Path(path)) => path,
+            _ => "icons/puzzle.svg",
+        };
         let mode = position.map(|(section, index)| {
             (
                 section,
@@ -2587,19 +2592,22 @@ impl SettingsView {
                     .truncate()
                     .child(kind.label()),
             )
-            .children(mode.map(|(section, index, mode)| {
-                let icon_path = match kind.icon_spec() {
-                    Some(crate::settings::WidgetIconSpec::Path(path)) => path,
-                    _ => "icons/puzzle.svg",
-                };
-                self.mode_segmented(
-                    &format!("mode-{kind:?}"),
-                    icon_path,
-                    mode,
-                    section,
-                    index,
-                    cx,
-                )
+            // the pill set a widget offers comes from the registry:
+            // the clock gets faces, the chips get icon shapes, and a
+            // single-option widget shows no pills at all
+            .children(mode.and_then(|(section, index, mode)| {
+                let modes = kind.modes();
+                (modes.len() > 1).then(|| {
+                    self.mode_segmented(
+                        &format!("mode-{kind:?}"),
+                        icon_path,
+                        modes,
+                        mode,
+                        section,
+                        index,
+                        cx,
+                    )
+                })
             }))
             .child(
                 div()
@@ -2810,6 +2818,7 @@ impl SettingsView {
         &self,
         id: &str,
         icon_path: &'static str,
+        modes: &'static [WidgetMode],
         current: WidgetMode,
         section: Section,
         index: usize,
@@ -2823,7 +2832,7 @@ impl SettingsView {
             .rounded_sm()
             .bg(rgb(crate::theme::current().inset))
             .children(
-                [WidgetMode::Icon, WidgetMode::IconText, WidgetMode::Text].map(|mode| {
+                modes.iter().copied().map(|mode| {
                     let active = mode == current;
                     div()
                         .id(SharedString::from(format!("mode-{id}-{mode:?}")))
@@ -2842,7 +2851,7 @@ impl SettingsView {
                                 settings.set_mode(section, index, mode, cx)
                             });
                         }))
-                        .when(mode != WidgetMode::Text, |el| {
+                        .when(matches!(mode, WidgetMode::Icon | WidgetMode::IconText), |el| {
                             el.child(
                                 gpui::svg()
                                     .path(icon_path)

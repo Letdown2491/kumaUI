@@ -45,6 +45,14 @@ kuma-monitor 0.2.1
 
 ### Changed
 
+- The mode pills are per widget now: the registry names the dial each
+  widget offers, instead of every widget getting icon / icon+text /
+  text. The clock's dial is date+time / time (its shipped face carries
+  the compact day beside the time), the count-bearing chips drop the
+  bare text that read as "5" with no subject, the apps button is
+  icon-only, and the workspaces and tray rows have no dial at all. A
+  config naming a mode a widget does not offer clamps to that
+  widget's default at load, in memory only.
 - Idle cost, all four apps: the shell's bar no longer repaints on a
   sysmon, tray, or vault poll that found nothing moved, and a wedged
   PipeWire can no longer stall the shell's poll for the session (the

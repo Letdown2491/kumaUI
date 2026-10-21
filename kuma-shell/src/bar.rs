@@ -452,7 +452,13 @@ impl ShellBar {
                 // has to say how much; detail lives in the panel the
                 // click opens
                 let text = match widget.mode {
-                    WidgetMode::Text => Some(format!("CPU: {percent}%")),
+                    // the clock's two faces are text-only dials and
+                    // never arrive on a readout: the load clamps a
+                    // stray placement to its kind's default, but the
+                    // arms stay honest to the enum
+                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time => {
+                        Some(format!("CPU: {percent}%"))
+                    }
                     WidgetMode::IconText => Some(format!("{percent}%")),
                     WidgetMode::Icon => None,
                 };
@@ -586,7 +592,9 @@ impl ShellBar {
             WidgetKind::Ram => sysmon.ram.map(|ram| {
                 let percent = ram.percent;
                 let text = match widget.mode {
-                    WidgetMode::Text => Some(format!("RAM: {percent}%")),
+                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time => {
+                        Some(format!("RAM: {percent}%"))
+                    }
                     WidgetMode::IconText => Some(format!("{percent}%")),
                     WidgetMode::Icon => None,
                 };
@@ -621,7 +629,9 @@ impl ShellBar {
                 // are losing
                 let color = if temp >= 85 { crate::theme::URGENT } else { crate::theme::current().text };
                 let text = match widget.mode {
-                    WidgetMode::Text => Some(format!("TEMP: {temp}°C")),
+                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time => {
+                        Some(format!("TEMP: {temp}°C"))
+                    }
                     WidgetMode::IconText => Some(format!("{temp}°C")),
                     WidgetMode::Icon => None,
                 };
@@ -649,7 +659,9 @@ impl ShellBar {
             WidgetKind::Disk => sysmon.disk.clone().map(|disk| {
                 let percent = disk.percent;
                 let text = match widget.mode {
-                    WidgetMode::Text => Some(format!("DISK: {percent}%")),
+                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time => {
+                        Some(format!("DISK: {percent}%"))
+                    }
                     WidgetMode::IconText => Some(format!("{percent}%")),
                     WidgetMode::Icon => None,
                 };
@@ -870,7 +882,7 @@ impl ShellBar {
                             .trim_end_matches(['F', 'C'])
                             .to_string(),
                     ),
-                    WidgetMode::Text => {
+                    WidgetMode::Text | WidgetMode::DateTime | WidgetMode::Time => {
                         Some(WeatherState::format_temp(fahrenheit, current.temp_c))
                     }
                 };
@@ -920,11 +932,22 @@ impl ShellBar {
             }
             WidgetKind::Clock => {
                 let date = Local::now().format("%A, %B %e").to_string();
+                // the dial is what the clock says: the fuller face
+                // carries the compact day beside the time, the bare
+                // face the time alone, and neither wears an icon
+                let text = match widget.mode {
+                    WidgetMode::Time => self.clock.clone(),
+                    _ => format!(
+                        "{} · {}",
+                        Local::now().format("%a %b %e"),
+                        self.clock.clone()
+                    ),
+                };
                 Some(
                     sys_widget(
                         kind,
-                        widget.mode,
-                        Some(self.clock.clone()),
+                        WidgetMode::Text,
+                        Some(text),
                         crate::theme::current().text,
                         move |_: &SysMon, _| date.clone().into(),
                         widget_icon(kind),

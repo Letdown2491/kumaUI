@@ -50,10 +50,25 @@ pub enum WidgetIconSpec {
 
 /// The widget registry: the single declaration table. Adding a widget = a new
 /// entry here + a render arm in bar.rs (compiler-checked) + data in sysmon/niri.
+/// Every widget whose body is data can dress it three ways.
+pub const MODES_DATA: &[WidgetMode] =
+    &[WidgetMode::Icon, WidgetMode::IconText, WidgetMode::Text];
+/// Count-bearing chips: the icon is the subject and the count is its
+/// shadow; the text alone ("5", "connected") is cryptic.
+pub const MODES_CHIP: &[WidgetMode] = &[WidgetMode::Icon, WidgetMode::IconText];
+/// The clock's dial: what it says, never how.
+pub const MODES_CLOCK: &[WidgetMode] = &[WidgetMode::DateTime, WidgetMode::Time];
+/// Widgets that render one way and know it: no dial, no pills.
+pub const MODES_NONE: &[WidgetMode] = &[];
+
 pub struct WidgetSpec {
     pub kind: WidgetKind,
     pub label: &'static str,
     pub icon: Option<WidgetIconSpec>,
+    /// The display modes this widget offers; the settings page renders
+    /// exactly these as pills, and a config naming anything else
+    /// clamps to the kind's default.
+    pub modes: &'static [WidgetMode],
 }
 
 pub const WIDGETS: &[WidgetSpec] = &[
@@ -61,106 +76,127 @@ pub const WIDGETS: &[WidgetSpec] = &[
         kind: WidgetKind::Workspaces,
         label: "Workspaces",
         icon: None,
+        modes: MODES_NONE,
     },
     WidgetSpec {
         kind: WidgetKind::WindowTitle,
         label: "Window title",
         icon: None,
+        modes: &[WidgetMode::Text],
     },
     WidgetSpec {
         kind: WidgetKind::Apps,
         label: "Apps",
         icon: Some(WidgetIconSpec::Path("icons/apps.svg")),
+        modes: &[WidgetMode::Icon],
     },
     WidgetSpec {
         kind: WidgetKind::Cpu,
         label: "CPU",
         icon: Some(WidgetIconSpec::Path("icons/cpu.svg")),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::Ram,
         label: "Memory",
         icon: Some(WidgetIconSpec::Path("icons/memory.svg")),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::Temp,
         label: "CPU temperature",
         icon: Some(WidgetIconSpec::Path("icons/temp.svg")),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::Disk,
         label: "Disk",
         icon: Some(WidgetIconSpec::Path("icons/drive.svg")),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::Volume,
         label: "Volume",
         icon: Some(WidgetIconSpec::Path("icons/volume.svg")),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::Mic,
         label: "Microphone",
         icon: Some(WidgetIconSpec::Path("icons/mic.svg")),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::Brightness,
         label: "Brightness",
         icon: Some(WidgetIconSpec::Path("icons/brightness.svg")),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::PowerProfile,
         label: "Power profile",
         icon: Some(WidgetIconSpec::Path("icons/power-profile.svg")),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::Media,
         label: "Media",
         icon: Some(WidgetIconSpec::Path("icons/media.svg")),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::Battery,
         label: "Battery",
         icon: Some(WidgetIconSpec::Generated),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::Clock,
         label: "Clock",
         icon: Some(WidgetIconSpec::Path("icons/clock.svg")),
+        modes: MODES_CLOCK,
     },
     WidgetSpec {
         kind: WidgetKind::Bluetooth,
         label: "Bluetooth",
         icon: Some(WidgetIconSpec::Path("icons/bluetooth.svg")),
+        modes: MODES_CHIP,
     },
     WidgetSpec {
         kind: WidgetKind::Internet,
         label: "Internet",
         icon: Some(WidgetIconSpec::Path("icons/wifi.svg")),
+        modes: MODES_CHIP,
     },
     WidgetSpec {
         kind: WidgetKind::Notifications,
         label: "Notifications",
         icon: Some(WidgetIconSpec::Path("icons/bell.svg")),
+        modes: MODES_CHIP,
     },
     WidgetSpec {
         kind: WidgetKind::Tray,
         label: "System tray",
         icon: None,
+        modes: MODES_NONE,
     },
     WidgetSpec {
         kind: WidgetKind::Nostr,
         label: "Nostr Signer",
         icon: Some(WidgetIconSpec::Path("icons/shield-lock.svg")),
+        modes: MODES_CHIP,
     },
     WidgetSpec {
         kind: WidgetKind::Weather,
         label: "Weather",
         icon: Some(WidgetIconSpec::Generated),
+        modes: MODES_DATA,
     },
     WidgetSpec {
         kind: WidgetKind::Updates,
         label: "Kuma Updates",
         icon: Some(WidgetIconSpec::Path("icons/updates.svg")),
+        modes: MODES_CHIP,
     },
 ];
 
@@ -176,17 +212,27 @@ impl WidgetKind {
         self.spec().label
     }
 
-    pub fn icon_spec(self) -> Option<WidgetIconSpec> {
-        self.spec().icon
+    /// The widget's dial, straight from the registry.
+    pub fn modes(self) -> &'static [WidgetMode] {
+        self.spec().modes
     }
 
-    pub fn supports_mode(self) -> bool {
-        // the apps widget is an action button (opens the launcher panel):
-        // always icon-only, it has no data to render as text
+    /// The mode a placement falls back to when its stored mode is not
+    /// one the widget offers (an old config, a config carried between
+    /// machines). The clock's default is its fuller face; the apps
+    /// button has only its icon; everyone else keeps the global
+    /// icon+text.
+    pub fn default_mode(self) -> WidgetMode {
         match self {
-            WidgetKind::Apps => false,
-            kind => kind.icon_spec().is_some(),
+            WidgetKind::Clock => WidgetMode::DateTime,
+            WidgetKind::Apps => WidgetMode::Icon,
+            WidgetKind::WindowTitle => WidgetMode::Text,
+            _ => WidgetMode::default(),
         }
+    }
+
+    pub fn icon_spec(self) -> Option<WidgetIconSpec> {
+        self.spec().icon
     }
 }
 
@@ -197,6 +243,12 @@ pub enum WidgetMode {
     #[default]
     IconText,
     Text,
+    /// The clock's fuller face: the day beside the time. A text-only
+    /// arrangement, so it belongs to the union of dials rather than to
+    /// the icon grammar.
+    DateTime,
+    /// The clock's bare face.
+    Time,
 }
 
 impl WidgetMode {
@@ -205,6 +257,8 @@ impl WidgetMode {
             WidgetMode::Icon => "icon",
             WidgetMode::IconText => "icon+text",
             WidgetMode::Text => "text",
+            WidgetMode::DateTime => "date+time",
+            WidgetMode::Time => "time",
         }
     }
 }
@@ -930,10 +984,10 @@ impl Default for Settings {
                     top_right: false,
                     ..CornerRounding::default()
                 },
-                left: vec![widget(WidgetKind::Apps), widget(WidgetKind::Workspaces)],
+                left: vec![icon(WidgetKind::Apps), widget(WidgetKind::Workspaces)],
                 center: vec![WidgetConfig {
                     kind: WidgetRef::Builtin(WidgetKind::Clock),
-                    mode: WidgetMode::Text,
+                    mode: WidgetMode::DateTime,
                 }],
                 right: vec![
                     icon(WidgetKind::Tray),
@@ -974,15 +1028,34 @@ impl Settings {
     pub fn load() -> Settings {
         match fs::read_to_string(config_path())
             .map_err(anyhow::Error::msg)
-            .and_then(|text| toml::from_str(&text).map_err(anyhow::Error::msg))
+            .and_then(|text| toml::from_str::<Settings>(&text).map_err(anyhow::Error::msg))
         {
-            Ok(settings) => settings,
+            Ok(mut settings) => {
+                settings.clamp_modes();
+                settings
+            }
             Err(err) => {
                 error!(
                     "loading config from {:?} failed, using defaults: {err:#}",
                     config_path()
                 );
                 Settings::default()
+            }
+        }
+    }
+
+    /// Every placement's mode must be one its widget offers: a config
+    /// can name a mode a widget does not have (the clock once offered
+    /// icon+text, a config can be carried between machines). Clamped
+    /// in memory only; the file stays the untouched record.
+    fn clamp_modes(&mut self) {
+        for section in SECTIONS {
+            for widget in self.widgets_mut(section) {
+                if let WidgetRef::Builtin(kind) = widget.kind
+                    && !kind.modes().contains(&widget.mode)
+                {
+                    widget.mode = kind.default_mode();
+                }
             }
         }
     }
@@ -1112,9 +1185,13 @@ impl Settings {
         if self.is_present(&kind) {
             return false;
         }
+        let mode = match kind {
+            WidgetRef::Builtin(builtin) => builtin.default_mode(),
+            WidgetRef::Custom(_) => WidgetMode::default(),
+        };
         self.widgets_mut(Section::Right).push(WidgetConfig {
             kind,
-            mode: WidgetMode::default(),
+            mode,
         });
         true
     }
@@ -1614,6 +1691,35 @@ kind = \"volume\"
     }
 
     #[test]
+    fn modes_clamp_to_the_widget_dial() {
+        let mut settings = Settings::default();
+        // the clock's dial is date+time/time; a stored mode outside it
+        // (the old icon grammar) falls back to the kind's default,
+        // in memory only
+        settings.widgets_mut(Section::Center)[0].mode = WidgetMode::Icon;
+        settings.clamp_modes();
+        assert_eq!(
+            settings.widgets(Section::Center)[0].mode,
+            WidgetMode::DateTime
+        );
+
+        // a chip cannot go bare text: its text alone is cryptic, so
+        // the dial clamps back to the icon+text default (volume is a
+        // data widget and may go bare; its neighbor cannot)
+        settings.widgets_mut(Section::Right)[1].mode = WidgetMode::Text;
+        settings.clamp_modes();
+        assert_eq!(
+            settings.widgets(Section::Right)[1].mode,
+            WidgetMode::IconText
+        );
+
+        // a mode the widget does offer stays put
+        settings.widgets_mut(Section::Right)[1].mode = WidgetMode::Icon;
+        settings.clamp_modes();
+        assert_eq!(settings.widgets(Section::Right)[1].mode, WidgetMode::Icon);
+    }
+
+    #[test]
     fn pruning_drops_placements_whose_widget_vanished_and_keeps_the_rest() {
         let config = "\
 [[bar.right]]
@@ -1697,11 +1803,6 @@ kind = \"nostr\"
 
     #[test]
     fn registry_owns_icon_decisions() {
-        // no-icon widgets never support icon modes
-        assert!(!WidgetKind::Workspaces.supports_mode());
-        assert!(!WidgetKind::WindowTitle.supports_mode());
-        // the apps widget has an icon but is an action button: icon-only
-        assert!(!WidgetKind::Apps.supports_mode());
         // the battery icon is generated at render time, not a themed asset
         assert_eq!(
             WidgetKind::Battery.icon_spec(),
@@ -1712,6 +1813,24 @@ kind = \"nostr\"
             Some(WidgetIconSpec::Path("icons/cpu.svg"))
         );
         assert_eq!(WIDGETS.len(), 21);
+
+        // every widget's default mode is one its own dial offers, and
+        // the dials read as designed: the apps button is icon-only
+        // (an action, not a readout), the clock's dial is what it
+        // says, never how, and the workspaces row has no dial at all
+        for spec in WIDGETS {
+            assert!(
+                spec.modes.is_empty() || spec.modes.contains(&spec.kind.default_mode()),
+                "{} defaults to a mode its dial does not offer",
+                spec.label
+            );
+        }
+        assert_eq!(WidgetKind::Apps.modes(), &[WidgetMode::Icon]);
+        assert_eq!(
+            WidgetKind::Clock.modes(),
+            &[WidgetMode::DateTime, WidgetMode::Time]
+        );
+        assert!(WidgetKind::Workspaces.modes().is_empty());
     }
 
     #[test]
