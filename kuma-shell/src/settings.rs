@@ -1069,14 +1069,8 @@ fn config_path() -> PathBuf {
 
 impl Settings {
     pub fn load() -> Settings {
-        match fs::read_to_string(config_path())
-            .map_err(anyhow::Error::msg)
-            .and_then(|text| toml::from_str::<Settings>(&text).map_err(anyhow::Error::msg))
-        {
-            Ok(mut settings) => {
-                settings.clamp_modes();
-                settings
-            }
+        match Settings::try_load() {
+            Ok(settings) => settings,
             Err(err) => {
                 error!(
                     "loading config from {:?} failed, using defaults: {err:#}",
@@ -1085,6 +1079,19 @@ impl Settings {
                 Settings::default()
             }
         }
+    }
+
+    /// The config read and parsed, errors surfaced: the boot path
+    /// defaults past them, and `reload` refuses on them (an unparsable
+    /// file is the user's hand edit mid-flight, never a reason to
+    /// write defaults over it).
+    pub fn try_load() -> anyhow::Result<Settings> {
+        let mut settings: Settings = toml::from_str(
+            &fs::read_to_string(config_path()).map_err(anyhow::Error::msg)?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        settings.clamp_modes();
+        Ok(settings)
     }
 
     /// Every placement's mode must be one its widget offers: a config
@@ -1154,8 +1161,21 @@ impl Settings {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        *self = Settings::load();
-        self.commit(cx);
+        match Settings::try_load() {
+            Ok(settings) => {
+                *self = settings;
+                self.commit(cx);
+            }
+            Err(err) => {
+                // the file fails to parse (a hand edit with a typo,
+                // most likely): the running settings stay, and the
+                // file keeps its bytes. Writing defaults here would
+                // destroy the user's config at the one moment the
+                // on-disk record matters
+                error!("reloading config failed, keeping the running settings: {err:#}");
+                cx.notify();
+            }
+        }
     }
 
     pub fn set_mode(

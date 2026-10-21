@@ -21,6 +21,12 @@ move rides unchanged.
 
 ### Fixed
 
+- Reloading config from the settings page no longer replaces the
+  running settings with defaults when the file fails to parse (a hand
+  edit with a typo), and no longer writes those defaults over the
+  file: the reload keeps the running settings and says so in the log,
+  because destroying the config at the one moment it is being edited
+  is the worst possible answer to a typo.
 - Koguma's rename no longer silently overwrites an existing file:
   rename(2) replaces its destination, so committing a name that
   already exists destroyed that file with no dialog and no undo. The
