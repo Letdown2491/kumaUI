@@ -21,6 +21,12 @@ move rides unchanged.
 
 ### Fixed
 
+- Wi-Fi network names containing a literal colon render and match
+  correctly in the network panel: `nmcli -t` escapes colons as `\:`,
+  and the panel split on every colon, both for the saved-network
+  list and the device status line, so `My:Net` showed as `My\:Net`
+  and never matched its own saved connection. Both paths go through
+  the same unescape the scan list uses.
 - Desktop files with `[Desktop Action]` sections no longer vanish
   from the greeter's session picker: a section header fell into the
   key=value arm, and its missing `=` aborted the whole file. Other

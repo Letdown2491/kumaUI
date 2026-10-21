@@ -1638,7 +1638,10 @@ fn read_access_points() -> Vec<AccessPoint> {
 }
 
 /// The remembered wireless connections: names whose type is the
-/// wifi one in `nmcli -t -f NAME,TYPE connection show`.
+/// wifi one in `nmcli -t -f NAME,TYPE connection show`. Names come
+/// through the same unescape as the scan list: a literal colon in an
+/// SSID arrives as `\:`, and the saved and scanned spellings must
+/// match or the panel re-prompts for a password on a known network.
 fn read_saved_wifi() -> Vec<String> {
     let Ok(output) = timed_output("nmcli", &["-t", "-f", "NAME,TYPE", "connection", "show"], 10)
     else {
@@ -1649,9 +1652,16 @@ fn read_saved_wifi() -> Vec<String> {
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|line| line.rsplit_once(':'))
-        .filter(|(_, kind)| *kind == "802-11-wireless" || *kind == "wifi")
-        .map(|(name, _)| name.to_string())
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let fields = split_nmcli_line(line);
+            let kind = fields.get(1)?;
+            if kind == "802-11-wireless" || kind == "wifi" {
+                fields.into_iter().next()
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -1736,12 +1746,15 @@ pub fn set_power_profile(profile: PowerProfile) -> anyhow::Result<()> {
 // `nmcli -t` device lines: TYPE:STATE:CONNECTION with short type names
 fn apply_device_status(network: &mut NetworkState, output: &str) {
     for line in output.lines() {
-        let fields: Vec<&str> = line.splitn(3, ':').collect();
+        // the split goes through the nmcli unescape: a connection
+        // named with a literal colon arrives as `\:` and renders
+        // with the colon, not the escape
+        let fields = split_nmcli_line(line);
         if fields.len() == 3 && fields[1] == "connected" {
-            match fields[0] {
+            match fields[0].as_str() {
                 "wifi" | "802-11-wireless" => {
                     network.wifi = true;
-                    network.ssid = Some(fields[2].to_string());
+                    network.ssid = Some(fields[2].clone());
                     return;
                 }
                 "ethernet" | "802-3-ethernet" => {
