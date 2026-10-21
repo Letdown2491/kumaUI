@@ -21,6 +21,13 @@ move rides unchanged.
 
 ### Fixed
 
+- Notification urgency reads the spec's wire form now: a byte in the
+  hints (0 low, 1 normal, 2 critical). Only the legacy string
+  spelling was understood, so every spec-compliant critical
+  notification rendered as a normal one.
+- A toast replaced by a newer notification emits the Closed signal
+  (the expiry shape) for the notification it replaced: the client
+  that sent it used to wait forever on a signal that never came.
 - Reloading config from the settings page no longer replaces the
   running settings with defaults when the file fails to parse (a hand
   edit with a typo), and no longer writes those defaults over the

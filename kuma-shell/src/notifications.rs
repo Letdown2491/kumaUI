@@ -178,15 +178,26 @@ fn parse_actions(actions: &[String]) -> Vec<(String, String)> {
 }
 
 fn urgency_from_hints(hints: &HashMap<String, OwnedValue>) -> Urgency {
-    hints
+    // the spec sends urgency as a byte (0 low, 1 normal, 2 critical);
+    // the string spellings stay as a fallback for the clients that
+    // shipped one, but a spec-compliant send must not read as Normal
+    let byte = hints
+        .get("urgency")
+        .and_then(|value| value.downcast_ref::<u8>().ok())
+        .map(|byte| match byte {
+            2 => Urgency::Critical,
+            1 => Urgency::Normal,
+            _ => Urgency::Low,
+        });
+    let text = hints
         .get("urgency")
         .and_then(|value| <&Str>::try_from(value).ok())
-        .map(|urgency| match urgency.as_str() {
-            "critical" => Urgency::Critical,
-            "normal" => Urgency::Normal,
-            _ => Urgency::Low,
-        })
-        .unwrap_or(Urgency::Normal)
+        .and_then(|urgency| match urgency.as_str() {
+            "critical" => Some(Urgency::Critical),
+            "normal" => Some(Urgency::Normal),
+            _ => Some(Urgency::Low),
+        });
+    byte.or(text).unwrap_or(Urgency::Normal)
 }
 
 /// The expire hint → how long the toast hangs: -1 = our default, 0 = the
@@ -440,6 +451,15 @@ impl NotificationState {
     }
 
     fn show_toast(&mut self, id: u32, cx: &mut Context<Self>) {
+        // a replaced toast's notification is off-screen now: the
+        // client waiting on its Closed signal gets reason 1 (the
+        // expiry shape), or it hangs on a signal that never comes
+        let replaced = self.toast.as_ref().map(|(old_id, _)| *old_id);
+        if let Some(old_id) = replaced
+            && old_id != id
+        {
+            self.expire_toast(old_id, cx);
+        }
         self.close_toast(cx);
         let Some(notification) = self.notifications.iter().find(|n| n.id == id).cloned() else {
             return;
@@ -673,6 +693,15 @@ mod tests {
     #[test]
     fn urgency_hint_maps_to_levels() {
         let mut hints = HashMap::new();
+        // the spec's wire form: a byte
+        hints.insert("urgency".to_string(), OwnedValue::from(2u8));
+        assert_eq!(urgency_from_hints(&hints), Urgency::Critical);
+        hints.insert("urgency".to_string(), OwnedValue::from(1u8));
+        assert_eq!(urgency_from_hints(&hints), Urgency::Normal);
+        hints.insert("urgency".to_string(), OwnedValue::from(0u8));
+        assert_eq!(urgency_from_hints(&hints), Urgency::Low);
+
+        // legacy string spellings still map
         hints.insert(
             "urgency".to_string(),
             OwnedValue::from(Str::from("critical")),
