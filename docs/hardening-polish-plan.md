@@ -144,3 +144,15 @@ form:
   need an owner call.
 - **Synchronous niri seed at files/monitor startup.** Only if a wedged
   niri socket ever shows up as a slow first frame.
+
+## Addendum 2026-10-21: the review cycle folded in
+
+The owner, back early, folded a full review round (correctness bugs,
+performance, and a first DRY pass) into this release instead of parking
+it for 0.6.0. Patch-style rules held: only wrong-behavior and hang
+fixes, patch-sized perf wins, and consolidate-now dedup landed. The
+findings and their commits are in the changelog under `## 0.5.1`
+(Changed and Fixed); nothing architectural moved, so the 0.6.0 list
+above is unchanged. New consolidation seams: `kuma_platform::process`
+(bounded_output/timed_output), `kuma_platform::files` (write_atomic,
+percent_decode), `kuma_platform::logging::init`.

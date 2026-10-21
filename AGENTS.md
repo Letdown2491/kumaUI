@@ -8,7 +8,9 @@ kumaOS is atomic: **there is no host toolchain**. Always build with:
 
 This runs cargo inside the `localhost/kuma-dev-rust` podman container
 (built on first use from `containers/`). It installs `kuma-shell` to
-`~/.local/bin/kuma-shell` and `kuma-term` to `~/.local/bin/kuma-term`;
+`~/.local/bin/kuma-shell`, `kuma-term` to `~/.local/bin/kuma-term`, and
+`kuma-greeter` to `~/.local/bin/kuma-greeter` (binary only: greetd runs
+the image's copy at login, the local one keeps `--version` current);
 when `target/release/kuma-files` exists it also installs Koguma: the
 binary, the menu entry, the app icon, and the directory-handler
 binding, and when `target/release/kuma-monitor` exists, Kamuy: the
