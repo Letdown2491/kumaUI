@@ -28,6 +28,14 @@ pub(crate) fn version_line() -> String {
     kuma_platform::version::line("kuma-greeter", env!("CARGO_PKG_VERSION"))
 }
 
+/// `--version` is a first-argument flag, like every binary in the
+/// family: a version spelling in a later position belongs to whatever
+/// it follows (a headless rehearsal's session command), not to us.
+pub(crate) fn wants_version(args: &[String]) -> bool {
+    args.first()
+        .is_some_and(|arg| kuma_platform::version::is_version_flag(arg))
+}
+
 fn main() {
     use std::io::Write as _;
     env_logger::Builder::from_env(env_logger::Env::default())
@@ -46,7 +54,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // --version prints and exits: no greetd socket, no compositor, no tty
-    if args.iter().any(|arg| kuma_platform::version::is_version_flag(arg)) {
+    if wants_version(&args) {
         println!("{}", version_line());
         return;
     }
@@ -569,5 +577,21 @@ mod tests {
         let line = version_line();
         assert!(line.starts_with("kuma-greeter "));
         assert!(line.contains("(g"));
+    }
+
+    #[test]
+    fn version_is_a_first_argument_flag_only() {
+        assert!(wants_version(&["--version".to_string()]));
+        assert!(wants_version(&["-V".to_string()]));
+        assert!(!wants_version(&[]));
+        // a later spelling belongs to the command after --headless:
+        // printing the version instead of logging in would be a very
+        // quiet way to strand a login screen
+        assert!(!wants_version(&[
+            "--headless".to_string(),
+            "user".to_string(),
+            "niri-session".to_string(),
+            "-V".to_string(),
+        ]));
     }
 }

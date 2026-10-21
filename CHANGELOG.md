@@ -21,6 +21,13 @@ move rides unchanged.
 
 ### Fixed
 
+- The greeter recognized a version flag anywhere in its arguments: a
+  headless rehearsal command spelling `-V` in a later position
+  printed the version line and exited instead of logging in. It is a
+  first-argument flag now, like every binary in the family.
+- The session mirror no longer logs an error, repeating on every
+  reconnect timer, for a session event stream that ended cleanly: a
+  clean end is a warning about the retry, not an error.
 - Long widget text (a media title, a custom widget's script line)
   ellipsizes inside its section instead of shoving the neighbors off
   the bar, and all three bar sections clip overflow at their edge the
