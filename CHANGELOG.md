@@ -21,6 +21,16 @@ move rides unchanged.
 
 ### Fixed
 
+- Night light on a compositor without the gamma protocol parks its
+  thread after one error line instead of logging the same error every
+  5 seconds.
+- The night-light schedule window follows DST: the local UTC offset
+  was sampled once per process and kept forever, so the window sat an
+  hour off after every transition. It re-samples at least every ten
+  minutes.
+- A healthy gamma control resets its rebind backoff, so a later
+  transient failure retries in a second instead of inheriting the
+  minute a long-ago permanent failure had backed off to.
 - A failed app launch keeps the launcher panel open: activate and
   the mouse click closed the panel regardless, dropping the user's
   query along with the error.

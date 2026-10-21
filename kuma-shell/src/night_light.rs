@@ -66,7 +66,16 @@ pub fn run(settings: &Entity<Settings>, cx: &mut App) {
             // a dead connection (compositor restart) retries rather
             // than ending the feature
             loop {
-                if let Err(err) = apply_loop(shared.clone()) {                    log::error!("night light stopped: {err:#}; retrying in 5s");
+                if let Err(err) = apply_loop(shared.clone()) {
+                    // a compositor without the gamma protocol is a
+                    // permanent answer: one honest line, then the
+                    // thread parks. Retrying would log the same error
+                    // every 5s for the life of the session
+                    if err.to_string().contains("wlr-gamma-control") {
+                        log::error!("night light stopped: {err:#}");
+                        return;
+                    }
+                    log::error!("night light stopped: {err:#}; retrying in 5s");
                     std::thread::sleep(std::time::Duration::from_secs(5));
                 } else {
                     return;
@@ -183,30 +192,42 @@ fn local_hm() -> (u32, u32) {
     (mins / 60, mins % 60)
 }
 
-/// The local UTC offset in minutes, east positive: `date +%z` once,
-/// cached. Bounded like every other subprocess read: a wedged `date`
-/// must cost the schedule one tick, not the feature.
+/// The local UTC offset in minutes, east positive: `date +%z`, cached
+/// for ten minutes so a DST transition moves the schedule window
+/// within a quarter hour instead of never (the offset was once
+/// sampled per process and kept forever, which left the window an
+/// hour off after every transition). Bounded like every other
+/// subprocess read: a wedged `date` must cost the schedule one tick,
+/// not the feature.
 fn local_offset_minutes(_secs: u64) -> i32 {
-    static OFFSET: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
-    *OFFSET.get_or_init(|| {
-        std::process::Command::new("timeout")
-            .args(["5", "date", "+%z"])
-            .output()
-            .ok()
-            .and_then(|out| {
-                let text = String::from_utf8_lossy(&out.stdout);
-                let text = text.trim();
-                // empty or odd output degrades to 0 (UTC): split_at(1)
-                // would panic on the empty case, and a panic in a
-                // OnceLock initializer kills the whole feature
-                let (sign, rest) = text.split_at_checked(1)?;
-                let hours: i32 = rest.get(..2)?.parse().ok()?;
-                let minutes: i32 = rest.get(2..4)?.parse().ok()?;
-                let magnitude = hours * 60 + minutes;
-                Some(if sign == "-" { -magnitude } else { magnitude })
-            })
-            .unwrap_or(0)
-    })
+    static OFFSET: std::sync::OnceLock<std::sync::Mutex<Option<(i32, std::time::Instant)>>> =
+        std::sync::OnceLock::new();
+    let cache = OFFSET.get_or_init(|| std::sync::Mutex::new(None));
+    let mut cached = cache.lock().unwrap();
+    if let Some((offset, at)) = *cached {
+        if at.elapsed() < std::time::Duration::from_secs(600) {
+            return offset;
+        }
+    }
+    let fresh = std::process::Command::new("timeout")
+        .args(["5", "date", "+%z"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let text = text.trim();
+            // empty or odd output degrades to 0 (UTC): split_at(1)
+            // would panic on the empty case, and a panic here kills
+            // the whole feature
+            let (sign, rest) = text.split_at_checked(1)?;
+            let hours: i32 = rest.get(..2)?.parse().ok()?;
+            let minutes: i32 = rest.get(2..4)?.parse().ok()?;
+            let magnitude = hours * 60 + minutes;
+            Some(if sign == "-" { -magnitude } else { magnitude })
+        })
+        .unwrap_or(0);
+    *cached = Some((fresh, std::time::Instant::now()));
+    fresh
 }
 
 struct NightApp {
@@ -364,6 +385,17 @@ impl Dispatch<ZwlrGammaControlV1, ()> for NightApp {
                     if entry.1 == *control {
                         entry.2 = Some(size);
                     }
+                }
+                // a control that reported a size is healthy: its
+                // rebind cooldown clears, so a later transient
+                // failure starts the ramp over at one second instead
+                // of inheriting the minute a long-ago permanent
+                // failure had backed off to
+                if let Some((output, _, _)) =
+                    state.controls.iter().find(|(_, c, _)| c == control)
+                {
+                    let output = output.clone();
+                    state.rebind_at.retain(|(known, _, _)| known != &output);
                 }
             }
             // the output or the ramp was rejected: drop the control so
