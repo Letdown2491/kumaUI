@@ -45,9 +45,19 @@ pub struct UpdatesState {
     pub checking: bool,
     /// An apply is running: the panel's button is down.
     pub applying: bool,
-    /// The last apply's outcome, kept until the next one starts. Ok
-    /// means the result staged; it applies at the next reboot.
-    pub applied: Option<Result<(), String>>,
+    /// The last apply's outcome, kept until the next one starts. Staged
+    /// means the result is waiting for the next reboot.
+    pub applied: Option<ApplyOutcome>,
+}
+
+/// How an apply ended. Cancellation is its own outcome because a
+/// dismissed or denied polkit dialog never ran anything: the base is
+/// untouched, and "the update failed" would be a lie.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ApplyOutcome {
+    Staged,
+    Cancelled,
+    Failed(String),
 }
 
 impl UpdatesState {
@@ -130,16 +140,27 @@ fn check_updates() -> Result<CheckResult, String> {
 /// agent (this shell's lock dialog), and `kuma update --yes` pulls,
 /// rebuilds, and stages for the next reboot. An image build is not a
 /// bounded wait: the timeout is generous by design.
-fn apply_updates() -> Result<(), String> {
-    let output = Command::new("timeout")
+fn apply_updates() -> ApplyOutcome {
+    let output = match Command::new("timeout")
         .args(["3600", "pkexec", "kuma", "update", "--yes", "--json"])
         .stderr(std::process::Stdio::null())
         .output()
-        .map_err(|err| format!("spawn failed: {err}"))?;
-    if !output.status.success() {
-        return Err(format!("kuma update exited {}", output.status));
+    {
+        Ok(output) => output,
+        Err(err) => return ApplyOutcome::Failed(format!("spawn failed: {err}")),
+    };
+    match output.status.code() {
+        Some(0) => ApplyOutcome::Staged,
+        // pkexec's own code for a dismissed auth dialog (126) and for
+        // an authorization it could not obtain (127): the update never
+        // started, so there is nothing failed to report
+        Some(126) | Some(127) => ApplyOutcome::Cancelled,
+        code => ApplyOutcome::Failed(format!(
+            "kuma update exited {}",
+            code.map(|c| c.to_string())
+                .unwrap_or_else(|| "from a signal".into())
+        )),
     }
-    Ok(())
 }
 
 /// The check's JSON into rows. `ok: false` or a missing `updates`

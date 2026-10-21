@@ -9,7 +9,7 @@ use gpui::{AnyElement, Context, Div, Entity, Render, SharedString, Window, div, 
 
 use crate::panel::PanelGeometry;
 use crate::panel_kit as kit;
-use crate::updates::{PackageUpdate, UpdatesState};
+use crate::updates::{ApplyOutcome, PackageUpdate, UpdatesState};
 
 pub struct UpdatesPanelView {
     geometry: PanelGeometry,
@@ -144,13 +144,20 @@ impl Render for UpdatesPanelView {
                 )
             })
             .when_some(applied, |el, result| match result {
-                Ok(()) => el.child(
+                ApplyOutcome::Staged => el.child(
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(crate::theme::current().text_dim))
                         .child("Staged. It applies at the next reboot."),
                 ),
-                Err(err) => el.child(
+                // the user said no: say it back quietly, not as a failure
+                ApplyOutcome::Cancelled => el.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(crate::theme::current().text_dim))
+                        .child("Cancelled. Nothing was changed."),
+                ),
+                ApplyOutcome::Failed(err) => el.child(
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(crate::theme::URGENT))
