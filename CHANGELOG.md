@@ -22,6 +22,12 @@ source's wrap points would pin the text to a narrow column.
   the tag before kumaOS could pin (version, sha). release.sh asserts
   all five installed siblings answer the release commit's sha and that
   the lock did not move after the commit, then tags.
+- The dev build writes the staging siblings beside the binaries, not
+  only the session copies: kumaOS's compose stages the three .desktop
+  entries and three icons from beside the running kuma as the release
+  variant (@BIN@ to /usr/bin), and build.sh now refreshes those six
+  files on every build, so a packaging change cannot leave the image's
+  copies silently stale (the stamp gate checks binaries only).
 
 ## v0.5.1 (2026-10-21)
 

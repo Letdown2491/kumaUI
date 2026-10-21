@@ -78,4 +78,15 @@ if [ "${1:-}" = "build" ]; then
     cp kuma-monitor/packaging/kuma-monitor.png \
       ~/.local/share/icons/hicolor/256x256/apps/kuma-monitor.png
   fi
+  # kumaOS's compose stages the three entries and three icons from
+  # beside the running kuma, this directory, as the RELEASE variant
+  # (@BIN@ -> /usr/bin); the session copies above stay dev-local. Same
+  # deal as the binaries: the release's files live together or the
+  # compose refuses. Writing them here on every build keeps the
+  # siblings from going silently stale on a packaging change (kumaOS
+  # #46); the stamp gate checks only the binaries.
+  for app in kuma-files kuma-term kuma-monitor; do
+    sed "s|@BIN@|/usr/bin|" "$app/packaging/$app.desktop.in" > ~/.local/bin/"$app".desktop
+    cp "$app/packaging/$app.png" ~/.local/bin/"$app".png
+  done
 fi
