@@ -332,8 +332,11 @@ pub fn run(state: &Entity<WeatherState>, settings: &Entity<Settings>, cx: &mut A
     let state = state.downgrade();
     cx.spawn(async move |cx| {
         loop {
-            cx.background_executor().timer(POLL).await;
+            // the first fetch happens now, not one POLL from now: a
+            // cached location should not cost a quarter hour of an
+            // empty widget after every boot
             let _ = state.update(cx, |state, cx| state.fetch(cx));
+            cx.background_executor().timer(POLL).await;
         }
     })
     .detach();

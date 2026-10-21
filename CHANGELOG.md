@@ -21,6 +21,9 @@ move rides unchanged.
 
 ### Fixed
 
+- The weather widget fetches at startup instead of one poll interval
+  after it: a cached location showed an empty widget for up to a
+  quarter hour after every boot.
 - Notification urgency reads the spec's wire form now: a byte in the
   hints (0 low, 1 normal, 2 critical). Only the legacy string
   spelling was understood, so every spec-compliant critical
