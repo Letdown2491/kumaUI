@@ -8,7 +8,7 @@ repository = "https://github.com/Letdown2491/kumaUI"
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "unstable-locales"] }
 image = "0.25"
 smallvec = "1"
 gpui = { workspace = true }

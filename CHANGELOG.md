@@ -11,6 +11,14 @@ move rides unchanged.
 
 ## Unreleased
 
+### Changed
+
+- The clock's date faces follow the system locale the way the time
+  follows the system zone: `LC_ALL`, then `LC_TIME`, then `LANG`
+  picks the vocabulary, and weekday and month names render in the
+  user's language (English when none is set or known, which is what
+  the faces printed before).
+
 ### Fixed
 
 - Long widget text (a media title, a custom widget's script line)
