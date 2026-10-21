@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use gpui::{Context, Div, Entity, Render, SharedString, Window, div, prelude::*, px, rgb};
+use gpui::{AnyElement, Context, Div, Entity, Render, SharedString, Window, div, prelude::*, px, rgba, rgb};
 
 use crate::panel::PanelGeometry;
 use crate::panel_kit as kit;
@@ -60,7 +60,21 @@ impl Render for UpdatesPanelView {
                 .overflow_y_scroll()
                 .flex_1()
                 .min_h_0()
-                .children(updates.iter().enumerate().map(|(ix, update)| update_row(ix, update)))
+                .children(updates.iter().enumerate().flat_map(|(ix, update)| {
+                    // the launcher's section rule: hairlines between the
+                    // rows, never a box around one
+                    let divider = div()
+                        .id(SharedString::from(format!("update-rule-{ix}")))
+                        .h(px(1.))
+                        .bg(rgba(crate::theme::current().divider_soft))
+                        .into_any_element();
+                    let row = update_row(ix, update).into_any_element();
+                    if ix == 0 {
+                        vec![row]
+                    } else {
+                        vec![divider, row]
+                    }
+                }))
                 .into_any_element()
         };
 
@@ -148,20 +162,19 @@ impl Render for UpdatesPanelView {
     }
 }
 
-/// One moved package: a flat row on the drawer (the launcher's fill
-/// rule: inset at rest, no naked rows), the name and the severity chip
-/// on the first line, the versions it rides between dim under.
-fn update_row(ix: usize, update: &PackageUpdate) -> gpui::Stateful<Div> {
-    let security = update.severity.as_deref() == Some("security");
+/// One moved package: a naked row on the drawer under a hairline rule,
+/// the name with its severity badge on the first line, the versions it
+/// rides between dim under. The list arrives worst-first from `kuma`,
+/// so the badge colors confirm what the position already says:
+/// critical paints urgent red, important paints the accent (update
+/// today), moderate and low share the quiet chip, and a null severity
+/// (bugfix or enhancement, no security advisory) earns no badge at all.
+fn update_row(ix: usize, update: &PackageUpdate) -> Div {
     div()
-        .id(SharedString::from(format!("update-{ix}")))
         .flex()
         .flex_col()
         .gap_0p5()
-        .px_3()
         .py_2()
-        .rounded_lg()
-        .bg(rgb(crate::theme::current().inset))
         .child(
             div()
                 .flex()
@@ -176,26 +189,7 @@ fn update_row(ix: usize, update: &PackageUpdate) -> gpui::Stateful<Div> {
                         .truncate()
                         .child(update.name.clone()),
                 )
-                .when_some(update.severity.clone(), |el, severity| {
-                    el.child(
-                        div()
-                            .px_1p5()
-                            .py_px()
-                            .rounded_sm()
-                            .text_size(px(10.))
-                            .text_color(rgb(if security {
-                                crate::theme::current().accent_text
-                            } else {
-                                crate::theme::current().text_dim
-                            }))
-                            .bg(rgb(if security {
-                                crate::theme::current().accent
-                            } else {
-                                crate::theme::current().panel_bg >> 8
-                            }))
-                            .child(severity),
-                    )
-                }),
+                .child(severity_badge(update.severity.as_deref())),
         )
         .child(
             div()
@@ -207,6 +201,41 @@ fn update_row(ix: usize, update: &PackageUpdate) -> gpui::Stateful<Div> {
                     update.from, update.to
                 ))),
         )
+}
+
+/// The severity chip: three visual classes over the four words plus
+/// null, all theme tokens, nothing invented. Every severity-bearing
+/// package is a security advisory, so "important" is the accent tier
+/// and the count line under the list carries the security number.
+fn severity_badge(severity: Option<&str>) -> AnyElement {
+    let (label, bg, fg) = match severity {
+        Some("critical") => (
+            "critical",
+            crate::theme::URGENT,
+            crate::theme::current().accent_text,
+        ),
+        Some("important") => (
+            "important",
+            crate::theme::current().accent,
+            crate::theme::current().accent_text,
+        ),
+        Some(level) => (
+            level,
+            crate::theme::current().inset,
+            crate::theme::current().text_dim,
+        ),
+        // bugfix or enhancement: the absence of news
+        None => return div().into_any_element(),
+    };
+    div()
+        .px_1p5()
+        .py_px()
+        .rounded_sm()
+        .text_size(px(10.))
+        .text_color(rgb(fg))
+        .bg(rgb(bg))
+        .child(label.to_string())
+        .into_any_element()
 }
 
 /// Wall-clock "how long ago", coarse on purpose: the panel refreshes
