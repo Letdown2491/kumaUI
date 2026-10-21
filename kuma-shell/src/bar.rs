@@ -1138,15 +1138,11 @@ impl ShellBar {
                         None,
                     )
                     .cursor_pointer()
-                    .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
-                        // anchored at the widget like every panel that
-                        // hangs off a chip, not centered like settings
-                        let anchor = f32::from(event.position().x);
-                        crate::panel::toggle_panel_anchored(
-                            crate::panel::PanelKind::Updates,
-                            anchor,
-                            cx,
-                        )
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        // centered like the launcher and settings: the
+                        // anchored hang looked off, and the panel is a
+                        // destination, not a glance
+                        crate::panel::toggle_panel(crate::panel::PanelKind::Updates, cx)
                     }))
                     .into_any_element(),
                 )

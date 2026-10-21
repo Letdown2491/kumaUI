@@ -148,12 +148,20 @@ impl Render for UpdatesPanelView {
     }
 }
 
-/// One moved package: the name, the versions it rides between, and the
-/// severity chip when `kuma` has an opinion. Security rows read as
-/// such even when the severity field is the only tell.
+/// One moved package: a flat row on the drawer (the launcher's fill
+/// rule: inset at rest, no naked rows), the name and the severity chip
+/// on the first line, the versions it rides between dim under.
 fn update_row(ix: usize, update: &PackageUpdate) -> gpui::Stateful<Div> {
     let security = update.severity.as_deref() == Some("security");
-    kit::card(SharedString::from(format!("update-{ix}")))
+    div()
+        .id(SharedString::from(format!("update-{ix}")))
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .bg(rgb(crate::theme::current().inset))
         .child(
             div()
                 .flex()
@@ -183,7 +191,7 @@ fn update_row(ix: usize, update: &PackageUpdate) -> gpui::Stateful<Div> {
                             .bg(rgb(if security {
                                 crate::theme::current().accent
                             } else {
-                                crate::theme::current().inset
+                                crate::theme::current().panel_bg >> 8
                             }))
                             .child(severity),
                     )
@@ -191,7 +199,7 @@ fn update_row(ix: usize, update: &PackageUpdate) -> gpui::Stateful<Div> {
         )
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(px(10.))
                 .text_color(rgb(crate::theme::current().text_dim))
                 .truncate()
                 .child(SharedString::from(format!(
