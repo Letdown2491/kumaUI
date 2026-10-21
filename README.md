@@ -8,7 +8,7 @@ The binary is `kuma-shell`: a top bar, an app launcher, drawer panels, and a ses
 
 ## What's in the shell
 
-- **Bar**: a top strip of widgets (workspaces, window title, apps, cpu, volume, brightness, media, battery, clock, bluetooth, internet, notifications, system tray, nostr signer), each enable/disable and placeable from the settings panel. Geometry applies live; the layer surface is always a full-width transparent window. New boxes ship apps and workspaces on the left, the clock alone in the center, and the status cluster (system tray, notifications, volume, internet, battery) on the right.
+- **Bar**: a top strip of widgets (workspaces, window title, apps, cpu, volume, brightness, media, battery, clock, bluetooth, internet, notifications, system tray, nostr signer), each enable/disable and placeable from the settings panel. User-made script widgets list beside them: a widget is a directory with a manifest and a script whose stdout is the label ([docs/widgets.md](docs/widgets.md)). Geometry applies live; the layer surface is always a full-width transparent window. New boxes ship apps and workspaces on the left, the clock alone in the center, and the status cluster (system tray, notifications, volume, internet, battery) on the right.
 - **Dock**: pinned favorites plus running windows on its own layer-shell surface at a screen edge. Click cycles an app's windows (or focuses its first), right-click pins or unpins, and position and visibility come from the settings panel live. The dock ships off; enabling it starts from first-run pins (a terminal and a browser).
 - **Launcher**: an app-list panel with search-as-you-type, fuzzy scoring, and most-used-first ordering from per-app usage counts.
 - **Panels**: drawer surfaces hanging flush under the bar (concave cove silhouette), opened with a scrim click-catcher. Panels with tabs use the shared panel kit: an icon-only rail with hover tooltips and the tab header over the right pane; settings carries the Widgets and Ordering pages.
@@ -70,9 +70,11 @@ kuma-shell depends on gpui via a path dependency into `vendor/zed/` (gitignored,
 - [`CHANGELOG.md`](CHANGELOG.md): the release history, kumaOS style, with each binary's version on three lines under the release heading.
 - [`CONTEXT.md`](CONTEXT.md): domain glossary (the names of the seams in the code, one line each) and the four-rule ethos that governs them.
 - [`docs/adr/`](docs/adr/): architecture decision records, including two about lock-screen failure modes that only ever show up as "PAM rejects the password the user typed correctly".
+- [`docs/widgets.md`](docs/widgets.md): how to write a bar widget: the manifest, the stdout contract, installing and placing.
 - [`AGENTS.md`](AGENTS.md): how AI agents should build, run, and debug in this repo.
 - [`kuma-platform/`](kuma-platform/): the shared crate: version reporting, the shell's palette handshake, the HSL color space, and the niri IPC envelope ([ADR-0017](docs/adr/0017-kuma-platform-crate.md)).
 - `kuma-shell/icons/`: the widget and panel icons, hand-made SVGs.
+- `widgets/`: the stock pool widgets the image ships to `/usr/share/kuma-shell/widgets/` (currently the System updates chip); what kumaOS does with them is [widgets-deploy.md](docs/widgets-deploy.md).
 - `kuma-files/icons/`: the in-app icons, hand-made SVGs (16px stroke style).
 - `kuma-files/packaging/`: the menu entry, the app icon generator, and the app icon.
 - `kuma-monitor/packaging/`: the same trio for Kamuy (48-unit grid, drawn at 4x, downscaled to the committed 256px PNG).
