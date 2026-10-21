@@ -41,6 +41,11 @@ theme from the settings fallbacks, and speaks greetd's IPC:
 create_session, answers for every auth message, start_session. On
 success the greeter exits and greetd starts the session.
 
+`kuma-greeter --version` prints the version line the other apps
+print (build version and git hash) and exits, so the image's upgrade
+path can pin the greeter's build like the rest of the family without
+starting a greeter.
+
 ## SELinux notes
 
 The greeter runs in the `xdm_t` context (inherited from greetd).

@@ -22,25 +22,29 @@ bar, the scheduler, and the settings list, so a stock distro never
 sees it. The
 check is unprivileged: one round-trip to the registry, or to Fedora's
 repos for a composed base's kernel, no pull, no build, no root. The
-chip shows the moved-package count and tints when security updates are
-among them; clicking it opens the panel listing each package's
-versions, with an Update now button that runs
-`pkexec kuma update --yes --json`: polkit carries the prompt to the
-shell's lock dialog, so staging costs the user's password and nothing
-else. For that to work end to end, kumaOS must ship whatever polkit
-wants to allow `kuma update` as root (pkexec's admin-auth rule
-suffices; a dedicated `com.kuma.update` action with a branded prompt
-is nicer), and `kuma update` running as root must resolve the
-machine's baked declaration the way the unprivileged check does
-(`source: machine`).
+chip shows the moved-package count and tints while security updates
+wait on the user (the accent drops once an apply has staged); clicking
+it opens the panel listing each package's versions with severity
+glyphs, an Update now button that runs `pkexec kuma update --yes
+--json` (the build's step lines stream into the panel while it runs,
+and a staged result grows a Restart now button): polkit carries the
+prompt to the shell's lock dialog, so staging costs the user's
+password and nothing else. For that to work end to end, kumaOS must
+ship whatever polkit wants to allow `kuma update` as root (pkexec's
+admin-auth rule suffices; a dedicated `com.kuma.update` action with a
+branded prompt is nicer), and `kuma update` running as root must
+resolve the machine's baked declaration the way the unprivileged check
+does (`source: machine`).
 
 ## What the user sees
 
 - Settings, Widgets tab: customs list beside the built-ins, one
-  alphabetical row each with the same placement toggle and mode pills;
-  the pool's stock widgets appear under Available to install. The
-  config follows the filesystem: deleting a widget's directory prunes
-  its placement live. Authoring widgets is [widgets.md](widgets.md).
+  alphabetical row each with the same placement toggle (a custom's
+  mode pills are the full icon / icon+text / text dial; built-ins
+  carry their own); the pool's stock widgets appear under Available to
+  install. The config follows the filesystem: deleting a widget's
+  directory prunes its placement live. Authoring widgets is
+  [widgets.md](widgets.md).
 - The Ordering tab places customs like built-ins: drag the chip.
 - A user can also install by hand: copy any widget directory into
   `~/.config/kuma-shell/widgets/`; the watcher makes it live within a

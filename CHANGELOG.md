@@ -31,7 +31,11 @@ move rides unchanged.
   updates are among them. Clicking it opens a panel listing each
   package with its version change, a severity glyph (critical through
   low), and an Update now button that stages via polkit; checks run at
-  boot and then every four hours, unprivileged. It probes for the
+  boot and then every four hours, unprivileged. While the apply runs,
+  the panel shows the build's actual step lines, and a staged result
+  grows a Restart now button while the chip drops its accent (the
+  accent means work waiting on you). `kuma-shell msg updates` toggles
+  the panel, the same road the memory probe drives. It probes for the
   `kuma` CLI at boot, and on anything that is not kumaOS it stays out
   of the bar, the scheduler, and the settings list entirely: there is
   nothing to drive.
