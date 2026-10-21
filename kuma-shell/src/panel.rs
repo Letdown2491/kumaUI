@@ -305,7 +305,7 @@ impl PanelKind {
             PanelKind::Weather => (320., 240., KeyboardInteractivity::OnDemand),
             PanelKind::Wifi => (360., 320., KeyboardInteractivity::OnDemand),
             PanelKind::Bluetooth => (360., 320., KeyboardInteractivity::OnDemand),
-            PanelKind::Updates => (400., 380., KeyboardInteractivity::OnDemand),
+            PanelKind::Updates => (560., 520., KeyboardInteractivity::OnDemand),
         }
     }
 

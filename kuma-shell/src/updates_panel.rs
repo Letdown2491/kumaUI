@@ -178,28 +178,51 @@ fn update_row(ix: usize, update: &PackageUpdate) -> Div {
         .child(
             div()
                 .flex()
-                .items_center()
-                .justify_between()
+                .items_start()
                 .gap_2()
+                // the bullet: a scanning anchor for the eye, one per row
                 .child(
                     div()
+                        .mt(px(6.))
+                        .w(px(3.5))
+                        .h(px(3.5))
+                        .rounded_full()
+                        .bg(rgb(crate::theme::current().text_dim)),
+                )
+                .child(
+                    div()
+                        .flex_1()
                         .min_w_0()
-                        .text_size(px(12.))
-                        .text_color(rgb(crate::theme::current().text))
-                        .truncate()
-                        .child(update.name.clone()),
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(crate::theme::current().text))
+                                        .truncate()
+                                        .child(update.name.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(rgb(crate::theme::current().text_dim))
+                                .truncate()
+                                .child(SharedString::from(format!(
+                                    "{} → {}",
+                                    update.from, update.to
+                                ))),
+                        ),
                 )
                 .child(severity_badge(ix, update.severity.as_deref())),
-        )
-        .child(
-            div()
-                .text_size(px(10.))
-                .text_color(rgb(crate::theme::current().text_dim))
-                .truncate()
-                .child(SharedString::from(format!(
-                    "{} → {}",
-                    update.from, update.to
-                ))),
         )
 }
 
