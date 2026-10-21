@@ -51,7 +51,7 @@ fn main() {
     // window, works from any tty
     if std::env::args()
         .nth(1)
-        .is_some_and(|arg| arg == "--version" || arg == "-V")
+        .is_some_and(|arg| kuma_platform::version::is_version_flag(&arg))
     {
         println!("{}", version_line());
         return;
