@@ -232,7 +232,15 @@ impl Render for ShellBar {
             bar.radius,
             bar.corners,
         )
-        .child(self.render_section(Section::Left, cx, tooltips_on))
+        // the three sections clip at their track edge like the center
+        // one does: one overflowing widget (a long title, a pile of
+        // tray icons) costs itself some pixels, never the bar's layout
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .child(self.render_section(Section::Left, cx, tooltips_on)),
+        )
         .child(
             div()
                 .min_w_0()
@@ -249,9 +257,11 @@ impl Render for ShellBar {
         )
         .child(
             div()
+                .min_w_0()
                 .flex()
                 .justify_end()
                 .gap_1p5()
+                .overflow_hidden()
                 .child(self.render_section(Section::Right, cx, tooltips_on))
                 .when_some(self.sysmon.read(cx).recording.clone(), |el, rec| {
                     el.child(recording_indicator(&rec, cx, tooltips_on))
@@ -561,8 +571,12 @@ impl ShellBar {
                     Some(format!("{}%", brightness.percent)),
                     crate::theme::current().text,
                     move |sysmon: &SysMon, _| {
-                        let percent = sysmon.brightness.map(|b| b.percent).unwrap_or(0);
-                        format!("Brightness: {percent}%").into()
+                        match sysmon.brightness {
+                            Some(brightness) => {
+                                format!("Brightness: {}%", brightness.percent).into()
+                            }
+                            None => "Brightness unknown".into(),
+                        }
                     },
                     widget_icon(kind),
                     tooltips_on,
@@ -813,10 +827,15 @@ impl ShellBar {
             }),
             WidgetKind::Battery => sysmon.battery.map(|battery| {
                 let low = battery.percent <= 15 && !battery.on_ac;
+                // the kernel's capacity field is 0-100 by ABI, but a
+                // nonstandard driver can report otherwise: the icon
+                // clamps its level, the text clamps too, so neither can
+                // render a nonsense "150%"
+                let percent = battery.percent.min(100);
                 let text = format!(
                     "{}{}%",
                     if battery.charging { "↑" } else { "" },
-                    battery.percent
+                    percent
                 );
                 sys_widget(
                     kind,
@@ -837,7 +856,7 @@ impl ShellBar {
                         });
                         match (sysmon.battery, status) {
                             (Some(battery), Some(status)) => {
-                                format!("Battery: {}% ({status})", battery.percent).into()
+                                format!("Battery: {}% ({status})", battery.percent.min(100)).into()
                             }
                             _ => "Battery unknown".into(),
                         }
@@ -931,17 +950,22 @@ impl ShellBar {
                 )
             }
             WidgetKind::Clock => {
-                let date = Local::now().format("%A, %B %e").to_string();
+                let locale = clock_locale();
+                let date = Local::now().format_localized("%A, %B %e", locale).to_string();
                 // the dial is what the clock says: the fuller face
                 // carries the compact day beside the time, the bare
                 // face the time alone, the date face the day alone,
-                // and none of them wears an icon
+                // and none of them wears an icon. The date names
+                // follow the system locale like the time follows the
+                // system zone.
                 let text = match widget.mode {
                     WidgetMode::Time => self.clock.clone(),
-                    WidgetMode::Date => Local::now().format("%a %b %e").to_string(),
+                    WidgetMode::Date => {
+                        Local::now().format_localized("%a %b %e", locale).to_string()
+                    }
                     _ => format!(
                         "{} · {}",
-                        Local::now().format("%a %b %e"),
+                        Local::now().format_localized("%a %b %e", locale),
                         self.clock.clone()
                     ),
                 };
@@ -1035,7 +1059,12 @@ impl ShellBar {
                         if !net.online {
                             "Network: offline".into()
                         } else if net.wifi {
-                            format!("Wi-Fi: {}", net.ssid.clone().unwrap_or_default()).into()
+                            match net.ssid.as_deref() {
+                                Some(ssid) if !ssid.is_empty() => format!("Wi-Fi: {ssid}").into(),
+                                // a hidden network broadcasts no name:
+                                // the tooltip says connected, not a blank
+                                _ => "Wi-Fi: connected (hidden network)".into(),
+                            }
                         } else {
                             "Ethernet: connected".into()
                         }
@@ -1304,9 +1333,11 @@ impl ShellBar {
             .when(widget.mode != WidgetMode::Icon, |el| {
                 // the same fixed 16px text box the sys widgets use:
                 // custom and built-in text stand the same height in one
-                // bar
+                // bar, and a script's long line truncates like theirs
                 el.child(
                     div()
+                        .min_w_0()
+                        .overflow_hidden()
                         .h(px(16.))
                         .flex()
                         .items_center()
@@ -1314,6 +1345,7 @@ impl ShellBar {
                             div()
                                 .text_size(px(12.))
                                 .text_color(rgb(color))
+                                .truncate()
                                 .child(text),
                         ),
                 )
@@ -1452,6 +1484,12 @@ fn sys_widget(
                 // widget's text stands the same height as its icons
                 // and rides the vertical middle, not the baseline
                 div()
+                    // long values (a media title, a widget script's
+                    // line, an ssid) ellipsize inside the section
+                    // instead of shoving neighbors off the bar, exactly
+                    // as the window title truncates
+                    .min_w_0()
+                    .overflow_hidden()
                     .h(px(16.))
                     .flex()
                     .items_center()
@@ -1459,6 +1497,7 @@ fn sys_widget(
                         div()
                             .text_size(px(12.))
                             .text_color(rgb(color))
+                            .truncate()
                             .children(text),
                     ),
             )
@@ -1524,6 +1563,35 @@ fn workspaces_widget(
                         .child(workspace.label.clone()),
                 )
         }))
+}
+
+/// The system locale for the clock's date names, resolved once:
+/// `LC_ALL`, then `LC_TIME`, then `LANG` (glibc's precedence), the
+/// value cut to its language_country tag. Undetected or unknown, the
+/// English names, which is what the faces printed before this existed.
+fn clock_locale() -> chrono::Locale {
+    static LOCALE: std::sync::OnceLock<chrono::Locale> = std::sync::OnceLock::new();
+    *LOCALE.get_or_init(|| {
+        let raw = ["LC_ALL", "LC_TIME", "LANG"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+            .unwrap_or_default();
+        locale_from_name(locale_tag(&raw))
+    })
+}
+
+/// The locale tag inside a locale string: the encoding ("de_DE.UTF-8")
+/// and the modifier ("de_DE@euro") name the same date vocabulary.
+fn locale_tag(raw: &str) -> &str {
+    let tag = raw.split('.').next().unwrap_or(raw);
+    tag.split('@').next().unwrap_or(tag)
+}
+
+/// A locale tag to chrono's locale, English when unknown. Kept small
+/// and total so the clock can never fail on a strange value of LANG.
+fn locale_from_name(tag: &str) -> chrono::Locale {
+    use std::str::FromStr;
+    chrono::Locale::from_str(tag).unwrap_or(chrono::Locale::en_US)
 }
 
 fn window_title_widget(title: &str, tooltips_on: bool) -> gpui::Stateful<Div> {
@@ -1599,4 +1667,24 @@ fn gear_button(cx: &mut Context<ShellBar>, tooltips_on: bool) -> gpui::Stateful<
                 .size(px(16.))
                 .text_color(rgb(crate::theme::current().text)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{locale_from_name, locale_tag};
+
+    #[test]
+    fn locale_tags_cut_encoding_and_modifier() {
+        assert_eq!(locale_tag("de_DE.UTF-8"), "de_DE");
+        assert_eq!(locale_tag("fr_FR@euro"), "fr_FR");
+        assert_eq!(locale_tag("pt_BR.utf8"), "pt_BR");
+        assert_eq!(locale_tag("C"), "C");
+    }
+
+    #[test]
+    fn locale_names_resolve_and_unknown_falls_back_to_english() {
+        assert_eq!(locale_from_name("de_DE"), chrono::Locale::de_DE);
+        assert_eq!(locale_from_name("nonsense"), chrono::Locale::en_US);
+        assert_eq!(locale_from_name("C"), chrono::Locale::en_US);
+    }
 }

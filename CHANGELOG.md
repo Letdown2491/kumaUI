@@ -13,6 +13,14 @@ move rides unchanged.
 
 ### Fixed
 
+- The battery widget clamps its label and tooltip to 100% the way its
+  icon already clamped, so a nonstandard driver reporting above-full
+  cannot render a nonsense "150%".
+- The brightness tooltip reads "Brightness unknown" when its reading
+  is missing, the way every other widget's unknown state reads,
+  instead of a stale-looking "Brightness: 0%".
+- A Wi-Fi network that broadcasts no name (a hidden SSID) tooltips
+  "Wi-Fi: connected (hidden network)" instead of an empty name.
 - The terminal's ctrl+click opener only sends `http` and `https` URLs
   to `xdg-open`, whatever the pty printed: a `file://` span is
   link-shaped text now, not one click away from executing a local
