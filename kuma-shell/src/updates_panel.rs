@@ -211,18 +211,31 @@ fn update_row(_ix: usize, update: &PackageUpdate) -> Div {
 /// severity (bugfix, enhancement) earns no badge at all: the absence
 /// of news is not a color.
 fn severity_badge(severity: Option<&str>) -> AnyElement {
-    let (icon, color) = match severity {
-        Some("critical") => ("icons/alert.svg", crate::theme::URGENT),
-        Some("important") => ("icons/shield-lock.svg", crate::theme::current().accent),
-        Some("moderate") => ("icons/shield.svg", crate::theme::current().text_dim),
+    let (icon, color, word) = match severity {
+        Some("critical") => ("icons/alert.svg", crate::theme::URGENT, "critical"),
+        Some("important") => (
+            "icons/shield-lock.svg",
+            crate::theme::current().accent,
+            "important",
+        ),
+        Some("moderate") => (
+            "icons/shield.svg",
+            crate::theme::current().text_dim,
+            "moderate",
+        ),
         // low, and any severity a future kuma adds: the quiet class
-        Some(_) => ("icons/info.svg", crate::theme::current().text_dim),
+        Some(_) => ("icons/info.svg", crate::theme::current().text_dim, "low"),
         None => return div().into_any_element(),
     };
     gpui::svg()
         .path(icon)
         .size(px(14.))
         .text_color(rgb(color))
+        // the glyph carries the vocabulary the shapes abstract: the
+        // hover names the tier, the severity stays a word somewhere
+        .tooltip(kit::text_tooltip(SharedString::from(format!(
+            "Security advisory: {word}"
+        ))))
         .into_any_element()
 }
 
