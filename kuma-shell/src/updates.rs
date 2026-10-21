@@ -5,6 +5,7 @@
 //! plus the parse into per-package rows the panel lists.
 
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext as _, Context, Entity};
@@ -45,6 +46,10 @@ pub struct UpdatesState {
     pub checking: bool,
     /// An apply is running: the panel's button is down.
     pub applying: bool,
+    /// Whether `kuma` was found on this system. False until the boot
+    /// probe lands; the chip, its checks, and its panel are kumaOS
+    /// machinery, and on a stock distro there is nothing to drive.
+    pub available: bool,
     /// The last apply's outcome, kept until the next one starts. Staged
     /// means the result is waiting for the next reboot.
     pub applied: Option<ApplyOutcome>,
@@ -65,7 +70,7 @@ impl UpdatesState {
     /// foreground, the JSON parsed into rows. A failure keeps the last
     /// list and marks it stale; the chip dims instead of vanishing.
     fn check(&mut self, cx: &mut Context<Self>) {
-        if self.checking {
+        if self.checking || !self.available {
             return;
         }
         self.checking = true;
@@ -210,15 +215,54 @@ fn parse_check(text: &str) -> Result<CheckResult, String> {
     })
 }
 
-/// Wire the poller up: a check at boot, then one per cadence. The
-/// shell calls this once at boot beside the other `run` fns.
+/// Whether this system has `kuma` at all: the widget is built for
+/// kumaOS, and a stock distro has nothing for it to drive. Set once by
+/// the boot probe; everything that renders the widget asks here, since
+/// a capability of the machine is not one view's state to hold.
+static KUMA_PROBE: OnceLock<bool> = OnceLock::new();
+
+pub fn kuma_available() -> bool {
+    *KUMA_PROBE.get().unwrap_or(&false)
+}
+
+/// The capability test: does `kuma` exist on PATH? The checks and the
+/// apply both invoke it bare, so its presence under the same
+/// environment is the whole test; there is no deeper "am I on kumaOS"
+/// mark worth chasing.
+fn detect_kuma() -> bool {
+    Command::new("sh")
+        .args(["-c", "command -v kuma >/dev/null 2>&1"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Wire the poller up: probe for `kuma`, and only on a hit run a check
+/// at boot and one per cadence. On a system without `kuma` the widget
+/// stays out of the bar and out of the scheduler entirely.
 pub fn run(state: &Entity<UpdatesState>, cx: &mut App) {
-    state.update(cx, |state, cx| state.check(cx));
+    let probe = state.downgrade();
+    cx.spawn(async move |cx| {
+        let found = cx.background_spawn(async { detect_kuma() }).await;
+        let _ = probe.update(cx, |state, cx| {
+            let _ = KUMA_PROBE.set(found);
+            state.available = found;
+            if found {
+                state.check(cx);
+            }
+            cx.notify();
+        });
+    })
+    .detach();
     let state = state.downgrade();
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(POLL).await;
-            let _ = state.update(cx, |state, cx| state.check(cx));
+            let _ = state.update(cx, |state, cx| {
+                if state.available {
+                    state.check(cx)
+                }
+            });
         }
     })
     .detach();

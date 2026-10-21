@@ -1100,6 +1100,11 @@ impl ShellBar {
                 // nothing. Security updates tint it the accent, the
                 // same tell the bell carries.
                 let state = self.updates.read(cx);
+                // kumaOS machinery: without `kuma` there is nothing to
+                // drive, and a widget with nothing to say says nothing
+                if !state.available {
+                    return None;
+                }
                 let count = state.updates.len();
                 if count == 0 && !state.stale {
                     return None;
