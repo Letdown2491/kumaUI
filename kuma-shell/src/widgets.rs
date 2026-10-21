@@ -244,13 +244,68 @@ fn resolve_relative(dir: &Path, relative: &str, what: &str) -> Result<PathBuf, S
 }
 
 /// True when an icon string names a file in the widget directory rather
-/// than a themed name. The render arm resolves the two differently; the
+/// than a themed name. The render arms resolve the two differently; the
 /// manifest carries only the string.
 pub fn icon_is_file(icon: &str) -> bool {
     Path::new(icon)
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ICON_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// A manifest icon to the imaging registry's key space: a file in the
+/// widget directory is its absolute path (the registry caches per key,
+/// so the per-frame resolve is free after the first decode); anything
+/// else is a themed name through the icon index. A file-named icon the
+/// directory does not hold falls back to themed resolution, so a
+/// manifest that wrote `bell.svg` meaning the theme's bell still
+/// renders something.
+pub fn icon_key(icon: &str, dir: &Path) -> String {
+    if icon_is_file(icon) {
+        let path = dir.join(icon);
+        if path.is_file() {
+            return path.to_string_lossy().to_string();
+        }
+    }
+    icon.to_string()
+}
+
+/// Copy a widget directory from the pool into the user's widgets dir:
+/// activation as a file operation. The copy is owned and editable, so
+/// kumaOS's immutable /usr never reaches under it, and the watcher's
+/// generation bump makes the install live before the settings page
+/// finishes its render. A widget already installed under this id
+/// refuses the copy: the user's edits are theirs.
+pub fn install(widget: &CustomWidget) -> std::io::Result<PathBuf> {
+    install_into(widget, &user_dir())
+}
+
+/// `install` with the destination pool named, the test's seam.
+pub fn install_into(widget: &CustomWidget, user: &Path) -> std::io::Result<PathBuf> {
+    let target = user.join(&widget.id);
+    if target.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("a widget {:?} is already installed", widget.id),
+        ));
+    }
+    copy_dir(&widget.dir, &target)?;
+    Ok(target)
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -896,5 +951,47 @@ mod tests {
         assert!(read.stale);
         // a second failure moves nothing: already stale
         assert!(!state.commit("w", Err("exited 2".to_string())));
+    }
+
+    #[test]
+    fn install_copies_the_pool_directory_into_the_user_pool() {
+        let user = pool("install-user", |_| {});
+        let system = pool("install-system", |dir| {
+            let stock = write_widget(dir, "stock", "command = \"echo hi\"\nlabel = \"Stock\"\n");
+            fs::write(stock.join("extra.txt"), "asset").unwrap();
+        });
+        let widgets = discover(&user, &system);
+        let stock = find(&widgets, "stock").clone();
+        assert!(stock.dir.starts_with(&system), "undiscovered user copies first");
+
+        let target = install_into(&stock, &user).unwrap();
+        assert_eq!(target, user.join("stock"));
+        assert!(target.join("widget.toml").is_file());
+        assert!(target.join("extra.txt").is_file());
+
+        // a second install refuses: the user's copy is theirs
+        assert!(install_into(&stock, &user).is_err());
+
+        // and the user pool wins discovery from here on
+        let widgets = discover(&user, &system);
+        assert_eq!(find(&widgets, "stock").dir, target);
+    }
+
+    #[test]
+    fn icon_keys() {
+        let dir = pool("icon-keys", |dir| {
+            let widget = write_widget(dir, "weather", "command = \"true\"\n");
+            fs::write(widget.join("bell.svg"), "<svg/>").unwrap();
+        });
+        let widget_dir = dir.join("weather");
+        // the file exists: its absolute path is the key, so the imaging
+        // registry's cache pins to it
+        assert_eq!(
+            icon_key("bell.svg", &widget_dir),
+            widget_dir.join("bell.svg").to_string_lossy().to_string()
+        );
+        assert_eq!(icon_key("sun", &widget_dir), "sun", "a themed name rides as-is");
+        // the file does not exist: themed resolution gets a chance
+        assert_eq!(icon_key("absent.svg", &widget_dir), "absent.svg");
     }
 }

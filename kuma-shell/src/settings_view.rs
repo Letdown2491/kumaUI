@@ -313,6 +313,10 @@ enum NightPart {
 pub struct SettingsView {
     settings: Entity<Settings>,
     sysmon: Entity<crate::sysmon::SysMon>,
+    /// The user-made widgets' runner: the custom section of the widgets
+    /// page reads its discovery snapshot, and an install landing on
+    /// disk re-renders the page through this entity's notify.
+    widgets: Entity<crate::widgets::CustomWidgets>,
     focus_handle: FocusHandle,
     geometry: PanelGeometry,
     page: Page,
@@ -353,12 +357,14 @@ impl SettingsView {
     pub fn new(
         settings: Entity<Settings>,
         sysmon: Entity<crate::sysmon::SysMon>,
+        widgets: Entity<crate::widgets::CustomWidgets>,
         window: &mut Window,
         cx: &mut Context<Self>,
         geometry: PanelGeometry,
     ) -> Self {
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
         cx.observe(&sysmon, |_, _, cx| cx.notify()).detach();
+        cx.observe(&widgets, |_, _, cx| cx.notify()).detach();
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         let power_row = kit::confirm_actions(
@@ -390,6 +396,7 @@ impl SettingsView {
         let view = Self {
             settings,
             sysmon,
+            widgets,
             focus_handle,
             geometry,
             // the gear leads with the quick page
@@ -2323,6 +2330,264 @@ impl SettingsView {
             .gap_2()
             .overflow_y_scroll()
             .children(kinds.iter().map(|&kind| self.widget_row(kind, cx)))
+            .child(self.custom_widget_section(cx))
+    }
+
+    /// The user-made widgets' section: the installed ones as full rows
+    /// (placement toggle and mode pills, the same single toggle the
+    /// built-ins use), the pool's stock widgets as install rows, and
+    /// the config's inert placements (naming a widget that is not
+    /// installed) as dimmed rows that only offer removal. Hidden
+    /// entirely while there is nothing of any of the three.
+    fn custom_widget_section(&self, cx: &mut Context<Self>) -> Div {
+        // the snapshot is cloned out first: the guards read cx, the
+        // rows build through it
+        let (installed, pool, placed_unknown) = {
+            let state = self.widgets.read(cx);
+            let user = crate::widgets::user_dir();
+            let installed: Vec<crate::widgets::CustomWidget> = state
+                .widgets()
+                .iter()
+                .filter(|w| w.dir.starts_with(&user))
+                .cloned()
+                .collect();
+            let pool: Vec<crate::widgets::CustomWidget> = state
+                .widgets()
+                .iter()
+                .filter(|w| !w.dir.starts_with(&user))
+                .cloned()
+                .collect();
+            let placed_unknown: Vec<String> = SECTIONS
+                .iter()
+                .flat_map(|&section| {
+                    self.settings
+                        .read(cx)
+                        .widgets(section)
+                        .iter()
+                        .filter_map(|placement| placement.kind.custom().map(str::to_string))
+                })
+                .filter(|id| !state.widgets().iter().any(|w| w.id == *id))
+                .collect();
+            (installed, pool, placed_unknown)
+        };
+        if installed.is_empty() && pool.is_empty() && placed_unknown.is_empty() {
+            return div();
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.section_header("User-made widgets".to_string()))
+            .children(installed.iter().map(|w| self.custom_row(w, cx)))
+            .children(placed_unknown.iter().map(|id| self.inert_row(id, cx)))
+            .children(pool.iter().map(|w| self.pool_row(w, cx)))
+    }
+
+    /// An installed custom widget's row: the manifest's icon (or the
+    /// puzzle fallback), the manifest's label, and the placement toggle
+    /// and mode pills every widget row carries.
+    fn custom_row(
+        &self,
+        manifest: &crate::widgets::CustomWidget,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let reference = crate::settings::WidgetRef::Custom(manifest.id.clone());
+        let position = self.settings.read(cx).position(&reference);
+        let enabled = position.is_some();
+        let mode = position.map(|(section, index)| {
+            (
+                section,
+                index,
+                self.settings.read(cx).widgets(section)[index].mode,
+            )
+        });
+        let icon = manifest.icon.as_ref().and_then(|icon| {
+            crate::imaging::resolve(&crate::widgets::icon_key(icon, &manifest.dir), 16)
+        });
+        div()
+            .id(SharedString::from(format!("widget-row-custom-{}", manifest.id)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3p5()
+            .py_2()
+            .rounded_lg()
+            .bg(rgb(crate::theme::current().surface))
+            .child(match &icon {
+                Some(icon) => match &**icon {
+                    crate::imaging::IconImage::Raster(raster) => img(
+                        gpui::ImageSource::Render(raster.clone()),
+                    )
+                    .size(px(16.))
+                    .into_any_element(),
+                    crate::imaging::IconImage::Svg(bytes) => gpui::svg()
+                        .data(bytes)
+                        .size(px(16.))
+                        .into_any_element(),
+                },
+                None => gpui::svg()
+                    .path("icons/puzzle.svg")
+                    .size(px(16.))
+                    .into_any_element(),
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(rgb(if enabled {
+                        crate::theme::current().text
+                    } else {
+                        crate::theme::current().text_dim
+                    }))
+                    .truncate()
+                    .child(manifest.label.clone()),
+            )
+            .children(mode.map(|(section, index, mode)| {
+                self.mode_segmented(
+                    &format!("mode-custom-{}", manifest.id),
+                    "icons/puzzle.svg",
+                    mode,
+                    section,
+                    index,
+                    cx,
+                )
+            }))
+            .child({
+                let id = manifest.id.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "widget-toggle-custom-{}",
+                        manifest.id
+                    )))
+                    .p_1()
+                    .cursor_pointer()
+                    .child(crate::controls::toggle_switch(enabled))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings
+                            .update(cx, |settings, cx| {
+                                let reference = crate::settings::WidgetRef::Custom(id.clone());
+                                match settings.position(&reference) {
+                                    Some((section, index)) => {
+                                        settings.remove(section, index, cx)
+                                    }
+                                    None => settings.add(reference, cx),
+                                }
+                            });
+                    }))
+            })
+    }
+
+    /// A placement whose widget is not installed: dimmed, the id for a
+    /// label, and the toggle only removes. It rides inert in the bar
+    /// until the widget shows up.
+    fn inert_row(&self, id: &str, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        div()
+            .id(SharedString::from(format!("widget-row-inert-{id}")))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3p5()
+            .py_2()
+            .rounded_lg()
+            .bg(rgb(crate::theme::current().surface))
+            .child(
+                gpui::svg()
+                    .path("icons/puzzle.svg")
+                    .size(px(16.))
+                    .text_color(rgb(crate::theme::current().text_dim)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(rgb(crate::theme::current().text_dim))
+                    .truncate()
+                    .child(format!("{id} (not installed)")),
+            )
+            .child({
+                let id = id.to_string();
+                div()
+                    .id(SharedString::from(format!("widget-toggle-inert-{id}")))
+                    .p_1()
+                    .cursor_pointer()
+                    .child(crate::controls::toggle_switch(false))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.update(cx, |settings, cx| {
+                            let reference = crate::settings::WidgetRef::Custom(id.clone());
+                            if let Some((section, index)) = settings.position(&reference) {
+                                settings.remove(section, index, cx);
+                            }
+                        });
+                    }))
+            })
+    }
+
+    /// A pool widget not yet installed: the label plus an install
+    /// button that copies the directory into the user's widgets dir.
+    /// The watcher sees the copy and the row becomes a full one.
+    fn pool_row(
+        &self,
+        manifest: &crate::widgets::CustomWidget,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        div()
+            .id(SharedString::from(format!("widget-row-pool-{}", manifest.id)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3p5()
+            .py_2()
+            .rounded_lg()
+            .bg(rgb(crate::theme::current().surface))
+            .child(
+                gpui::svg()
+                    .path("icons/puzzle.svg")
+                    .size(px(16.))
+                    .text_color(rgb(crate::theme::current().text_dim)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(rgb(crate::theme::current().text_dim))
+                    .truncate()
+                    .child(format!("{} (available to install)", manifest.label)),
+            )
+            .child({
+                let id = manifest.id.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "widget-install-{}",
+                        manifest.id
+                    )))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .text_size(px(11.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(crate::theme::current().accent))
+                    .bg(rgb(crate::theme::current().inset))
+                    .hover(|style| {
+                        style.bg(rgb(crate::theme::current().accent))
+                            .text_color(rgb(crate::theme::current().accent_text))
+                    })
+                    .cursor_pointer()
+                    .child("Install")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.widgets.update(cx, |state, _| {
+                            let snapshot: Vec<crate::widgets::CustomWidget> =
+                                state.widgets().to_vec();
+                            if let Some(manifest) = snapshot.iter().find(|w| w.id == id)
+                                && let Err(err) = crate::widgets::install(manifest)
+                            {
+                                log::error!("installing widget {:?} failed: {err}", manifest.id);
+                            }
+                        });
+                    }))
+            })
     }
 
     fn widget_row(
@@ -2368,7 +2633,18 @@ impl SettingsView {
                     .child(kind.label()),
             )
             .children(mode.map(|(section, index, mode)| {
-                self.mode_segmented(&format!("mode-{kind:?}"), kind, mode, section, index, cx)
+                let icon_path = match kind.icon_spec() {
+                    Some(crate::settings::WidgetIconSpec::Path(path)) => path,
+                    _ => "icons/puzzle.svg",
+                };
+                self.mode_segmented(
+                    &format!("mode-{kind:?}"),
+                    icon_path,
+                    mode,
+                    section,
+                    index,
+                    cx,
+                )
             }))
             .child(
                 div()
@@ -2578,16 +2854,12 @@ impl SettingsView {
     fn mode_segmented(
         &self,
         id: &str,
-        kind: crate::settings::WidgetKind,
+        icon_path: &'static str,
         current: WidgetMode,
         section: Section,
         index: usize,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
-        let icon_path = match kind.icon_spec() {
-            Some(crate::settings::WidgetIconSpec::Path(path)) => path,
-            _ => "icons/puzzle.svg",
-        };
         div()
             .id(SharedString::from(format!("mode-{id}")))
             .flex()

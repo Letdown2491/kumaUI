@@ -82,6 +82,7 @@ fn main() {
                 notifications.clone(),
                 nostr.clone(),
                 weather.clone(),
+                widgets.clone(),
             ));
 
             // the dock: its own layer-shell surface, synced to the dock settings

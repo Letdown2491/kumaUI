@@ -339,6 +339,7 @@ impl PanelKind {
         notifications: gpui::Entity<crate::notifications::NotificationState>,
         nostr: gpui::Entity<crate::nostr::NostrState>,
         weather: gpui::Entity<crate::weather::WeatherState>,
+        widgets: gpui::Entity<crate::widgets::CustomWidgets>,
         window: &mut Window,
         cx: &mut App,
     ) -> gpui::AnyView {
@@ -351,7 +352,9 @@ impl PanelKind {
         match self {
             PanelKind::Settings => cx
                 .new(|cx| {
-                    crate::settings_view::SettingsView::new(settings, sysmon, window, cx, geometry)
+                    crate::settings_view::SettingsView::new(
+                        settings, sysmon, widgets, window, cx, geometry,
+                    )
                 })
                 .into(),
             PanelKind::Launcher => cx
@@ -508,6 +511,9 @@ pub struct PanelHost {
     /// The weather's slow snapshot: the panel's state and the bar
     /// widget's.
     weather: gpui::Entity<crate::weather::WeatherState>,
+    /// The user-made widgets' runner: the settings page's custom
+    /// section reads its discovery snapshot.
+    widgets: gpui::Entity<crate::widgets::CustomWidgets>,
     /// The bar view, told about panel transitions so it can suppress the
     /// tooltips the compositor's re-entry would otherwise resurrect.
     bar_view: Option<gpui::WeakEntity<crate::bar::ShellBar>>,
@@ -548,6 +554,7 @@ impl PanelHost {
         notifications: gpui::Entity<crate::notifications::NotificationState>,
         nostr: gpui::Entity<crate::nostr::NostrState>,
         weather: gpui::Entity<crate::weather::WeatherState>,
+        widgets: gpui::Entity<crate::widgets::CustomWidgets>,
     ) -> Self {
         Self {
             settings,
@@ -555,6 +562,7 @@ impl PanelHost {
             notifications,
             nostr,
             weather,
+            widgets,
             bar_view: None,
             open: None,
             bar: BarGeometry::default(),
@@ -675,7 +683,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
         }
     }
 
-    let (settings, sysmon, notifications, nostr, weather) = {
+    let (settings, sysmon, notifications, nostr, weather, widgets) = {
         let host = cx.global_mut::<PanelHost>();
         (
             host.settings.clone(),
@@ -683,6 +691,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
             host.notifications.clone(),
             host.nostr.clone(),
             host.weather.clone(),
+            host.widgets.clone(),
         )
     };
     // the drawer's width and height are the view's business now (the
@@ -714,6 +723,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
                 notifications.clone(),
                 nostr.clone(),
                 weather.clone(),
+                widgets.clone(),
                 window,
                 cx,
             );

@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -1175,7 +1174,9 @@ impl ShellBar {
         let icon = manifest
             .icon
             .as_ref()
-            .and_then(|icon| crate::imaging::resolve(&custom_icon_key(icon, &manifest.dir), 16));
+            .and_then(|icon| {
+                crate::imaging::resolve(&crate::widgets::icon_key(icon, &manifest.dir), 16)
+            });
 
         let element = div()
             .id(SharedString::from(format!("widget-{}", widget.kind.key())))
@@ -1227,20 +1228,6 @@ impl ShellBar {
             });
         Some(element.into_any_element())
     }
-}
-
-/// The manifest's icon to the imaging registry's key space: a file in
-/// the widget directory is its absolute path (the registry caches per
-/// key, so the per-frame resolve is free after the first decode);
-/// anything else is a themed name through the icon index.
-fn custom_icon_key(icon: &str, dir: &Path) -> String {
-    if crate::widgets::icon_is_file(icon) {
-        let path = dir.join(icon);
-        if path.is_file() {
-            return path.to_string_lossy().to_string();
-        }
-    }
-    icon.to_string()
 }
 
 /// One tray item: its icon, tooltip, and click-through to dbus Activate.
