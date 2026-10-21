@@ -665,15 +665,16 @@ impl LauncherView {
         }
     }
 
-    fn launch_at(&mut self, app_index: usize, cx: &mut Context<Self>) {
+    fn launch_at(&mut self, app_index: usize, cx: &mut Context<Self>) -> bool {
         if let Some(app) = self.apps.get(app_index) {
             record_usage(&app.desktop_path);
             if let Err(err) = launch(&app.exec, app.terminal) {
                 log::error!("launching {:?} failed: {err:#}", app.name);
-                return;
+                return false;
             }
         }
         crate::panel::close_panels(cx);
+        true
     }
 
     /// Activate the selected row: an app launches (usage recorded, a
@@ -685,7 +686,13 @@ impl LauncherView {
             LauncherItem::Calc(result) => {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(result));
             }
-            LauncherItem::Row(app_index) => self.launch_at(app_index, cx),
+            LauncherItem::Row(app_index) => {
+                if !self.launch_at(app_index, cx) {
+                    // the launch failed: the panel stays open, the
+                    // same contract the mouse path keeps
+                    return;
+                }
+            }
             LauncherItem::Section(_) => {}
         }
         crate::panel::close_panels(cx);
@@ -986,8 +993,11 @@ fn app_row(
         }))
         .on_mouse_move(on_hover)
         .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-            let _ = launch(&app.exec, app.terminal);
-            crate::panel::close_panels(cx);
+            // a failed launch keeps the panel open, the same
+            // contract the keyboard path keeps
+            if launch(&app.exec, app.terminal).is_ok() {
+                crate::panel::close_panels(cx);
+            }
         })
         .hover(|style| style.bg(rgb(crate::theme::current().surface_hover)))
         .child(

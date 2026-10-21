@@ -21,6 +21,9 @@ move rides unchanged.
 
 ### Fixed
 
+- A failed app launch keeps the launcher panel open: activate and
+  the mouse click closed the panel regardless, dropping the user's
+  query along with the error.
 - Wi-Fi network names containing a literal colon render and match
   correctly in the network panel: `nmcli -t` escapes colons as `\:`,
   and the panel split on every colon, both for the saved-network
