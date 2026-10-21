@@ -1094,6 +1094,44 @@ impl Settings {
         Ok(settings)
     }
 
+    /// The built-in kinds placed on the bar, first seen, all sections.
+    /// The sysmon poll gates its expensive passes on this: a pass
+    /// feeding no placed widget is subprocess work for nobody.
+    pub fn placed_builtin_kinds(&self) -> Vec<WidgetKind> {
+        let mut kinds: Vec<WidgetKind> = Vec::new();
+        for config in self
+            .bar
+            .left
+            .iter()
+            .chain(&self.bar.center)
+            .chain(&self.bar.right)
+        {
+            if let Some(kind) = config.kind.builtin() {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+        }
+        kinds
+    }
+
+    /// Whether any bar widget the sysmon full pass feeds (cpu, ram,
+    /// temp, disk, battery) is placed. The lighter AV pass stays
+    /// unconditional: the OSD reads volume, mic, brightness, and the
+    /// power profile with no widget placed.
+    pub fn sysinfo_placed(&self) -> bool {
+        self.placed_builtin_kinds().iter().any(|kind| {
+            matches!(
+                kind,
+                WidgetKind::Cpu
+                    | WidgetKind::Ram
+                    | WidgetKind::Temp
+                    | WidgetKind::Disk
+                    | WidgetKind::Battery
+            )
+        })
+    }
+
     /// Every placement's mode must be one its widget offers: a config
     /// can name a mode a widget does not have (the clock once offered
     /// icon+text, a config can be carried between machines). Clamped
@@ -1583,6 +1621,51 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sysinfo_placed_tracks_the_full_pass_widgets() {
+        // default bar: sysinfo widgets are placed (the defaults ship
+        // a cpu widget), so the full pass runs
+        assert!(Settings::default().sysinfo_placed());
+        // a bar with no sysinfo widgets: the full pass would run for
+        // nobody
+        let mut settings = Settings::default();
+        for section in [&mut settings.bar.left, &mut settings.bar.center, &mut settings.bar.right] {
+            section.retain(|config| {
+                !matches!(
+                    config.kind,
+                    WidgetRef::Builtin(
+                        WidgetKind::Cpu
+                            | WidgetKind::Ram
+                            | WidgetKind::Temp
+                            | WidgetKind::Disk
+                            | WidgetKind::Battery
+                    )
+                )
+            });
+        }
+        assert!(!settings.sysinfo_placed());
+        assert!(!settings.sysinfo_placed());
+        assert!(!settings.sysinfo_placed());
+        // the kinds dedupe across sections, and a placed cpu feeds
+        // the pass again (the retained default bar holds eight
+        // distinct kinds)
+        assert_eq!(settings.placed_builtin_kinds().len(), 8);
+        settings.bar.left.push(WidgetConfig {
+            kind: WidgetRef::Builtin(WidgetKind::Cpu),
+            mode: Default::default(),
+        });
+        settings.bar.left.push(WidgetConfig {
+            kind: WidgetRef::Builtin(WidgetKind::Cpu),
+            mode: Default::default(),
+        });
+        settings.bar.right.push(WidgetConfig {
+            kind: WidgetRef::Builtin(WidgetKind::Cpu),
+            mode: Default::default(),
+        });
+        assert_eq!(settings.placed_builtin_kinds().len(), 9);
+        assert!(settings.sysinfo_placed());
+    }
 
     #[test]
     fn window_start_equal_end_is_the_whole_day() {

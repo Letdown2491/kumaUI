@@ -272,6 +272,10 @@ pub struct SysMon {
     /// The mount the disk widget watches: user state, mirrored from
     /// the settings' sysinfo section.
     pub disk_mount: std::path::PathBuf,
+    /// Whether any widget the full pass feeds is placed (settings'
+    /// `sysinfo_placed`): false skips the pass, its five scans would
+    /// run for nobody.
+    pub full_wanted: bool,
     pub bluetooth: Option<BluetoothState>,
     pub network: Option<NetworkState>,
     pub power_profile: Option<PowerProfile>,
@@ -1028,15 +1032,21 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
     // the disk mount is user state: seeded once, then mirrored on
     // settings changes (no re-mint needed, the poll reads it per tick)
     let mount = settings.read(cx).sysinfo.disk_mount.clone();
-    state.update(cx, |sysmon, _| sysmon.disk_mount = mount);
+    let full_wanted = settings.read(cx).sysinfo_placed();
+    state.update(cx, |sysmon, _| {
+        sysmon.disk_mount = mount;
+        sysmon.full_wanted = full_wanted;
+    });
     {
         let state = state.downgrade();
         cx.observe(settings, move |settings, cx| {
             let mount = settings.read(cx).sysinfo.disk_mount.clone();
+            let full_wanted = settings.read(cx).sysinfo_placed();
             let _ = state.update(cx, |sysmon, _| {
                 if sysmon.disk_mount != mount {
                     sysmon.disk_mount = mount;
                 }
+                sysmon.full_wanted = full_wanted;
             });
         })
         .detach();
@@ -1049,9 +1059,18 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
         loop {
             let full = tick % FULL_PASS_EVERY == 0;
             tick = tick.wrapping_add(1);
+            let Ok(full_wanted) = state.update(cx, |sysmon, _| sysmon.full_wanted) else {
+                break;
+            };
             let Ok(disk_mount) = state.update(cx, |sysmon, _| sysmon.disk_mount.clone()) else {
                 break;
             };
+            // nothing placed feeds the full pass: its five scans
+            // (cpu cores, loadavg, temp, disk, battery) would run
+            // for nobody, so the pass skips. The AV pass rides on:
+            // the OSD reads volume, mic, brightness, and the power
+            // profile with no widget placed
+            let full = full_wanted && tick % FULL_PASS_EVERY == 0;
             // the stream scan rides only while the volume panel is
             // open: the status dump is the heaviest call in the pass.
             // The same gate drives the Wi-Fi and Bluetooth panels'

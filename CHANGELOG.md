@@ -13,6 +13,12 @@ move rides unchanged.
 
 ### Changed
 
+- The sysmon full pass (the cpu cores, loadavg, temp, disk, and
+  battery scans) runs only while a widget that feeds it is placed on
+  the bar; with none placed the pass is skipped instead of running
+  for nobody. The lighter AV pass stays unconditional: the OSD reads
+  volume, mic, brightness, and the power profile with no widget
+  placed.
 - The clock's date faces follow the system locale the way the time
   follows the system zone: `LC_ALL`, then `LC_TIME`, then `LANG`
   picks the vocabulary, and weekday and month names render in the
