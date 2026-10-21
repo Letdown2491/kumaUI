@@ -1,0 +1,35 @@
+# The fuzz harness. Standalone on purpose: its own workspace, no gpui, no
+# vendored patches. It exercises the same parser seam kuma-term's pump
+# rides (vte's Processor into an alacritty Terminal), which is the
+# terminal's attack surface: raw pty bytes from any remote reach it
+# unmolested. Run it inside the build container:
+#
+#   cargo +nightly fuzz run pty_bytes -- -max_total_time=300
+#
+# See docs/hardening-audit.md T6 for what this target covers and what it
+# deliberately leaves to the unit tests (the kuma-term render functions,
+# which drag the whole GUI stack in for little reach).
+
+[package]
+name = "kuma-term-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+alacritty_terminal = "0.26"
+
+[[bin]]
+name = "pty_bytes"
+path = "fuzz_targets/pty_bytes.rs"
+test = false
+doc = false
+bench = false
+
+# do not join the repo workspace: the fuzz tree resolves its own
+# dependency graph and must not inherit the gpui patch table
+[workspace]
