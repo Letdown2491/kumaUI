@@ -16,7 +16,10 @@ itself now, so no pool entry and no grants are needed for it.
 ## The update chip
 
 The bar's Kuma Updates widget is built in, fed by
-`kuma update --check --json` (at boot, then every four hours). The
+`kuma update --check --json` (at boot, then every four hours). It
+probes for `kuma` first and on a system without it stays out of the
+bar, the scheduler, and the settings list, so a stock distro never
+sees it. The
 check is unprivileged: one round-trip to the registry, or to Fedora's
 repos for a composed base's kernel, no pull, no build, no root. The
 chip shows the moved-package count and tints when security updates are

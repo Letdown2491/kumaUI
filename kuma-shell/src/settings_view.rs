@@ -2328,6 +2328,13 @@ impl SettingsView {
     fn widgets_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let mut rows: Vec<(String, WidgetRow)> = crate::settings::WIDGETS
             .iter()
+            // the updates widget is kumaOS machinery: where `kuma` is
+            // absent it is not a widget anyone can enable, so it is
+            // not listed at all
+            .filter(|spec| {
+                spec.kind != crate::settings::WidgetKind::Updates
+                    || crate::updates::kuma_available()
+            })
             .map(|spec| (spec.kind.label().to_lowercase(), WidgetRow::Builtin(spec.kind)))
             .collect();
         let pool: Vec<crate::widgets::CustomWidget> = {
@@ -2545,12 +2552,7 @@ impl SettingsView {
     ) -> gpui::Stateful<Div> {
         let reference = crate::settings::WidgetRef::Builtin(kind);
         let position = self.settings.read(cx).position(&reference);
-        // the updates widget drives the kuma CLI, so on anything that
-        // is not kumaOS it is a label, not a widget: no toggle, no
-        // modes, just the note that says where it lives
-        let usable = kind != crate::settings::WidgetKind::Updates
-            || crate::updates::kuma_available();
-        let enabled = usable && position.is_some();
+        let enabled = position.is_some();
         let mode = position.map(|(section, index)| {
             (
                 section,
@@ -2583,49 +2585,41 @@ impl SettingsView {
                     .text_size(px(12.))
                     .text_color(rgb(if enabled { crate::theme::current().text } else { crate::theme::current().text_dim }))
                     .truncate()
-                    .child(if usable {
-                        SharedString::from(kind.label())
-                    } else {
-                        format!("{} (kumaOS only)", kind.label()).into()
-                    }),
+                    .child(kind.label()),
             )
-            .children(usable.then(|| {
-                mode.map(|(section, index, mode)| {
-                    let icon_path = match kind.icon_spec() {
-                        Some(crate::settings::WidgetIconSpec::Path(path)) => path,
-                        _ => "icons/puzzle.svg",
-                    };
-                    self.mode_segmented(
-                        &format!("mode-{kind:?}"),
-                        icon_path,
-                        mode,
-                        section,
-                        index,
-                        cx,
-                    )
-                })
-            }).unwrap_or_default())
-            .when(usable, |el| {
-                el.child(
-                    div()
-                        .id(SharedString::from(format!("widget-toggle-{kind:?}")))
-                        .p_1()
-                        .cursor_pointer()
-                        .child(crate::controls::toggle_switch(enabled))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.settings
-                                .update(cx, |settings, cx| {
-                                    let reference = crate::settings::WidgetRef::Builtin(kind);
-                                    match settings.position(&reference) {
-                                        Some((section, index)) => {
-                                            settings.remove(section, index, cx)
-                                        }
-                                        None => settings.add(reference, cx),
-                                    }
-                                });
-                        })),
+            .children(mode.map(|(section, index, mode)| {
+                let icon_path = match kind.icon_spec() {
+                    Some(crate::settings::WidgetIconSpec::Path(path)) => path,
+                    _ => "icons/puzzle.svg",
+                };
+                self.mode_segmented(
+                    &format!("mode-{kind:?}"),
+                    icon_path,
+                    mode,
+                    section,
+                    index,
+                    cx,
                 )
-            })
+            }))
+            .child(
+                div()
+                    .id(SharedString::from(format!("widget-toggle-{kind:?}")))
+                    .p_1()
+                    .cursor_pointer()
+                    .child(crate::controls::toggle_switch(enabled))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings
+                            .update(cx, |settings, cx| {
+                                let reference = crate::settings::WidgetRef::Builtin(kind);
+                                match settings.position(&reference) {
+                                    Some((section, index)) => {
+                                        settings.remove(section, index, cx)
+                                    }
+                                    None => settings.add(reference, cx),
+                                }
+                            });
+                    })),
+            )
     }
 
     /// The ordering page: the bar mirrored as three columns of chips.

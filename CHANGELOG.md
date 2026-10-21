@@ -25,7 +25,16 @@ move rides unchanged.
   (`text`, `tooltip`, `class`) is the upgrade path, empty output hides
   the widget; `interval` and a `click` line live in the manifest, and
   the mode pills and drag ordering work as they do for built-ins.
-- **Kuma Updates chip.** A built-in bar widget (on by default, right\n  cluster) fed by `kuma update --check --json`: icon and moved-package\n  count, hidden while the base is current, accented when security\n  updates are among them. Clicking it opens a panel listing each\n  package with its version change, a severity glyph (critical through\n  low), and an Update now button that stages via polkit; checks run at\n  boot and then every four hours, unprivileged. It probes for the\n  `kuma` CLI at boot and stays out of the bar and the scheduler on\n  anything that is not kumaOS, where there is nothing to drive.","oldString":"- **Kuma Updates chip.** A built-in bar widget (on by default, right\n  cluster) fed by `kuma update --check --json`: icon and moved-package\n  count, hidden while the base is current, accented when security\n  updates are among them. Clicking it opens a panel listing each\n  package with its version change, a severity glyph (critical through\n  low), and an Update now button that stages via polkit; checks run at\n  boot and then every four hours, unprivileged.","path":"CHANGELOG.md"}
+- **Kuma Updates chip.** A built-in bar widget (on by default, right
+  cluster) fed by `kuma update --check --json`: icon and moved-package
+  count, hidden while the base is current, accented when security
+  updates are among them. Clicking it opens a panel listing each
+  package with its version change, a severity glyph (critical through
+  low), and an Update now button that stages via polkit; checks run at
+  boot and then every four hours, unprivileged. It probes for the
+  `kuma` CLI at boot, and on anything that is not kumaOS it stays out
+  of the bar, the scheduler, and the settings list entirely: there is
+  nothing to drive.
 
 ## v0.4.1 (2026-10-19)
 
