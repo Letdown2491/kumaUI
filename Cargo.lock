@@ -3111,6 +3111,7 @@ dependencies = [
  "gpui_platform",
  "gpui_wgpu",
  "kuma-platform",
+ "libc",
  "log",
  "serde",
  "serde_json",

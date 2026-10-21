@@ -37,6 +37,15 @@ move rides unchanged.
   hold falls back to themed resolution by stem: `bell.svg` now
   renders the theme's bell instead of nothing (the themed index keys
   are file stems, and the extension used to ride along).
+- The monitor's disk widgets under-reported throughput and totals by
+  exactly 512x: /proc/diskstats counts sectors, and the parse handed
+  the raw sector counts down as if they were bytes. The parse grows
+  them to bytes now, so the disk view's rates and the per-device
+  sums read like every other byte figure.
+- The monitor's per-process memory assumed a 4096-byte page when it
+  grew /proc statm's page counts to bytes: on 16 KiB and 64 KiB page
+  kernels private memory under-reported by the page-size ratio. The
+  page size comes from the kernel now, read once.
 - Night light on a compositor without the gamma protocol parks its
   thread after one error line instead of logging the same error every
   5 seconds.

@@ -338,7 +338,12 @@ fn parse_net_devs(text: &str) -> Vec<(String, u64, u64)> {
 
 /// Per-whole-disk read/write sector counters, name-sorted.
 /// Partitions would double-count their parent's sectors; loops and
-/// zram are not disk throughput. Sectors are 512 bytes in practice.
+/// zram are not disk throughput. /proc/diskstats counts sectors, and
+/// the kernel has said 512 bytes per sector for every device it has
+/// ever reported here (the "in practice" of the text), so the parse
+/// grows them to bytes: every consumer below (sums, rates, the view)
+/// works in bytes, and the disk widgets used to under-report by
+/// exactly 512x.
 fn parse_disk_devs(text: &str) -> Vec<(String, u64, u64)> {
     let mut devs = Vec::new();
     for line in text.lines() {
@@ -346,10 +351,11 @@ fn parse_disk_devs(text: &str) -> Vec<(String, u64, u64)> {
         if fields.len() < 10 || !is_disk(fields[2]) {
             continue;
         }
+        let to_bytes = |f: &str| f.parse::<u64>().ok().map(|sectors| sectors * 512);
         devs.push((
             fields[2].to_string(),
-            fields.get(5).and_then(|f| f.parse().ok()).unwrap_or(0),
-            fields.get(9).and_then(|f| f.parse().ok()).unwrap_or(0),
+            fields.get(5).and_then(|f| to_bytes(f)).unwrap_or(0),
+            fields.get(9).and_then(|f| to_bytes(f)).unwrap_or(0),
         ));
     }
     devs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -496,7 +502,12 @@ mod tests {
                     259       0 nvme0n1 200 0 4096 0 10 0 2048 0 0 0 0 0 0 0 0 0 0\n\
                     259       1 nvme0n1p1 100 0 2048 0 5 0 1024 0 0 0 0 0 0 0 0 0 0\n\
                     7       0 loop0 999 0 999 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
-        assert_eq!(sum_devs(&parse_disk_devs(text)), (2048 + 4096, 1024 + 2048));
+        // the parse grows sectors to bytes (512 per sector), so the
+        // sums are byte totals like the net side
+        assert_eq!(
+            sum_devs(&parse_disk_devs(text)),
+            ((2048 + 4096) * 512, (1024 + 2048) * 512)
+        );
     }
 
     #[test]
@@ -527,8 +538,8 @@ mod tests {
             vec!["nvme0n1", "sda"],
             "partitions dropped, the rest name-sorted"
         );
-        assert_eq!(devs[0], ("nvme0n1".to_string(), 4096u64, 2048u64));
-        assert_eq!(devs[1], ("sda".to_string(), 2048u64, 1024u64));
+        assert_eq!(devs[0], ("nvme0n1".to_string(), 4096u64 * 512, 2048u64 * 512));
+        assert_eq!(devs[1], ("sda".to_string(), 2048u64 * 512, 1024u64 * 512));
     }
 
     #[test]

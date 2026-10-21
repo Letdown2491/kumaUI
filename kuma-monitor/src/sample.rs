@@ -187,16 +187,27 @@ fn live_user_pids(uid: u32) -> Vec<Pid> {
 /// page-table walk measured ~30ms per big process on this machine:
 /// proportional set size would cost more than the whole sysinfo walk.
 /// Falls back to RSS when the read fails.
+/// The kernel's page size, read once: statm's fields are pages, and
+/// the 4096 assumption is wrong on 16 KiB and 64 KiB page kernels
+/// (arm64 servers, some Asahi builds), where private memory would
+/// under-report by the page-size ratio.
+fn page_size() -> u64 {
+    static PAGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        // the sysconf can in principle fail or return 0; either way
+        // 4096 is the least-wrong constant
+        u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096).max(1)
+    })
+}
+
 fn private_mem(pid: u32, rss_fallback: u64) -> u64 {
     let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/statm")) else {
         return rss_fallback;
     };
     parse_statm(&text)
-        .map(|(resident, shared)| (resident.saturating_sub(shared)) * PAGE_SIZE)
+        .map(|(resident, shared)| (resident.saturating_sub(shared)) * page_size())
         .unwrap_or(rss_fallback)
 }
-
-const PAGE_SIZE: u64 = 4096;
 
 /// statm: "size resident shared text lib data dt", all in pages.
 fn parse_statm(text: &str) -> Option<(u64, u64)> {
