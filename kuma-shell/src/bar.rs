@@ -36,6 +36,7 @@ pub struct ShellBar {
     nostr: Entity<crate::nostr::NostrState>,
     weather: Entity<WeatherState>,
     widgets: Entity<crate::widgets::CustomWidgets>,
+    updates: Entity<crate::updates::UpdatesState>,
     applied_geometry: Option<(f32, f32, f32, f32, f32, BarPosition)>,
     clock: String,
     /// Set by the panel host on every panel transition; consumed at the next
@@ -59,6 +60,7 @@ impl ShellBar {
         nostr: Entity<crate::nostr::NostrState>,
         weather: Entity<WeatherState>,
         widgets: Entity<crate::widgets::CustomWidgets>,
+        updates: Entity<crate::updates::UpdatesState>,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&niri, |_, _, cx| cx.notify()).detach();
@@ -69,6 +71,7 @@ impl ShellBar {
         cx.observe(&nostr, |_, _, cx| cx.notify()).detach();
         cx.observe(&weather, |_, _, cx| cx.notify()).detach();
         cx.observe(&widgets, |_, _, cx| cx.notify()).detach();
+        cx.observe(&updates, |_, _, cx| cx.notify()).detach();
 
         cx.spawn(async move |this, cx| {
             loop {
@@ -104,6 +107,7 @@ impl ShellBar {
             nostr,
             weather,
             widgets,
+            updates,
             applied_geometry: None,
             clock: String::new(),
             suppress_tooltips_requested: false,
@@ -1086,6 +1090,56 @@ impl ShellBar {
                     .cursor_pointer()
                     .on_click(cx.listener(|_, _, _, cx| {
                         crate::panel::toggle_panel(crate::panel::PanelKind::Notifications, cx)
+                    }))
+                    .into_any_element(),
+                )
+            }
+            WidgetKind::Updates => {
+                // the count beside the icon, gone entirely when the
+                // base is current: a widget with nothing to say says
+                // nothing. Security updates tint it the accent, the
+                // same tell the bell carries.
+                let state = self.updates.read(cx);
+                let count = state.updates.len();
+                if count == 0 && !state.stale {
+                    return None;
+                }
+                let text = (count > 0).then(|| count.to_string());
+                let color = if state.stale {
+                    crate::theme::current().text_dim
+                } else if state.security > 0 {
+                    crate::theme::current().accent
+                } else {
+                    crate::theme::current().text
+                };
+                let updates = self.updates.clone();
+                let tooltip = move |_: &SysMon, cx: &App| {
+                    let state = updates.read(cx);
+                    match state.updates.len() {
+                        0 if state.stale => "System updates: the last check failed".into(),
+                        0 => "System updates: everything is current".into(),
+                        n => format!(
+                            "System updates: {} available ({} security)",
+                            n, state.security
+                        )
+                        .into(),
+                    }
+                };
+                Some(
+                    sys_widget(
+                        kind,
+                        widget.mode,
+                        text,
+                        color,
+                        tooltip,
+                        widget_icon(kind),
+                        tooltips_on,
+                        self.sysmon.clone(),
+                        None,
+                    )
+                    .cursor_pointer()
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        crate::panel::toggle_panel(crate::panel::PanelKind::Updates, cx)
                     }))
                     .into_any_element(),
                 )

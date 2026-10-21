@@ -74,6 +74,8 @@ fn main() {
             let lock = cx.new(|_| kuma_shell::lock::LockState::new(settings.clone()));
             kuma_shell::lock::connect(&lock, cx);
             let widgets = kuma_shell::widgets::start(&settings, cx);
+            let updates = cx.new(|_| kuma_shell::updates::UpdatesState::default());
+            kuma_shell::updates::run(&updates, cx);
             kuma_shell::idle::run(&settings, &lock, cx);
             kuma_shell::polkit::run(&lock, cx);
             cx.set_global(kuma_shell::panel::PanelHost::new(
@@ -83,6 +85,7 @@ fn main() {
                 nostr.clone(),
                 weather.clone(),
                 widgets.clone(),
+                updates.clone(),
             ));
 
             // the dock: its own layer-shell surface, synced to the dock settings
@@ -117,6 +120,7 @@ fn main() {
                     nostr,
                     weather,
                     widgets,
+                    updates,
                     lock,
                 },
                 cx,

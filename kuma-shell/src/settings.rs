@@ -36,6 +36,7 @@ pub enum WidgetKind {
     Tray,
     Nostr,
     Weather,
+    Updates,
 }
 
 /// Where a Widget's icon comes from. The registry owns the decision; render
@@ -155,6 +156,11 @@ pub const WIDGETS: &[WidgetSpec] = &[
         kind: WidgetKind::Weather,
         label: "Weather",
         icon: Some(WidgetIconSpec::Generated),
+    },
+    WidgetSpec {
+        kind: WidgetKind::Updates,
+        label: "System updates",
+        icon: Some(WidgetIconSpec::Path("icons/updates.svg")),
     },
 ];
 
@@ -935,6 +941,7 @@ impl Default for Settings {
                     icon(WidgetKind::Volume),
                     icon(WidgetKind::Internet),
                     icon(WidgetKind::Battery),
+                    icon(WidgetKind::Updates),
                 ],
             },
             background: BackgroundConfig::default(),
@@ -1704,7 +1711,7 @@ kind = \"nostr\"
             WidgetKind::Cpu.icon_spec(),
             Some(WidgetIconSpec::Path("icons/cpu.svg"))
         );
-        assert_eq!(WIDGETS.len(), 20);
+        assert_eq!(WIDGETS.len(), 21);
     }
 
     #[test]

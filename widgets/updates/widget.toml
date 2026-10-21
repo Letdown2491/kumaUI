@@ -1,6 +1,0 @@
-# The stock update chip: kumaOS issue #21 shipped as a script widget,
-# dogfooding the pool-to-user distribution path.
-label = "System updates"
-icon = "updates.svg"
-interval = 300
-source = "updates.sh"

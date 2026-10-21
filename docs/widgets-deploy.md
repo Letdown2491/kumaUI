@@ -1,35 +1,27 @@
 # Widget deploy: what kumaOS does with custom widgets
 
-What the image needs from kumaUI's user-made widgets, and what the
-widgets need from the image.
+What the image may ship into the widget pool, and what the widgets
+need from the image (today: nothing).
 
 ## The system pool
 
-The image ships stock widgets to `/usr/share/kuma-shell/widgets/`, one
-directory per widget, the same shape a user installs:
+The image may ship stock script widgets to
+`/usr/share/kuma-shell/widgets/`, one directory per widget, the same
+shape a user installs. The directory is the activation unit and the
+manifest names its siblings by relative path, so a partial copy is a
+broken widget: compose copies each widget in whole. The pool is empty
+in the current image; the System updates chip lives in kuma-shell
+itself now, so no pool entry and no grants are needed for it.
 
-```
-/usr/share/kuma-shell/widgets/
-  updates/
-    widget.toml
-    updates.sh
-    updates.svg
-```
+## The update chip
 
-The source of truth for the shipped widget is `widgets/updates/` in the
-kumaUI repo; the compose copies it in whole (the directory is the
-activation unit, and the manifest names its siblings by relative path,
-so a partial copy is a broken widget).
-
-## The bootc read
-
-`bootc status --json` wants root. The update chip's script tries
-unprivileged first, then `sudo -n`; with neither grant it prints
-nothing and the widget hides, so a machine without the grant is quiet,
-not broken. On kumaOS, grant the read, not the write: a polkit rule or
-a narrow sudoers stanza for `bootc status` is enough, and the chip
-comes alive. The write path (`bootc upgrade`) stays with `kuma
-upgrade` and its own authentication.
+The bar's System updates widget is built in, fed by
+`kuma update --check --json` (at boot, then every four hours). The
+check is unprivileged: one round-trip to the registry, or to Fedora's
+repos for a composed base's kernel, no pull, no build, no root. The
+chip shows the moved-package count and tints when security updates are
+among them; clicking it opens the panel listing each package's
+versions. Staging stays with `kuma update` and its own authentication.
 
 ## What the user sees
 

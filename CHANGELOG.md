@@ -25,8 +25,12 @@ move rides unchanged.
   (`text`, `tooltip`, `class`) is the upgrade path, empty output hides
   the widget; `interval` and a `click` line live in the manifest, and
   the mode pills and drag ordering work as they do for built-ins.
-  Ships with one stock widget in the pool: System updates, which says
-  "reboot to apply" while a staged bootc deployment waits.
+- **System updates chip.** A built-in bar widget (on by default, right
+  cluster) fed by `kuma update --check --json`: icon and moved-package
+  count, hidden while the base is current, accented when security
+  updates are among them. Clicking it opens a panel listing each
+  package with its version change and severity; checks run at boot and
+  then every four hours, unprivileged.
 
 ## v0.4.1 (2026-10-19)
 

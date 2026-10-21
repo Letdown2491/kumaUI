@@ -749,16 +749,18 @@ mod tests {
 
     #[test]
     fn the_user_pool_overrides_the_system_pool_by_stem() {
+        // the stem may not name a built-in ("updates" is one now), so
+        // the shared stem here is an invented one
         let user = pool("user", |dir| {
-            write_widget(dir, "updates", "command = \"echo mine\"\nlabel = \"Mine\"\n");
+            write_widget(dir, "stocker", "command = \"echo mine\"\nlabel = \"Mine\"\n");
         });
         let system = pool("system", |dir| {
-            write_widget(dir, "updates", "command = \"echo stock\"\nlabel = \"Stock\"\n");
+            write_widget(dir, "stocker", "command = \"echo stock\"\nlabel = \"Stock\"\n");
             write_widget(dir, "other", "command = \"echo other\"\n");
         });
         let widgets = discover(&user, &system);
         assert_eq!(widgets.len(), 2, "the shared stem collapses to one: {widgets:?}");
-        assert_eq!(find(&widgets, "updates").label, "Mine");
+        assert_eq!(find(&widgets, "stocker").label, "Mine");
         assert_eq!(find(&widgets, "other").label, "other");
     }
 

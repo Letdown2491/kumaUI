@@ -279,6 +279,7 @@ pub enum PanelKind {
     Weather,
     Wifi,
     Bluetooth,
+    Updates,
 }
 
 impl PanelKind {
@@ -304,6 +305,7 @@ impl PanelKind {
             PanelKind::Weather => (320., 240., KeyboardInteractivity::OnDemand),
             PanelKind::Wifi => (360., 320., KeyboardInteractivity::OnDemand),
             PanelKind::Bluetooth => (360., 320., KeyboardInteractivity::OnDemand),
+            PanelKind::Updates => (400., 380., KeyboardInteractivity::OnDemand),
         }
     }
 
@@ -327,6 +329,7 @@ impl PanelKind {
             PanelKind::Weather => "weather",
             PanelKind::Wifi => "wifi",
             PanelKind::Bluetooth => "bluetooth",
+            PanelKind::Updates => "updates",
         }
     }
 
@@ -340,6 +343,7 @@ impl PanelKind {
         nostr: gpui::Entity<crate::nostr::NostrState>,
         weather: gpui::Entity<crate::weather::WeatherState>,
         widgets: gpui::Entity<crate::widgets::CustomWidgets>,
+        updates: gpui::Entity<crate::updates::UpdatesState>,
         window: &mut Window,
         cx: &mut App,
     ) -> gpui::AnyView {
@@ -493,6 +497,11 @@ impl PanelKind {
                     crate::bluetooth_panel::BluetoothPanelView::new(sysmon, window, cx, geometry)
                 })
                 .into(),
+            PanelKind::Updates => cx
+                .new(|cx| {
+                    crate::updates_panel::UpdatesPanelView::new(updates, window, cx, geometry)
+                })
+                .into(),
         }
     }
 }
@@ -514,6 +523,9 @@ pub struct PanelHost {
     /// The user-made widgets' runner: the settings page's custom
     /// section reads its discovery snapshot.
     widgets: gpui::Entity<crate::widgets::CustomWidgets>,
+    /// The system updates' slow snapshot: the panel's state and the
+    /// chip's.
+    updates: gpui::Entity<crate::updates::UpdatesState>,
     /// The bar view, told about panel transitions so it can suppress the
     /// tooltips the compositor's re-entry would otherwise resurrect.
     bar_view: Option<gpui::WeakEntity<crate::bar::ShellBar>>,
@@ -555,6 +567,7 @@ impl PanelHost {
         nostr: gpui::Entity<crate::nostr::NostrState>,
         weather: gpui::Entity<crate::weather::WeatherState>,
         widgets: gpui::Entity<crate::widgets::CustomWidgets>,
+        updates: gpui::Entity<crate::updates::UpdatesState>,
     ) -> Self {
         Self {
             settings,
@@ -563,6 +576,7 @@ impl PanelHost {
             nostr,
             weather,
             widgets,
+            updates,
             bar_view: None,
             open: None,
             bar: BarGeometry::default(),
@@ -683,7 +697,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
         }
     }
 
-    let (settings, sysmon, notifications, nostr, weather, widgets) = {
+    let (settings, sysmon, notifications, nostr, weather, widgets, updates) = {
         let host = cx.global_mut::<PanelHost>();
         (
             host.settings.clone(),
@@ -692,6 +706,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
             host.nostr.clone(),
             host.weather.clone(),
             host.widgets.clone(),
+            host.updates.clone(),
         )
     };
     // the drawer's width and height are the view's business now (the
@@ -724,6 +739,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
                 nostr.clone(),
                 weather.clone(),
                 widgets.clone(),
+                updates.clone(),
                 window,
                 cx,
             );
