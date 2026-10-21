@@ -11,6 +11,12 @@ move rides unchanged.
 
 ## Unreleased
 
+### Added
+
+- `kuma-greeter --version` prints the version line the other apps
+  print, so the upgrade path can pin the greeter's build like the
+  rest of the family.
+
 ## v0.4.1 (2026-10-19)
 
 kuma-shell 0.4.1

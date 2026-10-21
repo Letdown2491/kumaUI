@@ -20,6 +20,14 @@ use kuma_shell::theme;
 
 use gpui_platform::application;
 
+/// The version line `--version` prints: the crate version plus the
+/// commit build.sh stamped in, so a pinned image answers to an exact
+/// build. The format lives in the platform crate; the version stays a
+/// call-site argument because it is this crate's.
+pub(crate) fn version_line() -> String {
+    kuma_platform::version::line("kuma-greeter", env!("CARGO_PKG_VERSION"))
+}
+
 fn main() {
     use std::io::Write as _;
     env_logger::Builder::from_env(env_logger::Env::default())
@@ -36,6 +44,13 @@ fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // --version prints and exits: no greetd socket, no compositor, no tty
+    if args.iter().any(|arg| kuma_platform::version::is_version_flag(arg)) {
+        println!("{}", version_line());
+        return;
+    }
+
     if args.first().map(String::as_str) == Some("--headless") {
         std::process::exit(headless(&args[1..]));
     }
@@ -542,5 +557,17 @@ impl Render for GreeterView {
                         )
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_line_names_the_binary() {
+        let line = version_line();
+        assert!(line.starts_with("kuma-greeter "));
+        assert!(line.contains("(g"));
     }
 }
