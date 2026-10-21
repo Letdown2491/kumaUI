@@ -33,6 +33,12 @@ move rides unchanged.
 
 ### Fixed
 
+- The wallpapers page no longer misreads a remote file URI as a
+  relative path: a folder picker on a mounted or remote location
+  answers `file://otherhost/wallpapers`, and the page stripped only
+  the scheme, reading the rest as `otherhost/wallpapers` relative to
+  the shell's working directory. A remote answer now points at
+  nothing, and the folder stays unset.
 - The launcher's usage record writes atomically now: a crash mid-save
   could tear the usage JSON, and the launcher read the wreck as
   "no usage" and rebuilt the ranking from nothing. Every state and

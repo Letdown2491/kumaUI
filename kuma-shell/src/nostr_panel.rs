@@ -1207,35 +1207,9 @@ fn offer_card(uri: String, cx: &mut Context<NostrSignerView>) -> gpui::Stateful<
 }
 
 fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
-                match u8::from_str_radix(hex, 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        index += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[index]);
-                        index += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    // the form-encoding quirk rides along: nostr links spell a space
+    // `+` in their query components
+    kuma_platform::files::percent_decode(text, true)
 }
 
 // ── the small vocabulary ─────────────────────────────────────────────

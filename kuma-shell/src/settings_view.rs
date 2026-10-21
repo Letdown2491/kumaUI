@@ -40,30 +40,22 @@ async fn pick_folder() -> anyhow::Result<Option<PathBuf>> {
     let Some(uri) = files.uris().first() else {
         return Ok(None);
     };
-    Ok(Some(percent_decode_path(uri.as_str())))
+    Ok(percent_decode_path(uri.as_str()))
 }
 
-fn percent_decode_path(uri: &str) -> PathBuf {
-    let path = uri.strip_prefix("file://").unwrap_or(uri);
-    let bytes = path.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(value) = u8::from_str_radix(
-                &format!("{}{}", bytes[i + 1] as char, bytes[i + 2] as char),
-                16,
-            )
-        {
-            decoded.push(value);
-            i += 3;
-        } else {
-            decoded.push(bytes[i]);
-            i += 1;
-        }
+fn percent_decode_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://").unwrap_or(uri);
+    // an authority means a remote host's URI: this page can only show
+    // local folders, and the old fallthrough read
+    // file://otherhost/wallpapers as the RELATIVE path
+    // otherhost/wallpapers, pointing the wallpapers folder wherever
+    // that landed
+    if uri.starts_with("file://") && !rest.starts_with('/') {
+        return None;
     }
-    PathBuf::from(String::from_utf8_lossy(&decoded).into_owned())
+    Some(PathBuf::from(kuma_platform::files::percent_decode(
+        rest, false,
+    )))
 }
 
 fn load_thumb(path: PathBuf) -> Option<Arc<RenderImage>> {
@@ -3316,16 +3308,19 @@ mod tests {
     fn percent_decode_handles_escapes() {
         assert_eq!(
             percent_decode_path("file:///home/m/My%20Wallpapers"),
-            PathBuf::from("/home/m/My Wallpapers")
+            Some(PathBuf::from("/home/m/My Wallpapers"))
         );
         assert_eq!(
             percent_decode_path("/plain/path"),
-            PathBuf::from("/plain/path")
+            Some(PathBuf::from("/plain/path"))
         );
         assert_eq!(
             percent_decode_path("file:///truncated%2"),
-            PathBuf::from("/truncated%2")
+            Some(PathBuf::from("/truncated%2"))
         );
+        // an authority is a remote host: no local path exists, and the
+        // old fallthrough read it as a relative one
+        assert_eq!(percent_decode_path("file://otherhost/wallpapers"), None);
     }
 
     #[test]

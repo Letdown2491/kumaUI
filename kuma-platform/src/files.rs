@@ -24,9 +24,59 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Percent-decode a URI's path or component: `%XX` hex escapes grow
+/// to bytes, an unterminated or non-hex escape stays literal, and the
+/// result is lossy UTF-8 (undecodable bytes become replacement
+/// characters). `plus_as_space` is the form-encoding quirk: query
+/// components spell a space `+`; filesystem paths do not, and a
+/// literal `+` in a directory name must survive.
+pub fn percent_decode(text: &str, plus_as_space: bool) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            b'+' if plus_as_space => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decode_grows_escapes_and_keeps_broken_ones() {
+        assert_eq!(percent_decode("My%20Wallpapers", false), "My Wallpapers");
+        assert_eq!(percent_decode("%2F%2B", false), "/+");
+        // a truncated escape and a non-hex one stay literal
+        assert_eq!(percent_decode("truncated%2", false), "truncated%2");
+        assert_eq!(percent_decode("odd%zz", false), "odd%zz");
+        // the form quirk is opt-in: a literal + in a path survives
+        assert_eq!(percent_decode("a+b", false), "a+b");
+        assert_eq!(percent_decode("a+b", true), "a b");
+    }
 
     #[test]
     fn a_failed_write_never_tears_the_record() {

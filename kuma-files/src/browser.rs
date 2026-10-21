@@ -10836,25 +10836,7 @@ fn path_uri(path: &Path) -> String {
 /// recent-files xbel. Undecodable bytes become replacement chars.
 fn uri_decode(uri: &str) -> PathBuf {
     let uri = uri.strip_prefix("file://").unwrap_or(uri);
-    let mut out: Vec<u8> = Vec::with_capacity(uri.len());
-    let mut chars = uri.as_bytes().iter().copied();
-    while let Some(byte) = chars.next() {
-        if byte == b'%' {
-            let hex = [chars.next(), chars.next()];
-            if let [Some(hi), Some(lo)] = hex {
-                if let Some(value) = (hi as char).to_digit(16).and_then(|hi| {
-                    (lo as char).to_digit(16).map(|lo| hi * 16 + lo)
-                }) {
-                    out.push(value as u8);
-                    continue;
-                }
-            }
-            out.push(byte);
-        } else {
-            out.push(byte);
-        }
-    }
-    PathBuf::from(String::from_utf8_lossy(&out).into_owned())
+    PathBuf::from(kuma_platform::files::percent_decode(uri, false))
 }
 
 /// Escape text for XML attribute/character data (xbel hrefs).
