@@ -105,7 +105,12 @@ impl Render for UpdatesPanelView {
             .size_full()
             .child(header)
             .child(list)
-            .when(!updates.is_empty() && !applying, |el| {
+            // the apply button hides while a stage waits on the
+            // reboot: the work is done, and a second button beside
+            // Restart now would offer to rebuild the same stage
+            .when(
+                !updates.is_empty() && !applying && applied.as_ref() != Some(&ApplyOutcome::Staged),
+                |el| {
                 el.child(
                     div()
                         .flex()
