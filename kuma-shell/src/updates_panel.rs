@@ -169,7 +169,7 @@ impl Render for UpdatesPanelView {
 /// critical paints urgent red, important paints the accent (update
 /// today), moderate and low share the quiet chip, and a null severity
 /// (bugfix or enhancement, no security advisory) earns no badge at all.
-fn update_row(_ix: usize, update: &PackageUpdate) -> Div {
+fn update_row(ix: usize, update: &PackageUpdate) -> Div {
     div()
         .flex()
         .flex_col()
@@ -189,7 +189,7 @@ fn update_row(_ix: usize, update: &PackageUpdate) -> Div {
                         .truncate()
                         .child(update.name.clone()),
                 )
-                .child(severity_badge(update.severity.as_deref())),
+                .child(severity_badge(ix, update.severity.as_deref())),
         )
         .child(
             div()
@@ -210,7 +210,7 @@ fn update_row(_ix: usize, update: &PackageUpdate) -> Div {
 /// holds the plain shield and low the info dot, both dim, and a null
 /// severity (bugfix, enhancement) earns no badge at all: the absence
 /// of news is not a color.
-fn severity_badge(severity: Option<&str>) -> AnyElement {
+fn severity_badge(ix: usize, severity: Option<&str>) -> AnyElement {
     let (icon, color, word) = match severity {
         Some("critical") => ("icons/alert.svg", crate::theme::URGENT, "critical"),
         Some("important") => (
@@ -227,15 +227,16 @@ fn severity_badge(severity: Option<&str>) -> AnyElement {
         Some(_) => ("icons/info.svg", crate::theme::current().text_dim, "low"),
         None => return div().into_any_element(),
     };
-    gpui::svg()
-        .path(icon)
-        .size(px(14.))
-        .text_color(rgb(color))
-        // the glyph carries the vocabulary the shapes abstract: the
-        // hover names the tier, the severity stays a word somewhere
+    div()
+        .id(SharedString::from(format!("update-severity-{ix}")))
         .tooltip(kit::text_tooltip(SharedString::from(format!(
             "Security advisory: {word}"
         ))))
+        .child(
+            // the glyph carries the vocabulary the shapes abstract: the
+            // hover names the tier, the severity stays a word somewhere
+            gpui::svg().path(icon).size(px(14.)).text_color(rgb(color)),
+        )
         .into_any_element()
 }
 
