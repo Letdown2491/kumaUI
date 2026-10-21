@@ -2404,7 +2404,10 @@ impl SettingsView {
             )
         });
         let icon = manifest.icon.as_ref().and_then(|icon| {
-            crate::imaging::resolve(&crate::widgets::icon_key(icon, &manifest.dir), 16)
+            let key = crate::widgets::icon_key(icon, &manifest.dir);
+            // an svg rides the tint pipeline, a raster paints full color
+            crate::imaging::resolve_svg(&key)
+                .or_else(|| crate::imaging::resolve(&key, 16))
         });
         // the same tint every widget row's icon carries: full text
         // color when enabled, dimmed when not

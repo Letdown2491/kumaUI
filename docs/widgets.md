@@ -41,7 +41,9 @@ click = "kuma-shell msg settings"
   extension (`.svg`, `.png`, `.jpg`) is a file path; anything else is a
   themed name. A file-named icon the directory does not hold falls
   back to themed resolution. Optional: without it the widget renders
-  text only.
+  text only. An SVG paints as a glyph in the widget's color, exactly
+  like the built-in icons; a raster (PNG, JPG) paints in its own
+  colors, right for artwork, wrong for chrome.
 - `interval`: seconds between runs. Defaults to 10, clamped from below
   at 1.
 - `source`: a file in the widget directory, executed directly on the

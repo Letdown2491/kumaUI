@@ -1171,12 +1171,13 @@ impl ShellBar {
             tooltip = format!("{tooltip} (stale: the source failed)");
         }
 
-        let icon = manifest
-            .icon
-            .as_ref()
-            .and_then(|icon| {
-                crate::imaging::resolve(&crate::widgets::icon_key(icon, &manifest.dir), 16)
-            });
+        let icon = manifest.icon.as_ref().and_then(|icon| {
+            let key = crate::widgets::icon_key(icon, &manifest.dir);
+            // an svg rides the tint pipeline (the glyph pipeline the
+            // built-in icons share); a raster paints full color
+            crate::imaging::resolve_svg(&key)
+                .or_else(|| crate::imaging::resolve(&key, 16))
+        });
 
         let element = div()
             .id(SharedString::from(format!("widget-{}", widget.kind.key())))

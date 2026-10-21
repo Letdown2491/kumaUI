@@ -385,6 +385,37 @@ pub fn resolve(key: &str, size: u32) -> Option<Arc<IconImage>> {
     decoded
 }
 
+/// An SVG icon's raw bytes, for callers that paint the glyph tint
+/// (widget chrome: the manifest icon rides the same alpha-mask pipeline
+/// the built-in icons do). `resolve` decodes SVGs to a full-color
+/// raster instead, right for app and tray art, useless for a tint. A
+/// themed name resolves through the icon theme index; only an .svg hit
+/// qualifies, rasters return None so the caller can fall back to
+/// `resolve`. Cached like any Svg entry: one slot, size-independent,
+/// under its own namespace so `resolve` never sees these.
+pub fn resolve_svg(key: &str) -> Option<Arc<IconImage>> {
+    if key.is_empty() {
+        return None;
+    }
+    let cached = RegistryKey(format!("svg:{key}").to_lowercase(), 0);
+    if let Some(hit) = registry().get(&cached) {
+        return hit;
+    }
+    let path = match key.starts_with('/') {
+        true => PathBuf::from(key),
+        false => lookup_icon_path(&key.to_lowercase())?,
+    };
+    let decoded = if path.extension().and_then(|ext| ext.to_str()) == Some("svg") {
+        std::fs::read(&path)
+            .ok()
+            .map(|bytes| Arc::new(IconImage::Svg(bytes.into())))
+    } else {
+        None
+    };
+    registry().put(cached, decoded.clone());
+    decoded
+}
+
 /// Drop an image's atlas tiles: the explicit end of a caller-owned image
 /// (the tray's replaced pixmap, the wallpaper's rotation predecessor,
 /// Koguma's evicted thumbnails). The `img` element never drops the tile it
