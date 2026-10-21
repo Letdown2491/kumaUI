@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -35,6 +36,7 @@ pub struct ShellBar {
     tray: Entity<crate::tray::TrayState>,
     nostr: Entity<crate::nostr::NostrState>,
     weather: Entity<WeatherState>,
+    widgets: Entity<crate::widgets::CustomWidgets>,
     applied_geometry: Option<(f32, f32, f32, f32, f32, BarPosition)>,
     clock: String,
     /// Set by the panel host on every panel transition; consumed at the next
@@ -57,6 +59,7 @@ impl ShellBar {
         tray: Entity<crate::tray::TrayState>,
         nostr: Entity<crate::nostr::NostrState>,
         weather: Entity<WeatherState>,
+        widgets: Entity<crate::widgets::CustomWidgets>,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&niri, |_, _, cx| cx.notify()).detach();
@@ -66,6 +69,7 @@ impl ShellBar {
         cx.observe(&tray, |_, _, cx| cx.notify()).detach();
         cx.observe(&nostr, |_, _, cx| cx.notify()).detach();
         cx.observe(&weather, |_, _, cx| cx.notify()).detach();
+        cx.observe(&widgets, |_, _, cx| cx.notify()).detach();
 
         cx.spawn(async move |this, cx| {
             loop {
@@ -100,6 +104,7 @@ impl ShellBar {
             tray,
             nostr,
             weather,
+            widgets,
             applied_geometry: None,
             clock: String::new(),
             suppress_tooltips_requested: false,
@@ -393,7 +398,7 @@ impl ShellBar {
         // custom placement hands off to its own arm
         let kind: WidgetKind = match widget.kind.builtin() {
             Some(kind) => kind,
-            None => return None,
+            None => return self.render_custom(widget, cx, tooltips_on),
         };
         match kind {
             WidgetKind::Workspaces => {
@@ -1134,6 +1139,108 @@ impl ShellBar {
             }
         }
     }
+
+    /// A user-made widget's bar arm: the last read as the label, the
+    /// manifest's icon beside it, the manifest's click line behind the
+    /// whole thing. An uninstalled id renders nothing (the inert
+    /// placement riding in the config); an empty read hides; a stale
+    /// read dims and tells the truth in the tooltip. The mode pills
+    /// apply as they do for built-ins, the manifest's icon being
+    /// optional.
+    fn render_custom(
+        &self,
+        widget: &WidgetConfig,
+        cx: &mut Context<Self>,
+        tooltips_on: bool,
+    ) -> Option<AnyElement> {
+        let id = widget.kind.custom()?.to_string();
+        // clone the snapshot out: the read guard borrows cx, and the
+        // element build below wants it
+        let (manifest, read) = {
+            let state = self.widgets.read(cx);
+            let manifest = state.widgets().iter().find(|w| w.id == id)?.clone();
+            (manifest, state.read(&id)?.clone())
+        };
+        let text = read.text.clone()?;
+        let color = if read.stale {
+            crate::theme::current().text_dim
+        } else {
+            crate::theme::current().text
+        };
+        let mut tooltip = read.tooltip.clone().unwrap_or(manifest.label.clone());
+        if read.stale {
+            tooltip = format!("{tooltip} (stale: the source failed)");
+        }
+
+        let icon = manifest
+            .icon
+            .as_ref()
+            .and_then(|icon| crate::imaging::resolve(&custom_icon_key(icon, &manifest.dir), 16));
+
+        let element = div()
+            .id(SharedString::from(format!("widget-{}", widget.kind.key())))
+            .flex()
+            .items_center()
+            .gap_1()
+            .when(manifest.click.is_some(), |el| el.cursor_pointer())
+            .when(tooltips_on, |el| {
+                el.tooltip(text_tooltip(SharedString::from(tooltip)))
+            })
+            .when(widget.mode != WidgetMode::Text, |el| match &icon {
+                Some(icon) => el.child(match &**icon {
+                    crate::imaging::IconImage::Raster(raster) => img(
+                        gpui::ImageSource::Render(raster.clone()),
+                    )
+                    .size(px(16.))
+                    .into_any_element(),
+                    crate::imaging::IconImage::Svg(bytes) => svg()
+                        .data(bytes)
+                        .size(px(16.))
+                        .into_any_element(),
+                }),
+                None => el,
+            })
+            .when(widget.mode != WidgetMode::Icon, |el| {
+                // the same fixed 16px text box the sys widgets use:
+                // custom and built-in text stand the same height in one
+                // bar
+                el.child(
+                    div()
+                        .h(px(16.))
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(color))
+                                .child(text),
+                        ),
+                )
+            })
+            .when(manifest.click.is_some(), {
+                let id = id.clone();
+                move |el| {
+                    el.on_click(cx.listener(move |this, _, _, cx| {
+                        this.widgets.update(cx, |state, _| state.click(&id));
+                    }))
+                }
+            });
+        Some(element.into_any_element())
+    }
+}
+
+/// The manifest's icon to the imaging registry's key space: a file in
+/// the widget directory is its absolute path (the registry caches per
+/// key, so the per-frame resolve is free after the first decode);
+/// anything else is a themed name through the icon index.
+fn custom_icon_key(icon: &str, dir: &Path) -> String {
+    if crate::widgets::icon_is_file(icon) {
+        let path = dir.join(icon);
+        if path.is_file() {
+            return path.to_string_lossy().to_string();
+        }
+    }
+    icon.to_string()
 }
 
 /// One tray item: its icon, tooltip, and click-through to dbus Activate.

@@ -51,6 +51,7 @@ pub struct SurfaceDeps {
     pub tray: Entity<TrayState>,
     pub nostr: Entity<NostrState>,
     pub weather: Entity<crate::weather::WeatherState>,
+    pub widgets: Entity<crate::widgets::CustomWidgets>,
     pub lock: Entity<lock::LockState>,
 }
 
@@ -133,7 +134,7 @@ pub fn ensure(cx: &mut App) {
         }
     }
     if bar_gone {
-        let (niri, sysmon, settings, notifications, tray, nostr, weather) = {
+        let (niri, sysmon, settings, notifications, tray, nostr, weather, widgets) = {
             let deps = &cx.global::<SurfaceHost>().deps;
             (
                 deps.niri.clone(),
@@ -143,13 +144,14 @@ pub fn ensure(cx: &mut App) {
                 deps.tray.clone(),
                 deps.nostr.clone(),
                 deps.weather.clone(),
+                deps.widgets.clone(),
             )
         };
         let config: BarConfig = settings.read(cx).bar.clone();
         match cx.open_window(bar_window_options(&config), |_, cx| {
             cx.new(|cx| {
                 ShellBar::new(
-                    niri, sysmon, settings, notifications, tray, nostr, weather, cx,
+                    niri, sysmon, settings, notifications, tray, nostr, weather, widgets, cx,
                 )
             })
         }) {
