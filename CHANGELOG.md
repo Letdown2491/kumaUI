@@ -11,6 +11,13 @@ move rides unchanged.
 
 ## Unreleased
 
+## v0.5.0 (2026-10-21)
+
+kuma-shell 0.5.0
+kuma-files 0.4.1
+kuma-term 0.3.1
+kuma-monitor 0.2.1
+
 ### Added
 
 - `kuma-greeter --version` prints the version line the other apps
