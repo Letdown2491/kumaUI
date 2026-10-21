@@ -113,12 +113,13 @@ fn update_row(ix: usize, update: &PackageUpdate) -> gpui::Stateful<Div> {
             div()
                 .flex()
                 .items_center()
+                .justify_between()
                 .gap_2()
                 .child(
                     div()
-                        .flex_1()
                         .min_w_0()
                         .text_size(px(12.))
+                        .text_color(rgb(crate::theme::current().text))
                         .truncate()
                         .child(update.name.clone()),
                 )
