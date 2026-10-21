@@ -11,6 +11,13 @@ move rides unchanged.
 
 ## Unreleased
 
+## v0.5.1 (2026-10-21)
+
+kuma-shell 0.5.1
+kuma-files 0.4.2
+kuma-term 0.3.2
+kuma-monitor 0.2.2
+
 ### Changed
 
 - The build installs kuma-greeter next to kuma-shell: binary only,

@@ -1,6 +1,6 @@
 [package]
 name = "kuma-files"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 description = "Koguma, kumaOS's file manager (starts as the gpui DnD spike for issue #25)"
 license = "MIT"
