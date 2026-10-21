@@ -13,6 +13,10 @@ move rides unchanged.
 
 ### Changed
 
+- The build installs kuma-greeter next to kuma-shell: binary only,
+  no menu entry or icon (greetd runs the image's copy at login), so
+  `--version` and the headless rehearsal scripts answer for the
+  build they were run against.
 - The sysmon full pass (the cpu cores, loadavg, temp, disk, and
   battery scans) runs only while a widget that feeds it is placed on
   the bar; with none placed the pass is skipped instead of running

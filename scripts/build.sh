@@ -39,6 +39,11 @@ if [ "${1:-}" = "build" ]; then
   # kuma-term: binary plus menu entry, so Mod+T and the launcher find it
   cp target/release/kuma-term ~/.local/bin/kuma-term.new
   mv -f ~/.local/bin/kuma-term.new ~/.local/bin/kuma-term
+  # kuma-greeter: binary only, no menu entry or icon: the launcher never
+  # starts it (greetd runs the image's copy at login); a local copy
+  # keeps --version and scripting on the current build
+  cp target/release/kuma-greeter ~/.local/bin/kuma-greeter.new
+  mv -f ~/.local/bin/kuma-greeter.new ~/.local/bin/kuma-greeter
   mkdir -p ~/.local/share/applications \
     ~/.local/share/icons/hicolor/256x256/apps
   sed "s|@BIN@|$HOME/.local/bin|" kuma-term/packaging/kuma-term.desktop.in \
