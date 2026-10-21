@@ -16,8 +16,6 @@ mod view;
 #[cfg(test)]
 pub(crate) static PTY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-use std::io::Write as _;
-
 use gpui::{App, AppContext, TitlebarOptions, WindowBounds, WindowOptions, px, size, SharedString};
 use gpui_platform::application;
 
