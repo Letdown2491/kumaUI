@@ -43,6 +43,7 @@ const WATCH_TICK: Duration = Duration::from_secs(2);
 
 /// The entities the persistent surfaces render from, held so the watch
 /// can rebuild any of them long after startup ran.
+#[derive(Clone)]
 pub struct SurfaceDeps {
     pub niri: Entity<SessionState>,
     pub sysmon: Entity<SysMon>,
@@ -71,6 +72,20 @@ struct SurfaceHost {
 }
 
 impl Global for SurfaceHost {}
+
+impl SurfaceHost {
+    /// The deps, cloned out of the global: every ensure path starts
+    /// by handing the entities to a new surface, and the tuple-of-
+    /// clones prologue used to be re-spelled at each one.
+    fn deps(cx: &App) -> SurfaceDeps {
+        cx.global::<SurfaceHost>().deps.clone()
+    }
+
+    /// Whether a persistent surface is still open (a probe update).
+    fn alive(handle: Option<AnyWindowHandle>, cx: &mut App) -> bool {
+        handle.is_some_and(|window| window.update(cx, |_, _, _| {}).is_ok())
+    }
+}
 
 /// Take ownership of the persistent surfaces. Nothing opens here: the
 /// shell's first `ensure` does, so startup and every recovery run the
@@ -117,11 +132,11 @@ pub fn ensure(cx: &mut App) {
         let host = cx.global_mut::<SurfaceHost>();
         (host.wallpaper, host.bar)
     };
-    let wallpaper_gone = wallpaper.is_none_or(|window| window.update(cx, |_, _, _| {}).is_err());
-    let bar_gone = bar.is_none_or(|window| window.update(cx, |_, _, _| {}).is_err());
+    let wallpaper_gone = !SurfaceHost::alive(wallpaper, cx);
+    let bar_gone = !SurfaceHost::alive(bar, cx);
 
     if wallpaper_gone {
-        let settings = cx.global::<SurfaceHost>().deps.settings.clone();
+        let settings = SurfaceHost::deps(cx).settings;
         match cx.open_window(wallpaper_options(), |_, cx| {
             cx.new(|cx| crate::wallpaper::WallpaperView::new(settings, cx))
         }) {
@@ -135,20 +150,18 @@ pub fn ensure(cx: &mut App) {
         }
     }
     if bar_gone {
-        let (niri, sysmon, settings, notifications, tray, nostr, weather, widgets, updates) = {
-            let deps = &cx.global::<SurfaceHost>().deps;
-            (
-                deps.niri.clone(),
-                deps.sysmon.clone(),
-                deps.settings.clone(),
-                deps.notifications.clone(),
-                deps.tray.clone(),
-                deps.nostr.clone(),
-                deps.weather.clone(),
-                deps.widgets.clone(),
-                deps.updates.clone(),
-            )
-        };
+        let SurfaceDeps {
+            niri,
+            sysmon,
+            settings,
+            notifications,
+            tray,
+            nostr,
+            weather,
+            widgets,
+            updates,
+            lock: _,
+        } = SurfaceHost::deps(cx);
         let config: BarConfig = settings.read(cx).bar.clone();
         match cx.open_window(bar_window_options(&config), |_, cx| {
             cx.new(|cx| {
@@ -171,11 +184,11 @@ pub fn ensure(cx: &mut App) {
 
     // the lock screen and the dock own their surfaces; the watch just
     // gives them the tick
-    let lock = cx.global::<SurfaceHost>().deps.lock.clone();
+    let lock = SurfaceHost::deps(cx).lock;
     lock::ensure_surfaces(&lock, cx);
     let (niri, settings) = {
-        let deps = &cx.global::<SurfaceHost>().deps;
-        (deps.niri.clone(), deps.settings.clone())
+        let deps = SurfaceHost::deps(cx);
+        (deps.niri, deps.settings)
     };
     crate::dock::ensure(&niri, &settings, cx);
 }
