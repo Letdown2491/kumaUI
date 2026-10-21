@@ -35,9 +35,9 @@ upgrade` and its own authentication.
 
 - Settings, Widgets tab: customs list beside the built-ins, one
   alphabetical row each with the same placement toggle and mode pills;
-  the pool's stock widgets appear under Available to install; and a
-  placement whose widget is not installed rides dimmed as a
-  remove-only row. Authoring widgets is [widgets.md](widgets.md).
+  the pool's stock widgets appear under Available to install. The
+  config follows the filesystem: deleting a widget's directory prunes
+  its placement live. Authoring widgets is [widgets.md](widgets.md).
 - The Ordering tab places customs like built-ins: drag the chip.
 - A user can also install by hand: copy any widget directory into
   `~/.config/kuma-shell/widgets/`; the watcher makes it live within a

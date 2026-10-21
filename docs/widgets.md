@@ -104,9 +104,10 @@ Two doors, one truth:
 Installing makes a widget *available*. Placing it on the bar is the
 same toggle every widget has: the Widgets page's switch adds it to the
 bar (appending to the right section), the Ordering tab drags it
-between sections. Customs list beside the built-ins; a placement whose
-widget is not installed rides dimmed as "not installed" instead of
-disappearing, so a config never loses a line behind your back.
+between sections. Customs list beside the built-ins. The config
+follows the filesystem: deleting a widget's directory removes its
+placement (and its line in `config.toml`) live, and reinstalling
+starts from the default position again.
 
 ## An example with JSON and an icon
 

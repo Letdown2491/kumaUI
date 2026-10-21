@@ -73,7 +73,7 @@ fn main() {
             kuma_shell::weather::run(&weather, &settings, cx);
             let lock = cx.new(|_| kuma_shell::lock::LockState::new(settings.clone()));
             kuma_shell::lock::connect(&lock, cx);
-            let widgets = kuma_shell::widgets::start(cx);
+            let widgets = kuma_shell::widgets::start(&settings, cx);
             kuma_shell::idle::run(&settings, &lock, cx);
             kuma_shell::polkit::run(&lock, cx);
             cx.set_global(kuma_shell::panel::PanelHost::new(

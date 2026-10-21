@@ -1120,6 +1120,28 @@ impl Settings {
         })
     }
 
+    /// Drop the placements of custom widgets that no longer exist (the
+    /// runner calls this when discovery loses one): the config follows
+    /// the filesystem. True when anything moved.
+    pub fn prune_custom(&mut self, alive: &[String], cx: &mut Context<Self>) {
+        if self.prune_custom_impl(alive) {
+            self.commit(cx);
+        }
+    }
+
+    fn prune_custom_impl(&mut self, alive: &[String]) -> bool {
+        let mut changed = false;
+        for section in SECTIONS {
+            let before = self.widgets(section).len();
+            self.widgets_mut(section).retain(|placement| match &placement.kind {
+                WidgetRef::Custom(id) => alive.contains(id),
+                WidgetRef::Builtin(_) => true,
+            });
+            changed |= self.widgets(section).len() != before;
+        }
+        changed
+    }
+
     pub fn missing_kinds(&self) -> Vec<WidgetKind> {
         WIDGETS
             .iter()
@@ -1560,11 +1582,9 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_placement_round_trips_and_survives_uninstalled() {
-        // a config naming a user-made widget: it parses as a custom ref,
-        // serializes back unchanged, and survives a default-less round
-        // trip even though no such widget is discovered (a placement
-        // naming an uninstalled widget is inert, never dropped)
+    fn a_custom_placement_round_trips() {
+        // a config naming a user-made widget: it parses as a custom ref
+        // and serializes back unchanged
         let config = "\
 [[bar.right]]
 kind = \"weather-station\"
@@ -1584,6 +1604,37 @@ kind = \"volume\"
         let out = toml::to_string_pretty(&settings.bar).unwrap();
         assert!(out.contains("kind = \"weather-station\""), "{out}");
         assert!(out.contains("kind = \"volume\""), "{out}");
+    }
+
+    #[test]
+    fn pruning_drops_placements_whose_widget_vanished_and_keeps_the_rest() {
+        let config = "\
+[[bar.right]]
+kind = \"weather-station\"
+
+[[bar.right]]
+kind = \"volume\"
+
+[[bar.left]]
+kind = \"clock\"
+
+[[bar.left]]
+kind = \"nostr\"
+";
+        let mut settings: Settings = toml::from_str(config).unwrap();
+        let custom = WidgetRef::Custom("weather-station".to_string());
+        // nothing alive yet: both customs go, both built-ins stay
+        assert!(settings.prune_custom_impl(&[]));
+        assert!(!settings.is_present(&custom));
+        assert!(settings.is_present(&WidgetRef::Builtin(WidgetKind::Volume)));
+        assert!(settings.is_present(&WidgetRef::Builtin(WidgetKind::Clock)));
+        assert!(settings.is_present(&WidgetRef::Builtin(WidgetKind::Nostr)));
+        // a second prune with nothing to drop is not a change
+        assert!(!settings.prune_custom_impl(&[]));
+        // the surviving custom keeps its placement
+        let mut settings: Settings = toml::from_str(config).unwrap();
+        assert!(!settings.prune_custom_impl(&["weather-station".to_string()]));
+        assert!(settings.is_present(&custom));
     }
 
     #[test]

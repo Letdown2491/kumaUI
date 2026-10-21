@@ -526,11 +526,12 @@ impl CustomWidgets {
 
     /// One tick of the runner loop: re-discover if the watcher moved,
     /// then start every due widget's run that is not already in flight.
-    fn tick(&mut self, cx: &mut Context<Self>) {
+    fn tick(&mut self, settings: &Entity<crate::settings::Settings>, cx: &mut Context<Self>) {
         let generation = self.generation.load(Ordering::Relaxed);
         if generation != self.seen_generation {
             self.seen_generation = generation;
             if self.rediscover(&user_dir(), &system_dir()) {
+                self.prune(settings, cx);
                 cx.notify();
             }
         }
@@ -557,23 +558,42 @@ impl CustomWidgets {
             .detach();
         }
     }
+
+    /// Drop the config's placements for widgets discovery no longer
+    /// finds: the config follows the filesystem, so deleting a widget
+    /// directory unplaces it instead of leaving an inert line behind.
+    /// A no-op when every placed id is alive.
+    fn prune(
+        &self,
+        settings: &Entity<crate::settings::Settings>,
+        cx: &mut Context<Self>,
+    ) {
+        let alive: Vec<String> = self.widgets.iter().map(|w| w.id.clone()).collect();
+        settings.update(cx, |settings, cx| settings.prune_custom(&alive, cx));
+    }
 }
 
 /// Wire the runner up: the dir watcher, the entity, and the tick loop.
 /// The shell calls this once at boot beside the other `run` fns.
-pub fn start(cx: &mut App) -> Entity<CustomWidgets> {
+pub fn start(settings: &Entity<crate::settings::Settings>, cx: &mut App) -> Entity<CustomWidgets> {
     let generation = Arc::new(AtomicU64::new(0));
     watch_dirs(generation.clone());
     let entity = cx.new(|_| CustomWidgets::new(generation));
     // the first discovery happens here so the bar's first paint already
-    // knows the widget set; the reads arrive as the first ticks land
-    entity.update(cx, |state, _| {
+    // knows the widget set; the reads arrive as the first ticks land,
+    // and a config naming an uninstalled widget is pruned right away
+    entity.update(cx, |state, cx| {
         state.rediscover(&user_dir(), &system_dir());
+        state.prune(settings, cx);
     });
     let state = entity.downgrade();
+    let tick_settings = settings.clone();
     cx.spawn(async move |cx| {
         loop {
-            if state.update(cx, |state, cx| state.tick(cx)).is_err() {
+            if state
+                .update(cx, |state, cx| state.tick(&tick_settings, cx))
+                .is_err()
+            {
                 break;
             }
             cx.background_executor()

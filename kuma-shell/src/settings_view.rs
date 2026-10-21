@@ -232,11 +232,11 @@ struct WidgetDrag {
 }
 
 /// One widgets-page row: customs and built-ins render beside each
-/// other, an uninstalled placement dimmed in its alphabetical place.
+/// other. A placement naming a vanished widget is pruned by the
+/// runner, so no row exists to render for it.
 enum WidgetRow {
     Builtin(crate::settings::WidgetKind),
     Custom(crate::widgets::CustomWidget),
-    Inert(String),
 }
 
 /// What follows the cursor during a widget drag: the widget's name.
@@ -2320,19 +2320,17 @@ impl SettingsView {
     }
 
     /// The widgets page: one row per widget, customs beside built-ins in
-    /// one alphabetical list, an inert placement (naming a widget that
-    /// is not installed) riding dimmed in its place. The switch is the
-    /// bar: on means it renders, off means it waits in reserve; the
-    /// mode pills choose how an enabled one presents. The pool (shipped,
-    /// not yet installed) keeps its own stretch at the bottom, because
-    /// its action is install rather than toggle, and it empties as the
-    /// user installs.
+    /// one alphabetical list. The switch is the bar: on means it renders,
+    /// off means it waits in reserve; the mode pills choose how an
+    /// enabled one presents. The pool (shipped, not yet installed) keeps
+    /// its own stretch at the bottom, because its action is install
+    /// rather than toggle, and it empties as the user installs.
     fn widgets_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let mut rows: Vec<(String, WidgetRow)> = crate::settings::WIDGETS
             .iter()
             .map(|spec| (spec.kind.label().to_lowercase(), WidgetRow::Builtin(spec.kind)))
             .collect();
-        let (pool, placed_unknown) = {
+        let pool: Vec<crate::widgets::CustomWidget> = {
             let state = self.widgets.read(cx);
             let user = crate::widgets::user_dir();
             for w in state.widgets() {
@@ -2340,30 +2338,13 @@ impl SettingsView {
                     rows.push((w.label.to_lowercase(), WidgetRow::Custom(w.clone())));
                 }
             }
-            let pool: Vec<crate::widgets::CustomWidget> = state
+            state
                 .widgets()
                 .iter()
                 .filter(|w| !w.dir.starts_with(&user))
                 .cloned()
-                .collect();
-            let placed_unknown: Vec<String> = SECTIONS
-                .iter()
-                .flat_map(|&section| {
-                    self.settings
-                        .read(cx)
-                        .widgets(section)
-                        .iter()
-                        .filter_map(|placement| placement.kind.custom().map(str::to_string))
-                })
-                .filter(|id| !state.widgets().iter().any(|w| w.id == *id))
-                .collect();
-            (pool, placed_unknown)
+                .collect()
         };
-        rows.extend(
-            placed_unknown
-                .into_iter()
-                .map(|id| (id.to_lowercase(), WidgetRow::Inert(id))),
-        );
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         div()
             .id("page-widgets")
@@ -2376,7 +2357,6 @@ impl SettingsView {
             .children(rows.iter().map(|(_, row)| match row {
                 WidgetRow::Builtin(kind) => self.widget_row(*kind, cx),
                 WidgetRow::Custom(manifest) => self.custom_row(manifest, cx),
-                WidgetRow::Inert(id) => self.inert_row(id, cx),
             }))
             .when(!pool.is_empty(), |el| {
                 el.child(self.section_header("Available to install".to_string())).children(
@@ -2488,52 +2468,6 @@ impl SettingsView {
                                     None => settings.add(reference, cx),
                                 }
                             });
-                    }))
-            })
-    }
-
-    /// A placement whose widget is not installed: dimmed, the id for a
-    /// label, and the toggle only removes. It rides inert in the bar
-    /// until the widget shows up.
-    fn inert_row(&self, id: &str, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
-        div()
-            .id(SharedString::from(format!("widget-row-inert-{id}")))
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3p5()
-            .py_2()
-            .rounded_lg()
-            .bg(rgb(crate::theme::current().surface))
-            .child(
-                gpui::svg()
-                    .path("icons/puzzle.svg")
-                    .size(px(16.))
-                    .text_color(rgb(crate::theme::current().text_dim)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(12.))
-                    .text_color(rgb(crate::theme::current().text_dim))
-                    .truncate()
-                    .child(format!("{id} (not installed)")),
-            )
-            .child({
-                let id = id.to_string();
-                div()
-                    .id(SharedString::from(format!("widget-toggle-inert-{id}")))
-                    .p_1()
-                    .cursor_pointer()
-                    .child(crate::controls::toggle_switch(false))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings.update(cx, |settings, cx| {
-                            let reference = crate::settings::WidgetRef::Custom(id.clone());
-                            if let Some((section, index)) = settings.position(&reference) {
-                                settings.remove(section, index, cx);
-                            }
-                        });
                     }))
             })
     }
