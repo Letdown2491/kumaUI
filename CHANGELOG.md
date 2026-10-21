@@ -58,6 +58,11 @@ move rides unchanged.
 
 ### Changed
 
+- The nostr signer's panel opens on the asks when asks are pending,
+  instead of on whatever tab was last chosen: the thing waiting on a
+  decision outranks the memory, and the remembered tab returns once
+  the queue is clear. A riding nostrconnect:// offer still lands on
+  Pair, as does onboarding.
 - The mode pills are per widget, named by the registry. The clock's
   dial is date+time / time / date (and its default face now shows the
   weekday and month beside the time), the count chips drop bare text

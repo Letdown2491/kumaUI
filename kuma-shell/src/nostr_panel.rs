@@ -116,15 +116,21 @@ impl NostrSignerView {
         // open: the state remembers, the fresh view obeys. A chosen
         // tab (the person's click wins) also retires onboarding;
         // once a key is on the entity, an empty app list no longer
-        // lands the open on Pair.
+        // lands the open on Pair. Pending asks outrank the memory:
+        // an open with things waiting on a decision belongs to the
+        // asks, and the remembered tab returns once they are cleared
+        // (the memory is only written by a person's click, so the
+        // detour does not erase it).
         let tab = {
             let state = nostr.read(cx);
             if state.offered_uri.is_some() {
                 Tab::Pair
-            } else if let Some(key) = state.panel_tab {
-                Tab::from_key(key).unwrap_or(Tab::Asks)
             } else if state.apps.is_empty() {
                 Tab::Pair
+            } else if !state.prompts.is_empty() {
+                Tab::Asks
+            } else if let Some(key) = state.panel_tab {
+                Tab::from_key(key).unwrap_or(Tab::Asks)
             } else {
                 Tab::Asks
             }
