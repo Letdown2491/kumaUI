@@ -4,8 +4,10 @@
 //! Fedora's repos for a composed base's kernel; no pull, no build),
 //! plus the parse into per-package rows the panel lists.
 
-use std::process::Command;
-use std::sync::OnceLock;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext as _, Context, Entity};
@@ -46,6 +48,12 @@ pub struct UpdatesState {
     pub checking: bool,
     /// An apply is running: the panel's button is down.
     pub applying: bool,
+    /// The apply's live position: the newest step line the build has
+    /// printed, a poll behind the pipe. The panel prefers it over the
+    /// generic wording, so a slow build says which step it is on.
+    pub progress: Option<String>,
+    /// The system refused the staged reboot.
+    pub reboot_refused: bool,
     /// Whether `kuma` was found on this system. False until the boot
     /// probe lands; the chip, its checks, and its panel are kumaOS
     /// machinery, and on a stock distro there is nothing to drive.
@@ -99,22 +107,71 @@ impl UpdatesState {
 
     /// Stage the update, then re-check so the panel reflects the moved
     /// lock. The button is down while it builds; the polkit agent
-    /// (this shell's lock dialog) carries the password prompt.
+    /// (this shell's lock dialog) carries the password prompt, and the
+    /// build's own step lines stream into the panel while it works.
     pub fn apply(&mut self, cx: &mut Context<Self>) {
         if self.applying {
             return;
         }
         self.applying = true;
         self.applied = None;
+        self.progress = None;
+        self.reboot_refused = false;
         cx.notify();
+        let lines: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let watch = lines.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move { apply_updates() }).await;
+            let handle = cx.background_spawn(async move { apply_updates(watch, flag) });
+            // the build's position rides a shared line and a small
+            // poll: the entity only moves on the foreground executor,
+            // and a seven-tenths cadence is cheap next to a build
+            loop {
+                cx.background_executor().timer(Duration::from_millis(700)).await;
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                let latest = lines.lock().ok().and_then(|guard| guard.clone());
+                let _ = this.update(cx, |state, cx| {
+                    if state.progress != latest {
+                        state.progress = latest;
+                        cx.notify();
+                    }
+                });
+            }
+            let result = handle.await;
             let _ = this.update(cx, |state, cx| {
                 state.applying = false;
+                state.progress = None;
                 state.applied = Some(result);
                 state.check(cx);
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// Apply what is staged: one click, one reboot. The staging is
+    /// done, so this is not an update step; if the system refuses it,
+    /// the panel says so and the staged result still stands.
+    pub fn restart(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let ok = cx
+                .background_spawn(async {
+                    Command::new("systemctl")
+                        .arg("reboot")
+                        .status()
+                        .map(|status| status.success())
+                        .unwrap_or(false)
+                })
+                .await;
+            if !ok {
+                let _ = this.update(cx, |state, cx| {
+                    state.reboot_refused = true;
+                    cx.notify();
+                });
+            }
         })
         .detach();
     }
@@ -145,27 +202,69 @@ fn check_updates() -> Result<CheckResult, String> {
 /// agent (this shell's lock dialog), and `kuma update --yes` pulls,
 /// rebuilds, and stages for the next reboot. An image build is not a
 /// bounded wait: the timeout is generous by design.
-fn apply_updates() -> ApplyOutcome {
-    let output = match Command::new("timeout")
+/// Run the apply: `pkexec kuma update` under the generous timeout,
+/// with the build's step lines sipped off its stderr by a reader
+/// thread (podman numbers its steps, `COMMIT` closes the build, and
+/// the post-build staging speaks in dashes). A seven-tenths poll on
+/// the far side lifts the newest line into the panel.
+fn apply_updates(watch: Arc<Mutex<Option<String>>>, done: Arc<AtomicBool>) -> ApplyOutcome {
+    let mut child = match Command::new("timeout")
         .args(["3600", "pkexec", "kuma", "update", "--yes", "--json"])
-        .stderr(std::process::Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
     {
-        Ok(output) => output,
-        Err(err) => return ApplyOutcome::Failed(format!("spawn failed: {err}")),
+        Ok(child) => child,
+        Err(err) => {
+            done.store(true, Ordering::Relaxed);
+            return ApplyOutcome::Failed(format!("spawn failed: {err}"));
+        }
     };
-    match output.status.code() {
-        Some(0) => ApplyOutcome::Staged,
-        // pkexec's own code for a dismissed auth dialog (126) and for
-        // an authorization it could not obtain (127): the update never
-        // started, so there is nothing failed to report
-        Some(126) | Some(127) => ApplyOutcome::Cancelled,
-        code => ApplyOutcome::Failed(format!(
-            "kuma update exited {}",
-            code.map(|c| c.to_string())
-                .unwrap_or_else(|| "from a signal".into())
-        )),
+    // kuma's stdout carries the JSON report at the end; the pipe must
+    // drain or the writer blocks, so a quiet thread swallows it
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let _ = BufReader::new(stdout).lines().count();
+        });
     }
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let line = line.trim_end();
+                let keep = line.starts_with("STEP ")
+                    || line.starts_with("COMMIT")
+                    || line.starts_with("--> ")
+                    || line.starts_with("Staging")
+                    || line.starts_with("Queued ");
+                if keep {
+                    // the reader caps the line so a \\r-refreshing
+                    // progress bar cannot pile the whole stream into
+                    // one shared string
+                    let capped: String = line.chars().take(160).collect();
+                    if let Ok(mut guard) = watch.lock() {
+                        *guard = Some(capped);
+                    }
+                }
+            }
+        });
+    }
+    let outcome = match child.wait() {
+        Ok(status) => match status.code() {
+            Some(0) => ApplyOutcome::Staged,
+            // pkexec's own code for a dismissed auth dialog (126) and
+            // for an authorization it could not obtain (127): the
+            // update never started, so there is nothing failed to report
+            Some(126) | Some(127) => ApplyOutcome::Cancelled,
+            code => ApplyOutcome::Failed(format!(
+                "kuma update exited {}",
+                code.map(|c| c.to_string())
+                    .unwrap_or_else(|| "from a signal".into())
+            )),
+        },
+        Err(err) => ApplyOutcome::Failed(format!("spawn failed: {err}")),
+    };
+    done.store(true, Ordering::Relaxed);
+    outcome
 }
 
 /// The check's JSON into rows. `ok: false` or a missing `updates`

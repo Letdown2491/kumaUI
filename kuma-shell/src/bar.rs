@@ -1133,9 +1133,12 @@ impl ShellBar {
                     return None;
                 }
                 let text = (count > 0).then(|| count.to_string());
+                // the accent means "there is work waiting for you"; once
+                // the build has staged it, the waiting is the machine's
+                let staged = matches!(state.applied, Some(crate::updates::ApplyOutcome::Staged));
                 let color = if state.stale {
                     crate::theme::current().text_dim
-                } else if state.security > 0 {
+                } else if state.security > 0 && !staged {
                     crate::theme::current().accent
                 } else {
                     crate::theme::current().text
@@ -1143,9 +1146,14 @@ impl ShellBar {
                 let updates = self.updates.clone();
                 let tooltip = move |_: &SysMon, cx: &App| {
                     let state = updates.read(cx);
+                    let staged =
+                        matches!(state.applied, Some(crate::updates::ApplyOutcome::Staged));
                     match state.updates.len() {
                         0 if state.stale => "Kuma Updates: the last check failed".into(),
                         0 => "Kuma Updates: everything is current".into(),
+                        n if staged => {
+                            format!("Kuma Updates: {n} staged, restart to apply").into()
+                        }
                         n => format!(
                             "Kuma Updates: {} available ({} security)",
                             n, state.security

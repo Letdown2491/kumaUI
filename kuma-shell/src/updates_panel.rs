@@ -35,7 +35,9 @@ impl Render for UpdatesPanelView {
         let stale = state.stale;
         let checking = state.checking;
         let applying = state.applying;
+        let progress = state.progress.clone();
         let applied = state.applied.clone();
+        let reboot_refused = state.reboot_refused;
         let checked_ago = state.checked_at.map(|at| ago(at, Instant::now()));
 
         let list = if updates.is_empty() {
@@ -138,17 +140,39 @@ impl Render for UpdatesPanelView {
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(crate::theme::current().text_dim))
+                        .truncate()
                         .child(
-                            "Updating: pulling, rebuilding, and staging the image; this can take a while",
+                            progress.clone().unwrap_or_else(|| {
+                                "Updating: pulling, rebuilding, and staging the image; this can take a while".to_string()
+                            }),
                         ),
                 )
             })
             .when_some(applied, |el, result| match result {
                 ApplyOutcome::Staged => el.child(
                     div()
-                        .text_size(px(11.))
-                        .text_color(rgb(crate::theme::current().text_dim))
-                        .child("Staged. It applies at the next reboot."),
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(crate::theme::current().text_dim))
+                                .child("Staged. It applies at the next reboot."),
+                        )
+                        .child(kit::button(
+                            "restart-now",
+                            "Restart now",
+                            Some("icons/power.svg"),
+                            kit::ButtonVariant::Primary,
+                            {
+                                let state = self.state.clone();
+                                move |_, _, cx| {
+                                    state.update(cx, |state, cx| state.restart(cx));
+                                }
+                            },
+                        )),
                 ),
                 // the user said no: say it back quietly, not as a failure
                 ApplyOutcome::Cancelled => el.child(
@@ -163,6 +187,14 @@ impl Render for UpdatesPanelView {
                         .text_color(rgb(crate::theme::URGENT))
                         .child(SharedString::from(format!("The update failed: {err}"))),
                 ),
+            })
+            .when(reboot_refused, |el| {
+                el.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(crate::theme::URGENT))
+                        .child("The system refused the reboot. Stage is kept; `systemctl reboot` applies it."),
+                )
             });
 
         crate::panel::chrome(self.geometry, window, cx, content)
