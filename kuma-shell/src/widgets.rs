@@ -401,15 +401,11 @@ fn run_budget(interval: Duration) -> u32 {
     interval.as_secs().clamp(10, 60) as u32
 }
 
-/// Run one widget's source, blocking, bounded twice: `timeout` bounds
-/// the direct child, and the run's own deadline plus a process-group
-/// kill bound everything else. This is `timed_output`'s idiom with one
-/// extra clause: a source that backgrounds a pipe-holding grandchild
-/// (`sleep 999 & echo hi`) keeps its stdout open past `timeout`'s
-/// SIGTERM, so plain `.output()` would wait on every writer forever.
-/// The read is capped too: duration bounds are not memory bounds, and a
-/// source printing at line speed for its whole budget is gigabytes.
-/// Called on the background executor only.
+/// Run one widget's source, blocking, bounded: the platform's
+/// `bounded_output` (`timeout` bounds the direct child, a process-group
+/// deadline kill bounds a source that backgrounds a pipe-holding
+/// grandchild, and the read is capped, since duration bounds are not
+/// memory bounds). Called on the background executor only.
 fn run_widget_bounded(widget: &CustomWidget, secs: u32) -> Result<WidgetRead, String> {
     const MAX_OUTPUT_BYTES: usize = 64 * 1024;
     let mut command = Command::new("timeout");
@@ -425,70 +421,13 @@ fn run_widget_bounded(widget: &CustomWidget, secs: u32) -> Result<WidgetRead, St
             command.arg("sh").arg("-c").arg(line);
         }
     }
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::null());
-    // its own process group: the deadline kill below must reach the
-    // source's backgrounded grandchildren, which hold the pipes
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("spawning failed: {err}"))?;
-    let mut stdout = child.stdout.take().ok_or("the widget has no stdout")?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::Read;
-        let mut kept = Vec::with_capacity(MAX_OUTPUT_BYTES);
-        let mut sink = [0u8; 8192];
-        loop {
-            match stdout.read(&mut sink) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    // past the cap the bytes are drained, not stored
-                    let take = n.min(MAX_OUTPUT_BYTES.saturating_sub(kept.len()));
-                    kept.extend_from_slice(&sink[..take]);
-                }
-            }
-        }
-        let _ = tx.send(kept);
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(secs as u64 + 5);
-    let output = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            // every writer died or the budget ran out with the pipe
-            // still open (the grandchild case): close it for them, then
-            // give the reader its moment to hand over what it kept
-            kill_group(child.id());
-            match rx.recv_timeout(Duration::from_secs(2)) {
-                Ok(bytes) => bytes,
-                Err(_) => return Err("the widget's output never ended".to_string()),
-            }
-        }
-    };
-    // reap the direct child under the same deadline. Normally it has
-    // already exited (`timeout` exits when its child does, a moment
-    // after the reader sees EOF), so no kill ever fires; the kill is
-    // for a straggler that closed its stdout and kept running
-    // (`sh -c 'exec 1>&-; sleep 999'`), and it fires only past the
-    // deadline a healthy run never reaches.
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                kill_group(child.id());
-                break child.wait().map_err(|err| format!("waiting failed: {err}"))?;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(err) => return Err(format!("waiting failed: {err}")),
-        }
-    };
-    if !status.success() {
+    let output = kuma_platform::process::bounded_output(command, secs, MAX_OUTPUT_BYTES)
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
         // timeout kills with 124; the exit status is the useful part
-        return Err(format!("exited {}", status));
+        return Err(format!("exited {}", output.status));
     }
-    let read = parse_output(String::from_utf8_lossy(&output).as_ref());
+    let read = parse_output(String::from_utf8_lossy(&output.stdout).as_ref());
     if read.text.is_none() {
         // an empty read is a valid "nothing to show", but a source that
         // exits cleanly and prints nothing on every tick is more likely
@@ -501,15 +440,6 @@ fn run_widget_bounded(widget: &CustomWidget, secs: u32) -> Result<WidgetRead, St
 /// The real-budget wrapper the runner uses.
 fn run_widget(widget: &CustomWidget) -> Result<WidgetRead, String> {
     run_widget_bounded(widget, run_budget(widget.interval))
-}
-
-/// SIGKILL to a process group: the widget runner's guarantee that
-/// nothing it spawned outlives the run. `kill(-pgid)` fails harmlessly
-/// (ESRCH) when everything already exited.
-fn kill_group(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
 }
 
 /// The entity the bar and the settings page read: the discovery snapshot

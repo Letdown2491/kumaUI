@@ -287,11 +287,9 @@ fn fetch_cli(field: Field) -> Option<serde_json::Value> {
         Field::Status => &["status", "--json"],
         Field::Log => &["log", "--json"],
     };
-    let output = std::process::Command::new("timeout")
-        .args(["15", "kuma-nostr"])
-        .args(args)
-        .output()
-        .ok()?;
+    // bounded like every other CLI read (the platform's timed_output):
+    // a hung vault daemon costs this task one wait, never forever
+    let output = kuma_platform::process::timed_output("kuma-nostr", args, 15).ok()?;
     if !output.status.success() {
         return None;
     }

@@ -215,17 +215,6 @@ fn match_app<'a>(apps: &'a [AppEntry], app_id: &str) -> Option<&'a AppEntry> {
 /// an app installed after the dock's last scan (its raw entry shows the
 /// app_id as label, no icon, no menu). Missing app_ids (bare surfaces)
 /// never match anything and are no trigger.
-fn has_unmatched_app_id<'a>(
-    apps: &[AppEntry],
-    app_ids: impl Iterator<Item = Option<&'a str>>,
-) -> bool {
-    !unmatched_app_ids(apps, app_ids).is_empty()
-}
-
-/// The app_ids of the windows that matched no desktop entry, in first
-/// seen order. The rescan's give-up counter compares this set between
-/// renders: a set that keeps not matching after a few scans is a bare
-/// terminal, not an app that installed yesterday.
 fn unmatched_app_ids<'a>(
     apps: &[AppEntry],
     app_ids: impl Iterator<Item = Option<&'a str>>,
@@ -386,7 +375,7 @@ pub struct DockView {
     apps: Vec<AppEntry>,
     icons: HashMap<String, Option<IconImage>>,
     /// The last rescan attempt and whether one is in flight: rescans are
-    /// rate limited and single-filed (see [`has_unmatched_app_id`]).
+    /// rate limited and single-filed (see [`unmatched_app_ids`]).
     last_app_scan: Option<Instant>,
     scan_in_flight: bool,
     /// Consecutive fruitless rescans for an unchanged unmatched set:
@@ -975,19 +964,21 @@ mod tests {
         let ids = |windows: Vec<SessionWindow>| -> Vec<Option<String>> {
             windows.into_iter().map(|w| w.app_id).collect()
         };
+        let collect =
+            |windows: &[Option<String>]| unmatched_app_ids(&apps, windows.iter().map(|id| id.as_deref()));
         let none = ids(vec![]);
-        assert!(!has_unmatched_app_id(&apps, none.iter().map(|id| id.as_deref())));
+        assert!(collect(&none).is_empty());
 
         // matched by stem, and by name case-insensitively
         let matched = ids(vec![window(1, Some("foo"), false), window(2, Some("FOO"), false)]);
-        assert!(!has_unmatched_app_id(&apps, matched.iter().map(|id| id.as_deref())));
+        assert!(collect(&matched).is_empty());
 
         // an app_id matching nothing: the rescan trigger
         let unmatched = ids(vec![window(3, Some("spotify"), false)]);
-        assert!(has_unmatched_app_id(&apps, unmatched.iter().map(|id| id.as_deref())));
+        assert_eq!(collect(&unmatched), vec!["spotify".to_string()]);
 
         // a missing app_id (a bare surface) never matches and never triggers
         let nameless = ids(vec![window(4, None, false)]);
-        assert!(!has_unmatched_app_id(&apps, nameless.iter().map(|id| id.as_deref())));
+        assert!(collect(&nameless).is_empty());
     }
 }

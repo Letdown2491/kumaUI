@@ -33,6 +33,12 @@ move rides unchanged.
 
 ### Fixed
 
+- A subprocess that backgrounds a pipe-holding grandchild
+  (`sleep 999 & echo hi`) no longer wedges the poll that ran it
+  forever: the shared bounded read (nmcli, bluetoothctl, wpctl,
+  playerctl, widget sources) kills the whole process group at its
+  deadline and caps what it captures, where the old reads waited on
+  every writer of the pipe.
 - A custom widget icon naming a file the widget directory does not
   hold falls back to themed resolution by stem: `bell.svg` now
   renders the theme's bell instead of nothing (the themed index keys

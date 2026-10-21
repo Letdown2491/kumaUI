@@ -209,10 +209,11 @@ fn local_offset_minutes(_secs: u64) -> i32 {
             return offset;
         }
     }
-    let fresh = std::process::Command::new("timeout")
-        .args(["5", "date", "+%z"])
-        .output()
+    // re-sample through the shared bounded read: `date` is tiny, but
+    // every subprocess read in the shell goes through the same ceiling
+    let fresh = kuma_platform::process::timed_output("date", &["+%z"], 5)
         .ok()
+        .filter(|out| out.status.success())
         .and_then(|out| {
             let text = String::from_utf8_lossy(&out.stdout);
             let text = text.trim();

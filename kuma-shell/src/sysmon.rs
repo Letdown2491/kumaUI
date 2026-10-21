@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::Context as _;
 use gpui::{App, AppContext, Context, Entity};
+use kuma_platform::process::timed_output;
 
 use crate::settings::Settings;
 
@@ -185,21 +186,11 @@ pub struct RecordingState {
     pub elapsed_secs: u64,
 }
 
-/// A subprocess read bounded by `timeout`, the bluetooth acts' idiom
-/// applied to every poll and verb: each of these is awaited in
-/// sequence by the poll or the panel, so one hung CLI must cost
+/// A subprocess read bounded like every poll and verb in this file:
+/// the shared `timed_output` (the platform's: `timeout` bounds the
+/// direct child, a process-group deadline kill bounds backgrounded
+/// writers, and the capture is capped), so one hung CLI costs
 /// seconds, not that subsystem's updates for the rest of the session.
-fn timed_output(
-    program: &str,
-    args: &[&str],
-    secs: u32,
-) -> std::io::Result<std::process::Output> {
-    Command::new("timeout")
-        .arg(secs.to_string())
-        .arg(program)
-        .args(args)
-        .output()
-}
 
 fn read_recording() -> Option<RecordingState> {
     // pgrep walks /proc: bounded like every other poll read, cheap as
@@ -719,16 +710,12 @@ impl SysMon {
                     };
                     // the connect waits on the whole association (DHCP
                     // included), so its bound is the generous one
-                    let mut command = Command::new("timeout");
-                    command.arg("60").arg("nmcli");
-                    command.args(["dev", "wifi", "connect", &ssid]);
+                    let mut args = vec!["dev", "wifi", "connect", ssid.as_str()];
                     if let Some(path) = &passwd_path {
-                        command.args([
-                            "passwd-file",
-                            path.to_str().context("non-UTF-8 runtime dir")?,
-                        ]);
+                        args.push("passwd-file");
+                        args.push(path.to_str().context("non-UTF-8 runtime dir")?);
                     }
-                    let output = command.output();
+                    let output = timed_output("nmcli", &args, 60);
                     if let Some(path) = &passwd_path {
                         let _ = std::fs::remove_file(path);
                     }
@@ -1057,7 +1044,6 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
         let mut previous: Option<CpuSample> = None;
         let mut tick = 0u32;
         loop {
-            let full = tick % FULL_PASS_EVERY == 0;
             tick = tick.wrapping_add(1);
             let Ok(full_wanted) = state.update(cx, |sysmon, _| sysmon.full_wanted) else {
                 break;
@@ -1499,10 +1485,7 @@ fn read_bluetooth(scan_devices: bool) -> Option<BluetoothState> {
 /// five-second ceiling keeps ten paired devices from holding the poll
 /// for a minute.
 fn read_device_info(mac: &str, alias: &str) -> Option<BluetoothDevice> {
-    let output = Command::new("timeout")
-        .args(["5", "bluetoothctl", "info", mac])
-        .output()
-        .ok()?;
+    let output = timed_output("bluetoothctl", &["info", mac], 5).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1559,38 +1542,26 @@ impl BluetoothAct {
     fn execute(self, mac: &str) -> anyhow::Result<()> {
         match self {
             BluetoothAct::Connect => {
-                let status = Command::new("timeout")
-                    .args(["15", "bluetoothctl", "connect", mac])
-                    .status()?;
+                let status = timed_output("bluetoothctl", &["connect", mac], 15)?.status;
                 anyhow::ensure!(status.success(), "connect failed");
             }
             BluetoothAct::Disconnect => {
-                let status = Command::new("timeout")
-                    .args(["10", "bluetoothctl", "disconnect", mac])
-                    .status()?;
+                let status = timed_output("bluetoothctl", &["disconnect", mac], 10)?.status;
                 anyhow::ensure!(status.success(), "disconnect failed");
             }
             BluetoothAct::Pair => {
-                let status = Command::new("timeout")
-                    .args(["20", "bluetoothctl", "pair", mac])
-                    .status()?;
+                let status = timed_output("bluetoothctl", &["pair", mac], 20)?.status;
                 anyhow::ensure!(status.success(), "pairing failed");
-                if let Ok(trust) = Command::new("timeout")
-                    .args(["10", "bluetoothctl", "trust", mac])
-                    .status()
-                    && !trust.success()
+                if let Ok(trust) = timed_output("bluetoothctl", &["trust", mac], 10)
+                    && !trust.status.success()
                 {
                     log::info!("bluetooth: trust after pair failed for {mac}");
                 }
-                let status = Command::new("timeout")
-                    .args(["15", "bluetoothctl", "connect", mac])
-                    .status()?;
+                let status = timed_output("bluetoothctl", &["connect", mac], 15)?.status;
                 anyhow::ensure!(status.success(), "paired, but connect failed");
             }
             BluetoothAct::Remove => {
-                let status = Command::new("timeout")
-                    .args(["10", "bluetoothctl", "remove", mac])
-                    .status()?;
+                let status = timed_output("bluetoothctl", &["remove", mac], 10)?.status;
                 anyhow::ensure!(status.success(), "remove failed");
             }
         }

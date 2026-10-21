@@ -1142,9 +1142,7 @@ fn pair_ready(
 fn mint_cli() -> Option<serde_json::Value> {
     // bounded like every other CLI read (nostr.rs's fetch_cli): a hung
     // vault daemon costs this task one wait, never forever
-    let output = std::process::Command::new("timeout")
-        .args(["15", "kuma-nostr", "bunker", "--json"])
-        .output()
+    let output = kuma_platform::process::timed_output("kuma-nostr", &["bunker", "--json"], 15)
         .ok()?;
     if !output.status.success() {
         return None;

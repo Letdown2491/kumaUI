@@ -22,5 +22,6 @@ pub mod color;
 pub mod imaging;
 pub mod niri;
 pub mod palette;
+pub mod process;
 pub mod titlebar;
 pub mod version;
