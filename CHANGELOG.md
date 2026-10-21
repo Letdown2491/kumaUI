@@ -11,6 +11,29 @@ move rides unchanged.
 
 ## Unreleased
 
+### Fixed
+
+- The lock screen no longer accepts any password when a PAM service's
+  stack file exists but carries no `auth` rules (an empty or
+  comment-only `/etc/pam.d/kuma-lock` from a truncated deploy is an
+  empty stack, and an empty stack succeeds): such a service is now
+  skipped like a missing one, and the chain's fall-through still
+  rejects.
+- The greeter answers echo-on (visible) PAM questions with an empty
+  string instead of the password, matching the polkit agent's rule; a
+  login module that asks echo-on can no longer echo or log the
+  password.
+- Lock-screen password buffers are scrubbed from memory when an
+  attempt, a lock, or an unlock clears them, instead of being left in
+  freed heap for a core dump or swap to recover.
+- The polkit helper runs under `timeout -k 5 30`: a helper that hangs
+  and ignores SIGTERM no longer pins the polkit card on "checking..."
+  until the shell is restarted. (Also fixes the stale comment that
+  claimed the setuid helper fallback was not implemented.)
+- The greetd socket read is bounded (30 s per exchange): a wedged
+  greetd surfaces as an auth error instead of a greeter stuck on
+  "signing in..." forever.
+
 ## v0.5.0 (2026-10-21)
 
 kuma-shell 0.5.0

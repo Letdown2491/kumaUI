@@ -74,6 +74,11 @@ impl GreetdClient {
     pub fn connect_to(path: &str) -> anyhow::Result<Self> {
         let stream = UnixStream::connect(path)
             .with_context(|| format!("connecting to greetd at {path}"))?;
+        // greetd is a trusted, root-owned peer, but a wedged one must not
+        // pin the greeter's auth thread forever ("signing in..." with no
+        // exit); a dead one already recovers, the socket closes and every
+        // read errors.
+        stream.set_read_timeout(Some(GREETD_EXCHANGE_TIMEOUT))?;
         let reader = BufReader::new(stream.try_clone()?);
         Ok(Self { stream, reader })
     }
@@ -118,6 +123,11 @@ impl GreetdClient {
 /// `read_response`): real greetd messages are tiny.
 const MAX_RESPONSE: usize = 1024 * 1024;
 
+/// How long one greetd request/response round trip may take. Real
+/// exchanges are milliseconds; the bound exists so a wedged greetd
+/// surfaces as an auth error instead of a forever-busy greeter.
+const GREETD_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A real PAM exchange is a handful of messages; more is a broken or
 /// hostile peer, and every secret question would carry the password
 /// again.
@@ -132,9 +142,10 @@ pub enum LoginOutcome {
 }
 
 /// Drive one login attempt: create the session for `username`, answer
-/// every auth message on the way (the password goes to secret and
-/// visible questions; info and error statements are acknowledged),
-/// then start `cmd`. A wrong password surfaces as `AuthFailed` and
+/// every auth message on the way (the password goes to secret questions
+/// only; a visible question must never receive it, where a module could
+/// echo it or log it, matching the polkit agent's rule), then start
+/// `cmd`. A wrong password surfaces as `AuthFailed` and
 /// the caller may simply try again: greetd ended that attempt.
 pub fn login(
     client: &mut GreetdClient,
@@ -158,10 +169,14 @@ pub fn login(
             Response::AuthMessage {
                 auth_message_type, ..
             } => {
-                // a question takes the password; info and error
+                // a question takes an answer: the password only for the
+                // secret one, an empty string for visible questions
+                // (a module asking echo-on wanted a username or a
+                // confirmation, never the password), and info and error
                 // statements only want an acknowledgement
                 let answer = match auth_message_type {
-                    AuthMessageType::Visible | AuthMessageType::Secret => Some(password),
+                    AuthMessageType::Secret => Some(password),
+                    AuthMessageType::Visible => Some(""),
                     AuthMessageType::Info | AuthMessageType::Error => None,
                 };
                 response = client.request(&Request::PostAuthMessageResponse { response: answer })?;
@@ -380,6 +395,29 @@ mod tests {
         assert_eq!(ack["type"], "post_auth_message_response");
         assert_eq!(ack["response"], serde_json::Value::Null);
         assert_eq!(fake.sent(2)["response"], "hunter2");
+    }
+
+    #[test]
+    fn visible_questions_get_an_empty_answer_never_the_password() {
+        // an echo-on question wanted a username or a confirmation; the
+        // password must not ride to whatever would echo it back
+        let script = vec![
+            auth_message("visible", "Login: "),
+            auth_message("secret", "Password: "),
+            serde_json::json!({ "type": "success" }),
+            serde_json::json!({ "type": "success" }),
+        ];
+        let (mut client, fake) = FakeGreetd::spawn(&script);
+
+        let outcome = login(&mut client, "martin", "hunter2", &["niri-session"]).unwrap();
+        assert_eq!(outcome, LoginOutcome::Started);
+
+        let requests: Vec<serde_json::Value> = (0..4).map(|i| fake.sent(i)).collect();
+        assert_eq!(
+            requests[1]["response"], "",
+            "the visible question must not get the password: {requests:?}"
+        );
+        assert_eq!(requests[2]["response"], "hunter2");
     }
 
     #[test]

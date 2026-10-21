@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use chrono::Local;
 use futures_lite::StreamExt;
+use zeroize::Zeroize;
 use gpui::{
     App, AppContext, Bounds, Context, DisplayId, Entity, FocusHandle, Focusable, KeyDownEvent,
     ObjectFit, Render, RenderImage, SharedString, Window, WindowBackgroundAppearance, WindowBounds,
@@ -35,6 +36,8 @@ const PAM_SERVICES: [&str; 3] = ["kuma-lock", "swaylock", "vlock"];
 /// (a second factor, a re-prompt) is refused; v1 is password-only, and
 /// fingerprint hardware that consults the user directly doesn't need us.
 struct PasswordConversation {
+    /// The typed password as PAM wants it: scrubbed when the
+    /// conversation drops, not left in freed heap (see Drop).
     password: CString,
 }
 
@@ -56,9 +59,40 @@ impl pam_client2::ConversationHandler for PasswordConversation {
     }
 }
 
+impl Drop for PasswordConversation {
+    fn drop(&mut self) {
+        // zeroize has no CString impl: consume it into bytes and scrub
+        // what was the password before the buffer goes back to the heap
+        let mut bytes = std::mem::take(&mut self.password).into_bytes();
+        bytes.zeroize();
+    }
+}
+
+/// Whether /etc/pam.d/<service> is usable. A missing file is skipped (the
+/// `other` policy rejects, see authenticate), and so is an existing file
+/// with no applicable `auth` rules: an empty stack does not reject, it
+/// succeeds having run nothing, so a truncated deploy (a zero-length file
+/// from a failed swap, an editor saving only comments) must read as
+/// missing, never as a chain that unlocks on anything.
+fn service_has_auth_stack(service: &str) -> bool {
+    match std::fs::read_to_string(std::path::Path::new("/etc/pam.d").join(service)) {
+        Ok(text) => has_auth_stack(&text),
+        Err(_) => false,
+    }
+}
+
+/// Whether any line names an `auth` rule: a non-comment line whose first
+/// field is `auth` (leading whitespace is PAM-legal).
+fn has_auth_stack(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        !line.starts_with('#') && line.split_whitespace().next() == Some("auth")
+    })
+}
+
 /// One unlock attempt, on a blocking thread: start the first service in
 /// the chain, authenticate, validate the account.
-fn authenticate(user: &str, password: String) -> anyhow::Result<()> {
+fn authenticate(user: &str, mut password: String) -> anyhow::Result<()> {
     let mut last = None;
     for service in PAM_SERVICES {
         // Linux-PAM defers reading a service's stack to the first call and,
@@ -67,13 +101,16 @@ fn authenticate(user: &str, password: String) -> anyhow::Result<()> {
         // a wrong one would, and pam_start succeeds regardless, so the only
         // way the chain reaches the first installed service is to skip the
         // ones that aren't on disk (kuma-lock and swaylock on kumaOS).
-        if !std::path::Path::new("/etc/pam.d").join(service).exists() {
+        if !service_has_auth_stack(service) {
             continue;
         }
         let conversation = PasswordConversation {
             password: CString::new(password.as_bytes())
                 .map_err(|_| anyhow::anyhow!("password contains a NUL byte"))?,
         };
+        // the password has reached its only consumer: what lives on from
+        // here is the CString copy above, zeroized with the conversation
+        password.zeroize();
         match pam_client2::Context::new(service, Some(user), conversation) {
             Ok(mut context) => {
                 // A real stack's answer is final: wrong password, expired
@@ -131,7 +168,7 @@ impl LockState {
             return;
         }
         self.locked = true;
-        self.password.clear();
+        self.password.zeroize();
         self.busy = false;
         self.message = None;
         cx.notify();
@@ -187,7 +224,7 @@ impl LockState {
             return;
         }
         self.locked = false;
-        self.password.clear();
+        self.password.zeroize();
         self.busy = false;
         self.message = None;
         // hold nothing while unlocked: the decoded wallpaper is an 8-33 MB
@@ -272,7 +309,7 @@ impl LockState {
                         // generic message: PAM's own text can leak details
                         log::info!("unlock attempt failed: {err:#}");
                         this.message = Some("wrong password".into());
-                        this.password.clear();
+                        this.password.zeroize();
                         cx.notify();
                     }
                 }
@@ -622,7 +659,23 @@ async fn run_lock_listener(tx: Sender<LockEvent>, hint_rx: Receiver<bool>) -> an
 
 #[cfg(test)]
 mod tests {
-    use super::needs_lock_surfaces;
+    use super::{has_auth_stack, needs_lock_surfaces};
+
+    #[test]
+    fn a_pam_stack_counts_only_when_an_auth_rule_exists() {
+        // a real stack
+        assert!(has_auth_stack("auth required pam_unix.so\naccount permit\n"));
+        // leading whitespace is PAM-legal
+        assert!(has_auth_stack("  auth required pam_unix.so\n"));
+        // the accept-shaped degenerate cases: no auth rules at all
+        assert!(!has_auth_stack(""));
+        assert!(!has_auth_stack("# just a comment\n"));
+        assert!(!has_auth_stack("account permit\nsession required pam_unix.so\n"));
+        // the word `auth` alone is a malformed stack (PAM rejects it at
+        // parse); the gate treats it as auth-bearing and lets PAM's
+        // reject happen
+        assert!(has_auth_stack("auth"));
+    }
 
     #[test]
     fn locked_sessions_get_surfaces_back_only_when_displays_exist() {

@@ -3157,6 +3157,7 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-wlr",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]

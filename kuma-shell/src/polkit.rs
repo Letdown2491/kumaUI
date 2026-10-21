@@ -41,8 +41,9 @@ const AUTHORITY_DEST: &str = "org.freedesktop.PolicyKit1";
 const AUTHORITY_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
 const AUTHORITY_IFACE: &str = "org.freedesktop.PolicyKit1.Authority";
 const AGENT_PATH: &str = "/org/kuma/PolicyKit1/AuthenticationAgent";
-/// polkit 127's socket-activated helper; the setuid spawn fallback is
-/// deliberately not implemented (kumaOS ships the socket).
+/// polkit 127's socket-activated helper, preferred when the unit is up;
+/// the setuid spawn fallback runs when it is not (kumaOS ships the socket,
+/// distro installs often do not).
 const HELPER_SOCKET: &str = "/run/polkit/agent-helper.socket";
 /// A dead connection (system bus restart) retries rather than ending the
 /// feature, night-light style.
@@ -859,7 +860,8 @@ const HELPER_BINARIES: [&str; 2] = [
 /// Blocking on purpose: it runs on a background executor thread like
 /// every other subprocess read. Bounded too: a PAM stack that hangs
 /// (a wedged LDAP lookup) must not pin the thread forever, so the
-/// exchange rides `timeout` in spawn mode and socket timeouts in
+/// exchange rides `timeout` with a kill-after (a helper that hangs and
+/// ignores SIGTERM still ends) in spawn mode and socket timeouts in
 /// socket mode, like the bluetooth acts' `timeout` wrappers.
 const HELPER_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -889,6 +891,8 @@ fn run_pump(cookie: &str, user: &str, password: &str, notes: &Sender<PumpNote>) 
         return PumpEnd::Broke("no polkit agent helper is available".into());
     };
     let child = std::process::Command::new("timeout")
+        .arg("-k")
+        .arg("5")
         .arg(HELPER_EXCHANGE_TIMEOUT.as_secs().to_string())
         .arg(helper)
         .arg(user)
