@@ -14,12 +14,18 @@
 //! Scripts written to feed a Waybar custom module render here unchanged;
 //! CSS classes have no meaning in this bar and are ignored.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::time::{Duration, Instant};
 
-use log::warn;
+use gpui::{App, AppContext as _, Context, Entity};
+use notify::{Watcher as _, RecursiveMode};
+use std::process::Command;
+use log::{debug, error, warn};
 use serde::Deserialize;
 
+use crate::launcher::reap;
 use crate::settings::WidgetKind;
 
 /// The shortest tick a widget may ask for. A script that polls faster than
@@ -247,6 +253,332 @@ pub fn icon_is_file(icon: &str) -> bool {
         .is_some_and(|ext| ICON_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
+// ---------------------------------------------------------------------------
+// the runner: one tick loop, one execution in flight per widget
+// ---------------------------------------------------------------------------
+
+/// What a widget's source last printed, as the bar renders it. `text` is
+/// `None` when there is nothing to show (empty stdout hides the widget,
+/// the way Weather hides with no read). `class` is stored but unused at
+/// render: Waybar scripts set it for CSS hooks this bar does not have,
+/// so accepting and ignoring is the graceful degradation.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WidgetRead {
+    pub text: Option<String>,
+    pub tooltip: Option<String>,
+    pub class: Option<String>,
+    /// The last run failed (nonzero exit, timeout kill, spawn error):
+    /// the previous text stays up, dimmed, with the render arm telling
+    /// the honest story in the tooltip.
+    pub stale: bool,
+}
+
+/// The JSON subset of the Waybar custom-module output contract. Unknown
+/// fields are ignored on purpose: scripts written for Waybar carry CSS
+/// hints (`percentage`, `interval`, whole class lists) that mean nothing
+/// here.
+#[derive(Debug, Deserialize)]
+struct WidgetJson {
+    text: Option<String>,
+    tooltip: Option<String>,
+    class: Option<String>,
+}
+
+/// Parse a source's stdout into a read. Plain text is a label; the JSON
+/// object `{"text", "tooltip", "class"}` is the upgrade path. A stdout
+/// that starts with `{` but does not parse falls back to plain text:
+/// a script mid-rewrite must not blank the bar.
+pub fn parse_output(stdout: &str) -> WidgetRead {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return WidgetRead::default();
+    }
+    if trimmed.starts_with('{')
+        && let Ok(json) = serde_json::from_str::<WidgetJson>(trimmed)
+    {
+        let text = json
+            .text
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        return WidgetRead {
+            text,
+            tooltip: json.tooltip.map(|t| t.trim().to_string()),
+            class: json.class,
+            stale: false,
+        };
+    }
+    WidgetRead {
+        text: Some(trimmed.to_string()),
+        ..WidgetRead::default()
+    }
+}
+
+/// The seconds a source may run before `timeout` kills it. An interval
+/// longer than ten seconds earns a matching budget (a slow-but-honest
+/// source is not a hung one), capped at a minute: past that the source
+/// is hung and the stale path applies.
+fn run_budget(interval: Duration) -> u32 {
+    interval.as_secs().clamp(10, 60) as u32
+}
+
+/// Run one widget's source, blocking, bounded by `timeout`. This is
+/// `timed_output`'s idiom: one hung script must cost seconds, not the
+/// widget's updates for the rest of the session. Called on the
+/// background executor only.
+fn run_widget_bounded(widget: &CustomWidget, secs: u32) -> Result<WidgetRead, String> {
+    let mut command = Command::new("timeout");
+    command.arg(secs.to_string());
+    match &widget.run {
+        // a source file is executed directly: its shebang applies and it
+        // is never reinterpreted by a shell, so a non-executable file is
+        // an honest error, not a surprise interpreter
+        WidgetRun::Script(path) => {
+            command.arg(path);
+        }
+        WidgetRun::Command(line) => {
+            command.arg("sh").arg("-c").arg(line);
+        }
+    }
+    let output = command
+        .output()
+        .map_err(|err| format!("spawning failed: {err}"))?;
+    if !output.status.success() {
+        // timeout kills with 124; the exit status is the useful part
+        return Err(format!("exited {}", output.status));
+    }
+    let read = parse_output(String::from_utf8_lossy(&output.stdout).as_ref());
+    if read.text.is_none() {
+        // an empty read is a valid "nothing to show", but a source that
+        // exits cleanly and prints nothing on every tick is more likely
+        // a bug; the log is the only trace (debug: it fires per tick)
+        debug!("widget {:?} printed nothing", widget.id);
+    }
+    Ok(read)
+}
+
+/// The real-budget wrapper the runner uses.
+fn run_widget(widget: &CustomWidget) -> Result<WidgetRead, String> {
+    run_widget_bounded(widget, run_budget(widget.interval))
+}
+
+/// The entity the bar and the settings page read: the discovery snapshot
+/// plus each widget's last read. Owned by the shell's surface deps; the
+/// tick loop and the dir watcher are the only writers.
+pub struct CustomWidgets {
+    widgets: Vec<CustomWidget>,
+    reads: HashMap<String, WidgetRead>,
+    next_due: HashMap<String, Instant>,
+    in_flight: HashSet<String>,
+    /// The watcher bumps it when the widgets dirs move; the tick loop
+    /// re-discovers when it has moved. The night_light shape, third use.
+    generation: Arc<AtomicU64>,
+    seen_generation: u64,
+}
+
+impl CustomWidgets {
+    pub fn new(generation: Arc<AtomicU64>) -> Self {
+        Self {
+            widgets: Vec::new(),
+            reads: HashMap::new(),
+            next_due: HashMap::new(),
+            in_flight: HashSet::new(),
+            generation,
+            seen_generation: 0,
+        }
+    }
+
+    /// The discovery snapshot, stable-sorted by id.
+    pub fn widgets(&self) -> &[CustomWidget] {
+        &self.widgets
+    }
+
+    /// A widget's last read, for the bar arm and the settings rows.
+    pub fn read(&self, id: &str) -> Option<&WidgetRead> {
+        self.reads.get(id)
+    }
+
+    /// Run a widget's click line, fire and forget: bounded like every
+    /// subprocess here, reaped like every spawn, and never awaited by
+    /// the click handler.
+    pub fn click(&self, id: &str) {
+        let Some(widget) = self.widgets.iter().find(|w| w.id == id) else {
+            return;
+        };
+        let Some(line) = &widget.click else {
+            return;
+        };
+        match Command::new("timeout")
+            .args(["15", "sh", "-c", line])
+            .spawn()
+        {
+            Ok(child) => reap(child),
+            Err(err) => error!("widget {:?} click failed to spawn: {err}", widget.id),
+        }
+    }
+
+    /// Re-read both pools. Keeps the reads and due times of surviving
+    /// widgets so a reinstall does not blank them; drops the state of
+    /// vanished ones. Returns true when the snapshot moved (the callers
+    /// notify only then).
+    fn rediscover(&mut self, user: &Path, system: &Path) -> bool {
+        let fresh = discover(user, system);
+        if fresh == self.widgets {
+            return false;
+        }
+        let alive: HashSet<String> = fresh.iter().map(|w| w.id.clone()).collect();
+        self.reads.retain(|id, _| alive.contains(id));
+        self.next_due.retain(|id, _| alive.contains(id));
+        self.widgets = fresh;
+        true
+    }
+
+    /// Commit a finished run. A success replaces the read and schedules
+    /// the next tick; a failure keeps the previous read and marks it
+    /// stale. Returns true when anything moved.
+    fn commit(&mut self, id: &str, result: Result<WidgetRead, String>) -> bool {
+        self.in_flight.remove(id);
+        let interval = self
+            .widgets
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.interval)
+            .unwrap_or(DEFAULT_INTERVAL);
+        self.next_due.insert(id.to_string(), Instant::now() + interval);
+        match result {
+            Ok(read) => {
+                let changed = self.reads.get(id).map(|old| old != &read).unwrap_or(true);
+                if changed {
+                    self.reads.insert(id.to_string(), read);
+                }
+                changed
+            }
+            Err(err) => {
+                warn!("widget {:?} run failed: {}", id, err);
+                match self.reads.get_mut(id) {
+                    Some(read) if !read.stale => {
+                        read.stale = true;
+                        true
+                    }
+                    Some(_) => false,
+                    None => {
+                        // never succeeded: nothing to keep, nothing to show
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// One tick of the runner loop: re-discover if the watcher moved,
+    /// then start every due widget's run that is not already in flight.
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        let generation = self.generation.load(Ordering::Relaxed);
+        if generation != self.seen_generation {
+            self.seen_generation = generation;
+            if self.rediscover(&user_dir(), &system_dir()) {
+                cx.notify();
+            }
+        }
+        let now = Instant::now();
+        for widget in self.widgets.clone() {
+            if self.in_flight.contains(&widget.id) {
+                continue;
+            }
+            if !self.next_due.get(&widget.id).is_none_or(|due| now >= *due) {
+                continue;
+            }
+            self.in_flight.insert(widget.id.clone());
+            let id = widget.id.clone();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_spawn(async move { run_widget(&widget) })
+                    .await;
+                let _ = this.update(cx, |state, cx| {
+                    if state.commit(&id, result) {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+}
+
+/// Wire the runner up: the dir watcher, the entity, and the tick loop.
+/// The shell calls this once at boot beside the other `run` fns.
+pub fn start(cx: &mut App) -> Entity<CustomWidgets> {
+    let generation = Arc::new(AtomicU64::new(0));
+    watch_dirs(generation.clone());
+    let entity = cx.new(|_| CustomWidgets::new(generation));
+    // the first discovery happens here so the bar's first paint already
+    // knows the widget set; the reads arrive as the first ticks land
+    entity.update(cx, |state, _| {
+        state.rediscover(&user_dir(), &system_dir());
+    });
+    let state = entity.downgrade();
+    cx.spawn(async move |cx| {
+        loop {
+            if state.update(cx, |state, cx| state.tick(cx)).is_err() {
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_secs(1))
+                .await;
+        }
+    })
+    .detach();
+    entity
+}
+
+/// Watch both pools for structural change: an install, a removal, a
+/// manifest edit bumps the generation counter and the next tick
+/// re-discovers. Recursive, because a widget's own script edits apply on
+/// the next interval anyway (the runner re-reads the file each run), but
+/// a manifest edit inside the widget directory must be seen live.
+/// The Access drop is the kuma-files lesson: notify 8.x's watch mask
+/// includes OPEN, so any readdir of a watched dir's children fires
+/// events and the watcher would re-trigger itself forever.
+fn watch_dirs(generation: Arc<AtomicU64>) {
+    let _ = std::thread::Builder::new()
+        .name("kuma-widgets-watch".to_string())
+        .spawn(move || {
+            // the user pool exists even when empty: an install target
+            // that is already watched
+            if let Err(err) = std::fs::create_dir_all(user_dir()) {
+                debug!("creating the widgets dir failed: {err}");
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut watcher = match notify::recommended_watcher(tx) {
+                Ok(watcher) => watcher,
+                Err(err) => {
+                    error!("widgets watcher unavailable: {err}");
+                    return;
+                }
+            };
+            for dir in [user_dir(), system_dir()] {
+                match watcher.watch(&dir, RecursiveMode::Recursive) {
+                    Ok(()) => {}
+                    // a dev machine has no system pool; the user pool is the one that matters
+                    Err(err) => debug!("watching {dir:?} failed: {err}"),
+                }
+            }
+            let meaningful = |event: &notify::Result<notify::Event>| {
+                matches!(event, Ok(event) if !matches!(event.kind, notify::EventKind::Access(_)))
+            };
+            loop {
+                let Ok(event) = rx.recv() else { break };
+                let mut bump = meaningful(&event);
+                // coalesce the burst: one install is many events, one bump
+                while let Ok(event) = rx.recv_timeout(Duration::from_millis(50)) {
+                    bump = bump || meaningful(&event);
+                }
+                if bump {
+                    generation.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +743,158 @@ mod tests {
         let widgets = discover(&dir, Path::new("/nonexistent"));
         let widget = find(&widgets, "tappy");
         assert_eq!(widget.click.as_deref(), Some("notify-send hi"));
+    }
+
+    #[test]
+    fn plain_text_is_a_label() {
+        let read = parse_output("72 F and sunny\n");
+        assert_eq!(read.text.as_deref(), Some("72 F and sunny"));
+        assert_eq!(read.tooltip, None);
+        assert!(!read.stale);
+    }
+
+    #[test]
+    fn empty_stdout_hides() {
+        assert_eq!(parse_output("\n  \n").text, None);
+        assert_eq!(parse_output("").text, None);
+    }
+
+    #[test]
+    fn the_json_subset_is_the_upgrade_path() {
+        let read = parse_output(
+            "{\"text\": \"1 update\", \"tooltip\": \"reboot to apply\", \"class\": \"urgent\", \"percentage\": 42}\n",
+        );
+        assert_eq!(read.text.as_deref(), Some("1 update"));
+        assert_eq!(read.tooltip.as_deref(), Some("reboot to apply"));
+        assert_eq!(read.class.as_deref(), Some("urgent"));
+    }
+
+    #[test]
+    fn malformed_json_falls_back_to_plain_text() {
+        let read = parse_output("{\"text\": \"unclosed");
+        assert_eq!(
+            read.text.as_deref(),
+            Some("{\"text\": \"unclosed"),
+            "a script mid-rewrite must not blank the bar"
+        );
+    }
+
+    #[test]
+    fn json_with_an_empty_text_hides() {
+        assert_eq!(parse_output("{\"text\": \"\", \"tooltip\": \"gone\"}").text, None);
+    }
+
+    #[test]
+    fn a_command_widget_runs_bounded() {
+        let widget = CustomWidget {
+            id: "hello".to_string(),
+            label: "hello".to_string(),
+            icon: None,
+            interval: Duration::from_secs(10),
+            click: None,
+            run: WidgetRun::Command("echo from sh".to_string()),
+            dir: PathBuf::from("/nonexistent"),
+        };
+        let read = run_widget(&widget).unwrap();
+        assert_eq!(read.text.as_deref(), Some("from sh"));
+    }
+
+    #[test]
+    fn a_failing_command_is_an_err() {
+        let widget = CustomWidget {
+            id: "bad".to_string(),
+            label: "bad".to_string(),
+            icon: None,
+            interval: Duration::from_secs(10),
+            click: None,
+            run: WidgetRun::Command("echo boom >&2; exit 3".to_string()),
+            dir: PathBuf::from("/nonexistent"),
+        };
+        assert!(run_widget(&widget).is_err());
+    }
+
+    #[test]
+    fn a_hung_source_is_killed_by_the_budget() {
+        let widget = CustomWidget {
+            id: "hung".to_string(),
+            label: "hung".to_string(),
+            icon: None,
+            interval: Duration::from_secs(10),
+            click: None,
+            run: WidgetRun::Command("sleep 999".to_string()),
+            dir: PathBuf::from("/nonexistent"),
+        };
+        // one second of budget, so the test is fast; the real budget
+        // floors at ten seconds (run_budget), which no test should wait out
+        assert!(run_widget_bounded(&widget, 1).is_err());
+    }
+
+    #[test]
+    fn the_budget_floors_at_ten_and_caps_at_a_minute() {
+        assert_eq!(run_budget(Duration::from_secs(1)), 10);
+        assert_eq!(run_budget(Duration::from_secs(30)), 30);
+        assert_eq!(run_budget(Duration::from_secs(3600)), 60);
+    }
+
+    #[test]
+    fn a_source_file_is_executed_directly() {
+        let dir = pool("exec", |dir| {
+            let widget = write_widget(dir, "scripty", "source = \"run.sh\"\n");
+            let script = widget.join("run.sh");
+            fs::write(&script, "#!/bin/sh\necho direct\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            // the twin without the exec bit: the error is the honesty
+            let widget = write_widget(dir, "plain", "source = \"run.sh\"\n");
+            let script = widget.join("run.sh");
+            fs::write(&script, "#!/bin/sh\necho direct\n").unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        });
+        let widgets = discover(&dir, Path::new("/nonexistent"));
+        assert!(run_widget(find(&widgets, "scripty")).is_ok());
+        assert!(
+            run_widget(find(&widgets, "plain")).is_err(),
+            "a non-executable source is an honest error, not a shell reinterpretation"
+        );
+    }
+
+    #[test]
+    fn rediscover_keeps_surviving_reads_and_drops_vanished_ones() {
+        let generation = Arc::new(AtomicU64::new(0));
+        let mut state = CustomWidgets::new(generation);
+        let dir = pool("rediscover", |dir| {
+            write_widget(dir, "stays", "command = \"echo a\"\n");
+            write_widget(dir, "leaves", "command = \"echo b\"\n");
+        });
+        state.rediscover(&dir, Path::new("/nonexistent"));
+        assert!(state.commit("stays", Ok(parse_output("first"))));
+        assert!(state.read("stays").is_some());
+        assert!(state.read("leaves").is_none(), "never succeeded: nothing to keep");
+
+        // the leaves widget departs; its state goes with it, the stays
+        // widget's read and due time survive
+        fs::remove_dir_all(dir.join("leaves")).unwrap();
+        assert!(state.rediscover(&dir, Path::new("/nonexistent")));
+        assert_eq!(state.widgets.len(), 1);
+        assert!(state.read("stays").is_some());
+        assert!(state.read("leaves").is_none());
+        assert!(state.next_due.contains_key("stays"));
+        assert!(!state.next_due.contains_key("leaves"));
+
+        // an unchanged pool is not a change
+        assert!(!state.rediscover(&dir, Path::new("/nonexistent")));
+    }
+
+    #[test]
+    fn a_failure_keeps_the_last_text_and_marks_stale() {
+        let generation = Arc::new(AtomicU64::new(0));
+        let mut state = CustomWidgets::new(generation);
+        assert!(state.commit("w", Ok(parse_output("last good"))));
+        assert!(state.commit("w", Err("exited 1".to_string())), "fresh to stale is a change");
+        let read = state.read("w").unwrap();
+        assert_eq!(read.text.as_deref(), Some("last good"));
+        assert!(read.stale);
+        // a second failure moves nothing: already stale
+        assert!(!state.commit("w", Err("exited 2".to_string())));
     }
 }

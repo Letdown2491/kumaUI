@@ -15,6 +15,7 @@ gpui = { workspace = true }
 gpui_platform = { workspace = true }
 kuma-platform = { workspace = true }
 log = "0.4"
+notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smol = "2"

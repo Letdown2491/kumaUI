@@ -3146,6 +3146,7 @@ dependencies = [
  "kuma-platform",
  "libc",
  "log",
+ "notify",
  "pam-client2",
  "serde",
  "serde_json",
