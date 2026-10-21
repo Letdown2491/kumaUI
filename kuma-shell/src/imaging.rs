@@ -142,6 +142,10 @@ fn walk_icon_trees(roots: &[PathBuf]) -> (std::collections::HashMap<String, Path
     let mut index: HashMap<String, (i32, PathBuf)> = HashMap::new();
     let mut dirs: Vec<(PathBuf, u64, Option<std::time::SystemTime>)> = Vec::new();
     let mut stack: Vec<PathBuf> = roots.to_vec();
+    // a symlink cycle (`ln -s .. loop`) must not walk forever: the
+    // walk runs under the themed-index lock, so an unbounded loop is
+    // the whole shell frozen at the next icon resolve
+    let mut visited: std::collections::HashSet<PathBuf> = roots.iter().cloned().collect();
     while let Some(dir) = stack.pop() {
         let mut count: u64 = 0;
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -149,7 +153,16 @@ fn walk_icon_trees(roots: &[PathBuf]) -> (std::collections::HashMap<String, Path
                 count += 1;
                 let path = entry.path();
                 if path.is_dir() {
-                    stack.push(path);
+                    // canonicalize resolves symlinks, so a cycle
+                    // (`ln -s .. loop`) revisits a seen canonical dir
+                    // and stops: the walk runs under the themed-index
+                    // lock, and an unbounded loop there is the whole
+                    // shell frozen at the next icon resolve. Honest
+                    // symlinked theme directories still walk.
+                    let guard = path.canonicalize().unwrap_or_else(|_| path.clone());
+                    if visited.insert(guard) {
+                        stack.push(path);
+                    }
                     continue;
                 }
                 let is_icon = path

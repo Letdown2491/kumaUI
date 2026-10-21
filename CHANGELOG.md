@@ -21,6 +21,11 @@ move rides unchanged.
 
 ### Fixed
 
+- The themed-icon index walk survives a symlink cycle in an icon
+  tree: a stray `ln -s .. loop` walked forever under the index lock
+  and froze the shell at the next icon resolve. Directories are
+  canonicalized before they stack, so honest symlinked theme
+  directories still walk and cycles stop.
 - A slow wallpaper decode can no longer clobber a newer wallpaper
   choice: the decode adopted whatever path was current when it
   finished, so a quick A then B then A swap could leave A's pixels
