@@ -7,7 +7,10 @@ Bullets land under Added, Changed, or Fixed; `scripts/release.sh` reads
 those headings to infer the bump (any Added or Removed: minor; only
 Changed and Fixed: patch). The version lines under a release heading
 name each binary's version in that release: an app whose line did not
-move rides unchanged.
+move rides unchanged. When publishing a section to a GitHub release or
+pasting it into an issue or PR comment, unwrap each bullet to a single
+line first: GitHub renders newlines there as hard breaks, and the
+source's wrap points would pin the text to a narrow column.
 
 ## Unreleased
 
