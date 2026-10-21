@@ -8,6 +8,7 @@ repository = "https://github.com/Letdown2491/kumaUI"
 
 [dependencies]
 anyhow = "1"
+env_logger = "0.11"
 futures = "0.3"
 gpui = { workspace = true }
 image = "0.25"

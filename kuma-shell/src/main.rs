@@ -7,21 +7,7 @@ use kuma_shell::settings::Settings;
 use gpui_platform::application;
 
 fn main() {
-    // millis in the log: the difference between a key's bounce (two
-    // requests tens of ms apart) and a human's second press
-    use std::io::Write as _;
-    env_logger::Builder::from_env(env_logger::Env::default())
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "[{} {:<5} {}] {}",
-                buf.timestamp_millis(),
-                record.level(),
-                record.target(),
-                record.args()
-            )
-        })
-        .init();
+    kuma_platform::logging::init();
 
     // Startup instrumentation: every marker logs elapsed-since-main, so
     // one journalctl pass over a login prices the phases (config read,

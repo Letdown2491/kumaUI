@@ -12117,7 +12117,9 @@ mod tests {
 
     #[test]
     fn a_failed_mid_copy_never_leaves_the_old_target_destroyed() {
-        let room = std::env::temp_dir().join(format!("koguma-test-{}", std::process::id()));
+        // a room of this test's own: tests run in parallel threads,
+        // and another test's remove_dir_all must not reach in here
+        let room = std::env::temp_dir().join(format!("koguma-copy-replace-{}", std::process::id()));
         fs::create_dir_all(&room).unwrap();
         let old = room.join("report.txt");
         fs::write(&old, "the original\n").unwrap();
@@ -12157,7 +12159,8 @@ mod tests {
 
     #[test]
     fn a_replace_copy_into_an_existing_directory_is_an_error_not_a_merge() {
-        let room = std::env::temp_dir().join(format!("koguma-test-{}", std::process::id()));
+        // a room of this test's own (parallel threads)
+        let room = std::env::temp_dir().join(format!("koguma-copy-merge-{}", std::process::id()));
         fs::create_dir_all(&room).unwrap();
         let src_dir = room.join("srcdir");
         fs::create_dir_all(&src_dir).unwrap();

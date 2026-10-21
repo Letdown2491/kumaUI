@@ -3,7 +3,6 @@
 //! questions: is gpui's list fast enough at a 1s tick, does the niri
 //! join hold, and does the owner want it in the dock a week later.
 
-use std::io::Write as _;
 
 use gpui::{App, AppContext, TitlebarOptions, WindowBounds, WindowOptions, px, size, SharedString};
 use gpui_platform::application;
@@ -24,18 +23,7 @@ pub(crate) fn version_line() -> String {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default())
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "[{} {:<5} {}] {}",
-                buf.timestamp_millis(),
-                record.level(),
-                record.target(),
-                record.args()
-            )
-        })
-        .init();
+    kuma_platform::logging::init();
 
     // --version prints and exits: no session, no window, any tty
     if std::env::args()

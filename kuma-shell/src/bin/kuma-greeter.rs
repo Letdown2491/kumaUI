@@ -37,19 +37,7 @@ pub(crate) fn wants_version(args: &[String]) -> bool {
 }
 
 fn main() {
-    use std::io::Write as _;
-    env_logger::Builder::from_env(env_logger::Env::default())
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "[{} {:<5} {}] {}",
-                buf.timestamp_millis(),
-                record.level(),
-                record.target(),
-                record.args()
-            )
-        })
-        .init();
+    kuma_platform::logging::init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 

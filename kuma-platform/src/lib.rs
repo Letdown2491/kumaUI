@@ -21,6 +21,7 @@ pub mod activation;
 pub mod color;
 pub mod files;
 pub mod imaging;
+pub mod logging;
 pub mod niri;
 pub mod palette;
 pub mod process;

@@ -35,18 +35,7 @@ fn main() {
     // it). Sound: no other thread exists yet.
     unsafe { std::env::set_var("KUMA_TERM", "1") };
 
-    env_logger::Builder::from_env(env_logger::Env::default())
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "[{} {:<5} {}] {}",
-                buf.timestamp_millis(),
-                record.level(),
-                record.target(),
-                record.args()
-            )
-        })
-        .init();
+    kuma_platform::logging::init();
 
     // --version prints and exits: no session, no window, any tty
     if std::env::args()
