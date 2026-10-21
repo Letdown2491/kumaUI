@@ -281,6 +281,16 @@ pub fn icon_key(icon: &str, dir: &Path) -> String {
         if path.is_file() {
             return path.to_string_lossy().to_string();
         }
+        // the directory does not hold the file: `bell.svg` may still
+        // mean the theme's bell. The themed index keys are file
+        // stems, so the fallback drops the extension; a name with no
+        // matching themed icon renders nothing, exactly as before
+        let stem = icon
+            .rsplit_once('.')
+            .filter(|(_, ext)| ICON_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+            .map(|(stem, _)| stem)
+            .unwrap_or(icon);
+        return stem.to_string();
     }
     icon.to_string()
 }
@@ -1155,7 +1165,11 @@ mod tests {
             widget_dir.join("bell.svg").to_string_lossy().to_string()
         );
         assert_eq!(icon_key("sun", &widget_dir), "sun", "a themed name rides as-is");
-        // the file does not exist: themed resolution gets a chance
-        assert_eq!(icon_key("absent.svg", &widget_dir), "absent.svg");
+        // the file does not exist: the stem falls back to themed
+        // resolution (the index keys are stems), so a manifest that
+        // wrote `bell.svg` meaning the theme's bell renders the
+        // theme's bell instead of nothing
+        assert_eq!(icon_key("absent.svg", &widget_dir), "absent");
+        assert_eq!(icon_key("Absent.PNG", &widget_dir), "Absent", "case-insensitive extension, stem kept");
     }
 }

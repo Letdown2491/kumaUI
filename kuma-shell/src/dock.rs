@@ -40,6 +40,12 @@ const LAUNCHER_KEY: &str = "__kuma-launcher__";
 /// leaves its windows unmatched until one lands. Installs are rare and
 /// the scan is a readdir pass, so this stays cheap.
 const APP_SCAN_EVERY: Duration = Duration::from_secs(5);
+/// Fruitless rescans (the unmatched set neither matched nor changed)
+/// before the dock stops looking: many windows match no desktop file
+/// permanently, and the 5s walk must not run for the session's whole
+/// life. A changed or cleared set resets the counter at the render
+/// that sees it, so an actually-installed app still gets its scan.
+const APP_SCAN_GIVE_UP: usize = 3;
 
 /// The drag payload between dock cells: what's being carried, plus enough
 /// to render the ghost (the icon itself).
@@ -213,10 +219,24 @@ fn has_unmatched_app_id<'a>(
     apps: &[AppEntry],
     app_ids: impl Iterator<Item = Option<&'a str>>,
 ) -> bool {
-    app_ids
-        .flatten()
-        .filter(|app_id| !app_id.is_empty())
-        .any(|app_id| match_app(apps, app_id).is_none())
+    !unmatched_app_ids(apps, app_ids).is_empty()
+}
+
+/// The app_ids of the windows that matched no desktop entry, in first
+/// seen order. The rescan's give-up counter compares this set between
+/// renders: a set that keeps not matching after a few scans is a bare
+/// terminal, not an app that installed yesterday.
+fn unmatched_app_ids<'a>(
+    apps: &[AppEntry],
+    app_ids: impl Iterator<Item = Option<&'a str>>,
+) -> Vec<String> {
+    let mut seen = Vec::new();
+    for app_id in app_ids.flatten().filter(|id| !id.is_empty()) {
+        if match_app(apps, app_id).is_none() && !seen.iter().any(|known| known == app_id) {
+            seen.push(app_id.to_string());
+        }
+    }
+    seen
 }
 
 /// The dock's window: always stretched along its screen edge (the bar's
@@ -369,6 +389,15 @@ pub struct DockView {
     /// rate limited and single-filed (see [`has_unmatched_app_id`]).
     last_app_scan: Option<Instant>,
     scan_in_flight: bool,
+    /// Consecutive fruitless rescans for an unchanged unmatched set:
+    /// past the cap the dock stops rescanning, because many windows
+    /// (bare terminals, toolkit helper surfaces) match no desktop
+    /// file permanently and the 5s scan would run for the session's
+    /// whole life. The counter resets when the unmatched set changes
+    /// (a newly opened window's id) or clears (the window closed), so
+    /// an app that actually installs still gets its scan.
+    fruitless_scans: usize,
+    last_unmatched: Vec<String>,
     /// The card's last-known rect (offset along the stretch axis, length):
     /// gates the input region update.
     applied_card: Option<(f32, f32)>,
@@ -419,6 +448,8 @@ impl DockView {
             icons: HashMap::new(),
             last_app_scan: None,
             scan_in_flight: false,
+            fruitless_scans: 0,
+            last_unmatched: Vec::new(),
             applied_card: None,
         }
     }
@@ -456,6 +487,11 @@ impl DockView {
                 }
                 this.apps = apps;
                 this.scan_in_flight = false;
+                // the scan is over: it either matched the set (the
+                // render resets on the change or the cleared list) or
+                // it was fruitless, which is one strike closer to the
+                // give-up cap
+                this.fruitless_scans += 1;
                 cx.notify();
             });
         })
@@ -481,8 +517,17 @@ impl Render for DockView {
         // a window matching no entry means an app may have installed after
         // the startup scan: rescan so its entry grows icon, label, and menu
         // (checked after the entries build: the rescan needs cx mutably,
-        // and the entries above are already owned)
-        if has_unmatched_app_id(&self.apps, windows.iter().map(|w| w.app_id.as_deref())) {
+        // and the entries above are already owned). The rescan gives up
+        // after a few fruitless rounds for an unchanged unmatched set:
+        // without the cap, one bare-terminal window costs a full
+        // applications-dir walk every 5 seconds for the session's life
+        let unmatched =
+            unmatched_app_ids(&self.apps, windows.iter().map(|w| w.app_id.as_deref()));
+        if unmatched != self.last_unmatched {
+            self.fruitless_scans = 0;
+            self.last_unmatched = unmatched.clone();
+        }
+        if !unmatched.is_empty() && self.fruitless_scans < APP_SCAN_GIVE_UP {
             self.rescan_apps(cx);
         }
 

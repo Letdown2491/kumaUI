@@ -18,9 +18,19 @@ move rides unchanged.
   picks the vocabulary, and weekday and month names render in the
   user's language (English when none is set or known, which is what
   the faces printed before).
+- The dock stops rescanning the applications directories after three
+  fruitless rounds for an unchanged set of unmatched windows: one
+  bare-terminal window used to cost a full applications-dir walk
+  every 5 seconds for the session's whole life. A changed or cleared
+  set resets the counter, so an actually-installed app still gets
+  its scan.
 
 ### Fixed
 
+- A custom widget icon naming a file the widget directory does not
+  hold falls back to themed resolution by stem: `bell.svg` now
+  renders the theme's bell instead of nothing (the themed index keys
+  are file stems, and the extension used to ride along).
 - Night light on a compositor without the gamma protocol parks its
   thread after one error line instead of logging the same error every
   5 seconds.
