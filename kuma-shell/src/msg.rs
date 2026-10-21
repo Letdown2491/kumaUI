@@ -28,6 +28,9 @@ pub enum Request {
     /// settings panel. The road out of the KUMA_DEBUG_OPEN_SETTINGS
     /// scaffolding the panel was built behind.
     Settings,
+    /// Toggle the Kuma Updates panel: the memory probe's and scripted
+    /// sessions' road into the row-and-badge render.
+    Updates,
     /// The audio and brightness keybinds' road: applied in-process, the
     /// widgets and the OSD react at once instead of at the next poll.
     Volume(VolumeCmd),
@@ -58,6 +61,7 @@ impl Request {
             Request::Nostr(_) => "Nostr",
             Request::NostrPanel => "NostrPanel",
             Request::Settings => "Settings",
+            Request::Updates => "Updates",
             Request::Volume(_) => "Volume",
             Request::Brightness(_) => "Brightness",
             Request::MicMute => "Mic",
@@ -71,6 +75,7 @@ impl Request {
             Request::Nostr(uri) => uri.clone(),
             Request::NostrPanel => "Open".into(),
             Request::Settings => "Toggle".into(),
+            Request::Updates => "Toggle".into(),
             Request::Volume(cmd) => match cmd {
                 VolumeCmd::Up => "Up".into(),
                 VolumeCmd::Down => "Down".into(),
@@ -120,6 +125,7 @@ pub fn parse(line: &str) -> Option<Request> {
         "nostr" => Some(Request::Nostr(value.to_string())),
         "nostrpanel" => Some(Request::NostrPanel),
         "settings" => Some(Request::Settings),
+        "updates" => Some(Request::Updates),
         "volume" => match value.to_lowercase().as_str() {
             "up" => Some(Request::Volume(VolumeCmd::Up)),
             "down" => Some(Request::Volume(VolumeCmd::Down)),

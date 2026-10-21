@@ -17,6 +17,10 @@
 #   notify      60 notifications over the session bus
 #   panels      20 settings-panel open/close cycles over the msg CLI
 #   launcher    3 launcher open/close cycles
+#   widgets     2 custom widgets planted and removed live: 60s of
+#               1s-cadence spawns (watcher install, runner, prune)
+#   updates     3 Kuma Updates panel open/close cycles over a fake
+#               kuma on PATH (the chip answers the boot probe)
 #   tray        2 minutes of one fat static pixmap item under the 2s poll
 #   hotplug     10 create_output/unplug cycles
 #   settle      idle again; what stayed grown here is what leaked
@@ -37,6 +41,23 @@ export RUST_LOG=info
 # sets it): glibc's arena-per-thread spread otherwise pads the probe's
 # numbers by hundreds of MB and drowns the phase deltas
 export MALLOC_ARENA_MAX=2
+# the widget pools and the settings config both resolve here, so the
+# probe's shell runs on its own private config home; the fake kuma on
+# PATH turns the availability probe's answer to yes and gives the
+# updates chip something to drive
+export XDG_CONFIG_HOME=/tmp/xdg-config
+mkdir -p "$XDG_CONFIG_HOME" /tmp/fake-bin
+cat > /tmp/fake-bin/kuma <<'EOF'
+#!/bin/sh
+# the check's shape is kuma's own contract: moved rows with the
+# severity scale, a security count, and the machine source
+case "$1 $2" in
+  "update --check") printf '%s' '{"ok": true, "updates": {"moved": [{"name": "kernel", "from": "7.2.11", "to": "7.2.12", "severity": "important"}, {"name": "fish", "from": "4.0", "to": "4.1", "severity": "low"}, {"name": "git", "from": "2.51", "to": "2.52", "severity": null}], "security": 1, "source": "machine"}}';;
+  *) echo "kuma-probe";;
+esac
+EOF
+chmod +x /tmp/fake-bin/kuma
+export PATH="/tmp/fake-bin:$PATH"
 mkdir -p "$XDG_RUNTIME_DIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 
@@ -110,6 +131,49 @@ for i in $(seq 3); do
 	"$SHELL_BIN" launcher-toggle >/dev/null 2>&1 || true
 	sample
 	sleep 3
+done
+sleep 8
+
+set_phase widgets
+# Two custom widgets planted mid-session, so the phase starts with the
+# watcher-driven install: one text widget at the minimum 1s cadence
+# (one spawn per tick, the fastest honest rate) and one JSON widget
+# with an svg icon (the tint pipeline). Sixty seconds of spawns, then
+# removal: the config follows the filesystem, and the prune is part of
+# the load.
+mkdir -p "$XDG_CONFIG_HOME/kuma-shell/widgets/fast"
+printf '%s\n' 'command = "date +%H:%M:%S"' 'interval = 1' \
+	> "$XDG_CONFIG_HOME/kuma-shell/widgets/fast/widget.toml"
+mkdir -p "$XDG_CONFIG_HOME/kuma-shell/widgets/rich"
+cat > "$XDG_CONFIG_HOME/kuma-shell/widgets/rich/widget.toml" <<'EOF'
+label = "Rich"
+icon = "rich.svg"
+interval = 2
+source = "rich.sh"
+EOF
+printf '%s\n' '#!/bin/sh' 'echo '\''{"text": "rich", "tooltip": "probe widget", "class": "probe"}'\''' \
+	> "$XDG_CONFIG_HOME/kuma-shell/widgets/rich/rich.sh"
+printf '%s' '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="8" fill="currentColor"/></svg>' \
+	> "$XDG_CONFIG_HOME/kuma-shell/widgets/rich/rich.svg"
+chmod +x "$XDG_CONFIG_HOME/kuma-shell/widgets/rich/rich.sh"
+sleep 3
+for _ in $(seq 30); do sample; sleep 2; done
+rm -rf "$XDG_CONFIG_HOME/kuma-shell/widgets/fast" "$XDG_CONFIG_HOME/kuma-shell/widgets/rich"
+sleep 8
+
+set_phase updates
+# The chip is live since boot (the fake kuma answers the availability
+# probe), and the boot check already ran against the fake: the phase
+# opens and closes the panel over the row-and-badge render and the
+# severity glyphs.
+for i in $(seq 3); do
+	"$SHELL_BIN" updates >/dev/null 2>&1 || true
+	sample
+	sleep 3
+	sample
+	"$SHELL_BIN" updates >/dev/null 2>&1 || true
+	sample
+	sleep 2
 done
 sleep 8
 

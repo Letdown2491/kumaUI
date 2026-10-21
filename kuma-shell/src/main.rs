@@ -162,6 +162,12 @@ fn main() {
                                 cx,
                             );
                         }
+                        kuma_shell::msg::Request::Updates => {
+                            kuma_shell::panel::toggle_panel(
+                                kuma_shell::panel::PanelKind::Updates,
+                                cx,
+                            );
+                        }
                         kuma_shell::msg::Request::Notifications => {
                             let settings = msg_settings.clone();
                             settings.update(cx, |settings, cx| {
@@ -261,6 +267,7 @@ fn run_cli(args: &[String]) -> i32 {
         ),
         "launcher-toggle" => kuma_shell::msg::send(&kuma_shell::msg::Request::Launcher),
         "settings" => kuma_shell::msg::send(&kuma_shell::msg::Request::Settings),
+        "updates" => kuma_shell::msg::send(&kuma_shell::msg::Request::Updates),
         "notifications-dnd" => kuma_shell::msg::send(&kuma_shell::msg::Request::Notifications),
         // the scheme handler's road: `kuma-shell msg nostr <nostrconnect://…>`,
         // the URI is argv end to end, never a shell string. Bare
@@ -319,7 +326,7 @@ fn run_cli(args: &[String]) -> i32 {
         other => {
             eprintln!("kuma-shell: unknown command {other:?}");
             eprintln!(
-                "usage: kuma-shell [msg] volume-up | volume-down | volume-mute | mute | mic-mute | launcher-toggle | settings | notifications-dnd | nostr [uri] | media <play-pause|stop|next|previous> | brightness-up [step] | brightness-down [step] | workspace <n>"
+                "usage: kuma-shell [msg] volume-up | volume-down | volume-mute | mute | mic-mute | launcher-toggle | settings | updates | notifications-dnd | nostr [uri] | media <play-pause|stop|next|previous> | brightness-up [step] | brightness-down [step] | workspace <n>"
             );
             return 1;
         }
