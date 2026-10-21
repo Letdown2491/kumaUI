@@ -8,7 +8,7 @@ use std::{collections::HashMap, future::Future, time::Duration};
 
 use anyhow::Result;
 use gpui::{App, AppContext, Entity};
-use log::{debug, error};
+use log::{debug, error, warn};
 use serde::Deserialize;
 use smol::channel::{Sender, unbounded};
 
@@ -221,7 +221,7 @@ pub(crate) fn mirror<Stream, Fut>(
             if let Err(err) = stream(event_tx.clone()).await {
                 error!("{name} event stream terminated: {err:#}; retrying in {RECONNECT_AFTER:?}");
             } else {
-                error!("{name} event stream ended without error; retrying in {RECONNECT_AFTER:?}");
+                warn!("{name} event stream ended without error; retrying in {RECONNECT_AFTER:?}");
             }
             smol::Timer::after(RECONNECT_AFTER).await;
         }

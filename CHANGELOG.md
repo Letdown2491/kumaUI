@@ -21,6 +21,9 @@ move rides unchanged.
 
 ### Fixed
 
+- The session mirror no longer logs an error, repeating on every
+  reconnect timer, for a session event stream that ended cleanly: a
+  clean end is a warning about the retry, not an error.
 - The greeter recognized a version flag anywhere in its arguments: a
   headless rehearsal command spelling `-V` in a later position
   printed the version line and exited instead of logging in. It is a
