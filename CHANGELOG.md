@@ -16,6 +16,12 @@ move rides unchanged.
 - `kuma-greeter --version` prints the version line the other apps
   print, so the upgrade path can pin the greeter's build like the
   rest of the family.
+- Night light's schedule says Always or Scheduled out loud: a
+  segmented switch names the two states the backend always had
+  (Always was reachable only by leaving an endpoint unset, which the
+  dropdowns never showed), Always dims the dropdowns and remembers
+  for the session the times you left, and Scheduled from nothing
+  lands on 9:00 PM to 7:00 AM.
 - **User-made widgets.** The bar learns scripts: a widget is a
   directory (`widget.toml` plus the scripts and icons it names),
   dropped into `~/.config/kuma-shell/widgets/` or installed from the

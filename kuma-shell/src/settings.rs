@@ -557,6 +557,32 @@ impl Default for NightLightConfig {
     }
 }
 
+/// The window a fresh switch to Scheduled starts from: the classic
+/// evening-to-morning span, and the example the settings card cites.
+pub const NIGHT_DEFAULT_WINDOW: (&str, &str) = ("21:00", "07:00");
+
+impl NightLightConfig {
+    /// The window the Always/Scheduled switch writes for the given
+    /// state: Always is the empty window (the schema reads that as
+    /// tint whenever enabled); Scheduled keeps a stored window and
+    /// lands on the default span without one.
+    pub fn resolve_scheduled_window(&self, scheduled: bool) -> (Option<String>, Option<String>) {
+        if !scheduled {
+            return (None, None);
+        }
+        let have_window =
+            self.window_start.is_some() && self.window_end.is_some();
+        if have_window {
+            (self.window_start.clone(), self.window_end.clone())
+        } else {
+            (
+                Some(NIGHT_DEFAULT_WINDOW.0.to_string()),
+                Some(NIGHT_DEFAULT_WINDOW.1.to_string()),
+            )
+        }
+    }
+}
+
 impl NightLightConfig {
     /// The parsed window: `None` means no window restriction. An
     /// unparsable endpoint is ignored (treated as no window) rather
@@ -1338,6 +1364,17 @@ impl Settings {
         self.commit(cx);
     }
 
+    /// The window card's Always/Scheduled switch. The schema already
+    /// reads a missing window as "tint whenever enabled", so Always is
+    /// the empty window; Scheduled without a stored window (a fresh
+    /// config, or a return from Always) lands on the default
+    /// evening span. The remember-the-times-you-left job belongs to
+    /// the settings view; this only writes what the config says.
+    pub fn set_night_light_scheduled(&mut self, scheduled: bool, cx: &mut Context<Self>) {
+        let (start, end) = self.night_light.resolve_scheduled_window(scheduled);
+        self.set_night_light_window(start, end, cx);
+    }
+
     /// Re-derive the palette from the current wallpaper when
     /// wallpaper-derived theming is on: decode, seed, generate, swap
     /// the live theme. A failure at any step keeps the previous
@@ -1917,5 +1954,41 @@ kind = \"nostr\"
         .unwrap();
         assert_eq!(inverted.idle.lock_timeout, 900);
         assert_eq!(inverted.idle.screen_off_timeout, 300);
+    }
+
+    #[test]
+    fn the_night_light_schedule_speaks_always_and_scheduled() {
+        let mut config = NightLightConfig::default();
+        config.enabled = true;
+        // the schema's default (no window) is already the always-on
+        // state the switch names out loud
+        assert!(config.active_now((15, 0)));
+
+        // Scheduled from an empty window lands on the default span
+        let (start, end) = config.resolve_scheduled_window(true);
+        assert_eq!(start.as_deref(), Some("21:00"));
+        assert_eq!(end.as_deref(), Some("07:00"));
+        config.window_start = start;
+        config.window_end = end;
+        assert_eq!(config.window(), Some(((21, 0), (7, 0))));
+        assert!(!config.active_now((15, 0)));
+        assert!(config.active_now((23, 30)));
+        assert!(config.active_now((5, 0)));
+
+        // a stored window survives the switch back and forth
+        config.window_start = Some("22:30".into());
+        config.window_end = Some("06:00".into());
+        let (start, end) = config.resolve_scheduled_window(true);
+        assert_eq!(start.as_deref(), Some("22:30"));
+        assert_eq!(end.as_deref(), Some("06:00"));
+
+        // Always is the empty window, whatever was stored
+        assert_eq!(
+            config.resolve_scheduled_window(false),
+            (None, None)
+        );
+        config.window_start = None;
+        config.window_end = None;
+        assert!(config.active_now((15, 0)));
     }
 }

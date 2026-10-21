@@ -343,6 +343,12 @@ pub struct SettingsView {
     weather_resolve: Option<WeatherResolve>,
     /// the open night light dropdown, if any
     night_menu: Option<(NightField, NightPart)>,
+    /// The scheduled window the user left behind on the way to
+    /// Always, session-only: flipping back to Scheduled restores it
+    /// instead of the default span. The config stays clean (its
+    /// None/None already means always-on); this is the view's memory,
+    /// not a fourth config field.
+    night_last_window: Option<(String, String)>,
     /// the Displays page's probe: the outputs as last read, why the
     /// last read failed, and why the last store write failed. The
     /// probe is the page's truth; nothing here lives in kuma.toml.
@@ -417,6 +423,7 @@ impl SettingsView {
             weather_edit: None,
             weather_resolve: None,
             night_menu: None,
+            night_last_window: None,
             displays: Vec::new(),
             displays_error: None,
             store_error: None,
@@ -1181,6 +1188,7 @@ impl SettingsView {
 
         let start = config.window_start.clone();
         let end = config.window_end.clone();
+        let scheduled = start.is_some() && end.is_some();
         let start_row = div()
             .flex()
             .items_center()
@@ -1220,6 +1228,77 @@ impl SettingsView {
                 self, NightField::End, NightPart::Meridiem, end.as_deref(), cx,
             ));
 
+        // The window card: one honest switch over the two states the
+        // backend always had, with the dropdowns dimmed but visible
+        // outside Scheduled (showing what Scheduled would start
+        // from) instead of the old implicit rule where a state the
+        // UI could not show did the work.
+        let shown_window = if scheduled {
+            (start.clone().unwrap_or_default(), end.clone().unwrap_or_default())
+        } else {
+            self.night_last_window
+                .clone()
+                .unwrap_or_else(|| {
+                    (
+                        crate::settings::NIGHT_DEFAULT_WINDOW.0.into(),
+                        crate::settings::NIGHT_DEFAULT_WINDOW.1.into(),
+                    )
+                })
+        };
+        let dim_time_chip = |value: &str| {
+            let (hour, minute, meridiem) = crate::settings::to_12h(Some(value));
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(crate::theme::current().text_dim))
+                .child(format!(
+                    "{}:{} {}",
+                    crate::settings::HOUR_CHOICES[hour],
+                    crate::settings::MINUTE_CHOICES[minute],
+                    crate::settings::MERIDIEM_CHOICES[meridiem],
+                ))
+        };
+        let window_card = if scheduled {
+            kit::card("night-light-window")
+                .child(kit::card_note(
+                    "Scheduled: only tint between these times. 9:00 PM to 7:00 AM spans midnight.",
+                ))
+                .child(start_row)
+                .child(end_row)
+        } else {
+            kit::card("night-light-window")
+                .child(kit::card_note(
+                    "Always: tint whenever night light is on, day and night.",
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .opacity(0.55)
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(crate::theme::current().text_dim))
+                                .child("From"),
+                        )
+                        .child(dim_time_chip(&shown_window.0)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .opacity(0.55)
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(rgb(crate::theme::current().text_dim))
+                                .child("To"),
+                        )
+                        .child(dim_time_chip(&shown_window.1)),
+                )
+        };
+
         div()
             .id("page-night-light")
             .flex_1()
@@ -1250,13 +1329,68 @@ impl SettingsView {
                 ),
             ))
             .child(
-                kit::card("night-light-window")
-                    .child(kit::card_note(
-                        "Only tint between these times; both dropdowns set means the window is on. 9:00 PM to 7:00 AM spans midnight.",
-                    ))
-                    .child(start_row)
-                    .child(end_row),
+                kit::setting_row(
+                    "Schedule",
+                    self.night_schedule_segmented(scheduled, cx),
+                ),
             )
+            .child(window_card)
+    }
+
+    /// The window card's Always/Scheduled switch, a hand-rolled pair
+    /// of the settings segmented's segments: the generic helper's
+    /// mutator sees only `Settings`, and the flip has to move the
+    /// window through the view's memory (leaving Scheduled stashes
+    /// it; returning to Scheduled restores it before the config
+    /// defaults get a say).
+    fn night_schedule_segmented(
+        &mut self,
+        scheduled: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        div()
+            .id("seg-night-schedule")
+            .flex()
+            .gap_0p5()
+            .p_0p5()
+            .rounded_md()
+            .bg(rgb(crate::theme::current().inset))
+            .children([false, true].iter().map(|&option| {
+                let active = option == scheduled;
+                div()
+                    .id(SharedString::from(format!("seg-night-schedule-{option}")))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .text_size(px(11.))
+                    .cursor_pointer()
+                    .bg(rgb(if active { crate::theme::current().accent } else { crate::theme::current().inset }))
+                    .text_color(rgb(if active { crate::theme::current().accent_text } else { crate::theme::current().text_dim }))
+                    .hover(|style| {
+                        style
+                            .bg(rgb(if active { crate::theme::current().accent } else { crate::theme::current().surface }))
+                    })
+                    .tooltip(kit::text_tooltip(
+                        if option { "Scheduled" } else { "Always" }.into(),
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !option {
+                            // leaving Scheduled behind: remember its
+                            // window in memory, not in the config
+                            let night = &this.settings.read(cx).night_light;
+                            if let (Some(start), Some(end)) =
+                                (&night.window_start, &night.window_end)
+                            {
+                                this.night_last_window = Some((start.clone(), end.clone()));
+                            }
+                        }
+                        this.settings.update(cx, |settings, cx| {
+                            settings.set_night_light_scheduled(option, cx)
+                        });
+                        cx.notify();
+                    }))
+                    .child(if option { "Scheduled" } else { "Always" })
+            }))
     }
 
     /// The result of a displays probe, from the 2s tick or a one-shot
