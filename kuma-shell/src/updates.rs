@@ -43,6 +43,11 @@ pub struct UpdatesState {
     pub stale: bool,
     pub checked_at: Option<Instant>,
     pub checking: bool,
+    /// An apply is running: the panel's button is down.
+    pub applying: bool,
+    /// The last apply's outcome, kept until the next one starts. Ok
+    /// means the result staged; it applies at the next reboot.
+    pub applied: Option<Result<(), String>>,
 }
 
 impl UpdatesState {
@@ -76,6 +81,28 @@ impl UpdatesState {
         })
         .detach();
     }
+
+    /// Stage the update, then re-check so the panel reflects the moved
+    /// lock. The button is down while it builds; the polkit agent
+    /// (this shell's lock dialog) carries the password prompt.
+    pub fn apply(&mut self, cx: &mut Context<Self>) {
+        if self.applying {
+            return;
+        }
+        self.applying = true;
+        self.applied = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { apply_updates() }).await;
+            let _ = this.update(cx, |state, cx| {
+                state.applying = false;
+                state.applied = Some(result);
+                state.check(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
 }
 
 /// Run the check to completion. Blocking by design: the caller runs it
@@ -97,6 +124,22 @@ fn check_updates() -> Result<CheckResult, String> {
     }
     let text = String::from_utf8_lossy(&output.stdout);
     parse_check(&text)
+}
+
+/// Stage the update: `pkexec` hands the password prompt to the polkit
+/// agent (this shell's lock dialog), and `kuma update --yes` pulls,
+/// rebuilds, and stages for the next reboot. An image build is not a
+/// bounded wait: the timeout is generous by design.
+fn apply_updates() -> Result<(), String> {
+    let output = Command::new("timeout")
+        .args(["3600", "pkexec", "kuma", "update", "--yes", "--json"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|err| format!("spawn failed: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("kuma update exited {}", output.status));
+    }
+    Ok(())
 }
 
 /// The check's JSON into rows. `ok: false` or a missing `updates`

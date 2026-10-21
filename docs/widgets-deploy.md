@@ -21,7 +21,15 @@ check is unprivileged: one round-trip to the registry, or to Fedora's
 repos for a composed base's kernel, no pull, no build, no root. The
 chip shows the moved-package count and tints when security updates are
 among them; clicking it opens the panel listing each package's
-versions. Staging stays with `kuma update` and its own authentication.
+versions, with an Update now button that runs
+`pkexec kuma update --yes --json`: polkit carries the prompt to the
+shell's lock dialog, so staging costs the user's password and nothing
+else. For that to work end to end, kumaOS must ship whatever polkit
+wants to allow `kuma update` as root (pkexec's admin-auth rule
+suffices; a dedicated `com.kuma.update` action with a branded prompt
+is nicer), and `kuma update` running as root must resolve the
+machine's baked declaration the way the unprivileged check does
+(`source: machine`).
 
 ## What the user sees
 

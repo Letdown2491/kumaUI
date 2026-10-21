@@ -34,6 +34,8 @@ impl Render for UpdatesPanelView {
         let security = state.security;
         let stale = state.stale;
         let checking = state.checking;
+        let applying = state.applying;
+        let applied = state.applied.clone();
         let checked_ago = state.checked_at.map(|at| ago(at, Instant::now()));
 
         let list = if updates.is_empty() {
@@ -87,16 +89,59 @@ impl Render for UpdatesPanelView {
             .size_full()
             .child(header)
             .child(list)
-            .when(!updates.is_empty(), |el| {
+            .when(!updates.is_empty() && !applying, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(crate::theme::current().text_dim))
+                                .child(format!(
+                                    "{security} of {} are security updates",
+                                    updates.len()
+                                )),
+                        )
+                        .child(kit::button(
+                            "apply-updates",
+                            "Update now",
+                            Some("icons/updates.svg"),
+                            kit::ButtonVariant::Primary,
+                            {
+                                let state = self.state.clone();
+                                move |_, _, cx| {
+                                    state.update(cx, |state, cx| state.apply(cx));
+                                }
+                            },
+                        )),
+                )
+            })
+            .when(applying, |el| {
                 el.child(
                     div()
                         .text_size(px(11.))
                         .text_color(rgb(crate::theme::current().text_dim))
-                        .child(format!(
-                            "{security} of {} are security updates; `kuma update` stages them for the next reboot",
-                            updates.len()
-                        )),
+                        .child(
+                            "Updating: pulling, rebuilding, and staging the image; this can take a while",
+                        ),
                 )
+            })
+            .when_some(applied, |el, result| match result {
+                Ok(()) => el.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(crate::theme::current().text_dim))
+                        .child("Staged. It applies at the next reboot."),
+                ),
+                Err(err) => el.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(crate::theme::URGENT))
+                        .child(SharedString::from(format!("The update failed: {err}"))),
+                ),
             });
 
         crate::panel::chrome(self.geometry, window, cx, content)
