@@ -148,7 +148,7 @@ fn save_usage(usage: &HashMap<String, u64>) {
     }
     let text = serde_json::to_string(&serde_json::json!({ "Applications": usage }));
     if let Ok(text) = text
-        && let Err(err) = std::fs::write(&path, text)
+        && let Err(err) = kuma_platform::files::write_atomic(&path, text.as_bytes())
     {
         log::error!("saving usage failed: {err:#}");
     }

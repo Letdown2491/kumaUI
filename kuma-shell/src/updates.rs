@@ -415,11 +415,8 @@ fn persist_staged_at(path: &PathBuf, boot: &str) {
     let body = format!("staged = true\nboot_id = \"{boot}\"\n");
     // one atomic rename: a torn state file reads as no state, which
     // would ask the user for a second build of the same stage
-    let tmp = path.with_extension("toml.tmp");
-    let write = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
-    if let Err(err) = write {
+    if let Err(err) = kuma_platform::files::write_atomic(path, body.as_bytes()) {
         warn!("updates: could not persist the staged flag: {err}");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
 

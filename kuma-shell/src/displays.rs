@@ -752,13 +752,8 @@ fn write_store(blocks: &[OutputBlock]) -> Result<()> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("cannot create {}", dir.display()))?;
     }
-    let mut tmp = path.clone().into_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, serialize_store(blocks))
-        .with_context(|| format!("cannot write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("cannot move {} into place", tmp.display()))?;
+    kuma_platform::files::write_atomic(&path, serialize_store(blocks).as_bytes())
+        .with_context(|| format!("cannot write {}", path.display()))?;
     Ok(())
 }
 

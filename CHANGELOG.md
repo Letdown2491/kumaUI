@@ -33,6 +33,11 @@ move rides unchanged.
 
 ### Fixed
 
+- The launcher's usage record writes atomically now: a crash mid-save
+  could tear the usage JSON, and the launcher read the wreck as
+  "no usage" and rebuilt the ranking from nothing. Every state and
+  config record in the shell lands through the same temp-file-plus-
+  rename write.
 - A subprocess that backgrounds a pipe-holding grandchild
   (`sleep 999 & echo hi`) no longer wedges the poll that ran it
   forever: the shared bounded read (nmcli, bluetoothctl, wpctl,

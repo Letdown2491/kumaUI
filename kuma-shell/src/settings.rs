@@ -1162,13 +1162,8 @@ impl Settings {
                 // must tear the temp file, never the user's whole
                 // config (a torn config.toml loads as defaults, and
                 // the next save would seal the loss)
-                let tmp = path.with_extension("toml.tmp");
-                match fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, &path)) {
-                    Ok(()) => {}
-                    Err(err) => {
-                        error!("writing config to {:?} failed: {err:#}", path);
-                        let _ = fs::remove_file(&tmp);
-                    }
+                if let Err(err) = kuma_platform::files::write_atomic(&path, text.as_bytes()) {
+                    error!("writing config to {:?} failed: {err:#}", path);
                 }
             }
             Err(err) => error!("serializing config failed: {err:#}"),
@@ -1489,10 +1484,10 @@ impl Settings {
             return;
         }
         let theme = crate::theme::current();
-        let tmp = dir.join("palette.tmp");
-        if let Err(err) = std::fs::write(&tmp, crate::theme::palette_text(&theme))
-            .and_then(|()| std::fs::rename(&tmp, dir.join("palette")))
-        {
+        if let Err(err) = kuma_platform::files::write_atomic(
+            &dir.join("palette"),
+            crate::theme::palette_text(&theme).as_bytes(),
+        ) {
             log::error!("palette write: {err}");
         }
     }
