@@ -13,6 +13,10 @@ move rides unchanged.
 
 ### Fixed
 
+- Long widget text (a media title, a custom widget's script line)
+  ellipsizes inside its section instead of shoving the neighbors off
+  the bar, and all three bar sections clip overflow at their edge the
+  way the center section always did.
 - The battery widget clamps its label and tooltip to 100% the way its
   icon already clamped, so a nonstandard driver reporting above-full
   cannot render a nonsense "150%".
