@@ -13,6 +13,16 @@ move rides unchanged.
 
 ### Fixed
 
+- The terminal's ctrl+click opener only sends `http` and `https` URLs
+  to `xdg-open`, whatever the pty printed: a `file://` span is
+  link-shaped text now, not one click away from executing a local
+  `.desktop` file.
+- An OSC 52 clipboard-write flood can no longer hold the keyboard
+  past one deny window: while a prompt is up, further stores are
+  ignored instead of re-arming its timer.
+- Two defensive bounds on remote-data paths: a palette index beyond
+  the color table resolves to a theme color instead of panicking, and
+  a ragged cursor cell skips its bake instead of panicking the paint.
 - A Koguma move that replaces its target no longer destroys the
   destination before the move is guaranteed: the old target steps
   aside and comes back if the rename fails (a cross-filesystem move

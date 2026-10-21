@@ -880,14 +880,20 @@ impl Engine {
         };
 
         fill_rows(&self.theme, content, &mut rows, None);
-        // the block's bake lands on the filled cells
+        // the block's bake lands on the filled cells; a ragged row (a
+        // renderer seam that ever yields one) skips the bake instead of
+        // panicking the paint
         if let Some(spot) = &cursor {
             if cursor_visible && spot.shape == CursorShape::Block {
-                let cell = &mut rows[spot.row].cells[spot.col];
-                // cursor color behind, the theme's cursor text color
-                // for the glyph, regardless of what the cell wore
-                cell.bg = self.theme.cursor;
-                cell.fg = self.theme.cursor_text;
+                if let Some(cell) = rows
+                    .get_mut(spot.row)
+                    .and_then(|row| row.cells.get_mut(spot.col))
+                {
+                    // cursor color behind, the theme's cursor text color
+                    // for the glyph, regardless of what the cell wore
+                    cell.bg = self.theme.cursor;
+                    cell.fg = self.theme.cursor_text;
+                }
             }
         }
 

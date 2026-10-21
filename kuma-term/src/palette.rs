@@ -105,6 +105,9 @@ pub fn resolve(color: Color, overrides: &Colors, theme: &Theme) -> Rgb8 {
 
 /// Resolve a raw palette index (0..269) for OSC 4 replies: same lookup
 /// order as `resolve`, with the special indices 256+ (fg, bg, cursor, dims).
+/// Bounds-checked on the catch-all: today upstream clamps what arrives
+/// (vte's parse returns u8, the 10/11/12 queries land pre-clamped), and
+/// this must never panic even if a future vte does not.
 pub fn resolve_index(index: usize, overrides: &Colors, theme: &Theme) -> Rgb8 {
     if index < 256 {
         indexed_color(index as u8, theme)
@@ -117,7 +120,8 @@ pub fn resolve_index(index: usize, overrides: &Colors, theme: &Theme) -> Rgb8 {
                 theme.named[(index - 259) as usize].scale(2.0 / 3.0)
             }),
             267 => overrides[NamedColor::BrightForeground].map(rgb_of).unwrap_or(theme.foreground),
-            _ => overrides[index].map(rgb_of).unwrap_or(theme.background),
+            _ if index < 269 => overrides[index].map(rgb_of).unwrap_or(theme.background),
+            _ => theme.background,
         }
     }
 }
@@ -149,5 +153,16 @@ mod tests {
         overrides[42] = Some(Rgb { r: 9, g: 8, b: 7 });
         assert_eq!(resolve(Color::Indexed(42), &overrides, &theme), Rgb8(9, 8, 7));
         assert_eq!(resolve(Color::Indexed(41), &overrides, &theme), indexed_color(41, &theme));
+    }
+
+    #[test]
+    fn resolve_index_never_panics_at_any_index() {
+        // the table ends at 268; anything a future upstream hands over
+        // resolves to a theme color, never a panic in the paint path
+        let theme = Theme::builtin();
+        let overrides = Colors::default();
+        for index in 0..400 {
+            let _ = resolve_index(index, &overrides, &theme);
+        }
     }
 }

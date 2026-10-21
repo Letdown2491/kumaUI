@@ -551,7 +551,15 @@ impl TerminalView {
                 // prompt, and the prompt denies itself after ten
                 // seconds, so a card nobody is looking at can never
                 // hold the keyboard hostage. The stamp is what keeps a
-                // spent timer from denying a newer prompt.
+                // spent timer from denying a newer prompt. While a
+                // prompt is up, further stores are ignored: a flood
+                // re-sending just under the timeout would re-arm the
+                // timer forever and hold the keyboard indefinitely, so
+                // one deny window bounds every flood.
+                if self.clipboard_ask.is_some() {
+                    log::info!("osc 52 clipboard write: a prompt is already up, store ignored");
+                    return;
+                }
                 self.clipboard_ask_seq += 1;
                 let ask_id = self.clipboard_ask_seq;
                 self.clipboard_ask = Some((ask_id, text));
@@ -1176,8 +1184,16 @@ impl Focusable for TerminalView {
 }
 
 /// Open a URL through the desktop handler: fire and forget, reaped on a
-/// side thread so the child cannot zombie and the UI never blocks.
+/// side thread so the child cannot zombie and the UI never blocks. The
+/// scheme is checked here at the opener, not just in the span matcher:
+/// whatever the pty printed, only a web address may leave the terminal.
+/// A `file://` span is link-shaped text, not a click's license to hand
+/// xdg-open a local path (a .desktop file would execute).
 fn open_url(url: &str) {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        log::info!("not opening {url}: only http and https leave the terminal");
+        return;
+    }
     match std::process::Command::new("xdg-open").arg(url).spawn() {
         Ok(mut child) => {
             std::thread::spawn(move || {
