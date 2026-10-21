@@ -457,17 +457,22 @@ fn run_widget_bounded(widget: &CustomWidget, secs: u32) -> Result<WidgetRead, St
             }
         }
     };
-    let status = match child.try_wait() {
-        Ok(Some(status)) => status,
-        // still running with the read over (a backgrounded grandchild,
-        // or the read hit its cap): nothing of this run outlives us
-        Ok(None) => {
-            kill_group(child.id());
-            child
-                .wait()
-                .map_err(|err| format!("waiting failed: {err}"))?
+    // reap the direct child under the same deadline. Normally it has
+    // already exited (`timeout` exits when its child does, a moment
+    // after the reader sees EOF), so no kill ever fires; the kill is
+    // for a straggler that closed its stdout and kept running
+    // (`sh -c 'exec 1>&-; sleep 999'`), and it fires only past the
+    // deadline a healthy run never reaches.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                kill_group(child.id());
+                break child.wait().map_err(|err| format!("waiting failed: {err}"))?;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => return Err(format!("waiting failed: {err}")),
         }
-        Err(err) => return Err(format!("waiting failed: {err}")),
     };
     if !status.success() {
         // timeout kills with 124; the exit status is the useful part
