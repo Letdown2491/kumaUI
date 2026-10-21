@@ -159,7 +159,7 @@ pub const WIDGETS: &[WidgetSpec] = &[
     },
     WidgetSpec {
         kind: WidgetKind::Updates,
-        label: "System updates",
+        label: "Kuma Updates",
         icon: Some(WidgetIconSpec::Path("icons/updates.svg")),
     },
 ];

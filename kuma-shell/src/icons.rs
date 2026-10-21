@@ -78,6 +78,7 @@ impl AssetSource for KumaAssets {
             "icons/enter.svg" => Some(include_bytes!("../icons/enter.svg").as_slice()),
             "icons/terminal.svg" => Some(include_bytes!("../icons/terminal.svg").as_slice()),
             "icons/updates.svg" => Some(include_bytes!("../icons/updates.svg").as_slice()),
+            "icons/alert.svg" => Some(include_bytes!("../icons/alert.svg").as_slice()),
             "icons/calc.svg" => Some(include_bytes!("../icons/calc.svg").as_slice()),
             "icons/info.svg" => Some(include_bytes!("../icons/info.svg").as_slice()),
             _ => None,

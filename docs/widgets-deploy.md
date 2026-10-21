@@ -10,12 +10,12 @@ The image may ship stock script widgets to
 shape a user installs. The directory is the activation unit and the
 manifest names its siblings by relative path, so a partial copy is a
 broken widget: compose copies each widget in whole. The pool is empty
-in the current image; the System updates chip lives in kuma-shell
+in the current image; the Kuma Updates chip lives in kuma-shell
 itself now, so no pool entry and no grants are needed for it.
 
 ## The update chip
 
-The bar's System updates widget is built in, fed by
+The bar's Kuma Updates widget is built in, fed by
 `kuma update --check --json` (at boot, then every four hours). The
 check is unprivileged: one round-trip to the registry, or to Fedora's
 repos for a composed base's kernel, no pull, no build, no root. The

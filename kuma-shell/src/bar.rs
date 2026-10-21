@@ -1116,10 +1116,10 @@ impl ShellBar {
                 let tooltip = move |_: &SysMon, cx: &App| {
                     let state = updates.read(cx);
                     match state.updates.len() {
-                        0 if state.stale => "System updates: the last check failed".into(),
-                        0 => "System updates: everything is current".into(),
+                        0 if state.stale => "Kuma Updates: the last check failed".into(),
+                        0 => "Kuma Updates: everything is current".into(),
                         n => format!(
-                            "System updates: {} available ({} security)",
+                            "Kuma Updates: {} available ({} security)",
                             n, state.security
                         )
                         .into(),

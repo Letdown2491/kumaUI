@@ -74,7 +74,7 @@ kuma-shell depends on gpui via a path dependency into `vendor/zed/` (gitignored,
 - [`AGENTS.md`](AGENTS.md): how AI agents should build, run, and debug in this repo.
 - [`kuma-platform/`](kuma-platform/): the shared crate: version reporting, the shell's palette handshake, the HSL color space, and the niri IPC envelope ([ADR-0017](docs/adr/0017-kuma-platform-crate.md)).
 - `kuma-shell/icons/`: the widget and panel icons, hand-made SVGs.
-- `widgets/`: the stock pool widgets the image ships to `/usr/share/kuma-shell/widgets/` (currently the System updates chip); what kumaOS does with them is [widgets-deploy.md](docs/widgets-deploy.md).
+- `widgets/`: the widget pool directory the image ships to `/usr/share/kuma-shell/widgets/` (currently empty; the Kuma Updates chip is built in); what kumaOS does with it is [widgets-deploy.md](docs/widgets-deploy.md).
 - `kuma-files/icons/`: the in-app icons, hand-made SVGs (16px stroke style).
 - `kuma-files/packaging/`: the menu entry, the app icon generator, and the app icon.
 - `kuma-monitor/packaging/`: the same trio for Kamuy (48-unit grid, drawn at 4x, downscaled to the committed 256px PNG).

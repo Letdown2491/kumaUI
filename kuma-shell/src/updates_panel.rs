@@ -86,7 +86,7 @@ impl Render for UpdatesPanelView {
             (false, false, None) => String::new(),
         };
 
-        let header = kit::pane_header("System updates").child(
+        let header = kit::pane_header("Kuma Updates").child(
             div()
                 .text_size(px(11.))
                 .text_color(rgb(crate::theme::current().text_dim))
@@ -169,7 +169,7 @@ impl Render for UpdatesPanelView {
 /// critical paints urgent red, important paints the accent (update
 /// today), moderate and low share the quiet chip, and a null severity
 /// (bugfix or enhancement, no security advisory) earns no badge at all.
-fn update_row(ix: usize, update: &PackageUpdate) -> Div {
+fn update_row(_ix: usize, update: &PackageUpdate) -> Div {
     div()
         .flex()
         .flex_col()
@@ -203,38 +203,26 @@ fn update_row(ix: usize, update: &PackageUpdate) -> Div {
         )
 }
 
-/// The severity chip: three visual classes over the four words plus
-/// null, all theme tokens, nothing invented. Every severity-bearing
-/// package is a security advisory, so "important" is the accent tier
-/// and the count line under the list carries the security number.
+/// The severity badge: glyphs, not words, one per level of kuma's
+/// scale plus the no-advisory null, tinted by the same three visual
+/// classes. Critical rings the bell (urgent red), important locks the
+/// shield (the accent: a security advisory that matters), moderate
+/// holds the plain shield and low the info dot, both dim, and a null
+/// severity (bugfix, enhancement) earns no badge at all: the absence
+/// of news is not a color.
 fn severity_badge(severity: Option<&str>) -> AnyElement {
-    let (label, bg, fg) = match severity {
-        Some("critical") => (
-            "critical",
-            crate::theme::URGENT,
-            crate::theme::current().accent_text,
-        ),
-        Some("important") => (
-            "important",
-            crate::theme::current().accent,
-            crate::theme::current().accent_text,
-        ),
-        Some(level) => (
-            level,
-            crate::theme::current().inset,
-            crate::theme::current().text_dim,
-        ),
-        // bugfix or enhancement: the absence of news
+    let (icon, color) = match severity {
+        Some("critical") => ("icons/alert.svg", crate::theme::URGENT),
+        Some("important") => ("icons/shield-lock.svg", crate::theme::current().accent),
+        Some("moderate") => ("icons/shield.svg", crate::theme::current().text_dim),
+        // low, and any severity a future kuma adds: the quiet class
+        Some(_) => ("icons/info.svg", crate::theme::current().text_dim),
         None => return div().into_any_element(),
     };
-    div()
-        .px_1p5()
-        .py_px()
-        .rounded_sm()
-        .text_size(px(10.))
-        .text_color(rgb(fg))
-        .bg(rgb(bg))
-        .child(label.to_string())
+    gpui::svg()
+        .path(icon)
+        .size(px(14.))
+        .text_color(rgb(color))
         .into_any_element()
 }
 
