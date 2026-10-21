@@ -24,7 +24,11 @@ move rides unchanged.
   Plain-text stdout is the label, the Waybar custom-module JSON
   (`text`, `tooltip`, `class`) is the upgrade path, empty output hides
   the widget; `interval` and a `click` line live in the manifest, and
-  the mode pills and drag ordering work as they do for built-ins.
+  the mode pills and drag ordering work as they do for built-ins. A
+  manifest SVG paints as a glyph in the widget's color, a raster
+  paints as-is. The config follows the filesystem: deleting a
+  widget's directory prunes its placement live, and a reinstall
+  starts from the default position.
 - **Kuma Updates chip.** A built-in bar widget (on by default, right
   cluster) fed by `kuma update --check --json`: icon and moved-package
   count, hidden while the base is current, accented when security
@@ -42,7 +46,20 @@ move rides unchanged.
   the panel, the same road the memory probe drives. It probes for the
   `kuma` CLI at boot, and on anything that is not kumaOS it stays out
   of the bar, the scheduler, and the settings list entirely: there is
-  nothing to drive.
+  nothing to drive. A dismissed password dialog reads as a
+  cancellation, not a failure, and the apply button stands down while
+  a stage waits.
+
+### Changed
+
+- The mode pills are per widget, named by the registry. The clock's
+  dial is date+time / time (and its default face now shows the
+  weekday and month beside the time), the count chips drop bare text
+  (a chip that reads "5" with no subject is noise), the apps button
+  is icon-only (an action, not a readout), and workspaces and tray
+  have no dial at all. A stored mode outside its widget's dial clamps
+  to the default at load, in memory only: the file stays the portable
+  record.
 
 ## v0.4.1 (2026-10-19)
 
