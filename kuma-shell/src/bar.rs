@@ -1197,6 +1197,10 @@ impl ShellBar {
                     crate::imaging::IconImage::Svg(bytes) => svg()
                         .data(bytes)
                         .size(px(16.))
+                        // the sys widgets tint their icons with the
+                        // widget color; an untinted svg inherits
+                        // whatever ambient color is lying around
+                        .text_color(rgb(color))
                         .into_any_element(),
                 }),
                 None => el,

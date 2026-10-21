@@ -2406,6 +2406,13 @@ impl SettingsView {
         let icon = manifest.icon.as_ref().and_then(|icon| {
             crate::imaging::resolve(&crate::widgets::icon_key(icon, &manifest.dir), 16)
         });
+        // the same tint every widget row's icon carries: full text
+        // color when enabled, dimmed when not
+        let icon_tint = rgb(if enabled {
+            crate::theme::current().text
+        } else {
+            crate::theme::current().text_dim
+        });
         div()
             .id(SharedString::from(format!("widget-row-custom-{}", manifest.id)))
             .flex()
@@ -2425,11 +2432,13 @@ impl SettingsView {
                     crate::imaging::IconImage::Svg(bytes) => gpui::svg()
                         .data(bytes)
                         .size(px(16.))
+                        .text_color(icon_tint)
                         .into_any_element(),
                 },
                 None => gpui::svg()
                     .path("icons/puzzle.svg")
                     .size(px(16.))
+                    .text_color(icon_tint)
                     .into_any_element(),
             })
             .child(
