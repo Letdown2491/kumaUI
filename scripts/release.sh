@@ -6,7 +6,13 @@
 # breaking changes ride); only Changed and Fixed infer a patch. Kind
 # decides, not amount. The script asks which apps move, bumps their
 # Cargo.tomls, inserts the release heading with the version lines,
-# refreshes the lock and installs through build.sh, and commits.
+# commits, then builds and installs through build.sh. The order is the
+# fix for the parent-stamp bug (v0.4.1 and v0.5.1 both shipped binaries
+# stamped with the release commit's parent and needed a manual rebuild
+# at the tag before kumaOS could pin): the stamp is HEAD at build time,
+# so the commit must exist before the build runs. If the build fails
+# after the commit, the recovery is manual and honest: fix the build,
+# rerun `./scripts/build.sh build --release`, then tag by hand.
 # kumaOS is atomic (no host toolchain), so cargo only runs in the
 # container.
 #
@@ -86,10 +92,35 @@ awk '
   { print }
 ' CHANGELOG.md > .CHANGELOG.tmp && mv .CHANGELOG.tmp CHANGELOG.md
 
-# the build refreshes Cargo.lock and installs the fresh binaries
-./scripts/build.sh build --release
+# the lock refresh rides the container (no host toolchain) and cargo
+# update -w touches only the workspace members' versions, so the
+# release commit below is self-consistent and the post-commit build
+# has nothing left to rewrite
+./scripts/build.sh update -w
 
 git add CHANGELOG.md Cargo.lock "${APPS[@]/%//Cargo.toml}"
 git commit -m "release: v$train"
+
+# build and install: HEAD is the release commit now, so the binaries'
+# stamp is the sha the tag will name, and the tree built is the tree
+# the tag names
+./scripts/build.sh build --release
+
+# the stamp assert reads the installed paths (what kumaOS's stamp gate
+# reads), not target/release: a stale sibling from an earlier build
+# surviving there is a per-binary failure mode. All five answer, not
+# just the shell.
+sha=$(git rev-parse --short HEAD)
+for app in kuma-shell kuma-greeter kuma-files kuma-term kuma-monitor; do
+  stamp=$(~/.local/bin/"$app" --version)
+  case "$stamp" in
+    *"g$sha"*) ;;
+    *) echo "release: $app does not answer g$sha: $stamp" >&2; exit 1 ;;
+  esac
+done
+# a lock the build still rewrote means the tagged tree would not be the
+# tree that was built
+git diff --exit-code Cargo.lock
+
 [ "$TAG" = 1 ] && git tag "v$train"
 echo "release: v$train committed"

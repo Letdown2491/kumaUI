@@ -5,6 +5,12 @@
 /// the commit build.sh stamped in, so a running instance pins to an
 /// exact build. The version is the caller's (`env!("CARGO_PKG_VERSION")`
 /// at the call site), not this crate's.
+///
+/// The stamp shape `g<7-hex short sha>` is a cross-repo contract:
+/// kumaOS's staging gate compares each binary's 7-character stamp
+/// against the pin's first 7 characters, and its tests hardcode the
+/// shape. Never move to a git describe string or a different short
+/// length without coordinating the change with kumaOS first.
 pub fn line(app: &str, version: &str) -> String {
     format!("{app} {version} (g{})", env!("KUMA_GIT_SHA"))
 }

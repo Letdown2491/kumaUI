@@ -14,6 +14,15 @@ source's wrap points would pin the text to a narrow column.
 
 ## Unreleased
 
+### Changed
+
+- Release cuts commit before they build: the stamp in every installed
+  binary now names the commit the tag names, where v0.4.1 and v0.5.1
+  both shipped the parent commit's stamp and needed a manual rebuild at
+  the tag before kumaOS could pin (version, sha). release.sh asserts
+  all five installed siblings answer the release commit's sha and that
+  the lock did not move after the commit, then tags.
+
 ## v0.5.1 (2026-10-21)
 
 kuma-shell 0.5.1
