@@ -34,7 +34,11 @@ move rides unchanged.
   boot and then every four hours, unprivileged. While the apply runs,
   the panel shows the build's actual step lines, and a staged result
   grows a Restart now button while the chip drops its accent (the
-  accent means work waiting on you). `kuma-shell msg updates` toggles
+  accent means work waiting on you); the staged result survives a
+  shell restart (a small state file beside `config.toml`, stamped
+  with the boot id of the apply, retired by the reboot into it), so
+  the panel never asks for a second build of the same stage.
+  `kuma-shell msg updates` toggles
   the panel, the same road the memory probe drives. It probes for the
   `kuma` CLI at boot, and on anything that is not kumaOS it stays out
   of the bar, the scheduler, and the settings list entirely: there is
