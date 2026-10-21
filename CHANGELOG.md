@@ -14,6 +14,13 @@ source's wrap points would pin the text to a narrow column.
 
 ## Unreleased
 
+## v0.5.2 (2026-10-21)
+
+kuma-shell 0.5.2
+kuma-files 0.4.3
+kuma-term 0.3.3
+kuma-monitor 0.2.3
+
 ### Changed
 
 - Release cuts commit before they build: the stamp in every installed
