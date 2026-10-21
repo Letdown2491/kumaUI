@@ -412,9 +412,60 @@ impl Op {
                     return Err(format!("{} already exists", to.display()));
                 }
                 if from.is_dir() {
+                    if *replace && to.is_dir() {
+                        // Replace substitutes one entry for another;
+                        // merging into the directory would overwrite
+                        // same-named children with no prompt (the
+                        // conflict plan only offers Replace for
+                        // file-onto-file, so this is a plan/run race)
+                        return Err(format!(
+                            "copy: {} is a directory",
+                            to.display()
+                        ));
+                    }
                     copy_dir_all(from, to).map_err(|err| format!("copy: {err}"))?;
                 } else if from.is_file() {
-                    fs::copy(from, to).map_err(|err| format!("copy: {err}"))?;
+                    // a replace-copy steps the old target aside first,
+                    // the move's shape: fs::copy truncates the
+                    // destination before the first byte moves, and a
+                    // failure mid-copy (a full disk, an unplugged
+                    // drive) would otherwise leave the old file
+                    // destroyed and the undo able only to delete the
+                    // wreckage
+                    let aside = if *replace && to.exists() {
+                        let aside = move_aside_path(to);
+                        fs::rename(to, &aside).map_err(|err| format!("copy: {err}"))?;
+                        Some(aside)
+                    } else {
+                        None
+                    };
+                    if let Err(err) = fs::copy(from, to) {
+                        // the copy failed: the old target goes back
+                        // over the partial copy
+                        let restore = aside
+                            .as_ref()
+                            .map(|aside| fs::rename(aside, to))
+                            .transpose();
+                        return Err(format!(
+                            "copy: {err}{}",
+                            restore
+                                .err()
+                                .map(|e| format!(
+                                    " (the old target could not be restored: {e})"
+                                ))
+                                .unwrap_or_default()
+                        ));
+                    }
+                    if let Some(aside) = aside {
+                        // the old target survives in the aside until
+                        // the undo runs: moving it back is the inverse
+                        // of the replace, not a delete of the copy
+                        return Ok(Some(Op::Move {
+                            from: aside,
+                            to: to.clone(),
+                            replace: true,
+                        }));
+                    }
                 } else {
                     // a FIFO or device file: reading it could block
                     // forever with no writer, wedging the whole queue
@@ -914,6 +965,11 @@ struct ConflictDialog {
     can_replace_all: bool,
     ix: usize,
     apply_all: bool,
+    /// The plan came from a cut: when its queue is accepted, the
+    /// clipboard dies with it. A plan whose every entry was skipped
+    /// moves nothing, and the queue then refuses, so the cut survives
+    /// too.
+    is_cut: bool,
 }
 
 /// Compress dialog: target archive name, format choice, and whether
@@ -3142,15 +3198,15 @@ impl Browser {
         cx.notify();
     }
 
-    fn enqueue(&mut self, mut ops: Vec<Op>, cx: &mut Context<Self>) {
+    fn enqueue(&mut self, mut ops: Vec<Op>, cx: &mut Context<Self>) -> bool {
         ops.retain(|op| !matches!(op, Op::Nop));
         if ops.is_empty() {
-            return;
+            return false;
         }
         if self.busy {
             self.status = "a file operation is still running".into();
             cx.notify();
-            return;
+            return false;
         }
         self.busy = true;
         self.disarm();
@@ -3212,6 +3268,7 @@ impl Browser {
             }
         })
         .detach();
+        true
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
@@ -4014,7 +4071,9 @@ impl Browser {
         }
         self.empty_armed = None;
         match os_limited::list() {
-            Ok(items) if !items.is_empty() => self.enqueue(vec![Op::Purge { items }], cx),
+            Ok(items) if !items.is_empty() => {
+                self.enqueue(vec![Op::Purge { items }], cx);
+            }
             Ok(_) => {
                 self.status = "trash is already empty".into();
                 cx.notify();
@@ -4101,11 +4160,14 @@ impl Browser {
                 conflicts.push(ops.len() - 1);
             }
         }
-        if !is_copy {
-            self.clipboard = None;
-        }
+        let is_cut = !is_copy;
         if conflicts.is_empty() {
-            self.enqueue(ops.into_iter().map(PlannedOp::into_op).collect(), cx);
+            // the cut dies when the queue accepts it, not before: a
+            // busy refusal or a plan that skips everything must leave
+            // the clipboard holding the cut
+            if self.enqueue(ops.into_iter().map(PlannedOp::into_op).collect(), cx) && is_cut {
+                self.clipboard = None;
+            }
         } else {
             self.conflict_dialog = Some(ConflictDialog {
                 ops,
@@ -4113,10 +4175,11 @@ impl Browser {
                 can_replace_all,
                 ix: 0,
                 apply_all: false,
+                is_cut,
             });
             self.status = "a file with that name already exists".into();
-            cx.notify();
         }
+        cx.notify();
     }
 
     /// Resolve the conflict under the cursor with Replace / Keep both /
@@ -4152,7 +4215,12 @@ impl Browser {
         if dialog.ix < dialog.conflicts.len() {
             self.conflict_dialog = Some(dialog);
         } else {
-            self.enqueue(dialog.ops.into_iter().map(PlannedOp::into_op).collect(), cx);
+            let is_cut = dialog.is_cut;
+            if self.enqueue(dialog.ops.into_iter().map(PlannedOp::into_op).collect(), cx)
+                && is_cut
+            {
+                self.clipboard = None;
+            }
         }
         cx.notify();
     }
@@ -4166,7 +4234,13 @@ impl Browser {
             dialog.ops[dialog.conflicts[dialog.ix]].state = PlanState::Skipped;
             dialog.ix += 1;
         }
-        self.enqueue(dialog.ops.into_iter().map(PlannedOp::into_op).collect(), cx);
+        // every entry skipped: the ops all become Nop, the queue
+        // refuses, and the cut clipboard survives the no-op paste
+        if self.enqueue(dialog.ops.into_iter().map(PlannedOp::into_op).collect(), cx)
+            && dialog.is_cut
+        {
+            self.clipboard = None;
+        }
     }
 
     fn undo_last(&mut self, cx: &mut Context<Self>) {
@@ -6382,6 +6456,18 @@ impl Browser {
             return;
         }
         let dest = renaming.with_file_name(&target_name);
+        if dest.exists() {
+            // rename(2) replaces its destination silently: a name that
+            // already exists must refuse and keep the editor open,
+            // not destroy the other file with no dialog and no undo
+            // (a paste's Replace dialog is a copy/move contract; a
+            // rename names one entry, so refusing is the honest
+            // resolution)
+            tab.renaming = Some(renaming);
+            self.status = "a file with that name already exists".into();
+            cx.notify();
+            return;
+        }
         match fs::rename(&renaming, &dest) {
             Ok(()) => {
                 log::info!("rename: {} -> {}", renaming.display(), dest.display());
@@ -12030,6 +12116,74 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_mid_copy_never_leaves_the_old_target_destroyed() {
+        let room = std::env::temp_dir().join(format!("koguma-test-{}", std::process::id()));
+        fs::create_dir_all(&room).unwrap();
+        let old = room.join("report.txt");
+        fs::write(&old, "the original\n").unwrap();
+        let new = room.join("newer.txt");
+        fs::write(&new, "the replacement\n").unwrap();
+
+        let op = Op::Copy {
+            from: new.clone(),
+            to: old.clone(),
+            replace: true,
+        };
+        let inverse = op.run().unwrap().expect("a replace-copy has an inverse");
+        assert_eq!(
+            fs::read_to_string(&old).unwrap(),
+            "the replacement\n",
+            "the copy ran over the old target"
+        );
+        // the inverse is a move of the stepped-aside original back
+        // over the copy, not a delete of the copy
+        match inverse {
+            Op::Move { replace, .. } => assert!(replace, "the undo moves the old file back"),
+            other => panic!("expected a Move inverse, got {other:?}"),
+        }
+        inverse.run().unwrap();
+        assert_eq!(
+            fs::read_to_string(&old).unwrap(),
+            "the original\n",
+            "undo restores the pre-copy bytes"
+        );
+        assert!(
+            new.exists(),
+            "a copy leaves its source in place"
+        );
+
+        let _ = fs::remove_dir_all(&room);
+    }
+
+    #[test]
+    fn a_replace_copy_into_an_existing_directory_is_an_error_not_a_merge() {
+        let room = std::env::temp_dir().join(format!("koguma-test-{}", std::process::id()));
+        fs::create_dir_all(&room).unwrap();
+        let src_dir = room.join("srcdir");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("child.txt"), "src\n").unwrap();
+        let dest_dir = room.join("destdir");
+        fs::create_dir_all(&dest_dir).unwrap();
+        fs::write(dest_dir.join("child.txt"), "dest\n").unwrap();
+
+        let err = Op::Copy {
+            from: src_dir.clone(),
+            to: dest_dir.clone(),
+            replace: true,
+        }
+        .run()
+        .expect_err("a dir-onto-dir replace must refuse, not merge");
+        assert!(err.contains("is a directory"), "honest error: {err}");
+        assert_eq!(
+            fs::read_to_string(&dest_dir.join("child.txt")).unwrap(),
+            "dest\n",
+            "the existing child was never overwritten"
+        );
+
+        let _ = fs::remove_dir_all(&room);
+    }
+
+    #[test]
     fn friendly_kinds_map_extensions() {
         assert_eq!(friendly_kind("thing/", true), "folder");
         assert_eq!(friendly_kind("photo.png", false), "PNG image");
@@ -12446,6 +12600,69 @@ mod overlay_click_repro {
         assert!(!backdrop_closed.get(), "backdrop closed the menu mid-click");
     }
 }
+
+/// A regression test for the silent-rename-overwrite bug: rename(2)
+/// replaces its destination, so committing a rename onto an existing
+/// name used to destroy that file with no dialog and no undo.
+#[cfg(test)]
+mod rename_conflict {
+    use super::*;
+
+    #[test]
+    fn a_rename_onto_an_existing_name_refuses_and_keeps_the_editor() {
+        let dir = std::env::temp_dir().join(format!("koguma-rename-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "the renamer\n").unwrap();
+        fs::write(dir.join("b.txt"), "the innocent\n").unwrap();
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = app.open_window(|window, cx| Browser::new(Some(dir.clone()), window, cx));
+        app.run_until_parked();
+
+        window
+            .update(|browser, _, cx| {
+                {
+                    let tab = browser.tab_mut();
+                    tab.renaming = Some(dir.join("a.txt"));
+                    tab.rename_field = input::Field::new("b.txt");
+                }
+                browser.commit_rename(cx);
+                // the editor stays open on a refused rename: the name
+                // is still editable
+                browser.tab().renaming.is_some()
+            })
+            ;
+        assert_eq!(
+            fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "the innocent\n",
+            "the existing file was never touched"
+        );
+        assert!(
+            dir.join("a.txt").exists(),
+            "the renamed file did not move either"
+        );
+
+        // a free name still commits
+        window
+            .update(|browser, _, cx| {
+                let tab = browser.tab_mut();
+                tab.rename_field = input::Field::new("c.txt");
+                browser.commit_rename(cx);
+                true
+            })
+            ;
+        assert!(
+            dir.join("c.txt").exists() && !dir.join("a.txt").exists(),
+            "the non-conflicting rename went through"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 
 /// A regression test for the dead-menu bug: the item loop was once
 /// restructured and the `.on_click` fell off the row, leaving every

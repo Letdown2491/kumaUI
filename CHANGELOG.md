@@ -21,6 +21,25 @@ move rides unchanged.
 
 ### Fixed
 
+- Koguma's rename no longer silently overwrites an existing file:
+  rename(2) replaces its destination, so committing a name that
+  already exists destroyed that file with no dialog and no undo. The
+  rename now refuses, keeps the editor open, and says so.
+- A Koguma replace-copy no longer destroys the destination when the
+  copy fails midway: `fs::copy` truncates the target before the first
+  byte moves, so a full disk or an unplugged drive used to leave a
+  good file replaced by a partial one whose undo could only delete
+  the wreckage. The old target now steps aside first (the move's
+  shape) and the undo puts it back instead of deleting the copy.
+- A Koguma replace-copy aimed at a directory is an honest error
+  instead of a silent merge: the conflict dialog only offers Replace
+  for file-onto-file, so a directory landing between plan and run
+  used to overwrite same-named children with no prompt.
+- A Koguma cut survives a refused or skipped paste: the clipboard was
+  cleared before the queue even accepted the plan, so a paste refused
+  because another operation was running (or a conflict resolved as
+  Skip for all) destroyed the cut and nothing moved. The clipboard
+  now dies only when the queue accepts the plan.
 - The session mirror no longer logs an error, repeating on every
   reconnect timer, for a session event stream that ended cleanly: a
   clean end is a warning about the retry, not an error.
@@ -28,9 +47,6 @@ move rides unchanged.
   headless rehearsal command spelling `-V` in a later position
   printed the version line and exited instead of logging in. It is a
   first-argument flag now, like every binary in the family.
-- The session mirror no longer logs an error, repeating on every
-  reconnect timer, for a session event stream that ended cleanly: a
-  clean end is a warning about the retry, not an error.
 - Long widget text (a media title, a custom widget's script line)
   ellipsizes inside its section instead of shoving the neighbors off
   the bar, and all three bar sections clip overflow at their edge the
