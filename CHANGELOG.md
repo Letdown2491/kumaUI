@@ -16,6 +16,16 @@ move rides unchanged.
 - `kuma-greeter --version` prints the version line the other apps
   print, so the upgrade path can pin the greeter's build like the
   rest of the family.
+- **User-made widgets.** The bar learns scripts: a widget is a
+  directory (`widget.toml` plus the scripts and icons it names),
+  dropped into `~/.config/kuma-shell/widgets/` or installed from the
+  system pool by the settings page's new User-made widgets section.
+  Plain-text stdout is the label, the Waybar custom-module JSON
+  (`text`, `tooltip`, `class`) is the upgrade path, empty output hides
+  the widget; `interval` and a `click` line live in the manifest, and
+  the mode pills and drag ordering work as they do for built-ins.
+  Ships with one stock widget in the pool: System updates, which says
+  "reboot to apply" while a staged bootc deployment waits.
 
 ## v0.4.1 (2026-10-19)
 
