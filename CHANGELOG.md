@@ -21,6 +21,11 @@ move rides unchanged.
 
 ### Fixed
 
+- Desktop files with `[Desktop Action]` sections no longer vanish
+  from the greeter's session picker: a section header fell into the
+  key=value arm, and its missing `=` aborted the whole file. Other
+  section headers close the entry section now, and a stray line
+  without `=` is skipped instead of fatal.
 - The themed-icon index walk survives a symlink cycle in an icon
   tree: a stray `ln -s .. loop` walked forever under the index lock
   and froze the shell at the next icon resolve. Directories are

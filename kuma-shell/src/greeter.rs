@@ -243,8 +243,18 @@ fn parse_session(path: &Path) -> Option<Session> {
         match line.trim() {
             "[Desktop Entry]" => in_entry = true,
             "[]" | "" => in_entry = false,
+            // any other section header ([Desktop Action a], vendor
+            // extensions) ends the entry section. It used to fall
+            // through to the key/value arm, whose missing '=' aborted
+            // the whole file: a session shipping actions vanished
+            // from the picker
+            header if header.starts_with('[') && header.ends_with(']') => in_entry = false,
             _ if in_entry => {
-                let (key, value) = line.split_once('=')?;
+                // a stray line without '=' is skipped, not fatal: the
+                // session should not vanish over one bad line
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
                 match key.trim() {
                     "Name" => name = Some(value.trim().to_string()),
                     "Exec" => exec = Some(value.trim().to_string()),
