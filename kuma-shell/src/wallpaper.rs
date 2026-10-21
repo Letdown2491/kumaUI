@@ -79,6 +79,7 @@ impl Render for WallpaperView {
             self.shown = Some(wanted.clone());
             // the old image keeps painting until the new decode lands (no
             // blank flash); the swap then releases its atlas tile (ADR-0016)
+            let wanted_now = wanted.clone();
             cx.spawn(async move |this, cx| {
                 let image = cx
                     .background_spawn(async move {
@@ -89,8 +90,19 @@ impl Render for WallpaperView {
                     })
                     .await;
                 let _ = this.update(cx, |this, cx| {
-                    if let Some(old) = std::mem::replace(&mut this.image, image) {
-                        crate::imaging::release(&old, cx);
+                    // the decode adopts only while its path is still
+                    // the one wanted: a quick A→B→A must not let the
+                    // slow A decode overwrite B's pixels (the render
+                    // gate compares `shown` to `wanted`, so a stale
+                    // adoption would stick until the next change)
+                    if this.shown.as_ref() == Some(&wanted_now) {
+                        if let Some(old) = std::mem::replace(&mut this.image, image) {
+                            crate::imaging::release(&old, cx);
+                        }
+                    } else if let Some(image) = image {
+                        // the decode lost the race: its pixels are
+                        // released unused, not pinned in the atlas
+                        crate::imaging::release(&image, cx);
                     }
                     cx.notify();
                 });

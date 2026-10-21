@@ -21,6 +21,12 @@ move rides unchanged.
 
 ### Fixed
 
+- A slow wallpaper decode can no longer clobber a newer wallpaper
+  choice: the decode adopted whatever path was current when it
+  finished, so a quick A then B then A swap could leave A's pixels
+  pinned under B, and a decode that lost the race pinned its tiles in
+  the atlas unused. Adoption is gated on the path still being the
+  one wanted; a losing decode releases its tiles.
 - The weather widget fetches at startup instead of one poll interval
   after it: a cached location showed an empty widget for up to a
   quarter hour after every boot.
