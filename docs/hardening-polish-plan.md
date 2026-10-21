@@ -132,4 +132,15 @@ Per binary (kuma-shell, kuma-files, kuma-term, kuma-monitor, greeter):
 
 Findings from the audit that are architectural land here, each with the
 boundary it touches and a sentence on the shape of the fix. The owner
-triages this list when back.
+triages this list when back. The full entries live in the audit doc
+(docs/research/hardening-audit.md, "0.6.0 parking list"); the short
+form:
+
+- **A1: lock screen PAM timeout.** The authenticate seam.
+- **T1: vte OSC buffer cap.** A `patches/` overlay or an upstream pin.
+- **W4 (second half): widget discovery off the main thread.** Only if
+  discovery cost grows.
+- **kuma-shell double-start guard.** The activation seam; semantics
+  need an owner call.
+- **Synchronous niri seed at files/monitor startup.** Only if a wedged
+  niri socket ever shows up as a slow first frame.

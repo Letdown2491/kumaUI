@@ -416,6 +416,21 @@ and the palette. Cleanest surface in the family; nothing to fix.
 - **W4 (second half): move widget discovery off the main thread.** The
   FIFO/size guards make the current threading safe; the structural fix
   is a 0.6.0 candidate if discovery cost grows.
+- **Phase 4: kuma-shell double-start guard.** kuma-files and
+  kuma-monitor single-instance through
+  `kuma_platform::activation::become_single_instance`; kuma-shell has
+  no guard, and a second shell steals the msg socket while the two
+  fight over the layer surfaces and the logind lock listener. The fix
+  shape is known (become_single_instance before gpui starts); the
+  semantics need an owner call, because a second shell has no window
+  to bring forward and exit-quietly interacts with the systemd
+  service restart cycle.
+- **Phase 4: synchronous niri seed at files/monitor startup.** Both
+  binaries read `own_windows()` on the UI thread before first paint
+  (documented tradeoff: niri tiles at birth, the flicker otherwise),
+  bounded by the 2 s niri timeout. A shorter probe or a state-carry
+  redesign is a candidate only if a wedged niri socket ever shows up
+  as a slow first frame.
 
 ## What the audit did not find
 
