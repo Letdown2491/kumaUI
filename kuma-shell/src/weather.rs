@@ -181,6 +181,10 @@ pub fn geolocate(query: &str) -> anyhow::Result<ResolvedLocation> {
             "-fsSL",
             "--max-time",
             "15",
+            // the reply is five JSON matches: bound the body too, so a
+            // broken mirror streaming forever cannot fill memory
+            "--max-filesize",
+            "1000000",
             "-A",
             "kuma-shell/1.0 (desktop shell weather widget)",
         ])
@@ -247,7 +251,7 @@ fn fetch_weather(location: &ResolvedLocation) -> anyhow::Result<(Current, Vec<Fo
         location.lat, location.lon
     );
     let output = std::process::Command::new("curl")
-        .args(["-fsSL", "--max-time", "15"])
+        .args(["-fsSL", "--max-time", "15", "--max-filesize", "1000000"])
         .arg(url)
         .output()?;
     anyhow::ensure!(output.status.success(), "open-meteo request failed");

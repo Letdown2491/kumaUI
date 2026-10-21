@@ -1113,8 +1113,17 @@ impl Settings {
         }
         match toml::to_string_pretty(self) {
             Ok(text) => {
-                if let Err(err) = fs::write(&path, text) {
-                    error!("writing config to {:?} failed: {err:#}", path);
+                // one atomic rename: a crash or power loss mid-write
+                // must tear the temp file, never the user's whole
+                // config (a torn config.toml loads as defaults, and
+                // the next save would seal the loss)
+                let tmp = path.with_extension("toml.tmp");
+                match fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, &path)) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        error!("writing config to {:?} failed: {err:#}", path);
+                        let _ = fs::remove_file(&tmp);
+                    }
                 }
             }
             Err(err) => error!("serializing config failed: {err:#}"),

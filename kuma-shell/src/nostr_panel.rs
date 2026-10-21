@@ -310,8 +310,20 @@ impl NostrSignerView {
                     if let Some(parent) = parent {
                         let _ = std::fs::create_dir_all(parent);
                     }
+                    // the URL is remote content (a profile's picture
+                    // field): https only, size-capped, so it can neither
+                    // fill the disk nor ride curl's other protocols
                     std::process::Command::new("curl")
-                        .args(["-fsSL", "--max-time", "10", "-o"])
+                        .args([
+                            "-fsSL",
+                            "--max-time",
+                            "10",
+                            "--max-filesize",
+                            "5000000",
+                            "--proto",
+                            "https",
+                            "-o",
+                        ])
                         .arg(&dest)
                         .arg(&url)
                         .output()
@@ -1128,8 +1140,10 @@ fn pair_ready(
 }
 
 fn mint_cli() -> Option<serde_json::Value> {
-    let output = std::process::Command::new("kuma-nostr")
-        .args(["bunker", "--json"])
+    // bounded like every other CLI read (nostr.rs's fetch_cli): a hung
+    // vault daemon costs this task one wait, never forever
+    let output = std::process::Command::new("timeout")
+        .args(["15", "kuma-nostr", "bunker", "--json"])
         .output()
         .ok()?;
     if !output.status.success() {

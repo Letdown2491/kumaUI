@@ -1556,8 +1556,8 @@ impl BluetoothAct {
                     .args(["20", "bluetoothctl", "pair", mac])
                     .status()?;
                 anyhow::ensure!(status.success(), "pairing failed");
-                if let Ok(trust) = Command::new("bluetoothctl")
-                    .args(["trust", mac])
+                if let Ok(trust) = Command::new("timeout")
+                    .args(["10", "bluetoothctl", "trust", mac])
                     .status()
                     && !trust.success()
                 {

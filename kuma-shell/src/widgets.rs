@@ -158,7 +158,20 @@ pub fn discover(user: &Path, system: &Path) -> Vec<CustomWidget> {
 /// Load one widget directory. `stem` is the identity the directory grants;
 /// the manifest may not contradict it.
 fn load(dir: &Path, stem: &str) -> Result<CustomWidget, String> {
-    let text = std::fs::read_to_string(dir.join("widget.toml"))
+    const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+    let manifest_path = dir.join("widget.toml");
+    // regular files only, size-capped: discovery runs on the main
+    // thread, and a FIFO or a multi-GB manifest here would hold the
+    // whole shell at the next re-discovery
+    let meta = std::fs::metadata(&manifest_path)
+        .map_err(|err| format!("reading widget.toml failed: {err}"))?;
+    if !meta.is_file() {
+        return Err("widget.toml is not a regular file".to_string());
+    }
+    if meta.len() > MAX_MANIFEST_BYTES {
+        return Err("widget.toml is too large".to_string());
+    }
+    let text = std::fs::read_to_string(&manifest_path)
         .map_err(|err| format!("reading widget.toml failed: {err}"))?;
     let manifest: WidgetManifest = toml::from_str(&text)
         .map_err(|err| format!("parsing widget.toml failed: {err}"))?;
@@ -195,10 +208,12 @@ fn load(dir: &Path, stem: &str) -> Result<CustomWidget, String> {
     };
 
     // the interval is the user's choice bounded by ours: a manifest
-    // asking for sub-second ticks is clamped, not rejected
+    // asking for sub-second ticks is clamped, not rejected, and one
+    // asking for nonsense (`interval = nan`, a negative, a number that
+    // overflows) is a default, not a panic in discovery
     let interval = manifest
         .interval
-        .map(Duration::from_secs_f64)
+        .and_then(|value| Duration::try_from_secs_f64(value).ok())
         .unwrap_or(DEFAULT_INTERVAL);
     let interval = if interval < MIN_INTERVAL {
         MIN_INTERVAL
@@ -376,11 +391,17 @@ fn run_budget(interval: Duration) -> u32 {
     interval.as_secs().clamp(10, 60) as u32
 }
 
-/// Run one widget's source, blocking, bounded by `timeout`. This is
-/// `timed_output`'s idiom: one hung script must cost seconds, not the
-/// widget's updates for the rest of the session. Called on the
-/// background executor only.
+/// Run one widget's source, blocking, bounded twice: `timeout` bounds
+/// the direct child, and the run's own deadline plus a process-group
+/// kill bound everything else. This is `timed_output`'s idiom with one
+/// extra clause: a source that backgrounds a pipe-holding grandchild
+/// (`sleep 999 & echo hi`) keeps its stdout open past `timeout`'s
+/// SIGTERM, so plain `.output()` would wait on every writer forever.
+/// The read is capped too: duration bounds are not memory bounds, and a
+/// source printing at line speed for its whole budget is gigabytes.
+/// Called on the background executor only.
 fn run_widget_bounded(widget: &CustomWidget, secs: u32) -> Result<WidgetRead, String> {
+    const MAX_OUTPUT_BYTES: usize = 64 * 1024;
     let mut command = Command::new("timeout");
     command.arg(secs.to_string());
     match &widget.run {
@@ -394,14 +415,65 @@ fn run_widget_bounded(widget: &CustomWidget, secs: u32) -> Result<WidgetRead, St
             command.arg("sh").arg("-c").arg(line);
         }
     }
-    let output = command
-        .output()
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::null());
+    // its own process group: the deadline kill below must reach the
+    // source's backgrounded grandchildren, which hold the pipes
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    let mut child = command
+        .spawn()
         .map_err(|err| format!("spawning failed: {err}"))?;
-    if !output.status.success() {
+    let mut stdout = child.stdout.take().ok_or("the widget has no stdout")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut kept = Vec::with_capacity(MAX_OUTPUT_BYTES);
+        let mut sink = [0u8; 8192];
+        loop {
+            match stdout.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    // past the cap the bytes are drained, not stored
+                    let take = n.min(MAX_OUTPUT_BYTES.saturating_sub(kept.len()));
+                    kept.extend_from_slice(&sink[..take]);
+                }
+            }
+        }
+        let _ = tx.send(kept);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(secs as u64 + 5);
+    let output = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // every writer died or the budget ran out with the pipe
+            // still open (the grandchild case): close it for them, then
+            // give the reader its moment to hand over what it kept
+            kill_group(child.id());
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(bytes) => bytes,
+                Err(_) => return Err("the widget's output never ended".to_string()),
+            }
+        }
+    };
+    let status = match child.try_wait() {
+        Ok(Some(status)) => status,
+        // still running with the read over (a backgrounded grandchild,
+        // or the read hit its cap): nothing of this run outlives us
+        Ok(None) => {
+            kill_group(child.id());
+            child
+                .wait()
+                .map_err(|err| format!("waiting failed: {err}"))?
+        }
+        Err(err) => return Err(format!("waiting failed: {err}")),
+    };
+    if !status.success() {
         // timeout kills with 124; the exit status is the useful part
-        return Err(format!("exited {}", output.status));
+        return Err(format!("exited {}", status));
     }
-    let read = parse_output(String::from_utf8_lossy(&output.stdout).as_ref());
+    let read = parse_output(String::from_utf8_lossy(&output).as_ref());
     if read.text.is_none() {
         // an empty read is a valid "nothing to show", but a source that
         // exits cleanly and prints nothing on every tick is more likely
@@ -414,6 +486,15 @@ fn run_widget_bounded(widget: &CustomWidget, secs: u32) -> Result<WidgetRead, St
 /// The real-budget wrapper the runner uses.
 fn run_widget(widget: &CustomWidget) -> Result<WidgetRead, String> {
     run_widget_bounded(widget, run_budget(widget.interval))
+}
+
+/// SIGKILL to a process group: the widget runner's guarantee that
+/// nothing it spawned outlives the run. `kill(-pgid)` fails harmlessly
+/// (ESRCH) when everything already exited.
+fn kill_group(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
 }
 
 /// The entity the bar and the settings page read: the discovery snapshot
@@ -464,6 +545,10 @@ impl CustomWidgets {
         };
         match Command::new("timeout")
             .args(["15", "sh", "-c", line])
+            // its output is the click line's business, not the shell's
+            // journal
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
         {
             Ok(child) => reap(child),
@@ -765,6 +850,36 @@ mod tests {
     }
 
     #[test]
+    fn a_hostile_interval_is_a_default_not_a_panic() {
+        // from_secs_f64 panicked on every of these once: nan, a negative,
+        // a number that overflows u64 seconds, all legal TOML floats
+        let dir = pool("intervals", |dir| {
+            write_widget(dir, "nan", "command = \"true\"\ninterval = nan\n");
+            write_widget(dir, "negative", "command = \"true\"\ninterval = -1.0\n");
+            write_widget(dir, "overflow", "command = \"true\"\ninterval = 1e300\n");
+            write_widget(dir, "sane", "command = \"true\"\ninterval = 30.5\n");
+        });
+        let widgets = discover(&dir, Path::new("/nonexistent"));
+        assert_eq!(widgets.len(), 4);
+        for id in ["nan", "negative", "overflow"] {
+            assert_eq!(find(&widgets, id).interval, DEFAULT_INTERVAL, "{id}");
+        }
+        assert_eq!(find(&widgets, "sane").interval, Duration::from_secs_f64(30.5));
+    }
+
+    #[test]
+    fn a_manifest_that_is_not_a_regular_file_is_a_rejection() {
+        let dir = pool("fifo", |dir| {
+            let path = write_widget(dir, "dirmaker", "command = \"true\"\n");
+            fs::remove_file(path.join("widget.toml")).unwrap();
+            // a FIFO here (the worse case: the read would block) reads
+            // the same rejection; a directory exercises the is_file gate
+            fs::create_dir(path.join("widget.toml")).unwrap();
+        });
+        assert!(discover(&dir, Path::new("/nonexistent")).is_empty());
+    }
+
+    #[test]
     fn one_broken_widget_does_not_sink_the_pool() {
         let dir = pool("broken", |dir| {
             write_widget(dir, "bad", "this is not = = toml");
@@ -874,6 +989,28 @@ mod tests {
         };
         let read = run_widget(&widget).unwrap();
         assert_eq!(read.text.as_deref(), Some("from sh"));
+    }
+
+    #[test]
+    fn a_pipe_holding_grandchild_does_not_wedge_the_run() {
+        // the direct child exits, its backgrounded sleep holds the
+        // stdout open: the old `.output()` blocked forever here
+        let widget = CustomWidget {
+            id: "bg".to_string(),
+            label: "bg".to_string(),
+            icon: None,
+            interval: Duration::from_secs(10),
+            click: None,
+            run: WidgetRun::Command("sleep 60 & echo hi".to_string()),
+            dir: PathBuf::from("/nonexistent"),
+        };
+        let started = std::time::Instant::now();
+        let read = run_widget_bounded(&widget, 2).unwrap();
+        assert_eq!(read.text.as_deref(), Some("hi"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the run must end at its deadline, not when the sleep does"
+        );
     }
 
     #[test]

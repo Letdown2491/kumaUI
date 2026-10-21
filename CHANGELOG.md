@@ -9,9 +9,35 @@ Changed and Fixed: patch). The version lines under a release heading
 name each binary's version in that release: an app whose line did not
 move rides unchanged.
 
-## Unreleased
-
-### Fixed
+- A widget manifest's `interval` can no longer crash the shell: nan,
+  a negative, or an overflowing value is a default interval, not a
+  panic on the main thread at boot or on re-discovery.
+- A widget's output run is bounded in memory as well as time: stdout
+  is capped at 64 KiB, and a source that backgrounds a pipe-holding
+  grandchild (`sleep 999 & echo hi`) is killed by process group at its
+  deadline instead of wedging the widget's updates forever.
+- A widget directory whose `widget.toml` is not a regular file (a
+  FIFO) or is abnormally large is a rejection, not a blocked or
+  byte-hungry discovery pass, and a widget's `click` line no longer
+  inherits the shell's stdout into the journal.
+- The msg socket is created owner-only (0600) instead of trusting the
+  runtime directory's permissions, the CLI client bounds its wait and
+  its reply line like the server bounds its peers, request lines are
+  serialized by serde (a URI with a raw control byte no longer tears
+  the line), and a connected-and-silent peer now costs a half-second
+  wait instead of two.
+- `bluetoothctl trust` joins its sibling verbs under `timeout`, so a
+  wedged bluetoothd cannot pin the Bluetooth panel busy forever; the
+  nostr mint CLI gets the same 15 s bound.
+- Weather and avatar downloads are size-capped (`--max-filesize`),
+  and the avatar is https-only: a broken mirror or a hostile profile
+  field can no longer stream gigabytes into memory or onto disk.
+- Night light's one-time `date +%z` read is bounded and no longer
+  panics on empty output.
+- Settings, the updates staged flag, and Koguma's state file are
+  written through a temp file and renamed into place: a crash or
+  power loss mid-write tears the temp file, never the config or state
+  the next launch restores from.
 
 - The lock screen no longer accepts any password when a PAM service's
   stack file exists but carries no `auth` rules (an empty or

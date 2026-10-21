@@ -184,18 +184,22 @@ fn local_hm() -> (u32, u32) {
 }
 
 /// The local UTC offset in minutes, east positive: `date +%z` once,
-/// cached. Calling out per minute-grain tick is nothing.
+/// cached. Bounded like every other subprocess read: a wedged `date`
+/// must cost the schedule one tick, not the feature.
 fn local_offset_minutes(_secs: u64) -> i32 {
     static OFFSET: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *OFFSET.get_or_init(|| {
-        std::process::Command::new("date")
-            .arg("+%z")
+        std::process::Command::new("timeout")
+            .args(["5", "date", "+%z"])
             .output()
             .ok()
             .and_then(|out| {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let text = text.trim();
-                let (sign, rest) = text.split_at(1);
+                // empty or odd output degrades to 0 (UTC): split_at(1)
+                // would panic on the empty case, and a panic in a
+                // OnceLock initializer kills the whole feature
+                let (sign, rest) = text.split_at_checked(1)?;
                 let hours: i32 = rest.get(..2)?.parse().ok()?;
                 let minutes: i32 = rest.get(2..4)?.parse().ok()?;
                 let magnitude = hours * 60 + minutes;

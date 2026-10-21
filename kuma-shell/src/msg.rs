@@ -102,13 +102,16 @@ fn reply(handled: bool) -> &'static str {
 /// The wire: `{"Key":"Value"}`, the shape the first verb shipped with,
 /// kept byte-compatible so the two CLI spellings (`kuma-shell
 /// launcher-toggle` and the noctalia-compatible `kuma-shell msg
-/// launcher-toggle`) keep working across this refactor.
+/// launcher-toggle`) keep working across this refactor. Serialization is
+/// serde's, not hand-escaped: a URI arriving over argv can carry raw
+/// control bytes, and a hand-rolled escape lets them tear the line.
 fn to_line(request: &Request) -> String {
-    format!(
-        "{{\"{}\":\"{}\"}}",
-        request.key(),
-        request.value().replace('\\', "\\\\").replace('"', "\\\"")
-    )
+    let mut map = serde_json::Map::new();
+    map.insert(
+        request.key().to_string(),
+        serde_json::Value::String(request.value()),
+    );
+    serde_json::Value::Object(map).to_string()
 }
 
 /// The same wire, read back. Case-insensitive on the key (the old
@@ -145,17 +148,21 @@ pub fn parse(line: &str) -> Option<Request> {
     }
 }
 
-/// The client half: connect, send one line, read the reply.
+/// The client half: connect, send one line, read the reply. Bounded like
+/// the server half, for the same reason mirrored: a wedged or bogus
+/// listener on the socket path must cost this CLI a wait, not a hang,
+/// and its reply line must not grow without bound.
 fn transmit(request: &Request) -> anyhow::Result<String> {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
     let path = std::path::PathBuf::from(runtime_dir).join("kuma-shell.sock");
     let stream = std::os::unix::net::UnixStream::connect(&path)
         .with_context(|| format!("is kuma-shell running? (connect to {path:?} failed)"))?;
+    let _ = stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
     let mut writer = &stream;
     writer.write_all(to_line(request).as_bytes())?;
     writer.write_all(b"\n")?;
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream).take(MAX_REQUEST_LINE);
     let mut reply_line = String::new();
     reader.read_line(&mut reply_line)?;
     Ok(reply_line)
@@ -175,8 +182,11 @@ pub fn send_quiet(request: &Request) -> anyhow::Result<()> {
 
 /// How long the listener waits for one peer's request line. The accept
 /// loop is single-threaded, so a peer that connects and sends nothing
-/// must cost a bounded wait, not the socket forever.
-const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// must cost a bounded wait, not the socket forever: every real client
+/// (the CLI, a keybind's spawn) writes within microseconds of connect,
+/// so the window is short. The socket is created owner-only; the 0700
+/// runtime dir is the usual guard, this is the enforced one.
+const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 /// How many bytes one request line may grow to. A peer that floods
 /// bytes without a newline hits this ceiling instead of growing the
 /// String without bound.
@@ -203,6 +213,7 @@ pub fn spawn_listener(txs: smol::channel::Sender<Request>) {
     };
     std::thread::spawn(move || {
         use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
 
         let path = std::path::PathBuf::from(runtime_dir).join("kuma-shell.sock");
         let _ = std::fs::remove_file(&path);
@@ -210,6 +221,10 @@ pub fn spawn_listener(txs: smol::channel::Sender<Request>) {
             log::error!("failed to bind IPC socket at {path:?}");
             return;
         };
+        // owner-only, enforced rather than assumed: the 0700 runtime dir
+        // usually covers it, and a session started oddly should not hand
+        // the toggle verbs to other local accounts
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let mut writer = &stream;
@@ -293,6 +308,17 @@ mod tests {
         // launcher semantics: the same press that opened closes
         assert_eq!(parse(&to_line(&Request::Settings)), Some(Request::Settings));
         assert_eq!(to_line(&Request::Settings), "{\"Settings\":\"Toggle\"}");
+    }
+
+    #[test]
+    fn control_bytes_in_a_uri_serialize_as_json_not_as_line_noise() {
+        // a raw newline (legal in argv) used to escape the hand-rolled
+        // way as an unescaped control byte, and serde on the server
+        // dropped the request as malformed
+        let uri = "nostr://ab\ned".to_string();
+        let line = to_line(&Request::Nostr(uri.clone()));
+        assert!(!line.contains('\n'));
+        assert_eq!(parse(&line), Some(Request::Nostr(uri)));
     }
 
     #[test]
