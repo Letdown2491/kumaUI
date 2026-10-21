@@ -389,7 +389,13 @@ impl ShellBar {
         let niri = self.niri.read(cx);
         let focused_output = niri.focused_output().unwrap_or_default().to_owned();
         let sysmon = self.sysmon.read(cx);
-        match widget.kind {
+        // the built-ins' arms all read the kind: extract it once, and a
+        // custom placement hands off to its own arm
+        let kind: WidgetKind = match widget.kind.builtin() {
+            Some(kind) => kind,
+            None => return None,
+        };
+        match kind {
             WidgetKind::Workspaces => {
                 let workspaces: Vec<WorkspaceItem> = niri
                     .workspaces_on(&focused_output)
@@ -443,7 +449,7 @@ impl ShellBar {
                     WidgetMode::Icon => None,
                 };
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     text,
                     crate::theme::current().text,
@@ -483,7 +489,7 @@ impl ShellBar {
                         }
                         lines.join("\n").into()
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -503,7 +509,7 @@ impl ShellBar {
                     format!("{}%", volume.percent)
                 };
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     Some(text),
                     if muted { crate::theme::URGENT } else { crate::theme::current().text },
@@ -512,7 +518,7 @@ impl ShellBar {
                         Some(volume) => format!("Volume: {}%", volume.percent).into(),
                         None => "Volume unknown".into(),
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -536,7 +542,7 @@ impl ShellBar {
             }),
             WidgetKind::Brightness => sysmon.brightness.map(|brightness| {
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     Some(format!("{}%", brightness.percent)),
                     crate::theme::current().text,
@@ -544,7 +550,7 @@ impl ShellBar {
                         let percent = sysmon.brightness.map(|b| b.percent).unwrap_or(0);
                         format!("Brightness: {percent}%").into()
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -577,7 +583,7 @@ impl ShellBar {
                     WidgetMode::Icon => None,
                 };
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     text,
                     crate::theme::current().text,
@@ -590,7 +596,7 @@ impl ShellBar {
                         .into(),
                         None => "Memory unknown".into(),
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -612,7 +618,7 @@ impl ShellBar {
                     WidgetMode::Icon => None,
                 };
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     text,
                     color,
@@ -620,7 +626,7 @@ impl ShellBar {
                         Some(temp) => format!("CPU temperature: {temp}°C").into(),
                         None => "CPU temperature unknown".into(),
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -640,7 +646,7 @@ impl ShellBar {
                     WidgetMode::Icon => None,
                 };
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     text,
                     if percent >= 90 { crate::theme::URGENT } else { crate::theme::current().text },
@@ -654,7 +660,7 @@ impl ShellBar {
                         .into(),
                         None => "Disk unknown".into(),
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -674,7 +680,7 @@ impl ShellBar {
                     format!("{}%", mic.percent)
                 };
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     Some(text),
                     if muted { crate::theme::URGENT } else { crate::theme::current().text },
@@ -683,7 +689,7 @@ impl ShellBar {
                         Some(mic) => format!("Microphone: {}%", mic.percent).into(),
                         None => "Microphone unknown".into(),
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -698,7 +704,7 @@ impl ShellBar {
             WidgetKind::PowerProfile => sysmon.power_profile.map(|profile| {
                 let label = profile.title();
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     Some(label.to_string()),
                     if profile == crate::sysmon::PowerProfile::Performance {
@@ -712,7 +718,7 @@ impl ShellBar {
                         }
                         None => "Power profile unknown".into(),
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -740,7 +746,7 @@ impl ShellBar {
                     Playback::Paused | Playback::Stopped => crate::theme::current().text_dim,
                 };
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     Some(text),
                     color,
@@ -763,7 +769,7 @@ impl ShellBar {
                             Playback::Stopped => format!("Stopped: {text}").into(),
                         }
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -793,7 +799,7 @@ impl ShellBar {
                     battery.percent
                 );
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     Some(text),
                     if low { crate::theme::URGENT } else { crate::theme::current().text },
@@ -865,7 +871,7 @@ impl ShellBar {
                 let settings_entity = self.settings.clone();
                 Some(
                     sys_widget(
-                        widget.kind,
+                        kind,
                         widget.mode,
                         text,
                         color,
@@ -908,12 +914,12 @@ impl ShellBar {
                 let date = Local::now().format("%A, %B %e").to_string();
                 Some(
                     sys_widget(
-                        widget.kind,
+                        kind,
                         widget.mode,
                         Some(self.clock.clone()),
                         crate::theme::current().text,
                         move |_: &SysMon, _| date.clone().into(),
-                        widget_icon(widget.kind),
+                        widget_icon(kind),
                         tooltips_on,
                         self.sysmon.clone(),
                     None,
@@ -936,7 +942,7 @@ impl ShellBar {
                     (crate::theme::current().accent, Some(connected.len().to_string()))
                 };
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     text,
                     color,
@@ -960,7 +966,7 @@ impl ShellBar {
                             }
                         }
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -985,7 +991,7 @@ impl ShellBar {
                     None
                 };
                 sys_widget(
-                    widget.kind,
+                    kind,
                     widget.mode,
                     text,
                     if net.online { crate::theme::current().text } else { crate::theme::URGENT },
@@ -1001,7 +1007,7 @@ impl ShellBar {
                             "Ethernet: connected".into()
                         }
                     },
-                    widget_icon(widget.kind),
+                    widget_icon(kind),
                     tooltips_on,
                     self.sysmon.clone(),
                     None,
@@ -1063,12 +1069,12 @@ impl ShellBar {
                 };
                 Some(
                     sys_widget(
-                        widget.kind,
+                        kind,
                         widget.mode,
                         text,
                         color,
                         tooltip,
-                        widget_icon(widget.kind),
+                        widget_icon(kind),
                         tooltips_on,
                         self.sysmon.clone(),
                     None,
@@ -1094,12 +1100,12 @@ impl ShellBar {
                 };
                 Some(
                     sys_widget(
-                        widget.kind,
+                        kind,
                         widget.mode,
                         text,
                         color,
                         tooltip,
-                        widget_icon(widget.kind),
+                        widget_icon(kind),
                         tooltips_on,
                         self.sysmon.clone(),
                     None,

@@ -226,7 +226,7 @@ fn os_release_name(content: &str) -> Option<String> {
 /// where it came from.
 #[derive(Clone)]
 struct WidgetDrag {
-    kind: crate::settings::WidgetKind,
+    kind: crate::settings::WidgetRef,
     from: Section,
     index: usize,
 }
@@ -2330,7 +2330,8 @@ impl SettingsView {
         kind: crate::settings::WidgetKind,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
-        let position = self.settings.read(cx).position(kind);
+        let reference = crate::settings::WidgetRef::Builtin(kind);
+        let position = self.settings.read(cx).position(&reference);
         let enabled = position.is_some();
         let mode = position.map(|(section, index)| {
             (
@@ -2377,9 +2378,14 @@ impl SettingsView {
                     .child(crate::controls::toggle_switch(enabled))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.settings
-                            .update(cx, |settings, cx| match settings.position(kind) {
-                                Some((section, index)) => settings.remove(section, index, cx),
-                                None => settings.add(kind, cx),
+                            .update(cx, |settings, cx| {
+                                let reference = crate::settings::WidgetRef::Builtin(kind);
+                                match settings.position(&reference) {
+                                    Some((section, index)) => {
+                                        settings.remove(section, index, cx)
+                                    }
+                                    None => settings.add(reference, cx),
+                                }
                             });
                     })),
             )
@@ -2462,7 +2468,7 @@ impl SettingsView {
                             items.push(self.drop_line().into_any_element());
                         }
                         items.push(
-                            self.widget_chip(section, index, widget.kind, cx)
+                            self.widget_chip(section, index, widget.kind.clone(), cx)
                                 .into_any_element(),
                         );
                         items
@@ -2507,7 +2513,7 @@ impl SettingsView {
         &self,
         section: Section,
         index: usize,
-        kind: crate::settings::WidgetKind,
+        kind: crate::settings::WidgetRef,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<Div> {
         let tag = |name: &str| format!("{name}-{section:?}-{index}");

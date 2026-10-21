@@ -203,9 +203,60 @@ impl WidgetMode {
     }
 }
 
+/// What a placement names: a built-in kind or a user-made widget's id.
+/// Untagged so an existing config's `kind = "volume"` parses exactly as
+/// before and round-trips byte-identical; a string that is no built-in's
+/// name lands as a custom id. The widget registry rejects a user-made
+/// stem that names a built-in, so the two variants never fight over a
+/// name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WidgetRef {
+    Builtin(WidgetKind),
+    Custom(String),
+}
+
+impl WidgetRef {
+    /// The built-in kind, when this placement names one.
+    pub fn builtin(&self) -> Option<WidgetKind> {
+        match self {
+            WidgetRef::Builtin(kind) => Some(*kind),
+            WidgetRef::Custom(_) => None,
+        }
+    }
+
+    /// The user-made widget's id, when this placement names one.
+    pub fn custom(&self) -> Option<&str> {
+        match self {
+            WidgetRef::Custom(id) => Some(id.as_str()),
+            WidgetRef::Builtin(_) => None,
+        }
+    }
+
+    /// The stable identity string for element ids: distinct across the
+    /// two variants even if a custom id looked like a Debug form.
+    pub fn key(&self) -> String {
+        match self {
+            WidgetRef::Builtin(kind) => format!("{kind:?}"),
+            WidgetRef::Custom(id) => format!("custom-{id}"),
+        }
+    }
+
+    /// The display name. A custom widget's manifest label arrives with
+    /// the discovery snapshot at the call site when it matters; the id
+    /// is the honest fallback for a placement whose widget is not
+    /// installed.
+    pub fn label(&self) -> String {
+        match self {
+            WidgetRef::Builtin(kind) => kind.label().to_string(),
+            WidgetRef::Custom(id) => id.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WidgetConfig {
-    pub kind: WidgetKind,
+    pub kind: WidgetRef,
     #[serde(default)]
     pub mode: WidgetMode,
 }
@@ -844,13 +895,13 @@ impl Default for Settings {
     fn default() -> Self {
         fn widget(kind: WidgetKind) -> WidgetConfig {
             WidgetConfig {
-                kind,
+                kind: WidgetRef::Builtin(kind),
                 mode: WidgetMode::default(),
             }
         }
         fn icon(kind: WidgetKind) -> WidgetConfig {
             WidgetConfig {
-                kind,
+                kind: WidgetRef::Builtin(kind),
                 mode: WidgetMode::Icon,
             }
         }
@@ -875,7 +926,7 @@ impl Default for Settings {
                 },
                 left: vec![widget(WidgetKind::Apps), widget(WidgetKind::Workspaces)],
                 center: vec![WidgetConfig {
-                    kind: WidgetKind::Clock,
+                    kind: WidgetRef::Builtin(WidgetKind::Clock),
                     mode: WidgetMode::Text,
                 }],
                 right: vec![
@@ -1044,14 +1095,14 @@ impl Settings {
         false
     }
 
-    pub fn add(&mut self, kind: WidgetKind, cx: &mut Context<Self>) {
+    pub fn add(&mut self, kind: WidgetRef, cx: &mut Context<Self>) {
         if self.add_impl(kind) {
             self.commit(cx);
         }
     }
 
-    fn add_impl(&mut self, kind: WidgetKind) -> bool {
-        if self.is_present(kind) {
+    fn add_impl(&mut self, kind: WidgetRef) -> bool {
+        if self.is_present(&kind) {
             return false;
         }
         self.widgets_mut(Section::Right).push(WidgetConfig {
@@ -1061,11 +1112,11 @@ impl Settings {
         true
     }
 
-    pub fn is_present(&self, kind: WidgetKind) -> bool {
+    pub fn is_present(&self, kind: &WidgetRef) -> bool {
         SECTIONS.iter().any(|&section| {
             self.widgets(section)
                 .iter()
-                .any(|widget| widget.kind == kind)
+                .any(|widget| widget.kind == *kind)
         })
     }
 
@@ -1073,17 +1124,17 @@ impl Settings {
         WIDGETS
             .iter()
             .map(|spec| spec.kind)
-            .filter(|kind| !self.is_present(*kind))
+            .filter(|kind| !self.is_present(&WidgetRef::Builtin(*kind)))
             .collect()
     }
 
-    /// Where a kind sits on the bar, if it does: the widgets page's
+    /// Where a placement sits on the bar, if it does: the widgets page's
     /// enabled rows consult this for their mode control.
-    pub fn position(&self, kind: WidgetKind) -> Option<(Section, usize)> {
+    pub fn position(&self, kind: &WidgetRef) -> Option<(Section, usize)> {
         SECTIONS.iter().find_map(|&section| {
             self.widgets(section)
                 .iter()
-                .position(|widget| widget.kind == kind)
+                .position(|widget| widget.kind == *kind)
                 .map(|index| (section, index))
         })
     }
@@ -1450,8 +1501,8 @@ mod tests {
         // left: [Apps, Workspaces, ...]; center: [Clock]
         assert!(settings.move_widget_impl(Section::Left, 0, Section::Center, 0));
         assert_eq!(settings.widgets(Section::Left).len(), 1);
-        assert_eq!(settings.widgets(Section::Left)[0].kind, WidgetKind::Workspaces);
-        assert_eq!(settings.widgets(Section::Center)[0].kind, WidgetKind::Apps);
+        assert_eq!(settings.widgets(Section::Left)[0].kind, WidgetRef::Builtin(WidgetKind::Workspaces));
+        assert_eq!(settings.widgets(Section::Center)[0].kind, WidgetRef::Builtin(WidgetKind::Apps));
 
         // within a section: dropping two chips down moves past one;
         // dropping on the immediately next chip would be a no-op
@@ -1459,9 +1510,9 @@ mod tests {
         assert!(settings.move_widget_impl(Section::Right, 0, Section::Right, 2));
         assert_eq!(
             settings.widgets(Section::Right)[0].kind,
-            WidgetKind::Notifications
+            WidgetRef::Builtin(WidgetKind::Notifications)
         );
-        assert_eq!(settings.widgets(Section::Right)[1].kind, WidgetKind::Tray);
+        assert_eq!(settings.widgets(Section::Right)[1].kind, WidgetRef::Builtin(WidgetKind::Tray));
 
         // out-of-bounds source does nothing
         assert!(!settings.move_widget_impl(Section::Left, 5, Section::Right, 0));
@@ -1475,27 +1526,76 @@ mod tests {
         assert!(!settings.move_widget_impl(Section::Right, 1, Section::Right, 2));
         // a real same-section move still works
         assert!(settings.move_widget_impl(Section::Right, 0, Section::Right, 3));
-        assert_eq!(settings.widgets(Section::Right)[2].kind, WidgetKind::Tray);
+        assert_eq!(settings.widgets(Section::Right)[2].kind, WidgetRef::Builtin(WidgetKind::Tray));
     }
 
     #[test]
     fn remove_and_add_round_trip() {
         let mut settings = Settings::default();
         assert!(settings.remove_impl(Section::Right, 0)); // Tray
-        assert!(!settings.is_present(WidgetKind::Tray));
+        assert!(!settings.is_present(&WidgetRef::Builtin(WidgetKind::Tray)));
         assert!(settings.missing_kinds().contains(&WidgetKind::Tray));
 
-        assert!(settings.add_impl(WidgetKind::Tray));
-        assert!(settings.is_present(WidgetKind::Tray));
+        assert!(settings.add_impl(WidgetRef::Builtin(WidgetKind::Tray)));
+        assert!(settings.is_present(&WidgetRef::Builtin(WidgetKind::Tray)));
         // adding a present widget is a no-op
-        assert!(!settings.add_impl(WidgetKind::Tray));
+        assert!(!settings.add_impl(WidgetRef::Builtin(WidgetKind::Tray)));
         assert_eq!(
             settings
                 .widgets(Section::Right)
                 .iter()
-                .filter(|w| w.kind == WidgetKind::Tray)
+                .filter(|w| w.kind == WidgetRef::Builtin(WidgetKind::Tray))
                 .count(),
             1
+        );
+        // the same rule for a user-made widget: the ref, not the enum
+        let custom = WidgetRef::Custom("weather-station".to_string());
+        assert!(settings.add_impl(custom.clone()));
+        assert!(settings.is_present(&custom));
+        assert!(!settings.add_impl(custom.clone()));
+        // adds append to Right's end: remove the custom from there
+        let last = settings.widgets(Section::Right).len() - 1;
+        assert!(settings.remove_impl(Section::Right, last));
+        assert!(!settings.is_present(&custom));
+    }
+
+    #[test]
+    fn a_custom_placement_round_trips_and_survives_uninstalled() {
+        // a config naming a user-made widget: it parses as a custom ref,
+        // serializes back unchanged, and survives a default-less round
+        // trip even though no such widget is discovered (a placement
+        // naming an uninstalled widget is inert, never dropped)
+        let config = "\
+[[bar.right]]
+kind = \"weather-station\"
+mode = \"text\"
+
+[[bar.right]]
+kind = \"volume\"
+";
+        let settings: Settings = toml::from_str(config).unwrap();
+        let right = settings.widgets(Section::Right);
+        assert_eq!(right[0].kind.custom(), Some("weather-station"));
+        assert_eq!(right[0].mode, WidgetMode::Text);
+        assert_eq!(right[1].kind.builtin(), Some(WidgetKind::Volume));
+
+        // the round trip is byte-stable: the built-in spelling did not
+        // grow annotations, the custom spelling did not become an enum
+        let out = toml::to_string_pretty(&settings.bar).unwrap();
+        assert!(out.contains("kind = \"weather-station\""), "{out}");
+        assert!(out.contains("kind = \"volume\""), "{out}");
+    }
+
+    #[test]
+    fn an_ungrouped_kind_string_cannot_shadow_a_builtin() {
+        // a user-made widget may not take a built-in's name (the widget
+        // registry rejects the stem), so a ref that parses as a built-in
+        // always is one: the custom variant never wins the parse
+        let settings: Settings =
+            toml::from_str("[[bar.right]]\nkind = \"volume\"\n").unwrap();
+        assert_eq!(
+            settings.widgets(Section::Right)[0].kind,
+            WidgetRef::Builtin(WidgetKind::Volume)
         );
     }
 
