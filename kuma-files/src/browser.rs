@@ -413,8 +413,15 @@ impl Op {
                 }
                 if from.is_dir() {
                     copy_dir_all(from, to).map_err(|err| format!("copy: {err}"))?;
-                } else {
+                } else if from.is_file() {
                     fs::copy(from, to).map_err(|err| format!("copy: {err}"))?;
+                } else {
+                    // a FIFO or device file: reading it could block
+                    // forever with no writer, wedging the whole queue
+                    return Err(format!(
+                        "copy: {} is not a regular file",
+                        from.display()
+                    ));
                 }
                 Ok(Some(Op::Remove {
                     path: to.clone(),
@@ -426,13 +433,35 @@ impl Op {
                     if !replace {
                         return Err(format!("{} already exists", to.display()));
                     }
-                    // rename will not replace, so clear the way first
-                    let removed = if to.is_dir() {
-                        fs::remove_dir_all(to)
+                    // rename will not replace, so the target steps aside
+                    // first: across filesystems the rename below can fail
+                    // (EXDEV) with the queue's work already done, and a
+                    // destroyed destination on a failed move is data
+                    // loss, not an error message
+                    let aside = move_aside_path(to);
+                    fs::rename(to, &aside).map_err(|err| format!("move: {err}"))?;
+                    if let Err(err) = fs::rename(from, to) {
+                        // the move failed: the destination goes back
+                        let restore = fs::rename(&aside, to);
+                        return Err(format!(
+                            "move: {err}{}",
+                            restore.err().map(|e| format!(" (the old target could not be restored: {e})")).unwrap_or_default()
+                        ));
+                    }
+                    // the aside copy is the old target, replaced: garbage
+                    let cleanup = if aside.is_dir() {
+                        fs::remove_dir_all(&aside)
                     } else {
-                        fs::remove_file(to)
+                        fs::remove_file(&aside)
                     };
-                    removed.map_err(|err| format!("move: {err}"))?;
+                    if let Err(err) = cleanup {
+                        log::info!("move: clearing the replaced target failed: {err}");
+                    }
+                    return Ok(Some(Op::Move {
+                        from: to.clone(),
+                        to: from.clone(),
+                        replace: false,
+                    }));
                 }
                 fs::rename(from, to).map_err(|err| format!("move: {err}"))?;
                 Ok(Some(Op::Move {
@@ -613,6 +642,9 @@ impl Op {
                 .arg(ARCHIVE_TIMEOUT_SECS)
                 .arg("file-roller")
                 .arg(format!("--add-to={}", archive.display()))
+                // stop option parsing: a selection named like a flag
+                // (-foo, from a downloaded archive) rides as a file
+                .arg("--")
                 .args(&files)
                 .output()
         } else {
@@ -631,6 +663,9 @@ impl Op {
                 .arg("tar")
                 .arg("-czf")
                 .arg(archive.file_name().unwrap_or_default())
+                // a basename beginning with `-` is otherwise tar's, not
+                // ours: argument injection from a filename
+                .arg("--")
                 .args(basenames)
                 .current_dir(&dir)
                 .output()
@@ -641,6 +676,9 @@ impl Op {
                 Ok(None)
             }
             Ok(out) => {
+                // a half-written archive is garbage, and it would poison
+                // every retry with "already exists": clear it
+                let _ = fs::remove_file(&archive);
                 let noise = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 log::info!("compress: tool failed: {noise}");
                 Err(if noise.is_empty() {
@@ -649,23 +687,71 @@ impl Op {
                     format!("compress: {noise}")
                 })
             }
-            Err(err) => Err(format!("compress: {err}")),
+            Err(err) => {
+                let _ = fs::remove_file(&archive);
+                Err(format!("compress: {err}"))
+            }
         }
     }
 }
 
 fn copy_dir_all(from: &Path, to: &Path) -> io::Result<()> {
+    copy_dir_all_bounded(from, to, 0)
+}
+
+/// A real directory tree is shallower than any path limit; a bind-mount
+/// cycle is not. The cap turns a cycle into an honest error instead of
+/// a stack overflow.
+const COPY_DEPTH_CAP: usize = 128;
+
+fn copy_dir_all_bounded(from: &Path, to: &Path, depth: usize) -> io::Result<()> {
+    if depth > COPY_DEPTH_CAP {
+        return Err(io::Error::other("directory tree too deep (a mount cycle?)"));
+    }
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
+            copy_dir_all_bounded(&entry.path(), &target, depth + 1)?;
         } else {
             fs::copy(entry.path(), &target)?;
         }
     }
     Ok(())
+}
+
+/// The state file lands as one atomic rename: a crash or power loss
+/// mid-write must tear the temp file, never the state the next launch
+/// restores from.
+fn write_state_atomically(path: PathBuf, text: String) {
+    let tmp = path.with_extension("tmp");
+    if let Err(err) = fs::write(&tmp, text) {
+        log::error!("save state: {err}");
+        return;
+    }
+    if let Err(err) = fs::rename(&tmp, &path) {
+        log::error!("save state: {err}");
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// Where an existing target steps aside during a replace-move: its own
+/// directory, a pid-tagged name nothing else picks, bumped until free.
+fn move_aside_path(to: &Path) -> PathBuf {
+    let name = to
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("target")
+        .to_string();
+    let pid = std::process::id();
+    let mut aside = to.with_file_name(format!("{name}.kuma-old-{pid}"));
+    let mut bump = 0;
+    while aside.exists() {
+        bump += 1;
+        aside = to.with_file_name(format!("{name}.kuma-old-{pid}-{bump}"));
+    }
+    aside
 }
 
 struct Place {
@@ -3098,18 +3184,22 @@ impl Browser {
             let update = this.update(cx, |this, cx| {
                 this.busy = false;
                 this.progress.clear();
+                // the inverses of what succeeded are kept even on
+                // failure: the three files a five-file paste moved
+                // before the conflict happened are real moves, and
+                // undo must know about them
+                this.undo.extend(undo);
+                // a session of big pastes would grow this
+                // forever; past the cap the oldest steps
+                // stop being undoable
+                if this.undo.len() > UNDO_MAX_OPS {
+                    let drop = this.undo.len() - UNDO_MAX_OPS;
+                    this.undo.drain(..drop);
+                }
                 match failure {
                     Some(err) => this.status = err,
-                    None if !undo.is_empty() => {
+                    None if !this.undo.is_empty() => {
                         this.status = "done; Ctrl+Z to undo".into();
-                        this.undo.extend(undo);
-                        // a session of big pastes would grow this
-                        // forever; past the cap the oldest steps
-                        // stop being undoable
-                        if this.undo.len() > UNDO_MAX_OPS {
-                            let drop = this.undo.len() - UNDO_MAX_OPS;
-                            this.undo.drain(..drop);
-                        }
                     }
                     None => {}
                 }
@@ -3547,8 +3637,11 @@ impl Browser {
         cx.spawn(async move |this, cx| {
             let done = cx
                 .background_spawn(async move {
-                    std::process::Command::new("gio")
-                        .args(["mount", "-u"])
+                    // bounded: unmounting against a dead NFS/SMB server
+                    // can hang gio, and the hang would leave the status
+                    // line silent forever
+                    std::process::Command::new("timeout")
+                        .args(["30", "gio", "mount", "-u"])
                         .arg(&mount)
                         .output()
                 })
@@ -4268,16 +4361,24 @@ impl Browser {
         let mut text = text;
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Some(dir) = tab.current_dir() {
+                // the file is line-based key=value: a path with a raw
+                // newline (legal on Linux) would tear the record and
+                // silently lose the tail on the next load, so the tab
+                // is not remembered rather than remembered wrong
+                if dir.display().to_string().contains('\n') {
+                    continue;
+                }
                 text.push_str(&format!("tab{}={}\n", i, dir.display()));
             }
         }
         for (i, path) in self.place_order.iter().enumerate() {
+            if path.display().to_string().contains('\n') {
+                continue;
+            }
             text.push_str(&format!("place{}={}\n", i, path.display()));
         }
         text.push_str(&format!("active={}\n", self.active));
-        if let Err(err) = fs::write(path, text) {
-            log::error!("save state: {err}");
-        }
+        write_state_atomically(path, text);
     }
 
     /// Shift+Delete in a directory view: skip the trash entirely. Same

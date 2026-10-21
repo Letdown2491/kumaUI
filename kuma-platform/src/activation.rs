@@ -7,6 +7,7 @@
 //! refused removes the file and rebinds.
 
 use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
 /// The activation socket's path, keyed by app id: the session runtime
@@ -46,6 +47,11 @@ fn become_single_instance_in(
     let _ = std::fs::remove_file(&path);
     match std::os::unix::net::UnixListener::bind(&path) {
         Ok(listener) => {
+            // owner-only, enforced rather than assumed: in the runtime
+            // dir the 0700 parent already covers it, and in the /tmp
+            // fallback the umask's default (world-connectable) would
+            // hand single-instance control to any local account
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
             log::info!("single instance: listening on {}", path.display());
             Some(listener)
         }

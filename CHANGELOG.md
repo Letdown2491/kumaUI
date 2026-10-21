@@ -9,6 +9,35 @@ Changed and Fixed: patch). The version lines under a release heading
 name each binary's version in that release: an app whose line did not
 move rides unchanged.
 
+## Unreleased
+
+### Fixed
+
+- A Koguma move that replaces its target no longer destroys the
+  destination before the move is guaranteed: the old target steps
+  aside and comes back if the rename fails (a cross-filesystem move
+  used to report failure with the destination already gone).
+- A Koguma paste that fails partway keeps the undo records of the
+  steps that did complete, so the files moved before the conflict
+  stay undoable.
+- Koguma's compress passes file names after `--` for both tar and
+  file-roller, so a downloaded file named like a flag (`-foo`) is
+  archived as a file instead of being parsed as an option, and a
+  failed compress removes the partial archive that would have made
+  every retry fail on "already exists".
+- Copying a FIFO or other non-regular file is an honest error instead
+  of a queue wedged forever on a read with no writer, and a directory
+  copy into a mount cycle stops at a depth cap instead of overflowing
+  the stack.
+- Koguma's unmount (`gio mount -u`) is bounded at 30 s, so a dead
+  network mount costs a status message instead of a silent wait.
+- The single-instance activation socket is created owner-only
+  (0600): with no `XDG_RUNTIME_DIR` the `/tmp` fallback used to
+  leave it world-connectable.
+- Koguma skips paths containing raw newlines when saving its state
+  (the line-based format used to tear such a record and silently drop
+  the tab on the next launch).
+
 - A widget manifest's `interval` can no longer crash the shell: nan,
   a negative, or an overflowing value is a default interval, not a
   panic on the main thread at boot or on re-discovery.
@@ -38,7 +67,6 @@ move rides unchanged.
   written through a temp file and renamed into place: a crash or
   power loss mid-write tears the temp file, never the config or state
   the next launch restores from.
-
 - The lock screen no longer accepts any password when a PAM service's
   stack file exists but carries no `auth` rules (an empty or
   comment-only `/etc/pam.d/kuma-lock` from a truncated deploy is an
