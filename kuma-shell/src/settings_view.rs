@@ -231,6 +231,14 @@ struct WidgetDrag {
     index: usize,
 }
 
+/// One widgets-page row: customs and built-ins render beside each
+/// other, an uninstalled placement dimmed in its alphabetical place.
+enum WidgetRow {
+    Builtin(crate::settings::WidgetKind),
+    Custom(crate::widgets::CustomWidget),
+    Inert(String),
+}
+
 /// What follows the cursor during a widget drag: the widget's name.
 struct WidgetDragGhost {
     label: String,
@@ -2311,46 +2319,27 @@ impl SettingsView {
         }
     }
 
-    /// The widgets page: every registered kind, one row each in
-    /// alphabetical order. The switch is the bar: on means it renders,
-    /// off means it waits in reserve; the mode pills choose how an
-    /// enabled one presents.
+    /// The widgets page: one row per widget, customs beside built-ins in
+    /// one alphabetical list, an inert placement (naming a widget that
+    /// is not installed) riding dimmed in its place. The switch is the
+    /// bar: on means it renders, off means it waits in reserve; the
+    /// mode pills choose how an enabled one presents. The pool (shipped,
+    /// not yet installed) keeps its own stretch at the bottom, because
+    /// its action is install rather than toggle, and it empties as the
+    /// user installs.
     fn widgets_page(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
-        let mut kinds: Vec<crate::settings::WidgetKind> = crate::settings::WIDGETS
+        let mut rows: Vec<(String, WidgetRow)> = crate::settings::WIDGETS
             .iter()
-            .map(|spec| spec.kind)
+            .map(|spec| (spec.kind.label().to_lowercase(), WidgetRow::Builtin(spec.kind)))
             .collect();
-        kinds.sort_by_key(|kind| kind.label().to_lowercase());
-        div()
-            .id("page-widgets")
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .overflow_y_scroll()
-            .children(kinds.iter().map(|&kind| self.widget_row(kind, cx)))
-            .child(self.custom_widget_section(cx))
-    }
-
-    /// The user-made widgets' section: the installed ones as full rows
-    /// (placement toggle and mode pills, the same single toggle the
-    /// built-ins use), the pool's stock widgets as install rows, and
-    /// the config's inert placements (naming a widget that is not
-    /// installed) as dimmed rows that only offer removal. Hidden
-    /// entirely while there is nothing of any of the three.
-    fn custom_widget_section(&self, cx: &mut Context<Self>) -> Div {
-        // the snapshot is cloned out first: the guards read cx, the
-        // rows build through it
-        let (installed, pool, placed_unknown) = {
+        let (pool, placed_unknown) = {
             let state = self.widgets.read(cx);
             let user = crate::widgets::user_dir();
-            let installed: Vec<crate::widgets::CustomWidget> = state
-                .widgets()
-                .iter()
-                .filter(|w| w.dir.starts_with(&user))
-                .cloned()
-                .collect();
+            for w in state.widgets() {
+                if w.dir.starts_with(&user) {
+                    rows.push((w.label.to_lowercase(), WidgetRow::Custom(w.clone())));
+                }
+            }
             let pool: Vec<crate::widgets::CustomWidget> = state
                 .widgets()
                 .iter()
@@ -2368,19 +2357,32 @@ impl SettingsView {
                 })
                 .filter(|id| !state.widgets().iter().any(|w| w.id == *id))
                 .collect();
-            (installed, pool, placed_unknown)
+            (pool, placed_unknown)
         };
-        if installed.is_empty() && pool.is_empty() && placed_unknown.is_empty() {
-            return div();
-        }
+        rows.extend(
+            placed_unknown
+                .into_iter()
+                .map(|id| (id.to_lowercase(), WidgetRow::Inert(id))),
+        );
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
         div()
+            .id("page-widgets")
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_col()
             .gap_2()
-            .child(self.section_header("User-made widgets".to_string()))
-            .children(installed.iter().map(|w| self.custom_row(w, cx)))
-            .children(placed_unknown.iter().map(|id| self.inert_row(id, cx)))
-            .children(pool.iter().map(|w| self.pool_row(w, cx)))
+            .overflow_y_scroll()
+            .children(rows.iter().map(|(_, row)| match row {
+                WidgetRow::Builtin(kind) => self.widget_row(*kind, cx),
+                WidgetRow::Custom(manifest) => self.custom_row(manifest, cx),
+                WidgetRow::Inert(id) => self.inert_row(id, cx),
+            }))
+            .when(!pool.is_empty(), |el| {
+                el.child(self.section_header("Available to install".to_string())).children(
+                    pool.iter().map(|w| self.pool_row(w, cx)),
+                )
+            })
     }
 
     /// An installed custom widget's row: the manifest's icon (or the

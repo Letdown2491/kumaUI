@@ -19,7 +19,8 @@ move rides unchanged.
 - **User-made widgets.** The bar learns scripts: a widget is a
   directory (`widget.toml` plus the scripts and icons it names),
   dropped into `~/.config/kuma-shell/widgets/` or installed from the
-  system pool by the settings page's new User-made widgets section.
+  system pool by the settings page's Available-to-install section.
+  Customs list beside the built-ins, same toggle, same pills.
   Plain-text stdout is the label, the Waybar custom-module JSON
   (`text`, `tooltip`, `class`) is the upgrade path, empty output hides
   the widget; `interval` and a `click` line live in the manifest, and
