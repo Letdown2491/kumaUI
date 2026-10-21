@@ -31,6 +31,7 @@ pub mod sysmon;
 pub mod night_light;
 pub mod palette;
 pub mod greeter;
+pub mod widgets;
 pub mod theme;
 pub mod tray;
 pub mod wallpaper;
