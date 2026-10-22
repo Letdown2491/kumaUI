@@ -10,11 +10,24 @@ use std::path::Path;
 /// loads as defaults, and the next save would seal the loss, so the
 /// record is replaced whole or not at all; a failed rename removes
 /// the temp file instead of littering.
+///
+/// Two promises on top of the rename: the bytes are fsynced first
+/// (ext4's delayed allocation otherwise lets a power cut land the
+/// rename on a record that never made it to disk), and the record
+/// lands 0600 (these files carry where you are and what you browse;
+/// there is no reader that needs group or other). The rename keeps
+/// the temp file's permissions, so the mode is set on the temp before
+/// the move.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
-    std::fs::write(&tmp, bytes)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -100,6 +113,29 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "replaced = true\n"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_record_lands_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("kuma-write-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record.toml");
+
+        write_atomic(&path, b"private = true\n").expect("the write lands");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // a pre-existing wider record tightens too: the rename
+        // replaces the file, so the old mode does not survive it
+        std::fs::write(&path, "loose = true\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&path, b"tightened = true\n").expect("the rewrite lands");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -772,18 +772,13 @@ fn copy_dir_all_bounded(from: &Path, to: &Path, depth: usize) -> io::Result<()> 
     Ok(())
 }
 
-/// The state file lands as one atomic rename: a crash or power loss
-/// mid-write must tear the temp file, never the state the next launch
-/// restores from.
+/// The state file lands through the platform's atomic write: one
+/// rename, the bytes fsynced first, the record 0600. A crash or power
+/// loss mid-write must tear the temp file, never the state the next
+/// launch restores from.
 fn write_state_atomically(path: PathBuf, text: String) {
-    let tmp = path.with_extension("tmp");
-    if let Err(err) = fs::write(&tmp, text) {
+    if let Err(err) = kuma_platform::files::write_atomic(&path, text.as_bytes()) {
         log::error!("save state: {err}");
-        return;
-    }
-    if let Err(err) = fs::rename(&tmp, &path) {
-        log::error!("save state: {err}");
-        let _ = fs::remove_file(&tmp);
     }
 }
 
@@ -2631,7 +2626,9 @@ impl Browser {
             }
             text.push('\n');
         }
-        fs::write(path, text)
+        // the marks carry where you browse: the platform write keeps
+        // the record atomic, fsynced, and 0600
+        kuma_platform::files::write_atomic(std::path::Path::new(&path), text.as_bytes())
     }
 
     /// The kuma-shell palette file: the session's wallpaper-derived
@@ -2764,7 +2761,7 @@ impl Browser {
             .filter(|entry| entry.path != path)
             .collect();
         if let Some(store) = recent_xbel_path()
-            && let Err(err) = fs::write(&store, xbel_text(&entries))
+            && let Err(err) = kuma_platform::files::write_atomic(&store, xbel_text(&entries).as_bytes())
         {
             log::error!("recent write: {err}");
         }
@@ -10530,7 +10527,9 @@ fn write_mimeapps(path: &Path, mime: &str, desktop_id: &str) -> std::io::Result<
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, out)
+    // the user's default-app choices are a config record: atomic,
+    // fsynced, 0600 through the platform seam
+    kuma_platform::files::write_atomic(path, out.as_bytes())
 }
 
 /// (file-name suffix, archive kind), longest first: a name classifies
@@ -11461,7 +11460,8 @@ pub(crate) fn write_recent(path: &Path) {
         log::error!("recent dir: {err}");
         return;
     }
-    if let Err(err) = fs::write(&store, xbel_text(&entries)) {
+    // recents are browsing history: atomic, fsynced, 0600
+    if let Err(err) = kuma_platform::files::write_atomic(&store, xbel_text(&entries).as_bytes()) {
         log::error!("recent write: {err}");
     }
 }

@@ -37,6 +37,12 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- Config and state records (`write_atomic` and everything riding it:
+  the shell's settings and updates state, Koguma's browsing state,
+  marks, recents, and default-app choices) are fsynced before the
+  atomic rename and land 0600: a power cut can no longer leave a
+  renamed record empty, and where-you-are and what-you-browse data
+  is no longer world-readable.
 - Untrusted image decodes carry strict dimension and allocation
   limits (16K×16K, 64 MiB): a hostile oversized PNG in any browsed
   directory or wallpaper folder no longer spikes a gigabyte and a
