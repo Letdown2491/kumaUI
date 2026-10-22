@@ -66,8 +66,8 @@ boot, the user manager is starting cold and pre-warming it
 (linger or a system-side want) buys more than any ordering change.
 
 Measured on motherbox (2026-10-04, warm re-login): the shell-side
-path — exec to surfaces up, read from the shell's own `boot:` phase
-logs — took 16 ms. The shell is not the blank-second cost; whatever
+path (exec to surfaces up, read from the shell's own `boot:` phase
+logs) took 16 ms. The shell is not the blank-second cost; whatever
 the handoff chain spends, it spends before the shell execs, so
 re-anchoring and shell-side deferral are near-worthless warm. A
 cold-boot (first login) capture is the number still missing.
