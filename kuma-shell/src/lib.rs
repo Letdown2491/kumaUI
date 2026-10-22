@@ -11,6 +11,7 @@ pub mod launcher;
 pub mod lock;
 pub mod msg;
 pub mod niri;
+pub mod nm;
 pub mod nostr;
 pub mod nostr_panel;
 pub mod notifications;

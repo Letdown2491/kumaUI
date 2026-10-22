@@ -65,6 +65,13 @@ source's wrap points would pin the text to a narrow column.
 
 ### Changed
 
+- The shell's network state (online, connected device, ssid, wifi
+  radio) rides NetworkManager's own D-Bus signals instead of
+  spawning nmcli three times every two seconds: the watcher listens
+  once on the service-wide signal stream and recomputes the state
+  from properties on each event. Zero fork/execs at idle for the
+  network read. The nmcli poll stays as the fallback seam and keeps
+  owning the Wi-Fi panel's access-point scan.
 - The sysmon poll split its one serial pass into per-subsystem
   passes: each reads on its own cadence, gated on its own consumers.
   The fast audio/brightness pass (the OSD's and the keybinds'

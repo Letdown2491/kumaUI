@@ -1071,6 +1071,9 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
     spawn_network_pass(state.downgrade(), settings.clone(), cx);
     spawn_bluetooth_pass(state.downgrade(), settings.clone(), cx);
     spawn_streams_pass(state.downgrade(), settings.clone(), cx);
+    // the network state rides NM's own signals: the pass above keeps
+    // the panel's AP scan and stands by as the fallback
+    crate::nm::spawn(state.downgrade(), cx);
 }
 
 /// One subsystem tick's outcome.
@@ -1311,7 +1314,10 @@ fn spawn_network_pass(state: gpui::WeakEntity<SysMon>, settings: Entity<Settings
                     let gates = read_gates(&settings, app);
                     if gates.wifi_scan {
                         Some((PANEL_INTERVAL, true))
-                    } else if gates.network && idle_due {
+                    } else if gates.network && !crate::nm::watch_live() && idle_due {
+                        // the watcher owns the state fields while it
+                        // lives; the poll's idle read stands down
+                        // (the panel scan above keeps its cadence)
                         Some((NETWORK_IDLE, false))
                     } else {
                         None
