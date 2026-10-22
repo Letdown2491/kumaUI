@@ -2218,6 +2218,9 @@ impl SettingsView {
             }
             "escape" => {
                 self.weather_edit = None;
+                // the field consumed the cancel: it must not bubble to
+                // the panel chrome and close the whole panel with it
+                cx.stop_propagation();
                 cx.notify();
             }
             "backspace" => {

@@ -73,6 +73,9 @@ impl WifiPanelView {
             }
             "escape" => {
                 self.password = None;
+                // the field consumed the cancel: it must not bubble to
+                // the panel chrome and close the whole panel with it
+                cx.stop_propagation();
             }
             "backspace" => {
                 edit.text.pop();

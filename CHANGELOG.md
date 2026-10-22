@@ -58,6 +58,9 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- Esc inside an inline edit field cancels the edit only: the Wi-Fi
+  password prompt and the weather location edit no longer close the
+  whole panel with the cancel.
 - Clearing the history now tells clients: every cleared entry emits
   its NotificationClosed (reason 2) instead of leaving the sender
   hanging on a signal that never comes.
