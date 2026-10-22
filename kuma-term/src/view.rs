@@ -121,6 +121,11 @@ struct Tab {
 /// Height of the tab bar, shown only while more than one tab is open.
 const TAB_BAR_H: f32 = 22.0;
 
+/// The zoom chords' floor and ceiling, in points: beyond these the
+/// glyphs stop being readable anyway.
+const MIN_FONT_PT: f32 = 6.0;
+const MAX_FONT_PT: f32 = 32.0;
+
 pub struct TerminalView {
     /// one session per tab; at least one always exists
     tabs: Vec<Tab>,
@@ -134,6 +139,13 @@ pub struct TerminalView {
     font: gpui::Font,
     cell_w: f32,
     cell_h: f32,
+    /// The runtime font size in px: the zoom chords move this, not the
+    /// theme's config value, so the next launch starts from the config
+    /// again.
+    font_size_px: f32,
+    /// The context menu's anchor, window coordinates: a right-click
+    /// opens it, an item click or any other press or key closes it.
+    menu_at: Option<(f32, f32)>,
     cols: u16,
     lines: u16,
     /// a left-drag is actively stretching the selection
@@ -309,6 +321,8 @@ impl TerminalView {
             font,
             cell_w,
             cell_h,
+            font_size_px: font_size.as_f32(),
+            menu_at: None,
             cols: 80,
             lines: 24,
             selecting: false,
@@ -825,6 +839,22 @@ impl TerminalView {
         self.tabs[tab].engine.scroll_to_offset(target.max(0) as usize);
     }
 
+    /// Move the runtime font size: re-measure the cell grid and let
+    /// the render's fit pass resize the PTY (SIGWINCH), the same way a
+    /// window resize reflows it. The theme's config value never moves,
+    /// so the next launch starts from the config again.
+    fn set_font_size(&mut self, pt: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let size = px(pt * 96.0 / 72.0);
+        if size.as_f32() == self.font_size_px {
+            return;
+        }
+        self.font_size_px = size.as_f32();
+        let (cell_w, cell_h) = cell_metrics(&self.font, size, window.text_system());
+        self.cell_w = cell_w;
+        self.cell_h = cell_h;
+        cx.notify();
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k: &Keystroke = &event.keystroke;
         // the raw names, for chord debugging: RUST_LOG=debug names
@@ -935,6 +965,40 @@ impl TerminalView {
             }
         }
 
+        // an open context menu eats the keyboard: any key closes it and
+        // is consumed, so the shell never sees the keystroke a user
+        // made while dismissing the menu
+        if self.menu_at.take().is_some() {
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        // font zoom, every terminal's chords: = / - step a point, 0
+        // resets to the config's size. The render's fit pass turns the
+        // new cell metrics into a PTY resize (SIGWINCH), so the
+        // program reflows the same way a window resize reflows it.
+        // Shift rides along: the wayland key path clears the shift
+        // flag from symbol keys, so + arrives as its glyph
+        if k.modifiers.control {
+            let step = match k.key.as_str() {
+                "=" | "+" | "plus" | "numpad_add" => Some(1.0),
+                "-" | "minus" | "numpad_subtract" => Some(-1.0),
+                "0" => Some(0.0),
+                _ => None,
+            };
+            if let Some(step) = step {
+                let pt = if step == 0.0 {
+                    self.theme.font_size_pt
+                } else {
+                    (self.font_size_px * 72.0 / 96.0 + step).clamp(MIN_FONT_PT, MAX_FONT_PT)
+                };
+                self.set_font_size(pt, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         // while the search bar is open it eats the keyboard: typing goes
         // to the query, not to the shell
         if self.active().search.is_some() {
@@ -985,6 +1049,24 @@ impl TerminalView {
         Some(url)
     }
 
+    /// The menu's Copy item: copy the selection and close. Dimmed with
+    /// no selection, where it no-ops but still closes.
+    fn menu_copy(&mut self, _: &gpui::MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu_at = None;
+        if let Some(text) = self.active().engine.selection_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// The menu's Paste item: paste the clipboard into the shell.
+    fn menu_paste(&mut self, _: &gpui::MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.menu_at = None;
+        cx.stop_propagation();
+        self.paste(cx);
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &gpui::MouseDownEvent,
@@ -999,6 +1081,20 @@ impl TerminalView {
                     self.cell_at(event.position.x.as_f32(), event.position.y.as_f32());
                 self.active().engine.report_mouse(button, col, row, false);
             }
+            return;
+        }
+        // a right-click opens the context menu at the pointer, unless
+        // the program just took the click above
+        if event.button == MouseButton::Right {
+            self.menu_at =
+                Some((event.position.x.as_f32(), event.position.y.as_f32()));
+            cx.notify();
+            return;
+        }
+        // any other press while the menu is up closes it and is
+        // consumed: the click never reaches selection or the shell
+        if self.menu_at.take().is_some() {
+            cx.notify();
             return;
         }
         if event.button != MouseButton::Left {
@@ -1105,10 +1201,22 @@ impl TerminalView {
         }
         self.down_cell = None;
         self.active_mut().engine.finish_selection();
+        // the config's opt-in: a finished selection lands on the
+        // clipboard by itself, like the terminal.app habit
+        if self.theme.copy_on_select
+            && let Some(text) = self.active().engine.selection_text()
+            && !text.is_empty()
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
         cx.notify();
     }
 
     fn on_wheel(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // a scroll dismisses the context menu like a click would
+        if self.menu_at.take().is_some() {
+            cx.notify();
+        }
         let lines = match event.delta {
             ScrollDelta::Lines(point) => point.y,
             ScrollDelta::Pixels(point) => point.y.as_f32() / self.cell_h,
@@ -1208,6 +1316,54 @@ fn open_url(url: &str) {
 /// skins: y allows the clipboard write, n or escape denies. A short
 /// content preview rides along, so an informed click is possible
 /// before the keystroke is.
+/// The right-click menu: Copy and Paste, anchored at the pointer.
+/// Copy dims (and no-ops) when the grid holds no selection. The items
+/// act on mouse-down and stop propagation, so the press never
+/// reaches the terminal's own handlers, which would close the menu
+/// under the click.
+fn context_menu(at: (f32, f32), theme: &Theme, has_selection: bool, cx: &Context<TerminalView>) -> Div {
+    let mut bg = hsla_of(theme.background);
+    bg.a = 0.97;
+    let ink = hsla_of(theme.foreground);
+    let mut dim = ink;
+    dim.a *= 0.45;
+    let mut border = ink;
+    border.a *= 0.15;
+    let copy_ink = if has_selection { ink } else { dim };
+    div()
+        .absolute()
+        .left(px(at.0))
+        .top(px(at.1))
+        .min_w(px(120.))
+        .flex()
+        .flex_col()
+        .py(px(4.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .child(
+            div()
+                .id("menu-copy")
+                .px(px(12.))
+                .py(px(4.))
+                .text_size(px(12.))
+                .text_color(copy_ink)
+                .child("Copy")
+                .on_mouse_down(MouseButton::Left, cx.listener(TerminalView::menu_copy)),
+        )
+        .child(
+            div()
+                .id("menu-paste")
+                .px(px(12.))
+                .py(px(4.))
+                .text_size(px(12.))
+                .text_color(ink)
+                .child("Paste")
+                .on_mouse_down(MouseButton::Left, cx.listener(TerminalView::menu_paste)),
+        )
+}
+
 fn clipboard_prompt(text: &str, theme: &Theme) -> Div {
     let mut bg = hsla_of(theme.background);
     bg.a = 0.97;
@@ -1323,7 +1479,7 @@ impl Render for TerminalView {
             }
         });
 
-        let font_size = px(self.theme.font_size_px());
+        let font_size = px(self.font_size_px);
         let rows: Vec<Arc<RowRender>> =
             snapshot.rows.iter().map(|row| self.row_render(row)).collect();
 
@@ -1425,7 +1581,7 @@ impl Render for TerminalView {
         };
 
         let bar = self.active().search.as_ref().map(|search| {
-            search_bar(search, &self.theme, &self.font.family)
+            search_bar(search, &self.theme, px(self.font_size_px), &self.font.family)
         });
 
         // the tab bar: one label per session, the focused one lit.
@@ -1551,6 +1707,14 @@ impl Render for TerminalView {
             )
             .when_some(self.clipboard_ask.clone(), |root, ask| {
                 root.child(clipboard_prompt(&ask.1, &self.theme))
+            })
+            .when_some(self.menu_at, |root, at| {
+                root.child(context_menu(
+                    at,
+                    &self.theme,
+                    self.active().engine.selection_text().is_some(),
+                    cx,
+                ))
             })
             .when_some(bar, |root, bar| root.child(bar)),
             )
@@ -2066,7 +2230,12 @@ fn search_view_spans(
 /// so opening it never reflows the terminal. A `regex` badge marks the
 /// pattern mode; the stored bad-pattern flag names a rejected pattern
 /// inline, no per-frame DFA build.
-fn search_bar(search: &SearchState, theme: &Theme, family: &gpui::SharedString) -> gpui::AnyElement {
+fn search_bar(
+    search: &SearchState,
+    theme: &Theme,
+    font_size: Pixels,
+    family: &gpui::SharedString,
+) -> gpui::AnyElement {
     let status = if search.query.is_empty() {
         "type to search".to_string()
     } else if search.bad_pattern {
@@ -2101,7 +2270,7 @@ fn search_bar(search: &SearchState, theme: &Theme, family: &gpui::SharedString) 
         .border_color(hsla_of(theme.foreground))
         .bg(bg)
         .font_family(family.clone())
-        .text_size(px(theme.font_size_px()))
+        .text_size(font_size)
         .text_color(hsla_of(theme.foreground))
         .child(format!("{}\u{258e}", search.query))
         .child(div().text_color(badge_color).child(badge_text))
@@ -2940,5 +3109,171 @@ mod tests {
             assert!(gap > 2, "the step is visible, not a rounding nudge");
             assert!(gap < 20, "the step stays subtle, not a panel color");
         }
+    }
+
+    /// A full-window view test: the zoom chords move the runtime font
+    /// size (the cell metrics re-measure, the render's fit pass
+    /// reflows the PTY), reset returns to the config's size, and the
+    /// ceiling clamps.
+    #[test]
+    fn zoom_chords_step_reset_and_clamp() {
+        if std::env::var("KUMA_TERM_SKIP_PTY_TEST").is_ok() {
+            return;
+        }
+        let _env = crate::PTY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var("KUMA_TERM_COMMAND", "sleep 300") };
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| TerminalView::new(None, window, cx));
+        drop(_env);
+        app.run_until_parked();
+
+        let chord = |s: &str| KeyDownEvent {
+            keystroke: Keystroke::parse(s).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+
+        let initial = window.update(|view, _, _| view.cell_w);
+        assert!(initial > 0.0);
+
+        // one step up: the cells re-measure wider
+        window.update(|view, window, cx| view.on_key(&chord("ctrl-="), window, cx));
+        let grown = window.update(|view, _, _| view.cell_w);
+        assert!(grown > initial, "ctrl+= did not grow the cells");
+
+        // reset lands exactly back on the config's size
+        window.update(|view, window, cx| view.on_key(&chord("ctrl-0"), window, cx));
+        let reset = window.update(|view, _, _| view.cell_w);
+        assert_eq!(reset, initial, "ctrl+0 did not reset the size");
+
+        // the ceiling clamps: pressing past 32pt stops growing
+        window.update(|view, window, cx| {
+            for _ in 0..40 {
+                view.on_key(&chord("ctrl-="), window, cx);
+            }
+        });
+        let maxed = window.update(|view, _, _| view.cell_w);
+        assert!(maxed > grown, "the ceiling never reached");
+        window.update(|view, window, cx| view.on_key(&chord("ctrl-="), window, cx));
+        let clamped = window.update(|view, _, _| view.cell_w);
+        assert_eq!(clamped, maxed, "zoom ignored its ceiling");
+
+        // and the floor below 6pt stops shrinking
+        window.update(|view, window, cx| {
+            for _ in 0..60 {
+                view.on_key(&chord("ctrl-minus"), window, cx);
+            }
+        });
+        let mined = window.update(|view, _, _| view.cell_w);
+        assert!(mined < initial, "the floor never reached");
+        window.update(|view, window, cx| view.on_key(&chord("ctrl-minus"), window, cx));
+        let floored = window.update(|view, _, _| view.cell_w);
+        assert_eq!(floored, mined, "zoom ignored its floor");
+    }
+
+    /// A full-window view test: a right-click opens the context menu
+    /// at the pointer, any key closes it and is consumed, and a
+    /// selection finished under copy_on_select lands on the clipboard.
+    #[test]
+    fn context_menu_opens_and_copy_on_select_copies() {
+        if std::env::var("KUMA_TERM_SKIP_PTY_TEST").is_ok() {
+            return;
+        }
+        let _env = crate::PTY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        unsafe { std::env::set_var("KUMA_TERM_COMMAND", "sleep 300") };
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(()),
+        );
+        let mut window = app.open_window(|window, cx| TerminalView::new(None, window, cx));
+        drop(_env);
+        app.run_until_parked();
+
+        // fixture text on row 0: sleep 300 prints no prompt, so the
+        // tty's own echo of the typing is all the grid shows
+        let typed = |s: &str| -> Vec<KeyDownEvent> {
+            s.chars()
+                .map(|c| KeyDownEvent {
+                    keystroke: Keystroke {
+                        key: c.to_string(),
+                        key_char: Some(c.to_string()),
+                        ..Keystroke::parse(&c.to_string()).unwrap()
+                    },
+                    is_held: false,
+                    prefer_character_input: false,
+                })
+                .collect()
+        };
+        window.update(|view, window, cx| {
+            for event in typed("hello\r") {
+                view.on_key(&event, window, cx);
+            }
+        });
+        let mut landed = false;
+        for _ in 0..100 {
+            landed = window.update(|view, _, _| {
+                view.active_mut().engine.snapshot(false).rows.iter().any(|r| {
+                    let text: String = r.cells.iter().map(|c| c.c).collect();
+                    text.contains("hello")
+                })
+            });
+            if landed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            app.run_until_parked();
+        }
+        assert!(landed, "the typed fixture never echoed onto the grid");
+
+        let down = |x: f32, y: f32, button: gpui::MouseButton| gpui::MouseDownEvent {
+            button,
+            position: gpui::point(px(x), px(y)),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        let up = |x: f32, y: f32| gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: gpui::point(px(x), px(y)),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+        };
+
+        // right-click opens the menu at the pointer; any key closes it
+        window.update(|view, window, cx| {
+            view.on_mouse_down(&down(50.0, 50.0, gpui::MouseButton::Right), window, cx);
+            assert!(view.menu_at.is_some(), "right-click did not open the menu");
+            view.on_key(&KeyDownEvent {
+                keystroke: Keystroke::parse("x").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            }, window, cx);
+            assert!(view.menu_at.is_none(), "a key did not close the menu");
+        });
+
+        // a selection finished under copy_on_select copies itself
+        let metrics = window.update(|view, _, _| (view.cell_w, view.cell_h));
+        let (cell_w, cell_h) = metrics;
+        window.update(|view, _, _| view.theme.copy_on_select = true);
+        window.update(|view, window, cx| {
+            view.on_mouse_down(&down(PADDING + 1.0, PADDING + cell_h / 2.0, gpui::MouseButton::Left), window, cx);
+            // the drag: only a move extends the selection past the
+            // anchor, so the path is down, move, up
+            view.on_mouse_move(&gpui::MouseMoveEvent {
+                position: gpui::point(px(PADDING + 5.0 * cell_w + 1.0), px(PADDING + cell_h / 2.0)),
+                pressed_button: Some(gpui::MouseButton::Left),
+                modifiers: gpui::Modifiers::default(),
+            }, window, cx);
+            view.on_mouse_up(&up(PADDING + 5.0 * cell_w + 1.0, PADDING + cell_h / 2.0), window, cx);
+        });
+        let clipboard = window.update(|_, _, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        });
+        assert_eq!(clipboard, "hello", "copy_on_select did not copy the selection");
     }
 }

@@ -35,6 +35,15 @@ source's wrap points would pin the text to a narrow column.
 
 ### Added
 
+- The terminal zooms at the keyboard: `ctrl+=` and `ctrl+-` step the
+  font a point, `ctrl+0` returns to the configured size, and the
+  program on screen reflows the way a window resize reflows it. The
+  config's own `font_size` never moves, so the next launch starts
+  there.
+- The terminal takes a right-click: a small Copy / Paste menu opens
+  at the pointer (Copy dims when the grid holds no selection), and
+  `copy_on_select true` in the config lands every finished selection
+  on the clipboard by itself.
 - Kamuy can act on what it watches: the arrow keys walk the table (wrapping, the view following), `ctrl+k` sends the cursor row's process one SIGTERM, and pressing `ctrl+k` on the same row again arms a confirm card whose Enter sends SIGKILL, since a process that ignored the polite ask is killed on purpose or not at all. Group headers and the background summary have no single pid and are skipped. The footer says what was signaled, or why nothing was.
 - Kamuy's table remembers its sort and filter across launches, in a small state file under `~/.config/kuma-monitor` written atomically (Koguma's state file shape); a restored sort applies once, to the first table there is to sort.
 - The location bar completes as you type, fish-style: the folders

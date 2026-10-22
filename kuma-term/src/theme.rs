@@ -36,6 +36,9 @@ pub struct Theme {
     /// Scrolled-off lines the grid keeps. Read once at startup: changing
     /// it needs a restart, the grid is sized at term creation.
     pub scrollback_lines: usize,
+    /// A finished selection lands on the clipboard by itself. Off by
+    /// default: the audit's opt-in, for hands that expect it.
+    pub copy_on_select: bool,
 }
 
 impl Theme {
@@ -79,6 +82,7 @@ impl Theme {
                 "DejaVu Sans".to_string(),
             ],
             scrollback_lines: 10_000,
+            copy_on_select: false,
         }
     }
 
@@ -270,6 +274,12 @@ fn apply_config(theme: &mut Theme, path: &Path, depth: u8) {
                     }
                 }
             }
+            // kuma-term's own key: a finished selection copies itself
+            "copy_on_select" => match value.trim() {
+                "true" => theme.copy_on_select = true,
+                "false" => theme.copy_on_select = false,
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -352,6 +362,23 @@ mod tests {
         assert_eq!(theme.font_size_pt, 12.5);
         assert_eq!(theme.font_family.as_deref(), Some("JetBrains Mono"));
         assert_eq!(theme.background_opacity, 0.85);
+    }
+
+    #[test]
+    fn copy_on_select_key_parses() {
+        let mut theme = Theme::builtin();
+        assert!(!theme.copy_on_select);
+        let path = std::env::temp_dir().join(format!("kuma-term-test6-{}.conf", std::process::id()));
+        std::fs::write(&path, "copy_on_select true\n").unwrap();
+        apply_config(&mut theme, &path, 0);
+        std::fs::remove_file(&path).ok();
+        assert!(theme.copy_on_select);
+        // the off spelling turns it back off; a bogus value leaves it
+        let mut theme = Theme::builtin();
+        std::fs::write(&path, "copy_on_select false\ncopy_on_select maybe\n").unwrap();
+        apply_config(&mut theme, &path, 0);
+        std::fs::remove_file(&path).ok();
+        assert!(!theme.copy_on_select);
     }
 
     #[test]
