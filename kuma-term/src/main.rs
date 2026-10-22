@@ -5,6 +5,7 @@ mod encoder;
 mod font;
 mod glyphs;
 mod icons;
+mod kitty;
 mod palette;
 mod term;
 mod theme;

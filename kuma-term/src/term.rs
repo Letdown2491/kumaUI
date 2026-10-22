@@ -433,6 +433,7 @@ fn pump_thread(
     mut master: std::fs::File,
     term: Arc<FairMutex<Term<UiProxy>>>,
     proxy: UiProxy,
+    kitty: Arc<crate::kitty::Modes>,
 ) {
     // alacritty leaves the master nonblocking for its poller; the pump
     // wants blocking reads: zero idle CPU, the child's exit surfaces as
@@ -445,6 +446,11 @@ fn pump_thread(
     }
 
     let mut parser = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+    // the keyboard-protocol tap rides the same reads: it only observes
+    // (vte consumes the bytes too), applies the CSI-u mode changes to
+    // the shared flags, and answers the mode query straight onto the
+    // master before the next read
+    let mut tap = crate::kitty::Tap::default();
     let mut buf = [0u8; 8192];
     loop {
         match master.read(&mut buf) {
@@ -459,6 +465,12 @@ fn pump_thread(
                 // like alacritty's loop: wake the UI once per chunk, after
                 // the grid took the bytes
                 drop(locked);
+                if tap.feed(&buf[..n], &kitty) {
+                    let reply = format!("\x1b[?{}u", kitty.active());
+                    if let Err(err) = master.write_all(reply.as_bytes()) {
+                        log::warn!("keyboard mode reply failed: {err}");
+                    }
+                }
                 proxy.forward(UiEvent::Wakeup);
             },
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -576,6 +588,10 @@ pub struct Engine {
     /// (cells, flags, raw colors, dynamic color overrides, the block
     /// cursor's bake facts) rides the line's hash itself.
     line_cache: Vec<CachedLine>,
+    /// The kitty keyboard protocol's flag stack: the pump's output tap
+    /// mutates it as the program's CSI-u sequences arrive, the input
+    /// encoder reads the active flags before every keystroke.
+    kitty: Arc<crate::kitty::Modes>,
 }
 
 /// One viewport row's cached decode: the hash of everything the line's
@@ -649,9 +665,11 @@ impl Engine {
         let pump_term = term.clone();
         let master = pty_take_master(&mut pty);
         let pump_master = master.try_clone().expect("clone the PTY master for the pump");
+        let kitty = Arc::new(crate::kitty::Modes::default());
+        let pump_kitty = kitty.clone();
         thread::Builder::new()
             .name("kuma-term-pty".into())
-            .spawn(move || pump_thread(pump_master, pump_term, pump_proxy))
+            .spawn(move || pump_thread(pump_master, pump_term, pump_proxy, pump_kitty))
             .expect("spawn the PTY pump");
 
         // The writer thread. The pump cleared O_NONBLOCK on the shared
@@ -681,7 +699,16 @@ impl Engine {
             theme,
             selection_mode: None,
             line_cache: Vec::new(),
+            kitty,
         })
+    }
+
+    /// The kitty keyboard protocol flags the foreground program asked
+    /// for: while it asked for disambiguation the encoder shifts into
+    /// the CSI-u encoding (shift+enter, ctrl+tab, chords that legacy
+    /// bytes would collapse).
+    pub fn kitty_flags(&self) -> u16 {
+        self.kitty.active()
     }
 
     /// Swap the chrome colors for a republished shell palette; the next
@@ -1760,6 +1787,47 @@ mod tests {
         assert!(!saw_hook, "the env hook leaked past an explicit -e");
         assert!(saw_exit, "pump never reported the child exit");
         engine.resize(19, 4);
+    }
+
+    #[test]
+    fn pump_applies_kitty_modes_from_the_stream() {
+        if std::env::var("KUMA_TERM_SKIP_PTY_TEST").is_ok() {
+            return;
+        }
+        let window_size = WindowSize {
+            num_cols: 20,
+            num_lines: 5,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        // the lock keeps the other engine tests from spawning beside
+        // this one (live PTYs race the same shell startup)
+        let _env = crate::PTY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        use std::time::Duration;
+        // the command rides the -e argument, not the env hook (see the
+        // damage test's note): the child pushes one keyboard mode, so
+        // the tap must lift the shared flags off the output stream
+        let (tx, _rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+        let mut engine = Engine::new(
+            window_size,
+            crate::theme::Theme::builtin(),
+            tx,
+            Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf '\\033[>1u'; sleep 30".to_string(),
+            ]),
+        )
+        .expect("engine");
+        let mut applied = false;
+        for _ in 0..100 {
+            if engine.kitty_flags() == 1 {
+                applied = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(applied, "the program's keyboard push never reached the flags");
     }
 
     #[test]

@@ -35,6 +35,13 @@ source's wrap points would pin the text to a narrow column.
 
 ### Added
 
+- The terminal speaks the kitty keyboard protocol: a program can ask
+  what keyboard modes are active (`CSI ? u`) and set, push, and pop
+  its enhancement flags (`CSI = / > / < u`), and while it asks for
+  disambiguation the chords arrive as distinct CSI-u escapes instead
+  of collapsing into legacy bytes: shift+enter, ctrl+tab, ctrl+letter
+  reach programs that bind them. Without the push, every keystroke
+  encodes exactly as it always did.
 - The terminal zooms at the keyboard: `ctrl+=` and `ctrl+-` step the
   font a point, `ctrl+0` returns to the configured size, and the
   program on screen reflows the way a window resize reflows it. The

@@ -982,8 +982,10 @@ impl TerminalView {
         // flag from symbol keys, so + arrives as its glyph
         if k.modifiers.control {
             let step = match k.key.as_str() {
-                "=" | "+" | "plus" | "numpad_add" => Some(1.0),
-                "-" | "minus" | "numpad_subtract" => Some(-1.0),
+                // the numpad's kp_ prefix is stripped by the key path,
+                // so the keypad plus arrives as "add"
+                "=" | "+" | "plus" | "add" | "numpad_add" => Some(1.0),
+                "-" | "minus" | "subtract" | "numpad_subtract" => Some(-1.0),
                 "0" => Some(0.0),
                 _ => None,
             };
@@ -1008,7 +1010,7 @@ impl TerminalView {
         }
 
         let app_cursor = self.active().engine.app_cursor();
-        if let Some(bytes) = encoder::encode(k, app_cursor) {
+        if let Some(bytes) = encoder::encode(k, app_cursor, self.active().engine.kitty_flags()) {
             // landing input collapses any active selection, like every
             // terminal; bare modifier presses do not
             self.active_mut().engine.clear_selection();
