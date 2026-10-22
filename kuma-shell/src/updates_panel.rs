@@ -170,7 +170,7 @@ impl Render for UpdatesPanelView {
                             "restart-now",
                             "Restart now",
                             Some("icons/power.svg"),
-                            kit::ButtonVariant::Primary,
+                            kit::ButtonVariant::Destructive,
                             {
                                 let state = self.state.clone();
                                 move |_, _, cx| {

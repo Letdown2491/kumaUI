@@ -11,6 +11,12 @@ use crate::sysmon::{BluetoothAct, BluetoothDevice, SysMon};
 pub struct BluetoothPanelView {
     geometry: crate::panel::PanelGeometry,
     sysmon: Entity<SysMon>,
+    /// The unpair button's armed confirm: the mac waiting for its
+    /// second click, one arm at a time, expiring like the kit's row.
+    armed_remove: Option<String>,
+    /// Bumped on every arm; a pending disarm timer only disarms the
+    /// arm it was minted for.
+    remove_arm: u64,
 }
 
 impl BluetoothPanelView {
@@ -25,6 +31,40 @@ impl BluetoothPanelView {
         Self {
             geometry,
             sysmon,
+            armed_remove: None,
+            remove_arm: 0,
+        }
+    }
+
+    /// Arm (or confirm) the unpair for one device: the first click
+    /// arms (the trash swaps to the question, self-disarms in 5s),
+    /// the second fires. The kit's arm-then-confirm, keyed to a
+    /// dynamic row.
+    fn remove_clicked(&mut self, mac: &str, cx: &mut Context<Self>) {
+        if self.armed_remove.as_deref() == Some(mac) {
+            let mac = mac.to_string();
+            self.armed_remove = None;
+            self.sysmon.update(cx, |sysmon, cx| {
+                sysmon.request_bluetooth_act(BluetoothAct::Remove, mac, cx)
+            });
+            cx.notify();
+        } else {
+            self.armed_remove = Some(mac.to_string());
+            self.remove_arm += 1;
+            let stamp = self.remove_arm;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(kit::CONFIRM_DISARM)
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.remove_arm == stamp {
+                        this.armed_remove = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
         }
     }
 
@@ -110,19 +150,31 @@ impl BluetoothPanelView {
         );
 
         // the paired device's long-leave: remove the pairing entirely
+        // (one mis-tap must not unpair a device: the kit's
+        // arm-then-confirm, keyed to this row)
         if device.paired {
-            let sysmon_remove = self.sysmon.clone();
             let remove_mac = device.mac.clone();
-            row = row.child(kit::icon_button(
-                gpui::SharedString::from(format!("bt-remove-{}", device.mac)),
-                "icons/trash.svg",
-                kit::ButtonVariant::Ghost,
-                move |_, _, cx| {
-                    sysmon_remove.update(cx, |sysmon, cx| {
-                        sysmon.request_bluetooth_act(BluetoothAct::Remove, remove_mac.clone(), cx)
-                    });
-                },
-            ));
+            let armed = self.armed_remove.as_deref() == Some(device.mac.as_str());
+            if armed {
+                row = row.child(kit::button(
+                    gpui::SharedString::from(format!("bt-remove-{}", device.mac)),
+                    "Unpair this device?",
+                    Some("icons/trash.svg"),
+                    kit::ButtonVariant::Destructive,
+                    cx.listener(move |this, _, _, cx| {
+                        this.remove_clicked(&remove_mac, cx);
+                    }),
+                ));
+            } else {
+                row = row.child(kit::icon_button(
+                    gpui::SharedString::from(format!("bt-remove-{}", device.mac)),
+                    "icons/trash.svg",
+                    kit::ButtonVariant::Ghost,
+                    cx.listener(move |this, _, _, cx| {
+                        this.remove_clicked(&remove_mac, cx);
+                    }),
+                ));
+            }
         }
         row
     }

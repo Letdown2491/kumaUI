@@ -14,6 +14,12 @@ pub struct WifiPanelView {
     /// The password prompt's state: which secured unknown network it
     /// belongs to, the typed text, and the field's focus.
     password: Option<PasswordEdit>,
+    /// The forget button's armed confirm: the ssid waiting for its
+    /// second click, one arm at a time, expiring like the kit's row.
+    armed_forget: Option<String>,
+    /// Bumped on every arm; a pending disarm timer only disarms the
+    /// arm it was minted for.
+    forget_arm: u64,
 }
 
 struct PasswordEdit {
@@ -35,6 +41,39 @@ impl WifiPanelView {
             geometry,
             sysmon,
             password: None,
+            armed_forget: None,
+            forget_arm: 0,
+        }
+    }
+
+    /// Arm (or confirm) the forget for one ssid: the first click arms
+    /// (label swaps to the question, self-disarms in 5s), the second
+    /// fires. The kit's arm-then-confirm, keyed to a dynamic row.
+    fn forget_clicked(&mut self, ssid: &str, cx: &mut Context<Self>) {
+        if self.armed_forget.as_deref() == Some(ssid) {
+            let ssid = ssid.to_string();
+            self.armed_forget = None;
+            self.sysmon.update(cx, |sysmon, cx| {
+                sysmon.request_wifi_forget(ssid, cx)
+            });
+            cx.notify();
+        } else {
+            self.armed_forget = Some(ssid.to_string());
+            self.forget_arm += 1;
+            let stamp = self.forget_arm;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(kit::CONFIRM_DISARM)
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.forget_arm == stamp {
+                        this.armed_forget = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
         }
     }
 
@@ -291,8 +330,6 @@ impl Render for WifiPanelView {
         // forget affordance when it is also a saved connection
         if let Some(ssid) = &network.ssid {
             let saved_here = network.saved.contains(ssid);
-            let sysmon_forget = self.sysmon.clone();
-            let forget_ssid = ssid.clone();
             content = content.child(kit::card("wifi-connected").child(
                 div()
                     .flex()
@@ -322,16 +359,30 @@ impl Render for WifiPanelView {
                             .child("connected"),
                     )
                     .when(saved_here, |el| {
-                        el.child(kit::icon_button(
-                            "wifi-forget",
-                            "icons/trash.svg",
-                            kit::ButtonVariant::Ghost,
-                            move |_, _, cx| {
-                                sysmon_forget.update(cx, |sysmon, cx| {
-                                    sysmon.request_wifi_forget(forget_ssid.clone(), cx)
-                                });
-                            },
-                        ))
+                        let forget_ssid = ssid.clone();
+                        // the kit's arm-then-confirm, keyed to this
+                        // row: rest is the quiet trash icon, the arm
+                        // swaps in the question
+                        if self.armed_forget.as_deref() == Some(ssid.as_str()) {
+                            el.child(kit::button(
+                                "wifi-forget",
+                                "Forget this network?",
+                                Some("icons/trash.svg"),
+                                kit::ButtonVariant::Destructive,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.forget_clicked(&forget_ssid, cx)
+                                }),
+                            ))
+                        } else {
+                            el.child(kit::icon_button(
+                                "wifi-forget",
+                                "icons/trash.svg",
+                                kit::ButtonVariant::Ghost,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.forget_clicked(&forget_ssid, cx)
+                                }),
+                            ))
+                        }
                     }),
             ));
         }

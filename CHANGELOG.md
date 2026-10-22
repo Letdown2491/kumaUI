@@ -58,6 +58,11 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- Forget network and unpair device confirm before they fire: the
+  trash icon arms (label swaps to the question, self-disarms in 5s,
+  the kit's arm-then-confirm shape), the second click acts. The
+  updates panel's Restart now wears the destructive styling it
+  always should have.
 - The lock screen no longer blames every PAM failure on the password:
   a rejection still reads "wrong password", but a machine failure
   (broken PAM config, expired account, missing service) shows PAM's

@@ -432,7 +432,7 @@ pub fn icon_button(
 }
 
 /// How long an armed confirm row waits before it disarms itself.
-const CONFIRM_DISARM: Duration = Duration::from_secs(5);
+pub const CONFIRM_DISARM: Duration = Duration::from_secs(5);
 
 /// One act in a confirm row: what it says at rest, what it says armed,
 /// and what fires on the second click.
