@@ -37,6 +37,11 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- The greeter and the polkit agent match the lock screen's password
+  hygiene: the greeter's render never clones the secret (a masked
+  count feeds the field) and both zeroize the password once the
+  attempt's last consumer is done, so a failed login leaves no fresh
+  heap copies behind.
 - A corrupt or torn config.toml no longer risks permanent loss: the
   boot load backed by defaults now backs the unreadable file up
   beside itself (`config.toml.invalid-<timestamp>`) before the next

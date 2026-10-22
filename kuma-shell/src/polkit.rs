@@ -23,6 +23,7 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+
 use gpui::{
     App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton,
     Render, SharedString, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
@@ -34,6 +35,7 @@ use gpui::{
 };
 use smol::channel::{Sender, bounded, unbounded};
 use zbus::zvariant::{OwnedValue, Value};
+use zeroize::Zeroize;
 
 use crate::lock::LockState;
 
@@ -330,7 +332,15 @@ impl PolkitState {
         cx.spawn(async move |this, cx| {
             let end = cx
                 .background_spawn(async move {
-                    run_pump(&cookie, &candidate.name, &password, &note_tx)
+                    // run_pump is the password's last consumer: scrub
+                    // the heap copy before the String frees (the lock
+                    // screen's discipline; the dialog can sit through
+                    // several failed attempts, each otherwise a
+                    // residue copy)
+                    let mut password = password;
+                    let end = run_pump(&cookie, &candidate.name, &password, &note_tx);
+                    password.zeroize();
+                    end
                 })
                 .await;
             let _ = this.update(cx, |state, cx| state.pump_finished(generation, end, cx));

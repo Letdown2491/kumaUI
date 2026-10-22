@@ -12,11 +12,14 @@ use std::sync::Arc;
 
 use gpui::layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions};
 use gpui::{
+
     prelude::*, div, px, rgba, rgb, App, AppContext, Context, Focusable, FocusHandle,
     KeyDownEvent, Render, Window, WindowKind, WindowOptions,
-};use kuma_shell::greeter::{self, GreetdClient, LoginOutcome};
+};
+use kuma_shell::greeter::{self, GreetdClient, LoginOutcome};
 use kuma_shell::icons::KumaAssets;
 use kuma_shell::theme;
+use zeroize::Zeroize;
 
 use gpui_platform::application;
 
@@ -315,7 +318,14 @@ impl GreeterState {
                 .background_spawn(async move {
                     let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
                     let mut client = GreetdClient::connect()?;
-                    greeter::login(&mut client, &username, &password, &cmd)
+                    // the attempt's last consumer is here: scrub the
+                    // heap copy before the String frees (the lock
+                    // screen's discipline; a greeter runs pre-auth,
+                    // where freed heap is the exposure)
+                    let mut password = password;
+                    let result = greeter::login(&mut client, &username, &password, &cmd);
+                    password.zeroize();
+                    result
                 })
                 .await;
             let _ = this.update(cx, |this, cx| match result {
@@ -374,8 +384,7 @@ impl GreeterView {
         placeholder: &'static str,
         focused: bool,
         busy: bool,
-    ) -> gpui::Stateful<gpui::Div> {
-        let shown: gpui::SharedString = if value.is_empty() {
+    ) -> gpui::Stateful<gpui::Div> {        let shown: gpui::SharedString = if value.is_empty() {
             placeholder.into()
         } else {
             "•".repeat(value.chars().count()).into()
@@ -404,6 +413,21 @@ impl GreeterView {
             .when(busy, |el| el.text_color(rgb(theme::current().text_dim)))
             .child(shown)
     }
+
+    /// Same field, fed a count instead of the password itself: the
+    /// render never clones secret text onto the heap (the lock
+    /// screen's rule), so a keystroke's repaint adds no fresh copies
+    /// of a half-typed password.
+    fn masked_field(
+        &self,
+        len: usize,
+        placeholder: &'static str,
+        focused: bool,
+        busy: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let dots = "•".repeat(len);
+        self.field(&dots, placeholder, focused, busy)
+    }
 }
 
 impl Focusable for GreeterView {
@@ -421,7 +445,7 @@ impl Render for GreeterView {
         let wallpaper = state.wallpaper.clone();
         let theme = theme::current();
         let username = state.username.clone();
-        let password = state.password.clone();
+        let password_len = state.password.chars().count();
         let focus = state.focus;
         let busy = state.busy;
         let message = state.message.clone();
@@ -494,7 +518,7 @@ impl Render for GreeterView {
                                     ),
                             )
                             .child(
-                                self.field(&password, "password", focus == PASSWORD, busy)
+                                self.masked_field(password_len, "password", focus == PASSWORD, busy)
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
