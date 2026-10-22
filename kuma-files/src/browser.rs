@@ -1818,6 +1818,11 @@ pub(crate) struct Browser {
     path_editing: bool,
     /// the path bar's editor, live while `path_editing`
     path_field: input::Field,
+    /// fish-style location-bar completion: the child directories
+    /// extending the typed text, in typed form, and which one the
+    /// ghost currently shows
+    path_matches: Vec<String>,
+    path_match_ix: usize,
     /// Content zoom, 1.0 = normal; clamped to 0.75..=2.0.
     scale: f32,
     titled: Option<PathBuf>,
@@ -1940,6 +1945,8 @@ impl Browser {
             thumb_order: VecDeque::new(),
             path_editing: false,
             path_field: Default::default(),
+            path_matches: Vec::new(),
+            path_match_ix: 0,
             scale: 1.25,
             titled: None,
             watcher: None,
@@ -3163,11 +3170,13 @@ impl Browser {
         }
     }
 
-    fn start_path_edit(&mut self, cx: &mut Context<Self>) {        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+    fn start_path_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
             return;
         };
         self.path_editing = true;
         self.path_field = input::Field::new(dir.display().to_string());
+        self.refresh_path_matches();
         cx.notify();
     }
 
@@ -3176,10 +3185,17 @@ impl Browser {
         cx.notify();
     }
 
-    /// Enter in the path bar: ~ expands home, existing dirs navigate.
+    /// Enter in the path bar: ~ expands home, relative paths land
+    /// where the tab is looking (not wherever the process was started
+    /// from), existing dirs navigate.
     fn commit_path_edit(&mut self, cx: &mut Context<Self>) {
         self.path_editing = false;
         let mut target = self.path_field.text().trim().to_string();
+        if target.is_empty() {
+            // nothing typed: an Enter on the empty bar just closes it
+            cx.notify();
+            return;
+        }
         if target == "~" {
             target = dirs::home_dir()
                 .map(|home| home.display().to_string())
@@ -3189,7 +3205,12 @@ impl Browser {
                 target = home.join(rest).display().to_string();
             }
         }
-        let path = PathBuf::from(target);
+        let mut path = PathBuf::from(target);
+        if let Some(dir) = self.tab().current_dir().map(Path::to_path_buf)
+            && !path.is_absolute()
+        {
+            path = dir.join(path);
+        }
         match fs::metadata(&path) {
             Ok(meta) if meta.is_dir() => self.load_source(Source::Dir(path), cx),
             Ok(_) => {
@@ -3201,6 +3222,126 @@ impl Browser {
                 cx.notify();
             }
         }
+    }
+
+    /// Fish-style location-bar completion, filesystem only. From the
+    /// typed text take the directory part (kept in the typed form, so
+    /// a `~` stays a `~`) and the partial name, and list the child
+    /// directories that extend the partial case-insensitively. Files
+    /// never suggest: committing one would only bounce off "is not a
+    /// folder". Candidates carry a trailing slash so an accepted one
+    /// reads as a directory to keep typing into.
+    fn path_suggestions(
+        typed: &str,
+        base: Option<&Path>,
+        home: Option<&Path>,
+        show_hidden: bool,
+    ) -> Vec<String> {
+        // a bare "~" behaves like the "~/" prefix; every other form
+        // splits at the last slash into directory part + partial name
+        let (dir_form, partial) = if typed == "~" {
+            ("~/".to_string(), "")
+        } else {
+            match typed.rfind('/') {
+                Some(at) => (typed[..=at].to_string(), &typed[at + 1..]),
+                None => (String::new(), typed),
+            }
+        };
+        let root = if dir_form.is_empty() {
+            // a bare name or relative path reads against the tab's
+            // current folder
+            match base {
+                Some(base) => base.to_path_buf(),
+                None => return Vec::new(),
+            }
+        } else if dir_form.starts_with('~') {
+            let Some(home) = home else {
+                return Vec::new();
+            };
+            home.join(dir_form.trim_start_matches('~').trim_start_matches('/'))
+        } else {
+            PathBuf::from(&dir_form)
+        };
+        let Ok(read) = fs::read_dir(&root) else {
+            return Vec::new();
+        };
+        let partial_lc = partial.to_lowercase();
+        let mut out: Vec<(bool, String)> = Vec::new();
+        for entry in read.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            if !name.to_lowercase().starts_with(&partial_lc) {
+                continue;
+            }
+            // dirs only, symlinks to dirs included
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let is_dir = kind.is_dir()
+                || (kind.is_symlink()
+                    && fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir()));
+            if !is_dir {
+                continue;
+            }
+            // exact-case prefixes sort ahead of case-folded ones
+            out.push((!name.starts_with(partial), format!("{dir_form}{name}/")));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        out.truncate(100);
+        out.into_iter().map(|(_, candidate)| candidate).collect()
+    }
+
+    /// Recompute the suggestions from the field's current text; the
+    /// cycle index resets to the best match.
+    fn refresh_path_matches(&mut self) {
+        let base = self.tab().current_dir().map(Path::to_path_buf);
+        let home = dirs::home_dir();
+        let show_hidden = self.show_hidden;
+        self.path_matches = Browser::path_suggestions(
+            self.path_field.text(),
+            base.as_deref(),
+            home.as_deref(),
+            show_hidden,
+        );
+        self.path_match_ix = 0;
+        self.refresh_path_ghost();
+    }
+
+    /// The shown match's dim tail past what is typed. A candidate
+    /// whose case differs from the typed partial still completes the
+    /// word (the tail re-renders the name in its real case on accept);
+    /// one that cannot be sliced at the typed length simply shows no
+    /// ghost.
+    fn refresh_path_ghost(&mut self) {
+        self.path_field.ghost = self
+            .path_matches
+            .get(self.path_match_ix)
+            .and_then(|candidate| candidate.get(self.path_field.text().len()..))
+            .map(str::to_string);
+    }
+
+    /// Whether Right/End may land the ghost: the caret at the end of
+    /// the text with nothing selected, exactly when the ghost paints.
+    fn path_ghost_landable(&self) -> bool {
+        self.path_field.ghost.is_some()
+            && self.path_field.sel.is_none()
+            && self.path_field.cursor >= self.path_field.buf.len()
+    }
+
+    /// The shown match becomes the field's whole text, and the
+    /// suggestions recompute from there (the accepted directory's own
+    /// children suggest next).
+    fn accept_path_suggestion(&mut self, cx: &mut Context<Self>) {
+        let Some(candidate) = self.path_matches.get(self.path_match_ix).cloned() else {
+            return;
+        };
+        self.path_field = input::Field::new(candidate);
+        self.refresh_path_matches();
+        cx.notify();
     }
 
     fn load_source(&mut self, source: Source, cx: &mut Context<Self>) {
@@ -6016,6 +6157,27 @@ impl Browser {
             match keystroke.key.as_str() {
                 "enter" => self.commit_path_edit(cx),
                 "escape" => self.cancel_path_edit(cx),
+                // fish-style cycling: the ghost flips to the next
+                // match, the typed text never moves
+                "tab" => {
+                    if !self.path_matches.is_empty() {
+                        self.path_match_ix =
+                            (self.path_match_ix + 1) % self.path_matches.len();
+                        self.refresh_path_ghost();
+                        cx.notify();
+                    }
+                }
+                // at the end of the line the right arrow (and an
+                // already-there End) lands the ghost; the catch-all
+                // keeps them moving the caret otherwise
+                "right" | "end"
+                    if !keystroke.modifiers.control
+                        && !keystroke.modifiers.alt
+                        && !keystroke.modifiers.platform
+                        && self.path_ghost_landable() =>
+                {
+                    self.accept_path_suggestion(cx)
+                }
                 "a" if keystroke.modifiers.control || keystroke.modifiers.platform => {
                     self.path_field.select_all();
                     cx.notify();
@@ -6029,11 +6191,14 @@ impl Browser {
                             .trim_matches(|c: char| c == '\r' || c == '\n')
                             .to_string();
                         self.path_field.paste(&text);
+                        self.refresh_path_matches();
                         cx.notify();
                     }
                 }
                 key => {
-                    self.path_field.key(key, &keystroke);
+                    if self.path_field.key(key, &keystroke) {
+                        self.refresh_path_matches();
+                    }
                     cx.notify();
                 }
             }
@@ -13009,6 +13174,122 @@ mod browser_ux_keys {
         window.update(|browser, _, _| {
             assert!(browser.tab().entries.is_empty(), "the listing never emptied");
         });
+    }
+
+    #[test]
+    fn path_suggestions_list_child_dirs_only() {
+        let lab = Lab::new("path-suggest");
+        fs::create_dir_all(lab.dir.join("Documents")).unwrap();
+        fs::create_dir_all(lab.dir.join("Downloads")).unwrap();
+        fs::create_dir_all(lab.dir.join("docs_old")).unwrap();
+        fs::create_dir_all(lab.dir.join(".secret")).unwrap();
+        fs::write(lab.dir.join("notes.txt"), "x").unwrap();
+
+        // the partial extends case-insensitively, exact-case first;
+        // files and hidden dirs never suggest
+        let got =
+            Browser::path_suggestions(&format!("{}/Do", lab.dir.display()), None, None, false);
+        assert_eq!(
+            got,
+            vec![
+                format!("{}/Documents/", lab.dir.display()),
+                format!("{}/Downloads/", lab.dir.display()),
+                format!("{}/docs_old/", lab.dir.display()),
+            ]
+        );
+
+        // a trailing slash lists the directory: every visible child
+        // dir, nothing else (Lab ships one of its own, sub)
+        let got =
+            Browser::path_suggestions(&format!("{}/", lab.dir.display()), None, None, false);
+        assert_eq!(
+            got,
+            vec![
+                format!("{}/Documents/", lab.dir.display()),
+                format!("{}/Downloads/", lab.dir.display()),
+                format!("{}/docs_old/", lab.dir.display()),
+                format!("{}/sub/", lab.dir.display()),
+            ]
+        );
+
+        // hidden dirs ride along only when show_hidden is set
+        assert!(Browser::path_suggestions(
+            &format!("{}/.s", lab.dir.display()),
+            None,
+            None,
+            false
+        )
+        .is_empty());
+        assert_eq!(
+            Browser::path_suggestions(&format!("{}/.s", lab.dir.display()), None, None, true),
+            vec![format!("{}/.secret/", lab.dir.display())]
+        );
+
+        // ~ keeps its typed form in the candidates
+        let got = Browser::path_suggestions("~/Do", Some(&lab.dir), Some(&lab.dir), false);
+        assert_eq!(got, vec!["~/Documents/", "~/Downloads/", "~/docs_old/"]);
+
+        // a bare ~ lists home's child dirs as ~-form candidates
+        let got = Browser::path_suggestions("~", Some(&lab.dir), Some(&lab.dir), false);
+        assert_eq!(
+            got,
+            vec![
+                "~/Documents/",
+                "~/Downloads/",
+                "~/docs_old/",
+                "~/sub/",
+            ]
+        );
+
+        // relative partials suggest bare names off the tab's base
+        let got = Browser::path_suggestions("Do", Some(&lab.dir), None, false);
+        assert_eq!(got, vec!["Documents/", "Downloads/", "docs_old/"]);
+
+        // a directory that does not exist suggests nothing
+        assert!(Browser::path_suggestions("/no/such/dir/x", None, None, false).is_empty());
+    }
+
+    #[test]
+    fn path_bar_ghost_completes_and_the_keys_land_it() {
+        let lab = Lab::new("path-complete");
+        fs::create_dir_all(lab.dir.join("Documents")).unwrap();
+        fs::create_dir_all(lab.dir.join("Downloads")).unwrap();
+        fs::write(lab.dir.join("notes.txt"), "x").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            browser.start_path_edit(cx);
+            // the field then reads a partial path the way a paste or
+            // a select-all-then-type leaves it
+            browser.path_field = input::Field::new(lab.dir.join("D").display().to_string());
+            browser.refresh_path_matches();
+            assert_eq!(
+                browser.path_field.ghost.as_deref(),
+                Some("ocuments/"),
+                "the best match rides the field as a ghost tail"
+            );
+            // Tab cycles the matches and never touches the typed text
+            browser.route_key(&key("tab"), cx);
+            assert_eq!(browser.path_field.ghost.as_deref(), Some("ownloads/"));
+            assert_eq!(
+                browser.path_field.text(),
+                lab.dir.join("D").display().to_string()
+            );
+            // Right lands the shown match into the field
+            browser.route_key(&key("right"), cx);
+            assert_eq!(
+                browser.path_field.text(),
+                format!("{}/Downloads/", lab.dir.display())
+            );
+            // and Enter commits it: the tab navigates
+            browser.route_key(&key("enter"), cx);
+            let expected = lab.dir.join("Downloads");
+            assert_eq!(browser.tab().current_dir(), Some(expected.as_path()));
+        });
+        app.run_until_parked();
     }
 
     #[test]

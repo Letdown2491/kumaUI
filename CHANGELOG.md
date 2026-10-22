@@ -16,6 +16,14 @@ source's wrap points would pin the text to a narrow column.
 
 ### Added
 
+- The location bar completes as you type, fish-style: the folders
+  extending what you typed suggest as dim ghost text past the caret,
+  Right (or End, already at the end of the line) lands the suggestion
+  into the field, and Tab cycles the matches. Filesystem only, folders
+  only, with `~` kept in the suggestions' form; hidden folders appear
+  only when hidden files are shown. Relative paths in the bar now also
+  resolve against the folder the tab is looking at rather than
+  wherever Koguma was started from.
 - The bar shows when the screen is being shared. Niri reports its
   screencasts first-party, and the shell mirrors them into a sharing
   indicator beside the recording dot: an amber dot naming the target

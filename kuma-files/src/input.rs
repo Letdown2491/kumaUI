@@ -17,6 +17,11 @@ pub(crate) struct Field {
     pub cursor: usize,
     /// live selection, ordered (start, end)
     pub sel: Option<(usize, usize)>,
+    /// fish-style suggestion tail: rendered dim past the caret while
+    /// the caret sits at the end of the buffer and nothing is
+    /// selected. Set by the path bar; the other editors never touch
+    /// it.
+    pub ghost: Option<String>,
 }
 
 fn clamp_boundary(buf: &str, at: usize) -> usize {
@@ -31,7 +36,7 @@ impl Field {
     pub fn new(buf: impl Into<String>) -> Self {
         let buf = buf.into();
         let cursor = buf.len();
-        Self { buf, cursor, sel: None }
+        Self { buf, cursor, sel: None, ghost: None }
     }
 
     pub fn text(&self) -> &str {
@@ -187,6 +192,15 @@ pub(crate) fn spans(field: &Field, masked: bool) -> (String, Option<String>, Str
     }
 }
 
+/// Whether the ghost may paint: only at the end of the text with
+/// nothing selected, where it reads as the continuation of what the
+/// user typed.
+pub(crate) fn ghost_visible(field: &Field) -> bool {
+    field.ghost.is_some()
+        && field.sel.is_none()
+        && clamp_boundary(&field.buf, field.cursor) == field.buf.len()
+}
+
 /// The input rendered: text spans with the selection highlighted, a
 /// 1.5px accent-bar caret in the focused field (a real bar, not a
 /// typed character), or the placeholder hint in dim text when the
@@ -198,7 +212,20 @@ pub(crate) fn field_children(
     placeholder: &str,
 ) -> Vec<AnyElement> {
     let (before, selected, after) = spans(field, masked);
-    span_children(&before, selected, &after, caret, placeholder)
+    let mut children = span_children(&before, selected, &after, caret, placeholder);
+    if ghost_visible(field) {
+        // the suggestion tail, dim past the caret: the fish look.
+        // Ghosts only paint at the end of the text, so nothing
+        // follows them.
+        let ghost = field.ghost.as_deref().unwrap_or_default();
+        children.push(
+            div()
+                .text_color(theme::text_dim())
+                .child(ghost.to_string())
+                .into_any_element(),
+        );
+    }
+    children
 }
 
 /// The same render from precomputed spans, for sites that cannot
@@ -328,5 +355,21 @@ mod tests {
         assert_eq!((before, selected, after), ("".to_string(), None, "".to_string()));
         let children = field_children(&field, false, false, "hint");
         assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn ghost_paints_only_at_the_end_of_the_text() {
+        let mut field = Field::new("~/Doc");
+        field.ghost = Some("uments/".into());
+        // caret parked at the end by Field::new: the ghost is live
+        assert!(ghost_visible(&field));
+        // mid-text (caret moved left) it would split the text: off
+        field.left();
+        assert!(!ghost_visible(&field));
+        // and a selection crowds it out the same way
+        field.cursor = 0;
+        field.sel = Some((0, 2));
+        field.ghost = Some("uments/".into());
+        assert!(!ghost_visible(&field));
     }
 }
