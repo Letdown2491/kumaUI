@@ -71,6 +71,13 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- Selecting everything in a directory and pressing Delete could kill
+  Koguma: the trash emptied the listing while the view's virtualized
+  window still started rows past its new end, and the render's slice
+  panicked the process (which reads as the window closing). The
+  window clamps to what the listing actually holds now; a scrolled
+  icon-grid reproduction and the plain mass-trash sequence are pinned
+  by tests.
 - Forget network and unpair device confirm before they fire: the
   trash icon arms (label swaps to the question, self-disarms in 5s,
   the kit's arm-then-confirm shape), the second click acts. The

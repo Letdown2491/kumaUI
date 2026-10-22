@@ -9498,6 +9498,14 @@ impl Render for Browser {
                     .h(px(win_start as f32 * pitch)),
             );
         }
+        // the window derives from scroll and cursor state that a
+        // listing which just shrank invalidates: a mass trash
+        // emptying the directory mid-scroll left a start row past the
+        // end of the world and the slice died (the process with it,
+        // which reads as "the window closed"). Clamp to what the
+        // visible list actually holds.
+        let win_start = win_start.min(vis_count);
+        let win_end = win_end.min(vis_count).max(win_start);
         for (i, &entry_ix) in visible[win_start..win_end].iter().enumerate() {
             let vis_pos = win_start + i;
             let entry = &entries[entry_ix];
@@ -12965,6 +12973,75 @@ mod browser_ux_keys {
     /// directly with paths rather than listing entries.
     fn stamp_of(path: &Path) -> u64 {
         mtime_secs(&fs::symlink_metadata(path).unwrap())
+    }
+
+    #[test]
+    fn a_shrunk_listing_never_panics_the_windowed_render() {
+        // the field report: select all in a directory scrolled part
+        // way down, press Delete. The trash emptied the listing while
+        // the icon grid's window still started at row 30, and the
+        // slice took the process (and the window) down with it.
+        let lab = Lab::new("shrink-scroll");
+        for i in 0..40 {
+            fs::write(lab.dir.join(format!("bulk{i:02}.txt")), "x").unwrap();
+        }
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            use crate::browser::ViewMode;
+            browser.tab_mut().view_mode = ViewMode::Icons;
+            // scrolled down a few dozen rows: the grid window's start
+            // reads the stale offset once the listing empties
+            browser
+                .list_scroll
+                .set_offset(gpui::point(px(0.), px(-3600.)));
+            browser.route_key(&key("ctrl-a"), cx);
+            browser.route_key(&key("delete"), cx);
+        });
+        // the trash lands, the watcher and the op completion both
+        // rescan to empty, and the frames between render the window
+        app.run_until_parked();
+        app.advance_clock(std::time::Duration::from_secs(2));
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            assert!(browser.tab().entries.is_empty(), "the listing never emptied");
+        });
+    }
+
+    #[test]
+    fn select_all_delete_trashes_everything_and_the_window_lives() {
+        let lab = Lab::new("select-all-trash");
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        // select all, then Delete: everything trashes, the directory
+        // empties, and the browser must live through the reload
+        window.update(|browser, _, cx| {
+            browser.route_key(&key("ctrl-a"), cx);
+            assert_eq!(browser.tab().selection.len(), 4, "a.txt, b.txt, c.txt, sub");
+            browser.route_key(&key("delete"), cx);
+        });
+        app.run_until_parked();
+        app.advance_clock(std::time::Duration::from_secs(2));
+        app.run_until_parked();
+        assert!(!lab.dir.join("a.txt").exists(), "a.txt never trashed");
+        assert!(!lab.dir.join("sub").exists(), "sub never trashed");
+        window.update(|browser, _, _| {
+            assert!(browser.tab().entries.is_empty(), "the listing never emptied");
+        });
+        // and undo puts everything back
+        window.update(|browser, _, cx| {
+            browser.route_key(&key("ctrl-z"), cx);
+        });
+        app.run_until_parked();
+        app.advance_clock(std::time::Duration::from_secs(2));
+        app.run_until_parked();
+        assert!(lab.dir.join("a.txt").exists(), "undo never restored a.txt");
     }
 
     #[test]
