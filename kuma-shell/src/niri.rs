@@ -46,7 +46,59 @@ pub(crate) fn socket_path() -> Result<PathBuf> {
     kuma_platform::niri::socket_path()
 }
 
-async fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
+/// A ceiling on one IPC line, the same insurance the sway reader
+/// carries: a broken peer must not balloon the line buffer without
+/// limit. Real niri events never approach this.
+const MAX_IPC_PAYLOAD: u32 = 2 * 1024 * 1024;
+
+/// One newline-terminated line, capped: a broken peer must not
+/// balloon the line buffer without limit (the same insurance the
+/// sway reader carries; real niri events never approach the cap). A
+/// line past the cap, or EOF mid-line, ends the attempt: a
+/// truncated line cannot re-sync the stream.
+fn read_capped_line<R: BufRead>(reader: &mut R) -> Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        // the chunk's borrow is confined to this block; the consume
+        // happens after it ends
+        let (take, line_done, eof) = {
+            let chunk = match reader.fill_buf() {
+                Ok(chunk) => chunk,
+                // a signal mid-read retries, it does not end the attempt
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err.into()),
+            };
+            let (take, line_done) = match chunk.iter().position(|byte| *byte == b'\n') {
+                Some(pos) => {
+                    buf.extend_from_slice(&chunk[..=pos]);
+                    (pos + 1, true)
+                }
+                None => {
+                    buf.extend_from_slice(chunk);
+                    (chunk.len(), false)
+                }
+            };
+            (take, line_done, chunk.is_empty())
+        };
+        reader.consume(take);
+        if buf.len() > MAX_IPC_PAYLOAD as usize {
+            bail!("niri sent a line past the {MAX_IPC_PAYLOAD}-byte payload cap");
+        }
+        if line_done {
+            return Ok(Some(String::from_utf8(buf)?));
+        }
+        if eof {
+            // EOF: an unterminated tail is not a line to parse
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                bail!("niri closed the event stream mid-line")
+            };
+        }
+    }
+}
+
+fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
     let path = socket_path()?;
     let stream = UnixStream::connect(&path).context("failed to connect to niri IPC socket")?;
 
@@ -54,25 +106,24 @@ async fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
     writer.write_all(b"\"EventStream\"\n")?;
 
     let mut reader = BufReader::new(stream);
-    let mut reply = String::new();
-    reader.read_line(&mut reply)?;
+    let Some(reply) = read_capped_line(&mut reader)? else {
+        bail!("niri closed the event stream before the reply");
+    };
     if !reply.starts_with("{\"Ok\"") {
         bail!("unexpected niri IPC reply: {reply}");
     }
 
-    let mut line = String::new();
     loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let Some(line) = read_capped_line(&mut reader)? else {
             bail!("niri closed the event stream");
-        }
+        };
         // One bad line must not cost the stream: a reshaped event in
         // some future niri would otherwise end the mirror for the
         // whole session. Skip it and let the next event re-sync. EOF
         // and socket errors above still end the attempt; the mirror
         // reconnects (session.rs).
         match parse_event(&line) {
-            Ok(Some(event)) => event_tx.send(event).await?,
+            Ok(Some(event)) => event_tx.send_blocking(event)?,
             Ok(None) => {}
             Err(err) => error!("niri event skipped, parse failed: {err:#}"),
         }
@@ -170,6 +221,42 @@ pub fn stop_cast(session_id: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_line_and_reports_the_clean_eof() {
+        let mut reader = BufReader::new(&b"first\nsecond\n"[..]);
+        assert_eq!(read_capped_line(&mut reader).unwrap(), Some("first\n".into()));
+        assert_eq!(read_capped_line(&mut reader).unwrap(), Some("second\n".into()));
+        // a clean EOF reads None: the caller ends the attempt
+        assert_eq!(read_capped_line(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn a_line_past_the_cap_ends_the_attempt() {
+        let long = "x".repeat(MAX_IPC_PAYLOAD as usize + 1);
+        let mut reader = BufReader::new(long.as_bytes());
+        assert!(read_capped_line(&mut reader)
+            .unwrap_err()
+            .to_string()
+            .contains("payload cap"));
+    }
+
+    #[test]
+    fn an_unterminated_tail_is_not_a_line_to_parse() {
+        // a peer that dies mid-line (or mid-cap) must end the
+        // attempt, not hand a truncated line to the parser
+        let mut reader = BufReader::new(&b"{\"WorkspacesChanged\""[..]);
+        assert!(read_capped_line(&mut reader).is_err());
+    }
+
+    #[test]
+    fn a_line_split_across_reads_still_parses() {
+        // BufReader over a pipe hands out whatever arrived; the
+        // reader must reassemble across fills
+        let mut reader = BufReader::with_capacity(4, &b"{\"a\":1}\n{\"b\":2}\n"[..]);
+        assert_eq!(read_capped_line(&mut reader).unwrap(), Some("{\"a\":1}\n".into()));
+        assert_eq!(read_capped_line(&mut reader).unwrap(), Some("{\"b\":2}\n".into()));
+    }
 
     #[test]
     fn parses_workspaces_changed_event() {

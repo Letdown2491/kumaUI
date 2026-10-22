@@ -169,7 +169,7 @@ fn fetch_windows(ipc: &mut Ipc) -> Result<std::collections::HashMap<u64, Session
         .collect())
 }
 
-async fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
+fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
     let mut ipc = Ipc::connect()?;
     let subscribed = ipc.request(SUBSCRIBE, br#"["workspace","window"]"#)?;
     if !subscribed["success"].as_bool().unwrap_or(false) {
@@ -178,12 +178,8 @@ async fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
 
     // sway sends no state on subscribe: seed the mirror with a full
     // snapshot so a shell starting mid-session sees the session
-    event_tx
-        .send(SessionEvent::Workspaces(fetch_workspaces(&mut ipc)?))
-        .await?;
-    event_tx
-        .send(SessionEvent::Windows(fetch_windows(&mut ipc)?))
-        .await?;
+    event_tx.send_blocking(SessionEvent::Workspaces(fetch_workspaces(&mut ipc)?))?;
+    event_tx.send_blocking(SessionEvent::Windows(fetch_windows(&mut ipc)?))?;
 
     loop {
         let (kind, value) = ipc.next_event()?;
@@ -192,11 +188,11 @@ async fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
                 // the workspace object's flags are the truth: refetch
                 // rather than patch, so visible and focused stay exact
                 let workspaces = fetch_workspaces(&mut ipc)?;
-                event_tx.send(SessionEvent::Workspaces(workspaces)).await?;
+                event_tx.send_blocking(SessionEvent::Workspaces(workspaces))?;
             }
             EVENT_WINDOW => {
                 if let Some(event) = window_event(&value) {
-                    event_tx.send(event).await?;
+                    event_tx.send_blocking(event)?;
                 }
             }
             _ => {}

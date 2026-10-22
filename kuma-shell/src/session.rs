@@ -4,18 +4,25 @@
 //! is the first adapter, and sway and hyprland slot in beside it (the
 //! adapters are picked at startup by which IPC socket exists).
 
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{collections::HashMap, time::Duration, time::Instant};
 
 use anyhow::Result;
 use gpui::{App, AppContext, Entity};
 use log::{debug, error, warn};
 use serde::Deserialize;
-use smol::channel::{Sender, unbounded};
+use smol::channel::{Sender, bounded, unbounded};
 
 /// How long a terminated stream waits before reopening. Long enough
 /// that a restarting compositor is not hammered, short enough that a
 /// bar goes stale for seconds rather than for the rest of the session.
 const RECONNECT_AFTER: Duration = Duration::from_secs(3);
+/// The backoff ceiling: a permanently dead socket logs once a minute
+/// for the process life, not once every three seconds.
+const RECONNECT_MAX: Duration = Duration::from_secs(60);
+/// An attempt that stayed up this long was healthy: the next death
+/// restarts the ladder at the bottom instead of climbing from sixty
+/// seconds.
+const RECONNECT_RESET: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Workspace {
@@ -268,15 +275,10 @@ pub fn connect(state: &Entity<SessionState>, cx: &mut App) {
 /// Spawn an adapter's event stream and apply what it reports to the
 /// mirror. Both halves of the plumbing live here; only the stream
 /// function is the adapter's own. `name` is what a broken stream gets
-/// to be called in the log.
-pub(crate) fn mirror<Stream, Fut>(
-    state: &Entity<SessionState>,
-    name: &'static str,
-    cx: &mut App,
-    stream: Stream,
-) where
-    Stream: Fn(Sender<SessionEvent>) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<()>> + Send + 'static,
+/// to be called in the log, and what the attempt thread is named.
+pub(crate) fn mirror<Stream>(state: &Entity<SessionState>, name: &'static str, cx: &mut App, stream: Stream)
+where
+    Stream: Fn(Sender<SessionEvent>) -> Result<()> + Send + Sync + 'static,
 {
     let state = state.downgrade();
     let (event_tx, event_rx) = unbounded::<SessionEvent>();
@@ -286,14 +288,50 @@ pub(crate) fn mirror<Stream, Fut>(
     // loop opens a fresh one. State survives the gap and heals on
     // reconnect, because every attempt re-seeds it (niri snapshots on
     // connect, sway fetches after subscribe).
+    //
+    // Each attempt runs on its own thread: the adapters read their
+    // sockets with blocking Unix IO, and a dedicated thread keeps
+    // that pinned work off the executor's workers for the attempt's
+    // whole life.
     cx.background_spawn(async move {
+        let stream = std::sync::Arc::new(stream);
+        let mut delay = RECONNECT_AFTER;
         loop {
-            if let Err(err) = stream(event_tx.clone()).await {
-                error!("{name} event stream terminated: {err:#}; retrying in {RECONNECT_AFTER:?}");
-            } else {
-                warn!("{name} event stream ended without error; retrying in {RECONNECT_AFTER:?}");
+            let (done_tx, done_rx) = bounded::<Result<()>>(1);
+            let event_tx = event_tx.clone();
+            let started = Instant::now();
+            let spawned = std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn({
+                    let stream = stream.clone();
+                    move || {
+                        let _ = done_tx.send_blocking(stream(event_tx));
+                    }
+                });
+            match &spawned {
+                Ok(_) => match done_rx.recv().await {
+                    Ok(Ok(())) => {
+                        warn!("{name} event stream ended without error; retrying in {delay:?}")
+                    }
+                    // a panic inside the attempt drops the sender, so
+                    // a recv error reads like any other death
+                    Ok(Err(err)) => {
+                        error!("{name} event stream terminated: {err:#}; retrying in {delay:?}")
+                    }
+                    Err(_) => error!("{name} event stream thread died; retrying in {delay:?}"),
+                },
+                Err(err) => {
+                    error!("{name} event stream thread could not spawn: {err:#}; retrying in {delay:?}")
+                }
             }
-            smol::Timer::after(RECONNECT_AFTER).await;
+            // the ladder is for a dead socket, not for a compositor
+            // that restarts on a human timescale: a long-lived
+            // attempt resets it to the bottom
+            if spawned.is_ok() && started.elapsed() >= RECONNECT_RESET {
+                delay = RECONNECT_AFTER;
+            }
+            smol::Timer::after(delay).await;
+            delay = (delay * 2).min(RECONNECT_MAX);
         }
     })
     .detach();

@@ -97,6 +97,16 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- The session mirror now backs off when its compositor socket dies
+  instead of retrying on a fixed three-second clock forever: the
+  retry ladder climbs to a one-minute ceiling (a permanently dead
+  socket logs ~1,400 lines a day instead of ~28,800), and an attempt
+  that stayed up a minute resets it, so a compositor restarting on a
+  human timescale still reconnects in seconds. Each attempt also
+  runs on its own named thread (its blocking socket reads no longer
+  occupy a background-executor worker), and niri's event reader now
+  carries the same 2 MiB line cap sway's has, so a broken peer
+  cannot balloon the line buffer without limit.
 - Selecting everything in a directory and pressing Delete could kill
   Koguma: the trash emptied the listing while the view's virtualized
   window still started rows past its new end, and the render's slice
