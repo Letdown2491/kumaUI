@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, env, fs, io};
 
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Div, DragMoveEvent,
@@ -20,7 +20,7 @@ use gpui::{
     relative, rgba, rgb, svg, uniform_list, FontStyle, FontWeight, SharedString,
 };
 use trash::{os_limited, TrashItem};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use notify::Watcher as _;
 use std::os::unix::fs::PermissionsExt;
@@ -389,6 +389,160 @@ enum Op {
     Nop,
 }
 
+/// The shared state one enqueue run carries: the cancel flag the
+/// Cancel button sets, the byte counter the copy loops advance, and
+/// the progress facts the status ticker formats. Arc'd because the op
+/// runs on a background thread while the view reads from the UI one.
+#[derive(Default)]
+struct RunState {
+    cancel: Arc<AtomicBool>,
+    /// bytes moved so far, across every op of the run
+    done: Arc<AtomicU64>,
+    /// the run's total bytes, computed by a walk before the first op
+    /// (0 until it lands, and 0 when there is nothing to count)
+    total: Arc<AtomicU64>,
+    /// which op of how many is running, and its verb, for the
+    /// "copying 3 of 500" half of the line
+    ix: AtomicUsize,
+    count: AtomicUsize,
+    verb: std::sync::Mutex<&'static str>,
+}
+
+impl RunState {
+    fn new(count: usize) -> Self {
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicU64::new(0)),
+            total: Arc::new(AtomicU64::new(0)),
+            ix: AtomicUsize::new(0),
+            count: AtomicUsize::new(count),
+            verb: std::sync::Mutex::new("working"),
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// The progress line: "copying 3 of 500, 4.2 GiB / 9.8 GiB", with
+    /// the byte half dropped when the total walk found nothing to
+    /// count (extract and compress sizes are the tool's business).
+    fn line(&self) -> String {
+        let verb = *self.verb.lock().unwrap_or_else(|p| p.into_inner());
+        let ix = self.ix.load(Ordering::Relaxed);
+        let count = self.count.load(Ordering::Relaxed);
+        let done = self.done.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        let bytes = if total > 0 {
+            format!(", {} / {}", human_size(done), human_size(total))
+        } else if done > 0 {
+            format!(", {} copied", human_size(done))
+        } else {
+            String::new()
+        };
+        format!("{} {} of {}{}", verb, ix + 1, count, bytes)
+    }
+
+    /// Mark the run cancelled in the eyes of the loop: a plain error
+    /// from an op is a failure, but an error while the flag is set is
+    /// the cancellation surfacing from wherever it was noticed.
+    fn failure_if_cancelled(&self, err: String) -> Option<String> {
+        self.cancelled()
+            .then(|| CANCELLED.into())
+            .or(Some(err))
+    }
+}
+
+/// The error text a cancelled run ends with. Distinguished at the end
+/// of the queue loop only through the flag, so the op bodies can
+/// surface the check wherever it lands (between files, between
+/// chunks) without a special error type threading through them all.
+const CANCELLED: &str = "cancelled";
+
+fn cancel_err() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, CANCELLED)
+}
+
+/// Copy one regular file in chunks, advancing the run's byte counter
+/// and honoring the cancel flag between chunks. Stands in for
+/// `fs::copy`, whose single call gives no progress hook: one multi-GiB
+/// file would otherwise freeze the status line for minutes. Creates
+/// and truncates the destination like `fs::copy`, copies the source
+/// permissions at the end, and leaves a cancelled copy's partial
+/// destination for the caller to clean (it knows the replace rules).
+fn copy_file_progress(from: &Path, to: &Path, state: &RunState) -> io::Result<u64> {
+    if state.cancelled() {
+        return Err(cancel_err());
+    }
+    let mut src = fs::File::open(from)?;
+    let meta = src.metadata()?;
+    if !meta.is_file() {
+        // a FIFO or device file: reading it could block forever with
+        // no writer, wedging the whole queue (fs::copy had the same
+        // hazard in the directory walk)
+        return Err(io::Error::other(format!(
+            "{} is not a regular file",
+            from.display()
+        )));
+    }
+    let mut dst = fs::File::create(to)?;
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut copied = 0u64;
+    loop {
+        if state.cancelled() {
+            return Err(cancel_err());
+        }
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(&buf[..n])?;
+        copied += n as u64;
+        state.done.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    drop(dst);
+    fs::set_permissions(to, meta.permissions())?;
+    Ok(copied)
+}
+
+/// The chunk a byte-counted copy moves per read: large enough that the
+/// loop is I/O bound, small enough that a cancel lands within a
+/// fraction of a second and the progress line moves every tick.
+const COPY_CHUNK: usize = 256 * 1024;
+
+/// The run's total bytes, walked before the first op so the progress
+/// line can show a fraction. Sources are walked (a directory paste
+/// sums its tree), archives and compress inputs are stat'd. Failures
+/// are skipped: a total is a courtesy, not a promise.
+fn ops_total_bytes(ops: &[Op]) -> u64 {
+    fn path_bytes(path: &Path, depth: usize) -> u64 {
+        if depth > COPY_DEPTH_CAP {
+            return 0;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => {
+                let mut sum = 0;
+                if let Ok(entries) = fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        sum += path_bytes(&entry.path(), depth + 1);
+                    }
+                }
+                sum
+            },
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        }
+    }
+    ops.iter()
+        .map(|op| match op {
+            Op::Copy { from, .. } | Op::Move { from, .. } => path_bytes(from, 0),
+            Op::Extract { archive, .. } => path_bytes(archive, 0),
+            Op::Compress { files, .. } => files.iter().map(|f| path_bytes(f, 0)).sum(),
+            _ => 0,
+        })
+        .sum()
+}
+
 impl Op {
     fn verb(&self) -> &'static str {
         match self {
@@ -404,7 +558,7 @@ impl Op {
         }
     }
 
-    fn run(&self) -> Result<Option<Op>, String> {
+    fn run(&self, state: &RunState) -> Result<Option<Op>, String> {
         match self {
             Op::Nop => Ok(None),
             Op::Copy { from, to, replace } => {
@@ -423,7 +577,7 @@ impl Op {
                             to.display()
                         ));
                     }
-                    copy_dir_all(from, to).map_err(|err| format!("copy: {err}"))?;
+                    copy_dir_all(from, to, state).map_err(|err| format!("copy: {err}"))?;
                 } else if from.is_file() {
                     // a replace-copy steps the old target aside first,
                     // the move's shape: fs::copy truncates the
@@ -439,13 +593,21 @@ impl Op {
                     } else {
                         None
                     };
-                    if let Err(err) = fs::copy(from, to) {
+                    if let Err(err) = copy_file_progress(from, to, state) {
                         // the copy failed: the old target goes back
                         // over the partial copy
                         let restore = aside
                             .as_ref()
                             .map(|aside| fs::rename(aside, to))
                             .transpose();
+                        // a cancelled copy leaves a partial
+                        // destination; without a replace there was no
+                        // destination before, so take the partial
+                        // back out (with a replace the aside already
+                        // went back over it)
+                        if state.cancelled() && aside.is_none() {
+                            let _ = fs::remove_file(to);
+                        }
                         return Err(format!(
                             "copy: {err}{}",
                             restore
@@ -746,8 +908,8 @@ impl Op {
     }
 }
 
-fn copy_dir_all(from: &Path, to: &Path) -> io::Result<()> {
-    copy_dir_all_bounded(from, to, 0)
+fn copy_dir_all(from: &Path, to: &Path, state: &RunState) -> io::Result<()> {
+    copy_dir_all_bounded(from, to, 0, state)
 }
 
 /// A real directory tree is shallower than any path limit; a bind-mount
@@ -755,18 +917,23 @@ fn copy_dir_all(from: &Path, to: &Path) -> io::Result<()> {
 /// a stack overflow.
 const COPY_DEPTH_CAP: usize = 128;
 
-fn copy_dir_all_bounded(from: &Path, to: &Path, depth: usize) -> io::Result<()> {
+fn copy_dir_all_bounded(from: &Path, to: &Path, depth: usize, state: &RunState) -> io::Result<()> {
     if depth > COPY_DEPTH_CAP {
         return Err(io::Error::other("directory tree too deep (a mount cycle?)"));
+    }
+    // the walk checks between entries, not mid-file: within one file
+    // the chunk loop in copy_file_progress is the check
+    if state.cancelled() {
+        return Err(cancel_err());
     }
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_dir_all_bounded(&entry.path(), &target, depth + 1)?;
+            copy_dir_all_bounded(&entry.path(), &target, depth + 1, state)?;
         } else {
-            fs::copy(entry.path(), &target)?;
+            copy_file_progress(&entry.path(), &target, state)?;
         }
     }
     Ok(())
@@ -1852,6 +2019,9 @@ pub(crate) struct Browser {
     /// (on niri they are a CSD hint, and this client negotiates CSD),
     /// so the IPC is the only voice
     niri_tiled: bool,
+    /// The running file operation's shared state: the Cancel button
+    /// sets its flag, the ticker reads its counters. None while idle.
+    run_state: Option<Arc<RunState>>,
 }
 
 impl Focusable for Browser {
@@ -1961,6 +2131,7 @@ impl Browser {
             search_gen: 0,
             searching: false,
             niri_tiled: false,
+            run_state: None,
         };
         // the epub reading pane's indicator follows the wheel: the
         // chapter under the visible top becomes the position, so the
@@ -3470,35 +3641,91 @@ impl Browser {
         self.busy = true;
         self.disarm();
         let total = ops.len();
+        // the run's shared state: the Cancel button holds the same Arc
+        // the background ops hold, so a click lands between the copy
+        // chunks no matter where the queue is
+        let state = Arc::new(RunState::new(total));
+        self.run_state = Some(state.clone());
+        self.progress = state.line();
         cx.notify();
+        let for_total = ops.clone();
+        // the status ticker: while an op grinds (one multi-GiB file),
+        // the byte counter keeps the line moving and offers the
+        // fraction of the total; the worker sets `finished` when the
+        // queue is done with it
+        let finished = Arc::new(AtomicBool::new(false));
+        let ticker_finished = finished.clone();
+        let ticker_state = state.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                if ticker_finished.load(Ordering::Relaxed) {
+                    return;
+                }
+                let update = this.update(cx, |this, cx| {
+                    this.progress = ticker_state.line();
+                    cx.notify();
+                });
+                if update.is_err() {
+                    // the view is gone; the ticker dies with it
+                    return;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             let mut undo = Vec::new();
             let mut failure: Option<String> = None;
+            let mut cancelled = false;
+            // the walk for a total is one background stat pass; until
+            // it lands (and for extract/compress, which have nothing
+            // to count) the line stays count-only
+            let counted = cx
+                .background_spawn(async move { ops_total_bytes(&for_total) })
+                .await;
+            state.total.store(counted, Ordering::Relaxed);
             for (i, op) in ops.drain(..).enumerate() {
+                *state.verb.lock().unwrap_or_else(|p| p.into_inner()) = op.verb();
+                state.ix.store(i, Ordering::Relaxed);
                 let update = this.update(cx, |this, cx| {
-                    this.progress = format!("{} {} of {}", op.verb(), i + 1, total);
+                    this.progress = state.line();
                     cx.notify();
                 });
                 if let Err(err) = update {
                     log::error!("progress update failed: {err:#}");
                     return;
                 }
+                // between ops the flag is checked directly: a cancel
+                // that lands between two files never starts the next
+                if state.cancelled() {
+                    cancelled = true;
+                    break;
+                }
                 let outcome = {
                     let run_op = op.clone();
-                    cx.background_spawn(async move { run_op.run() }).await
+                    let run_state = state.clone();
+                    cx.background_spawn(async move { run_op.run(&run_state) }).await
                 };
                 match outcome {
                     Ok(Some(inverse)) => undo.push(inverse),
                     Ok(None) => {}
                     Err(err) => {
-                        failure = Some(format!("{} failed: {err}", op.verb()));
+                        // an error while the flag is set is the
+                        // cancellation surfacing from inside the op
+                        failure = state.failure_if_cancelled(err)
+                            .map(|msg| format!("{} {}", op.verb(), msg));
+                        cancelled = state.cancelled();
                         break;
                     }
                 }
             }
+            finished.store(true, Ordering::Relaxed);
             let update = this.update(cx, |this, cx| {
                 this.busy = false;
                 this.progress.clear();
+                this.run_state = None;
                 // the inverses of what succeeded are kept even on
                 // failure: the three files a five-file paste moved
                 // before the conflict happened are real moves, and
@@ -3511,12 +3738,17 @@ impl Browser {
                     let drop = this.undo.len() - UNDO_MAX_OPS;
                     this.undo.drain(..drop);
                 }
-                match failure {
-                    Some(err) => this.status = err,
-                    None if !this.undo.is_empty() => {
-                        this.status = "done; Ctrl+Z to undo".into();
+                if cancelled {
+                    this.status =
+                        "cancelled; the files that landed stay (Ctrl+Z to undo)".into();
+                } else {
+                    match failure {
+                        Some(err) => this.status = err,
+                        None if !this.undo.is_empty() => {
+                            this.status = "done; Ctrl+Z to undo".into();
+                        }
+                        None => {}
                     }
-                    None => {}
                 }
                 let show_hidden = this.show_hidden;
                 this.tab_mut().reload(show_hidden);
@@ -3528,6 +3760,20 @@ impl Browser {
         })
         .detach();
         true
+    }
+
+    /// The Cancel button: asks the running queue to stop. The flag is
+    /// honored between ops, between directory entries, and between
+    /// copy chunks, so a 50 GiB paste stops within a fraction of a
+    /// second; everything that already landed stays (and undoes).
+    fn cancel_ops(&mut self, cx: &mut Context<Self>) {
+        if self.busy
+            && let Some(state) = &self.run_state
+        {
+            state.cancel.store(true, Ordering::Relaxed);
+            self.status = "cancelling\u{2026}".into();
+            cx.notify();
+        }
     }
 
     fn copy_selection(&mut self, cx: &mut Context<Self>) {
@@ -10603,6 +10849,25 @@ impl Render for Browser {
                             .text_color(status_color)
                             .child(items_text)
                             .child(div().flex_1().truncate().child(status_text))
+                            // a running operation can be stopped: the
+                            // flag is honored between ops, entries,
+                            // and copy chunks, so even a 50 GiB paste
+                            // answers within a beat
+                            .when(self.busy, |row| {
+                                row.child(
+                                    div()
+                                        .id("cancel-ops")
+                                        .flex_none()
+                                        .px_2()
+                                        .text_color(theme::error())
+                                        .cursor_pointer()
+                                        .hover(|style| style.text_color(theme::accent()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_ops(cx)
+                                        }))
+                                        .child("Cancel"),
+                                )
+                            })
                             .child(match &cursor_info {
                                 // the info panel shows name, size, and
                                 // age whenever it is open, so the footer
@@ -12430,7 +12695,7 @@ mod tests {
             files: vec![src.clone()],
             archive: archive.clone(),
         };
-        if let Err(err) = made.run() {
+        if let Err(err) = made.run(&RunState::new(1)) {
             panic!("compress failed: {err}");
         }
         assert!(archive.exists(), "archive should exist after compress");
@@ -12440,7 +12705,7 @@ mod tests {
             archive: archive.clone(),
             dest: room.join("bundle"),
         };
-        op.run().unwrap();
+        op.run(&RunState::new(1)).unwrap();
         let restored = room.join("bundle/hello.txt");
         assert!(restored.exists(), "extract should restore the file");
         assert_eq!(fs::read_to_string(&restored).unwrap(), "hi there\n");
@@ -12464,7 +12729,7 @@ mod tests {
             to: old.clone(),
             replace: true,
         };
-        let inverse = op.run().unwrap().expect("a replace-copy has an inverse");
+        let inverse = op.run(&RunState::new(1)).unwrap().expect("a replace-copy has an inverse");
         assert_eq!(
             fs::read_to_string(&old).unwrap(),
             "the replacement\n",
@@ -12476,7 +12741,7 @@ mod tests {
             Op::Move { replace, .. } => assert!(replace, "the undo moves the old file back"),
             other => panic!("expected a Move inverse, got {other:?}"),
         }
-        inverse.run().unwrap();
+        inverse.run(&RunState::new(1)).unwrap();
         assert_eq!(
             fs::read_to_string(&old).unwrap(),
             "the original\n",
@@ -12507,7 +12772,7 @@ mod tests {
             to: dest_dir.clone(),
             replace: true,
         }
-        .run()
+        .run(&RunState::new(1))
         .expect_err("a dir-onto-dir replace must refuse, not merge");
         assert!(err.contains("is a directory"), "honest error: {err}");
         assert_eq!(
@@ -12993,6 +13258,206 @@ mod rename_conflict {
         assert!(
             dir.join("c.txt").exists() && !dir.join("a.txt").exists(),
             "the non-conflicting rename went through"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// The op run's cancel flag and byte counter: a running file operation
+/// can be stopped (between ops, between directory entries, between
+/// copy chunks) and the status line shows bytes moved, not just a
+/// frozen file count.
+#[cfg(test)]
+mod op_run {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("koguma-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn copy_file_progress_copies_counts_and_keeps_permissions() {
+        let dir = test_dir("copy-progress");
+        let src = dir.join("book.bin");
+        // a few chunks' worth: the loop must not depend on one read
+        let payload: Vec<u8> = (0..3 * COPY_CHUNK).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &payload).unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let state = RunState::new(1);
+        assert_eq!(
+            copy_file_progress(&src, &dir.join("out.bin"), &state).unwrap(),
+            payload.len() as u64
+        );
+        assert_eq!(
+            fs::read(dir.join("out.bin")).unwrap(),
+            payload,
+            "the copy is not byte-exact"
+        );
+        assert_eq!(state.done.load(Ordering::Relaxed), payload.len() as u64);
+        let mode = fs::metadata(dir.join("out.bin")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the source permissions did not ride along");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_preset_cancel_refuses_the_copy_and_leaves_no_destination() {
+        let dir = test_dir("copy-cancel");
+        let src = dir.join("book.bin");
+        fs::write(&src, "reachable bytes").unwrap();
+
+        let state = RunState::new(1);
+        state.cancel.store(true, Ordering::Relaxed);
+        let err = copy_file_progress(&src, &dir.join("out.bin"), &state).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            !dir.join("out.bin").exists(),
+            "a cancelled copy still created the destination"
+        );
+        assert_eq!(state.done.load(Ordering::Relaxed), 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_copies_count_bytes_and_cancel_between_entries() {
+        let dir = test_dir("dir-copy");
+        let from = dir.join("tree");
+        fs::create_dir_all(from.join("sub")).unwrap();
+        fs::write(from.join("a.bin"), "0123456789").unwrap();
+        fs::write(from.join("sub").join("b.bin"), "abcdef").unwrap();
+
+        let state = RunState::new(1);
+        copy_dir_all(&from, &dir.join("out"), &state).unwrap();
+        assert_eq!(fs::read(from.join("sub").join("b.bin")).unwrap(), b"abcdef");
+        assert_eq!(
+            state.done.load(Ordering::Relaxed),
+            10 + 6,
+            "the byte counter missed a file"
+        );
+
+        // a preset cancel stops the walk at its first check: the
+        // destination is never even created
+        let state = RunState::new(1);
+        state.cancel.store(true, Ordering::Relaxed);
+        let err = copy_dir_all(&from, &dir.join("out2"), &state).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            !dir.join("out2").exists(),
+            "a cancelled tree copy still created its destination"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_total_walk_sums_the_sources() {
+        let dir = test_dir("total-walk");
+        let tree = dir.join("tree");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("a.bin"), [0u8; 1000]).unwrap();
+        fs::write(tree.join("sub").join("b.bin"), [0u8; 250]).unwrap();
+        let lone = dir.join("lone.bin");
+        fs::write(&lone, [0u8; 40]).unwrap();
+
+        let ops = vec![
+            Op::Copy { from: tree.clone(), to: dir.join("x"), replace: false },
+            Op::Move { from: lone.clone(), to: dir.join("y"), replace: false },
+        ];
+        assert_eq!(ops_total_bytes(&ops), 1250 + 40);
+        // extract counts its archive, compress counts its inputs, and
+        // ops with nothing to count contribute nothing
+        let ops = vec![
+            Op::Extract { archive: lone.clone(), dest: dir.join("z") },
+            Op::Compress { files: vec![tree.clone()], archive: dir.join("a.tgz") },
+            Op::Trash { paths: vec![lone.clone()] },
+        ];
+        assert_eq!(ops_total_bytes(&ops), 40 + 1250);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_progress_line_shows_the_fraction_when_the_total_is_known() {
+        let state = RunState::new(500);
+        *state.verb.lock().unwrap() = "copying";
+        state.ix.store(2, Ordering::Relaxed);
+        state.done.store(4_500_000_000, Ordering::Relaxed);
+        state.total.store(9_800_000_000, Ordering::Relaxed);
+        assert_eq!(state.line(), "copying 3 of 500, 4.2 GiB / 9.1 GiB");
+
+        // without a total the line stays count-only, with a bare byte
+        // readout once something has moved
+        let state = RunState::new(500);
+        *state.verb.lock().unwrap() = "copying";
+        state.done.store(4096, Ordering::Relaxed);
+        assert_eq!(state.line(), "copying 1 of 500, 4.0 KiB copied");
+        assert_eq!(RunState::new(7).line(), "working 1 of 7");
+    }
+
+    #[test]
+    fn a_cancelled_queue_stops_reports_and_keeps_the_landed() {
+        let dir = test_dir("queue-cancel");
+        fs::write(dir.join("one.txt"), "first").unwrap();
+        fs::write(dir.join("two.txt"), "second").unwrap();
+        let dest = dir.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = app.open_window(|window, cx| {
+            Browser::new(Some(dest.clone()), window, cx)
+        });
+        app.run_until_parked();
+
+        window
+            .update(|browser, _, cx| {
+                let ops = vec![
+                    Op::Copy {
+                        from: dir.join("one.txt"),
+                        to: dest.join("one.txt"),
+                        replace: false,
+                    },
+                    Op::Copy {
+                        from: dir.join("two.txt"),
+                        to: dest.join("two.txt"),
+                        replace: false,
+                    },
+                ];
+                assert!(browser.enqueue(ops, cx));
+                // cancel before the background queue even starts: the
+                // loop's per-op check stops it at the first op, so the
+                // assert below does not race the copies
+                browser.cancel_ops(cx);
+            });
+        let mut settled = false;
+        for _ in 0..200 {
+            settled = window.update(|browser, _, _| !browser.busy);
+            if settled {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            app.run_until_parked();
+        }
+        assert!(settled, "the queue never settled after the cancel");
+
+        window.update(|browser, _, _| {
+            assert!(browser.run_state.is_none(), "the run state outlived the run");
+            assert!(
+                browser.status.starts_with("cancelled"),
+                "the status read {:?}", browser.status
+            );
+        });
+        assert!(
+            !dest.join("two.txt").exists(),
+            "the second op ran after the cancel"
         );
 
         let _ = fs::remove_dir_all(&dir);

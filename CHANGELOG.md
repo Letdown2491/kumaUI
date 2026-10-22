@@ -22,6 +22,13 @@ source's wrap points would pin the text to a narrow column.
   stream pays one line's decode instead of the screen's, and the
   paint buckets its selection and search washes per row instead of
   filtering every span against every row.
+- Koguma's file operations can be stopped: a Cancel button sits in
+  the footer beside the progress line while an operation runs, and
+  the stop lands between files, between directory entries, and
+  between copy chunks, so even a 50 GiB paste answers within a beat.
+  Everything that already landed stays and undoes; a cancelled copy
+  takes its partial destination back out (a replaced target's
+  original goes back over it, as on any other failure).
 
 ### Fixed
 
