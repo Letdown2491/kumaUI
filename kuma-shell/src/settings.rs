@@ -1067,15 +1067,41 @@ fn config_path() -> PathBuf {
     base.join("kuma-shell").join("config.toml")
 }
 
+/// Copy an unparsable config beside itself under a name that keeps the
+/// bytes reachable: `config.toml.invalid-<unix-secs>`. None means the
+/// file does not exist (a first boot has nothing to back up) or could
+/// not be read at all.
+fn backup_unreadable_config(path: &std::path::Path) -> Option<PathBuf> {
+    let bytes = fs::read(path).ok()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!("toml.invalid-{stamp}"));
+    fs::write(&backup, bytes).ok()?;
+    Some(backup)
+}
+
 impl Settings {
     pub fn load() -> Settings {
         match Settings::try_load() {
             Ok(settings) => settings,
             Err(err) => {
-                error!(
-                    "loading config from {:?} failed, using defaults: {err:#}",
-                    config_path()
-                );
+                // the file's bytes are the one record of the user's
+                // config, and the next commit writes defaults over
+                // them (this boot has nothing honest to preserve).
+                // Back the unreadable file up beside itself first, so
+                // a torn write or a bad hand edit costs a look at the
+                // backup, never the bar layout.
+                let path = config_path();
+                match backup_unreadable_config(&path) {
+                    Some(backup) => error!(
+                        "loading config from {path:?} failed, using defaults; the unreadable file is backed up at {backup:?}: {err:#}"
+                    ),
+                    None => error!(
+                        "loading config from {path:?} failed, using defaults (no backup made: the file is missing or unreadable): {err:#}"
+                    ),
+                }
                 Settings::default()
             }
         }
@@ -1672,6 +1698,36 @@ mod tests {
         });
         assert_eq!(settings.placed_builtin_kinds().len(), 8);
         assert!(settings.full_pass_placed());
+    }
+
+    #[test]
+    fn an_unreadable_config_backs_up_beside_itself() {
+        // no tempfile dependency, so the tests build their own path
+        let dir =
+            std::env::temp_dir().join(format!("kuma-config-backup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // no file: nothing to back up (a first boot)
+        assert_eq!(backup_unreadable_config(&path), None);
+
+        // an unreadable file: the bytes survive under the invalid name
+        std::fs::write(&path, "this is not toml [[").unwrap();
+        let backup = backup_unreadable_config(&path).expect("backup for an existing file");
+        assert!(
+            backup
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("config.toml.invalid-"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "this is not toml [["
+        );
+
+        // the backup never clobbers the live path's name
+        assert_ne!(backup, path);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

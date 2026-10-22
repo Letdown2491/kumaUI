@@ -37,6 +37,10 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- A corrupt or torn config.toml no longer risks permanent loss: the
+  boot load backed by defaults now backs the unreadable file up
+  beside itself (`config.toml.invalid-<timestamp>`) before the next
+  settings commit writes defaults over it.
 - Bar widgets the sysmon full pass feeds (internet, bluetooth,
   media, power profile) rendered empty forever unless a sysinfo
   widget was also placed: the pass's run gate checked only the
