@@ -77,7 +77,7 @@ fn exchange(request: &Value, timeout: Option<Duration>) -> Result<Value> {
 /// One reply line, capped: `take` bounds the read at cap+1, so an
 /// over-long line comes back without a newline and the length check
 /// turns it into an error instead of a ballooned buffer.
-fn read_capped_reply<R: std::io::BufRead>(mut reader: R) -> Result<String> {
+fn read_capped_reply<R: std::io::BufRead>(reader: R) -> Result<String> {
     let mut reply = String::new();
     if reader.take(MAX_REPLY + 1).read_line(&mut reply)? > MAX_REPLY as usize {
         bail!("niri reply exceeds the {}-byte cap", MAX_REPLY);

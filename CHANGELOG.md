@@ -43,8 +43,26 @@ source's wrap points would pin the text to a narrow column.
   audit's #1 polish gap: a 40-char vault password no longer means
   typing it by hand on the lock screen.
 
+### Added
+
+- Notification toasts carry their action buttons, and the body's
+  click fires the client's default action (the spec's "default" key)
+  instead of plain dismissal.
+- A burst of notifications queues instead of clobbering: one toast on
+  stage at a time, up to three waiting their turn (a longer burst
+  expires the oldest waiting unread), and a client replacing its own
+  notification still updates in place.
+- The history panel stacks consecutive notifications from one app
+  under a count header with an expand toggle, so a morning of pings
+  from one app reads as one row plus the newest card.
+
 ### Fixed
 
+- Clearing the history now tells clients: every cleared entry emits
+  its NotificationClosed (reason 2) instead of leaving the sender
+  hanging on a signal that never comes.
+- Invoking a notification action no longer emits NotificationClosed
+  twice.
 - The platform's plain niri exchange no longer trusts the socket
   forever: a generous default timeout (10s) bounds a stuck peer, and
   reply lines are capped at 1 MiB, so a broken niri cannot balloon

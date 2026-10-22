@@ -64,6 +64,18 @@ impl ToastView {
         (1.0 - elapsed / self.duration.as_secs_f32()).clamp(0.0, 1.0)
     }
 
+    /// The actions that render as buttons: every one of the client's
+    /// but the default, which the body's click fires instead of a
+    /// button (the spec's "default" key is the banner click).
+    fn actions(&self) -> Vec<(String, String)> {
+        self.notification
+            .actions
+            .iter()
+            .filter(|(key, _)| key != "default")
+            .cloned()
+            .collect()
+    }
+
     /// The toast's clock: repaint ~7×/sec so the bar drains smoothly,
     /// pause while hovered, and expire when the drained time runs out,
     /// which may be much later than `duration` if the user keeps the
@@ -116,6 +128,15 @@ impl Render for ToastView {
         let state = self.state.clone();
         let id = self.notification.id;
         let notification = self.notification.clone();
+        // the body's click fires the client's default action when it
+        // has one (the spec's "default" key), else the plain dismiss
+        let default_action = notification
+            .actions
+            .iter()
+            .find(|(key, _)| key == "default")
+            .map(|(key, _)| key.clone());
+        let toast_state = state.clone();
+        let toast_actions = self.actions();
         let progress = self.progress();
         let height = self.height;
 
@@ -130,10 +151,6 @@ impl Render for ToastView {
             .border_1()
             .border_color(rgb(crate::theme::current().divider))
             .overflow_hidden()
-            .cursor_pointer()
-            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-                state.update(cx, |state, cx| state.dismiss(id, 2, cx));
-            })
             // hovering pauses the clock; entering starts a pause (the
             // compositor's synthesized enter-move triggers this), leaving
             // banks it
@@ -149,8 +166,12 @@ impl Render for ToastView {
                     cx.notify();
                 }
             }))
+            // the body is the click target (default action or dismiss);
+            // the actions row and the drain bar are siblings of it, so
+            // a button click never also dismisses
             .child(
                 div()
+                    .id("toast-body")
                     .flex()
                     .flex_col()
                     .gap_0p5()
@@ -159,6 +180,13 @@ impl Render for ToastView {
                     .pb(px(8.))
                     .min_h_0()
                     .flex_1()
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        toast_state.update(cx, |state, cx| match &default_action {
+                            Some(key) => state.invoke(id, key.clone(), cx),
+                            None => state.dismiss(id, 2, cx),
+                        });
+                    })
                     .child(
                         div()
                             .flex()
@@ -193,6 +221,31 @@ impl Render for ToastView {
                         )
                     }),
             )
+            .when(!toast_actions.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .px(px(14.))
+                        .pb(px(8.))
+                        .children(toast_actions.into_iter().map(|(key, label)| {
+                            let action_state = state.clone();
+                            let action_key = key.clone();
+                            kit::button(
+                                SharedString::from(format!("toast-action-{id}-{key}")),
+                                &label,
+                                None,
+                                kit::ButtonVariant::Ghost,
+                                move |_, _, cx| {
+                                    action_state.update(cx, |state, cx| {
+                                        state.invoke(id, action_key.clone(), cx)
+                                    });
+                                },
+                            )
+                        })),
+                )
+            })
             .child(
                 // the closing indication: the drain bar. Inset by the card's
                 // corner radius: gpui's overflow clip is rectangular, so a
@@ -280,6 +333,9 @@ pub fn toast_window_options(edge: f32, position: crate::settings::BarPosition) -
 pub struct NotificationsView {
     geometry: PanelGeometry,
     state: Entity<NotificationState>,
+    /// The app groups the panel expanded (the rest render collapsed,
+    /// newest card visible): keyed by app name.
+    expanded: std::collections::HashSet<String>,
 }
 
 impl NotificationsView {
@@ -293,7 +349,11 @@ impl NotificationsView {
         cx.observe(&state, |_, _, cx| cx.notify()).detach();
         // opening the panel is seeing the notifications
         state.update(cx, |state, cx| state.mark_read(cx));
-        Self { geometry, state }
+        Self {
+            geometry,
+            state,
+            expanded: std::collections::HashSet::new(),
+        }
     }
 }
 
@@ -316,17 +376,17 @@ impl Render for NotificationsView {
             )
             .into_any_element()
         } else {
+            let groups = group_by_app(&notifications);
             div()
                 .id("notification-list")
                 .flex()
                 .flex_col()
                 .gap_1()
                 .overflow_y_scroll()
-                .children(
-                    notifications
-                        .iter()
-                        .map(|notification| notification_card(notification, cx)),
-                )
+                .children(groups.into_iter().map(|group| match group.len() {
+                    1 => notification_card(&group.notifications[0], cx).into_any_element(),
+                    _ => app_group(group, &self.expanded, cx).into_any_element(),
+                }))
                 .into_any_element()
         };
 
@@ -364,6 +424,110 @@ impl Render for NotificationsView {
 
         crate::panel::chrome(self.geometry, window, cx, content)
     }
+}
+
+/// A run of consecutive notifications from one app: the panel stacks
+/// them so a morning of pings reads as one row plus a count.
+struct AppGroup {
+    app_name: String,
+    /// The newest notification's icon (the header shows it).
+    icon: Option<IconImage>,
+    /// Newest first, as the history list runs.
+    notifications: Vec<Notification>,
+}
+
+impl AppGroup {
+    fn len(&self) -> usize {
+        self.notifications.len()
+    }
+}
+
+/// Group consecutive same-app runs: pure list surgery, testable
+/// without a context. Non-consecutive arrivals from one app stay in
+/// their own places; the list's order never changes.
+fn group_by_app(list: &[Notification]) -> Vec<AppGroup> {
+    let mut groups: Vec<AppGroup> = Vec::new();
+    for notification in list {
+        match groups.last_mut() {
+            Some(group) if group.app_name == notification.app_name => {
+                group.notifications.push(notification.clone());
+            }
+            _ => groups.push(AppGroup {
+                app_name: notification.app_name.clone(),
+                icon: notification.icon.clone(),
+                notifications: vec![notification.clone()],
+            }),
+        }
+    }
+    groups
+}
+
+/// One app group: a header row (icon, name, count, expand toggle) plus
+/// the newest card always, the rest when expanded.
+fn app_group(
+    group: AppGroup,
+    expanded: &std::collections::HashSet<String>,
+    cx: &mut Context<NotificationsView>,
+) -> gpui::Stateful<Div> {
+    let app_name = group.app_name.clone();
+    let app_label = app_name.clone();
+    let count = group.len();
+    let is_expanded = expanded.contains(&app_name);
+    let newest = &group.notifications[0];
+
+    kit::card(SharedString::from(format!("group-{app_name}")))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .id(SharedString::from(format!("group-header-{app_name}")))
+                .flex()
+                .items_center()
+                .gap_1()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.expanded.remove(&app_label) {
+                        this.expanded.insert(app_label.clone());
+                    }
+                    cx.notify();
+                }))
+                .when_some(group.icon.clone(), |el, icon| {
+                    el.child(icon_element(icon, 14.))
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(10.))
+                        .text_color(rgb(crate::theme::current().text_dim))
+                        .truncate()
+                        .child(app_name.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(crate::theme::current().text_dim))
+                        .child(format!("{count}")),
+                )
+                .child(
+                    gpui::svg()
+                        .path(if is_expanded {
+                            "icons/arrow-up.svg"
+                        } else {
+                            "icons/arrow-down.svg"
+                        })
+                        .size(px(10.))
+                        .text_color(rgb(crate::theme::current().text_dim)),
+                ),
+        )
+        .child(notification_card(newest, cx))
+        .when(is_expanded, |el| {
+            el.children(
+                group.notifications[1..]
+                    .iter()
+                    .map(|notification| notification_card(notification, cx)),
+            )
+        })
 }
 
 /// One history card: app + time, summary, body, actions.
@@ -449,4 +613,56 @@ fn notification_card(
                     })),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notification(id: u32, app: &str) -> Notification {
+        Notification {
+            id,
+            app_name: app.into(),
+            icon: None,
+            summary: format!("summary {id}"),
+            body: String::new(),
+            actions: Vec::new(),
+            urgency: crate::notifications::Urgency::Normal,
+            received_at: chrono::Local::now(),
+            expire_timeout: -1,
+            closed: false,
+        }
+    }
+
+    #[test]
+    fn consecutive_same_app_runs_group() {
+        // the history runs newest first: ids 4, 3 are two GitLab
+        // arrivals, then Files, then an older GitLab
+        let list = vec![
+            notification(4, "GitLab"),
+            notification(3, "GitLab"),
+            notification(2, "Files"),
+            notification(1, "GitLab"),
+        ];
+        let groups = group_by_app(&list);
+        // two runs of GitLab around Files: three groups
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].len(), 1);
+        assert_eq!(groups[2].len(), 1);
+        // newest first inside a group, order preserved overall
+        assert_eq!(groups[0].notifications[0].id, 4);
+        assert_eq!(groups[0].notifications[1].id, 3);
+        assert_eq!(groups[2].notifications[0].id, 1);
+    }
+
+    #[test]
+    fn a_single_app_is_one_group_and_singletons_render_plain() {
+        let list = vec![notification(2, "GitLab"), notification(1, "GitLab")];
+        let groups = group_by_app(&list);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+        // an empty history groups to nothing
+        assert!(group_by_app(&[]).is_empty());
+    }
 }

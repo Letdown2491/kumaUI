@@ -2,7 +2,7 @@
 //! hosted inside the shell, the state it feeds, and the seams panels and the
 //! bar read from. No separate mako process: the shell *is* the daemon.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +26,10 @@ const DEFAULT_EXPIRE: Duration = Duration::from_secs(5);
 /// The cap: clients may ask for anything (0 = never, 600000 = ten minutes),
 /// but a toast banner hangs around for at most this long.
 const MAX_EXPIRE: Duration = Duration::from_secs(5);
+/// How many notifications may wait behind the visible toast before the
+/// oldest queued one expires unread: a burst lands as a short queue,
+/// not a parade (one visible + three waiting).
+const TOAST_QUEUE_CAP: usize = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Urgency {
@@ -233,6 +237,10 @@ pub struct NotificationState {
         u32,
         gpui::WindowHandle<crate::notifications_view::ToastView>,
     )>,
+    /// Notifications waiting to toast, oldest first: a burst shows as
+    /// one toast after another instead of the newest clobbering the
+    /// rest before they were seen. Bounded at `TOAST_QUEUE_CAP`.
+    toast_queue: VecDeque<u32>,
     /// Ids the shell mints for its own notifications. Offset far past
     /// the daemon's counter so a self-push can never replace a client's
     /// toast by id collision.
@@ -262,6 +270,7 @@ impl NotificationState {
             settings,
             signals,
             toast: None,
+            toast_queue: VecDeque::new(),
             next_id: AtomicU32::new(1_000_000),
         }
     }
@@ -331,7 +340,7 @@ impl NotificationState {
         self.notifications
             .retain(|existing| existing.id != notification.id);
         for evicted in insert_notification(&mut self.notifications, notification, MAX_HISTORY) {
-            Self::drop_icon(&evicted.icon, cx);
+            self.retire_evicted(evicted, cx);
         }
         self.unread += 1;
         cx.notify();
@@ -356,7 +365,7 @@ impl NotificationState {
                 for evicted in
                     insert_notification(&mut self.notifications, notification, MAX_HISTORY)
                 {
-                    Self::drop_icon(&evicted.icon, cx);
+                    self.retire_evicted(evicted, cx);
                 }
                 // a replaced entry's icon must not pin its atlas slot
                 // unless the replacement carries the same image
@@ -388,6 +397,8 @@ impl NotificationState {
         let already_closed = self.notifications[index].closed;
         let removed = self.notifications.remove(index);
         self.unread = self.unread.saturating_sub(1);
+        // a queued toast whose notification is gone must never show
+        self.toast_queue.retain(|&queued| queued != id);
         cx.notify();
         if !already_closed {
             let _ = self.signals.try_send(SignalOut::Closed(id, reason));
@@ -398,8 +409,19 @@ impl NotificationState {
         self.close_toast_if(id, cx);
     }
 
-    /// Invoke one of the notification's actions, then close it (reason 2).
+    /// Invoke one of the notification's actions, then close it. The
+    /// entry reads as closed first: the Action signal's own
+    /// NotificationClosed covers it, and dismiss must not send a
+    /// second Closed for the same id (clients saw one dismissal, a
+    /// second is a protocol lie).
     pub fn invoke(&mut self, id: u32, action_key: String, cx: &mut Context<Self>) {
+        if let Some(notification) = self
+            .notifications
+            .iter_mut()
+            .find(|n| n.id == id && !n.closed)
+        {
+            notification.closed = true;
+        }
         let _ = self.signals.try_send(SignalOut::Action(id, action_key));
         self.dismiss(id, 2, cx);
     }
@@ -439,28 +461,51 @@ impl NotificationState {
         }
     }
 
-    /// Drop the whole history (the panel's clear button).
+    /// Drop the whole history (the panel's clear button). Every cleared
+    /// entry signals Closed: a client waiting on its notification is
+    /// told the user dismissed it (reason 2), the same as a single
+    /// dismissal, instead of hanging on a signal that never comes.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         if !self.notifications.is_empty() {
             for notification in self.notifications.drain(..) {
+                if !notification.closed {
+                    let _ = self.signals.try_send(SignalOut::Closed(notification.id, 2));
+                }
                 Self::drop_icon(&notification.icon, cx);
             }
+            self.toast_queue.clear();
+            self.close_toast(cx);
             self.unread = 0;
             cx.notify();
         }
     }
 
     fn show_toast(&mut self, id: u32, cx: &mut Context<Self>) {
-        // a replaced toast's notification is off-screen now: the
-        // client waiting on its Closed signal gets reason 1 (the
-        // expiry shape), or it hangs on a signal that never comes
-        let replaced = self.toast.as_ref().map(|(old_id, _)| *old_id);
-        if let Some(old_id) = replaced
-            && old_id != id
-        {
-            self.expire_toast(old_id, cx);
+        match self.toast.as_ref().map(|(visible, _)| *visible) {
+            // the client replaced its notification: restart the toast
+            // with the fresh body (no expiry of anything)
+            Some(visible) if visible == id => {
+                self.close_toast(cx);
+                self.open_toast(id, cx);
+            }
+            // something else is on screen: queue, don't clobber. The
+            // visible toast runs its own clock out (or the user deals
+            // with it), then the queue takes the stage.
+            Some(_) => {
+                if let Some(evicted) = enqueue_capped(&mut self.toast_queue, id, TOAST_QUEUE_CAP) {
+                    self.retire_queued(evicted, cx);
+                }
+                cx.notify();
+            }
+            None => self.open_toast(id, cx),
         }
-        self.close_toast(cx);
+        // the toast's own ticker owns the clock (pauses while hovered) and
+        // expires it; see ToastView::start_ticker
+    }
+
+    /// Open the toast window for one notification. The caller checked
+    /// that it should be on stage.
+    fn open_toast(&mut self, id: u32, cx: &mut Context<Self>) {
         let Some(notification) = self.notifications.iter().find(|n| n.id == id).cloned() else {
             return;
         };
@@ -496,8 +541,52 @@ impl NotificationState {
             Ok(handle) => self.toast = Some((id, handle)),
             Err(err) => log::error!("failed to open toast window: {err:#}"),
         }
-        // the toast's own ticker owns the clock (pauses while hovered) and
-        // expires it; see ToastView::start_ticker
+    }
+
+    /// The stage emptied: show the next queued notification, skipping
+    /// any that left the history while waiting, and re-checking the
+    /// DND gate (quiet hours may have started while it waited).
+    fn advance_toast(&mut self, cx: &mut Context<Self>) {
+        while let Some(next) = self.toast_queue.pop_front() {
+            let urgency = self
+                .notifications
+                .iter()
+                .find(|n| n.id == next)
+                .map(|n| n.urgency);
+            match urgency {
+                None => continue,
+                Some(urgency) if self.toast_allowed(urgency, cx) => {
+                    self.open_toast(next, cx);
+                    return;
+                }
+                Some(_) => self.retire_queued(next, cx),
+            }
+        }
+    }
+
+    /// A queued notification that will never show (the queue
+    /// overflowed): off the queue, and its client hears reason 1, the
+    /// expiry shape, rather than hanging on a signal that never comes.
+    fn retire_queued(&mut self, id: u32, _cx: &mut Context<Self>) {
+        if let Some(notification) = self
+            .notifications
+            .iter_mut()
+            .find(|n| n.id == id && !n.closed)
+        {
+            notification.closed = true;
+            let _ = self.signals.try_send(SignalOut::Closed(id, 1));
+        }
+    }
+
+    /// A history entry the cap pushed out before its toast showed:
+    /// its icon's atlas tiles go, and its client hears Closed(1) the
+    /// same as a queued eviction.
+    fn retire_evicted(&mut self, evicted: Notification, cx: &mut Context<Self>) {
+        self.toast_queue.retain(|&queued| queued != evicted.id);
+        Self::drop_icon(&evicted.icon, cx);
+        if !evicted.closed {
+            let _ = self.signals.try_send(SignalOut::Closed(evicted.id, 1));
+        }
     }
 
     /// Close whatever toast is on screen.
@@ -525,14 +614,13 @@ impl NotificationState {
         }
     }
 
-    /// Close the toast if it's showing this notification.
+    /// Close the toast if it's showing this notification, and if it
+    /// was, bring the next queued one on stage.
     fn close_toast_if(&mut self, id: u32, cx: &mut Context<Self>) {
-        if self
-            .toast
-            .as_ref()
-            .is_some_and(|(toast_id, _)| *toast_id == id)
-        {
+        let was_visible = self.toast.as_ref().is_some_and(|(toast_id, _)| *toast_id == id);
+        if was_visible {
             self.close_toast(cx);
+            self.advance_toast(cx);
         }
     }
 }
@@ -550,6 +638,20 @@ fn insert_notification(
         return list.split_off(cap);
     }
     Vec::new()
+}
+
+/// Queue one id, bounded: a repeat id is a no-op (a replaced
+/// notification keeps its queue slot), and overflowing the cap evicts
+/// the oldest waiting, returned for the caller to retire.
+fn enqueue_capped(queue: &mut VecDeque<u32>, id: u32, cap: usize) -> Option<u32> {
+    if !queue.contains(&id) {
+        queue.push_back(id);
+    }
+    if queue.len() > cap {
+        queue.pop_front()
+    } else {
+        None
+    }
 }
 
 /// Whether two icon slots hold the same decoded image.
@@ -746,6 +848,25 @@ mod tests {
         assert_eq!(evicted.iter().map(|n| n.id).collect::<Vec<u32>>(), [11]);
         assert_eq!(list[0].id, 61);
         assert_eq!(list.len(), 50);
+    }
+
+    #[test]
+    fn the_toast_queue_is_fifo_bounded_and_repeat_safe() {
+        let mut queue = VecDeque::new();
+        // fifo, bounded: the cap holds and overflow evicts the oldest
+        for id in 1..=4u32 {
+            assert_eq!(
+                enqueue_capped(&mut queue, id, 3),
+                if id == 4 { Some(1) } else { None },
+                "the fourth enqueue evicts the first"
+            );
+        }
+        assert_eq!(queue.make_contiguous(), &[2, 3, 4]);
+
+        // a repeat id is a no-op: a replaced notification keeps its
+        // place, nothing evicts
+        assert_eq!(enqueue_capped(&mut queue, 3, 3), None);
+        assert_eq!(queue.make_contiguous(), &[2, 3, 4]);
     }
 
     #[test]
