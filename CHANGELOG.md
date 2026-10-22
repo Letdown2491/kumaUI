@@ -33,41 +33,6 @@ source's wrap points would pin the text to a narrow column.
   (an extensionless png shows as an image; a jpeg wearing a .txt
   name keeps its bytes).
 
-### Changed
-
-- Koguma sorts names naturally: digit runs compare as numbers, so
-  file2 sits before file10. The list also gains a Type sort key and
-  column (folder, image, text, video, audio, archive, and friends),
-  ordering by the full mime with a natural-order tiebreak.
-
-### Changed
-
-- The terminal's snapshot tracks damage per viewport line: only the
-  lines the grid actually moved re-decode (an unchanged line hands the
-  renderer the same row it painted last frame), so a fast-emitting
-  stream pays one line's decode instead of the screen's, and the
-  paint buckets its selection and search washes per row instead of
-  filtering every span against every row.
-- Koguma's file operations can be stopped: a Cancel button sits in
-  the footer beside the progress line while an operation runs, and
-  the stop lands between files, between directory entries, and
-  between copy chunks, so even a 50 GiB paste answers within a beat.
-  Everything that already landed stays and undoes; a cancelled copy
-  takes its partial destination back out (a replaced target's
-  original goes back over it, as on any other failure).
-
-### Fixed
-
-- The idle watcher's screen-off blanked monitors only on niri: it
-  shelled out to `niri msg` regardless of compositor, so sway sessions
-  (explicitly supported) went dark-never, silently. The blank now
-  routes through the session adapter seam like the focus commands
-  (niri's power-off action, sway's `output * power off`), and a
-  compositor with neither socket logs the gap once instead of failing
-  mute every timeout.
-
-### Added
-
 - The terminal speaks the kitty keyboard protocol: a program can ask
   what keyboard modes are active (`CSI ? u`) and set, push, and pop
   its enhancement flags (`CSI = / > / < u`), and while it asks for
@@ -135,6 +100,25 @@ source's wrap points would pin the text to a narrow column.
 
 ### Changed
 
+- The terminal's snapshot tracks damage per viewport line: only the
+  lines the grid actually moved re-decode (an unchanged line hands the
+  renderer the same row it painted last frame), so a fast-emitting
+  stream pays one line's decode instead of the screen's, and the
+  paint buckets its selection and search washes per row instead of
+  filtering every span against every row.
+- Koguma's file operations can be stopped: a Cancel button sits in
+  the footer beside the progress line while an operation runs, and
+  the stop lands between files, between directory entries, and
+  between copy chunks, so even a 50 GiB paste answers within a beat.
+  Everything that already landed stays and undoes; a cancelled copy
+  takes its partial destination back out (a replaced target's
+  original goes back over it, as on any other failure).
+
+- Koguma sorts names naturally: digit runs compare as numbers, so
+  file2 sits before file10. The list also gains a Type sort key and
+  column (folder, image, text, video, audio, archive, and friends),
+  ordering by the full mime with a natural-order tiebreak.
+
 - The tray went signal-driven: item snapshots ride the item's own SNI
   update signals (and bus departures reap items as they exit) instead
   of a 2s property re-poll of every item, with a 60s heartbeat sweep
@@ -180,6 +164,14 @@ source's wrap points would pin the text to a narrow column.
   plays and pauses on click).
 
 ### Fixed
+
+- The idle watcher's screen-off blanked monitors only on niri: it
+  shelled out to `niri msg` regardless of compositor, so sway sessions
+  (explicitly supported) went dark-never, silently. The blank now
+  routes through the session adapter seam like the focus commands
+  (niri's power-off action, sway's `output * power off`), and a
+  compositor with neither socket logs the gap once instead of failing
+  mute every timeout.
 
 - The session mirror now backs off when its compositor socket dies
   instead of retrying on a fixed three-second clock forever: the
