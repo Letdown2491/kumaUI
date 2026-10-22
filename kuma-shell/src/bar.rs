@@ -8,6 +8,7 @@ use gpui::{
 };
 use log::error;
 
+use crate::calendar::clock_locale;
 use crate::session::{Cast, CastTarget, SessionState};
 use crate::settings::{
     BarAlign, BarPosition, BarRadius, CornerRounding, Section, Settings, WidgetConfig,
@@ -811,6 +812,8 @@ impl ShellBar {
                     self.sysmon.clone(),
                     None,
                 )
+                // it plays/pauses on click: the cursor says so
+                .cursor_pointer()
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.sysmon
                         .update(cx, |sysmon, cx| sysmon.request_play_pause(cx));
@@ -1568,35 +1571,6 @@ fn workspaces_widget(
         }))
 }
 
-/// The system locale for the clock's date names, resolved once:
-/// `LC_ALL`, then `LC_TIME`, then `LANG` (glibc's precedence), the
-/// value cut to its language_country tag. Undetected or unknown, the
-/// English names, which is what the faces printed before this existed.
-fn clock_locale() -> chrono::Locale {
-    static LOCALE: std::sync::OnceLock<chrono::Locale> = std::sync::OnceLock::new();
-    *LOCALE.get_or_init(|| {
-        let raw = ["LC_ALL", "LC_TIME", "LANG"]
-            .iter()
-            .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
-            .unwrap_or_default();
-        locale_from_name(locale_tag(&raw))
-    })
-}
-
-/// The locale tag inside a locale string: the encoding ("de_DE.UTF-8")
-/// and the modifier ("de_DE@euro") name the same date vocabulary.
-fn locale_tag(raw: &str) -> &str {
-    let tag = raw.split('.').next().unwrap_or(raw);
-    tag.split('@').next().unwrap_or(tag)
-}
-
-/// A locale tag to chrono's locale, English when unknown. Kept small
-/// and total so the clock can never fail on a strange value of LANG.
-fn locale_from_name(tag: &str) -> chrono::Locale {
-    use std::str::FromStr;
-    chrono::Locale::from_str(tag).unwrap_or(chrono::Locale::en_US)
-}
-
 fn window_title_widget(title: &str, tooltips_on: bool) -> gpui::Stateful<Div> {
     div()
         .id("widget-window-title")
@@ -1769,7 +1743,7 @@ fn gear_button(cx: &mut Context<ShellBar>, tooltips_on: bool) -> gpui::Stateful<
 
 #[cfg(test)]
 mod tests {
-    use super::{locale_from_name, locale_tag};
+    use crate::calendar::{locale_from_name, locale_tag};
 
     #[test]
     fn locale_tags_cut_encoding_and_modifier() {

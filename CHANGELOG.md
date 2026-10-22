@@ -35,16 +35,15 @@ source's wrap points would pin the text to a narrow column.
   xdg-open keep opening the editor; only a direct `kuma-view
   notes.txt` lands the text rung.
 
-### Added
-
 - Paste in every shell text field: Ctrl+V inserts the clipboard into
   the launcher query, the Wi-Fi and lock and greeter and polkit
   passwords, and the settings edits (Ctrl+U kills the line). The
   audit's #1 polish gap: a 40-char vault password no longer means
   typing it by hand on the lock screen.
 
-### Added
-
+- `kuma-shell msg notifications` opens the notifications panel, the
+  expected pair with the `notifications-dnd` toggle beside it (which
+  keeps its old meaning, on the CLI and on the wire).
 - Notification toasts carry their action buttons, and the body's
   click fires the client's default action (the spec's "default" key)
   instead of plain dismissal.
@@ -55,6 +54,20 @@ source's wrap points would pin the text to a narrow column.
 - The history panel stacks consecutive notifications from one app
   under a count header with an expand toggle, so a morning of pings
   from one app reads as one row plus the newest card.
+
+### Changed
+
+- The OSD cycles when one tick changes several channels: each changed
+  card gets its own turn on the stage (volume leading) instead of
+  every change but the loudest being dropped, with the waiting line
+  capped.
+- The settings panel reopens on the page a person left, instead of
+  always leading with Quick.
+- The calendar's month and weekday names follow the system locale
+  (the bar clock's date line already did).
+- Wi-Fi and Bluetooth rows press like every other row: click, not
+  mouse-down, and the media widget shows the pointer cursor (it
+  plays and pauses on click).
 
 ### Fixed
 

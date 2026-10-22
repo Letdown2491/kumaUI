@@ -140,14 +140,11 @@ impl BluetoothPanelView {
                 .text_color(rgb(if device.connected { crate::theme::current().text } else { crate::theme::current().text_dim }))
                 .child(state_word),
         )
-        .on_mouse_down(
-            gpui::MouseButton::Left,
-            cx.listener(move |this, _, _, cx| {
-                this.sysmon.update(cx, |sysmon, cx| {
-                    sysmon.request_bluetooth_act(act, mac.clone(), cx)
-                });
-            }),
-        );
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.sysmon.update(cx, |sysmon, cx| {
+                sysmon.request_bluetooth_act(act, mac.clone(), cx)
+            });
+        }));
 
         // the paired device's long-leave: remove the pairing entirely
         // (one mis-tap must not unpair a device: the kit's

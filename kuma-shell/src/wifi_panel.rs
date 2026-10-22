@@ -196,14 +196,11 @@ impl WifiPanelView {
             }
         }
         if joins_blind {
-            row = row.on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.sysmon.update(cx, |sysmon, cx| {
-                        sysmon.request_wifi_connect(ssid.clone(), None, cx)
-                    });
-                }),
-            );
+            row = row.on_click(cx.listener(move |this, _, _, cx| {
+                this.sysmon.update(cx, |sysmon, cx| {
+                    sysmon.request_wifi_connect(ssid.clone(), None, cx)
+                });
+            }));
         } else {
             row = row.on_click(cx.listener(move |this, _, window, cx| {
                 if this

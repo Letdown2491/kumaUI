@@ -138,6 +138,13 @@ enum Page {
     About,
 }
 
+/// The page the settings panel last showed, on a global because the
+/// panel view is rebuilt per open and the memory outlives it.
+#[derive(Default)]
+struct LastPage(Option<Page>);
+
+impl gpui::Global for LastPage {}
+
 impl Page {
     fn label(self) -> &'static str {
         match self {
@@ -405,8 +412,13 @@ impl SettingsView {
             widgets,
             focus_handle,
             geometry,
-            // the gear leads with the quick page
-            page: Page::Quick,
+            // reopen on the page a person left: the panel view is
+            // rebuilt per open, the memory outlives it (the nostr
+            // panel remembers its tab the same way)
+            page: cx
+                .try_global::<LastPage>()
+                .and_then(|last| last.0)
+                .unwrap_or(Page::Quick),
             dragging: None,
             drop_preview: None,
             thumbs: HashMap::new(),
@@ -3254,6 +3266,7 @@ impl Render for SettingsView {
                     None,
                     cx.listener(move |this, _, _, cx| {
                         this.page = page;
+                        cx.set_global(LastPage(Some(page)));
                         if page == Page::Displays {
                             // the page's first truth arrives right now,
                             // not on the next tick

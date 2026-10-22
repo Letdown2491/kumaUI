@@ -15,7 +15,12 @@ use anyhow::Context;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     Launcher,
+    /// Toggle do-not-disturb: the bell's sleep, not the panel. The
+    /// CLI's `notifications-dnd` verb.
     Notifications,
+    /// Open the notifications panel: the CLI's `notifications` verb,
+    /// the expected pair with the DND toggle beside it.
+    NotificationsPanel,
     /// The scheme handler's nostrconnect:// link: the URI rides the
     /// request, the shell opens the Pair pane with it as an offer.
     /// Argv form end to end: the URI's `&` and `?` never meet a shell.
@@ -58,6 +63,7 @@ impl Request {
         match self {
             Request::Launcher => "Launcher",
             Request::Notifications => "Notifications",
+            Request::NotificationsPanel => "NotificationsPanel",
             Request::Nostr(_) => "Nostr",
             Request::NostrPanel => "NostrPanel",
             Request::Settings => "Settings",
@@ -72,6 +78,7 @@ impl Request {
         match self {
             Request::Launcher => "Toggle".into(),
             Request::Notifications => "Dnd".into(),
+            Request::NotificationsPanel => "Open".into(),
             Request::Nostr(uri) => uri.clone(),
             Request::NostrPanel => "Open".into(),
             Request::Settings => "Toggle".into(),
@@ -125,6 +132,7 @@ pub fn parse(line: &str) -> Option<Request> {
     match key.to_lowercase().as_str() {
         "launcher" => Some(Request::Launcher),
         "notifications" => Some(Request::Notifications),
+        "notificationspanel" => Some(Request::NotificationsPanel),
         "nostr" => Some(Request::Nostr(value.to_string())),
         "nostrpanel" => Some(Request::NostrPanel),
         "settings" => Some(Request::Settings),
@@ -284,6 +292,12 @@ mod tests {
         assert_eq!(
             parse("{\"Notifications\":\"Dnd\"}"),
             Some(Request::Notifications)
+        );
+        // the panel verb: open the notifications surface, the expected
+        // pair with the DND toggle beside it
+        assert_eq!(
+            parse("{\"NotificationsPanel\":\"Open\"}"),
+            Some(Request::NotificationsPanel)
         );
         // and the new verb carries its URI whole
         let uri = "nostrconnect://pubkey?relay=wss%3A%2F%2Frelay&name=Signet";

@@ -5,6 +5,7 @@
 //! external changes (a keybind running wpctl, a hardware key) light it
 //! up, and repeated changes re-arm the one window instead of stacking.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use gpui::{
@@ -26,6 +27,9 @@ const OSD_DURATION: Duration = Duration::from_millis(1500);
 /// content (the toast's measured-height flow).
 const OSD_WIDTH: f32 = 240.;
 const OSD_HEIGHT: f32 = 48.;
+/// How many changed cards may wait in line: a slider drag against a
+/// fast poll must not bank a minute of stale cards.
+const PENDING_CARDS: usize = 4;
 
 /// One card's content: what changed, how much, and whether to shout.
 #[derive(Clone, Debug, PartialEq)]
@@ -61,44 +65,46 @@ fn snapshot_of(sysmon: &SysMon, settings: &Settings) -> OsdSnapshot {
     }
 }
 
-/// The card for one change; None when the two snapshots agree (the
-/// full poll notifies even when nothing moved). When several changed
-/// in one tick, volume wins: it is the commonest drumbeat. Every arm
-/// needs a previous value to diff against: a first sighting is the
-/// startup fill (a slow first read landing a poll late), not a thing
-/// the user did.
-fn content_for_change(before: OsdSnapshot, after: OsdSnapshot) -> Option<OsdContent> {
+/// The cards for one tick's changes, priority order; empty when the
+/// two snapshots agree (the full poll notifies even when nothing
+/// moved). Every arm needs a previous value to diff against: a first
+/// sighting is the startup fill (a slow first read landing a poll
+/// late), not a thing the user did. Several changed channels queue a
+/// card each: the stage shows them in turn instead of dropping every
+/// change but the loudest.
+fn content_for_change(before: OsdSnapshot, after: OsdSnapshot) -> Vec<OsdContent> {
+    let mut changes = Vec::new();
     if before.volume != after.volume
         && let Some(volume) = after.volume
         && before.volume.is_some()
     {
-        return Some(volume_content(volume));
+        changes.push(volume_content(volume));
     }
     if before.brightness != after.brightness
         && let Some(brightness) = after.brightness
         && before.brightness.is_some()
     {
-        return Some(brightness_content(brightness));
+        changes.push(brightness_content(brightness));
     }
     if before.mic != after.mic
         && let Some(mic) = after.mic
         && before.mic.is_some()
     {
-        return Some(mic_content(mic));
+        changes.push(mic_content(mic));
     }
     if before.profile != after.profile
         && let Some(profile) = after.profile
         && before.profile.is_some()
     {
-        return Some(profile_content(profile));
+        changes.push(profile_content(profile));
     }
     if before.dnd != after.dnd
         && let Some(dnd) = after.dnd
         && before.dnd.is_some()
     {
-        return Some(dnd_content(dnd));
+        changes.push(dnd_content(dnd));
     }
-    None
+    changes
 }
 
 fn volume_content(volume: Volume) -> OsdContent {
@@ -165,6 +171,9 @@ pub struct Osd {
     /// The previous snapshot: first sight records, later ones diff.
     last: Option<OsdSnapshot>,
     window: Option<WindowHandle<OsdView>>,
+    /// Cards waiting for the stage when one tick changed several
+    /// channels: the visible card's clock shows them in turn.
+    pending: VecDeque<OsdContent>,
     /// Bumped on every show; the expiry timer only dismisses the
     /// generation it was armed for, so re-shows outlive stale timers.
     generation: u64,
@@ -177,6 +186,7 @@ impl Osd {
             settings,
             last: None,
             window: None,
+            pending: VecDeque::new(),
             generation: 0,
         }
     }
@@ -196,11 +206,35 @@ impl Osd {
             // 64%" at login is noise, not feedback
             None => {}
             Some(before) => {
-                if let Some(content) = content_for_change(before, next) {
-                    log::info!("osd: {} {}", content.label, content.value);
-                    self.show(content, cx);
+                let mut changes = content_for_change(before, next);
+                if !changes.is_empty() {
+                    if let Some(first) = changes.first() {
+                        log::info!("osd: {} {}", first.label, first.value);
+                    }
+                    // this tick's first change takes the stage now; its
+                    // siblings precede any older waiters (a fresh card
+                    // must not stand behind a stale one), and the line
+                    // stays capped: a drag must not bank a minute of
+                    // cards
+                    let first = changes.remove(0);
+                    for card in changes.into_iter().rev() {
+                        self.pending.push_front(card);
+                    }
+                    while self.pending.len() > PENDING_CARDS {
+                        self.pending.pop_front();
+                    }
+                    self.show(first, cx);
                 }
             }
+        }
+    }
+
+    /// The stage's turn: show the next waiting card (which re-arms the
+    /// clock), or, with nothing waiting, take the card down.
+    fn show_next(&mut self, cx: &mut Context<Self>) {
+        match self.pending.pop_front() {
+            Some(content) => self.show(content, cx),
+            None => self.dismiss(cx),
         }
     }
 
@@ -254,7 +288,7 @@ impl Osd {
             cx.background_executor().timer(OSD_DURATION).await;
             let _ = this.update(cx, |this, cx| {
                 if this.generation == generation {
-                    this.dismiss(cx);
+                    this.show_next(cx);
                 }
             });
         })
@@ -442,11 +476,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let content = content_for_change(quiet, loud).expect("a change yields content");
+        let changes = content_for_change(quiet, loud);
+        assert_eq!(changes.len(), 1);
+        let content = &changes[0];
         assert_eq!(content.label, "Volume");
         assert_eq!(content.value, "64%");
         // the poll that found nothing new shows nothing
-        assert_eq!(content_for_change(loud, loud), None);
+        assert!(content_for_change(loud, loud).is_empty());
     }
 
     #[test]
@@ -489,10 +525,13 @@ mod tests {
             brightness: Some(Brightness { percent: 60 }),
             ..Default::default()
         };
-        assert_eq!(
-            content_for_change(before, after).map(|content| content.label),
-            Some("Volume")
-        );
+        // one tick moved both channels: a card each, volume leading
+        // (the commonest drumbeat takes the stage first), brightness
+        // getting its own turn behind it
+        let changes = content_for_change(before, after);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].label, "Volume");
+        assert_eq!(changes[1].label, "Brightness");
     }
 
     #[test]
@@ -504,7 +543,7 @@ mod tests {
             dnd: Some(false),
             ..Default::default()
         };
-        assert_eq!(content_for_change(OsdSnapshot::default(), fill), None);
+        assert!(content_for_change(OsdSnapshot::default(), fill).is_empty());
 
         // the same startup fill for every polled field: a value arriving
         // with no previous one is the poll finding the world (a slow
@@ -519,14 +558,16 @@ mod tests {
             brightness: Some(Brightness { percent: 80 }),
             ..Default::default()
         };
-        assert_eq!(content_for_change(OsdSnapshot::default(), learned), None);
+        assert!(content_for_change(OsdSnapshot::default(), learned).is_empty());
 
         // a real toggle names itself
         let on = OsdSnapshot {
             dnd: Some(true),
             ..fill
         };
-        let content = content_for_change(fill, on).expect("a dnd toggle yields content");
+        let content = &content_for_change(fill, on);
+        assert_eq!(content.len(), 1);
+        let content = &content[0];
         assert_eq!(content.label, "Do Not Disturb");
         assert_eq!(content.value, "On");
         assert!(content.urgent);
@@ -535,7 +576,9 @@ mod tests {
             profile: Some(PowerProfile::Performance),
             ..fill
         };
-        let content = content_for_change(fill, fast).expect("a profile change yields content");
+        let content = &content_for_change(fill, fast);
+        assert_eq!(content.len(), 1);
+        let content = &content[0];
         assert_eq!(content.label, "Power Profile");
         assert_eq!(content.value, "Performance");
         assert!(content.urgent);

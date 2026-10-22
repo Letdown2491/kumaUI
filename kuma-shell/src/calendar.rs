@@ -42,9 +42,6 @@ impl CalendarView {
     }
 }
 
-/// Monday-first weekday initials.
-const WEEKDAYS: [&str; 7] = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
-
 impl Render for CalendarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let today = Self::today();
@@ -61,7 +58,8 @@ impl Render for CalendarView {
             )
             .collect();
 
-        let header = format!("{} {}", month_name(month), year);
+        let locale = clock_locale();
+        let header = format!("{} {}", month_name(month, locale), year);
 
         // content is intrinsic-height (no size_full): the measurement below
         // is the sum of its rows, which becomes the panel height
@@ -89,7 +87,7 @@ impl Render for CalendarView {
                         )),
                 ),
             )
-            .child(weekday_row())
+            .child(weekday_row(locale))
             .child(
                 div()
                     .grid()
@@ -122,21 +120,42 @@ impl Render for CalendarView {
     }
 }
 
-fn month_name(month: u32) -> &'static str {
-    match month {
-        1 => "January",
-        2 => "February",
-        3 => "March",
-        4 => "April",
-        5 => "May",
-        6 => "June",
-        7 => "July",
-        8 => "August",
-        9 => "September",
-        10 => "October",
-        11 => "November",
-        _ => "December",
-    }
+/// The month's name in the system locale, via chrono's localized
+/// formatting (the bar clock's date line reads the same locale).
+fn month_name(month: u32, locale: chrono::Locale) -> String {
+    chrono::NaiveDate::from_ymd_opt(2024, month, 1)
+        .map(|first| first.format_localized("%B", locale).to_string())
+        .unwrap_or_default()
+}
+
+/// The system locale for date names, resolved once: `LC_ALL`, then
+/// `LC_TIME`, then `LANG` (glibc's precedence), the value cut to its
+/// language_country tag. Undetected or unknown, the English names,
+/// which is what the faces printed before this existed. The bar
+/// clock's date line reads it too.
+pub(crate) fn clock_locale() -> chrono::Locale {
+    static LOCALE: std::sync::OnceLock<chrono::Locale> = std::sync::OnceLock::new();
+    *LOCALE.get_or_init(|| {
+        let raw = ["LC_ALL", "LC_TIME", "LANG"]
+            .iter()
+            .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+            .unwrap_or_default();
+        locale_from_name(locale_tag(&raw))
+    })
+}
+
+/// The locale tag inside a locale string: the encoding ("de_DE.UTF-8")
+/// and the modifier ("de_DE@euro") name the same date vocabulary.
+pub(crate) fn locale_tag(raw: &str) -> &str {
+    let tag = raw.split('.').next().unwrap_or(raw);
+    tag.split('@').next().unwrap_or(tag)
+}
+
+/// A locale tag to chrono's locale, English when unknown. Kept small
+/// and total so the clock can never fail on a strange value of LANG.
+pub(crate) fn locale_from_name(tag: &str) -> chrono::Locale {
+    use std::str::FromStr;
+    chrono::Locale::from_str(tag).unwrap_or(chrono::Locale::en_US)
 }
 
 /// One month-step button: a chevron glyph that hovers, the kit's ghost
@@ -162,12 +181,23 @@ fn nav_button(
         )
 }
 
-fn weekday_row() -> Div {
+fn weekday_row(locale: chrono::Locale) -> Div {
+    // Monday-first: 2024-01-01 is a Monday; each initial is the first
+    // two characters of the day's abbreviated name in the locale
+    // ("Mo", "Di", "Mi" for German), the shape the English const had
+    let monday = NaiveDate::from_ymd_opt(2024, 1, 1).expect("2024 opens on a Monday");
     div()
         .grid()
         .grid_cols(7)
         .gap_0p5()
-        .children(WEEKDAYS.map(|name| {
+        .children((0..7).map(|offset| {
+            let day = monday + chrono::Duration::days(offset);
+            let name: String = day
+                .format_localized("%a", locale)
+                .to_string()
+                .chars()
+                .take(2)
+                .collect();
             div()
                 .h(px(24.))
                 .flex()
@@ -175,7 +205,7 @@ fn weekday_row() -> Div {
                 .justify_center()
                 .text_size(px(11.))
                 .text_color(rgb(crate::theme::current().text_dim))
-                .child(name.to_string())
+                .child(name)
         }))
 }
 
