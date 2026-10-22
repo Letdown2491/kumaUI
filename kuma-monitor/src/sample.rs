@@ -363,6 +363,28 @@ impl SortKey {
     pub(crate) fn sorts_down(self) -> bool {
         matches!(self, SortKey::Cpu | SortKey::Mem)
     }
+
+    /// The key's name in the state file, and back: the file is
+    /// key=value lines (Koguma's dialect), the sort line carrying
+    /// one of these words.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            SortKey::Cpu => "cpu",
+            SortKey::Mem => "mem",
+            SortKey::Name => "name",
+            SortKey::Pid => "pid",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "cpu" => SortKey::Cpu,
+            "mem" => SortKey::Mem,
+            "name" => SortKey::Name,
+            "pid" => SortKey::Pid,
+            _ => return None,
+        })
+    }
 }
 
 pub(crate) fn sort_groups(groups: &mut [AppGroup], key: SortKey) {

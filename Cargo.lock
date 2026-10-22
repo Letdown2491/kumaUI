@@ -3106,6 +3106,7 @@ name = "kuma-monitor"
 version = "0.2.3"
 dependencies = [
  "anyhow",
+ "dirs 7.0.0",
  "env_logger",
  "gpui",
  "gpui_platform",

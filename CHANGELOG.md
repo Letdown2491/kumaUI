@@ -16,6 +16,8 @@ source's wrap points would pin the text to a narrow column.
 
 ### Added
 
+- Kamuy can act on what it watches: the arrow keys walk the table (wrapping, the view following), `ctrl+k` sends the cursor row's process one SIGTERM, and pressing `ctrl+k` on the same row again arms a confirm card whose Enter sends SIGKILL, since a process that ignored the polite ask is killed on purpose or not at all. Group headers and the background summary have no single pid and are skipped. The footer says what was signaled, or why nothing was.
+- Kamuy's table remembers its sort and filter across launches, in a small state file under `~/.config/kuma-monitor` written atomically (Koguma's state file shape); a restored sort applies once, to the first table there is to sort.
 - The location bar completes as you type, fish-style: the folders
   extending what you typed suggest as dim ghost text past the caret,
   Right (or End, already at the end of the line) lands the suggestion
