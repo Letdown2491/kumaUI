@@ -1141,30 +1141,6 @@ impl Settings {
         kinds
     }
 
-    /// Whether any bar widget the sysmon full pass feeds is placed:
-    /// the sysinfo five (cpu, ram, temp, disk, battery) plus the other
-    /// full-pass-fed kinds (internet, bluetooth, media, power
-    /// profile). The lighter AV pass stays unconditional: the OSD
-    /// reads volume, mic, and brightness with no widget placed, and
-    /// the recording indicator (also an AV-pass read now) renders
-    /// whenever a recorder runs.
-    pub fn full_pass_placed(&self) -> bool {
-        self.placed_builtin_kinds().iter().any(|kind| {
-            matches!(
-                kind,
-                WidgetKind::Cpu
-                    | WidgetKind::Ram
-                    | WidgetKind::Temp
-                    | WidgetKind::Disk
-                    | WidgetKind::Battery
-                    | WidgetKind::Internet
-                    | WidgetKind::Bluetooth
-                    | WidgetKind::Media
-                    | WidgetKind::PowerProfile
-            )
-        })
-    }
-
     /// Every placement's mode must be one its widget offers: a config
     /// can name a mode a widget does not have (the clock once offered
     /// icon+text, a config can be carried between machines). Clamped
@@ -1651,12 +1627,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_pass_placed_tracks_the_full_pass_widgets() {
-        // default bar: sysinfo widgets are placed (the defaults ship
-        // a cpu widget), so the full pass runs
-        assert!(Settings::default().full_pass_placed());
-        // a bar with none of the full-pass-fed widgets: the full pass
-        // would run for nobody
+    fn placed_builtin_kinds_dedupe_across_sections() {
+        // a bar with none of the sysmon-fed widgets
         let mut settings = Settings::default();
         for section in [&mut settings.bar.left, &mut settings.bar.center, &mut settings.bar.right] {
             section.retain(|config| {
@@ -1676,13 +1648,10 @@ mod tests {
                 )
             });
         }
-        assert!(!settings.full_pass_placed());
-        assert!(!settings.full_pass_placed());
-        assert!(!settings.full_pass_placed());
         // the kinds dedupe across sections, and a placed cpu feeds
-        // the pass again (the retained default bar holds seven
-        // distinct kinds: the default's media chip rode out with the
-        // full-pass-fed pruning)
+        // the sysmon passes again (the retained default bar holds
+        // seven distinct kinds: the default's media chip rode out
+        // with the sysmon-fed pruning)
         assert_eq!(settings.placed_builtin_kinds().len(), 7);
         settings.bar.left.push(WidgetConfig {
             kind: WidgetRef::Builtin(WidgetKind::Cpu),
@@ -1697,7 +1666,6 @@ mod tests {
             mode: Default::default(),
         });
         assert_eq!(settings.placed_builtin_kinds().len(), 8);
-        assert!(settings.full_pass_placed());
     }
 
     #[test]

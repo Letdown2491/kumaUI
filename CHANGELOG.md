@@ -65,6 +65,17 @@ source's wrap points would pin the text to a narrow column.
 
 ### Changed
 
+- The sysmon poll split its one serial pass into per-subsystem
+  passes: each reads on its own cadence, gated on its own consumers.
+  The fast audio/brightness pass (the OSD's and the keybinds'
+  feedback path) no longer queues behind network, Bluetooth, and
+  media scans; the network and Bluetooth state now poll on slow
+  clocks (10s and 5s) instead of every 2s, panel-driven scans
+  (streams, AP list, paired devices) run only while their panel is
+  open, and a pass with no consumer at all idles to a cheap
+  heartbeat instead of running for nobody. The Wi-Fi AP scan no
+  longer fires while the Bluetooth panel is open, which was riding
+  the old shared gate by accident.
 - The OSD cycles when one tick changes several channels: each changed
   card gets its own turn on the stage (volume leading) instead of
   every change but the loudest being dropped, with the waiting line

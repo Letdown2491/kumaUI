@@ -7,7 +7,8 @@ use anyhow::Context as _;
 use gpui::{App, AppContext, Context, Entity};
 use kuma_platform::process::timed_output;
 
-use crate::settings::Settings;
+use crate::panel::{is_open, PanelKind};
+use crate::settings::{Settings, WidgetKind};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Battery {
@@ -249,7 +250,7 @@ pub struct SysMon {
     /// Per-core usage fractions, same order as the kernel's cpuN lines.
     pub cpu_cores: Option<Vec<f32>>,
     /// The total usage's recent history, newest last, capped at
-    /// HISTORY_LEN samples (one per full poll).
+    /// HISTORY_LEN samples (one per system pass).
     pub cpu_history: Vec<f32>,
     /// The other sysinfo widgets' histories, same cadence, as percents.
     pub ram_history: Vec<u32>,
@@ -260,7 +261,7 @@ pub struct SysMon {
     pub loadavg: Option<([f32; 3], u32)>,
     pub uptime: Option<u64>,
     /// Playback streams, populated only while the volume panel is
-    /// open (see the scan gate in the poll loop).
+    /// open (the streams pass gates on the panel).
     pub streams: Vec<Stream>,
     pub ram: Option<Ram>,
     pub temp: Option<u32>,
@@ -268,19 +269,16 @@ pub struct SysMon {
     /// The mount the disk widget watches: user state, mirrored from
     /// the settings' sysinfo section.
     pub disk_mount: std::path::PathBuf,
-    /// Whether any widget the full pass feeds is placed (settings'
-    /// `full_pass_placed`): false skips the pass, its scans would
-    /// run for nobody.
-    pub full_wanted: bool,
     pub bluetooth: Option<BluetoothState>,
     pub network: Option<NetworkState>,
     pub power_profile: Option<PowerProfile>,
     pub media: Option<MediaState>,
     pub recording: Option<RecordingState>,
-    /// The last full pass that reached the state: the poll notifies
-    /// only when a pass differs from this, so an idle desktop never
-    /// repaints the bar on a two-second metronome.
-    last_full: Option<Snapshot>,
+    /// The last system pass that reached the state: the pass applies
+    /// and repaints only when a reading differs from this, so an
+    /// idle desktop never repaints the bar on a two-second
+    /// metronome.
+    last_system: Option<SystemReading>,
     /// When the last audio/brightness request was stamped: the fast
     /// poll skips those fields while one is still landing, so a
     /// mid-flight read can't revert the optimistic value.
@@ -970,8 +968,8 @@ impl SysMon {
 /// cheap enough to keep forever: two wpctl calls and two sysfs reads.
 const FAST_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The sysinfo widgets' sparkline depth: one sample per full poll, so
-/// this is the recent window the little graphs show.
+/// The sysinfo widgets' sparkline depth: one sample per system pass,
+/// so this is the recent window the little graphs show.
 const HISTORY_LEN: usize = 60;
 /// When a poll read differs from the state and waits for the next
 /// read to confirm it (the confirm gate), the re-check rides a short
@@ -979,13 +977,31 @@ const HISTORY_LEN: usize = 60;
 /// wait half a second twice. One-tick garbage reads still fail it:
 /// they last well under the gap.
 const CONFIRM_RECHECK: Duration = Duration::from_millis(120);
-/// The full pass rides every fourth tick: everything else refreshes at
-/// the old two-second pace.
-const FULL_PASS_EVERY: u32 = 4;
 /// How long after a request the fast poll leaves the audio and
 /// brightness fields alone: a request's own optimistic write is the
 /// truth until its wpctl/brightnessctl call has landed.
 const REQUEST_LANDING: Duration = Duration::from_millis(250);
+
+/// The system pass (cpu, ram, temp, disk, battery, loadavg, uptime):
+/// the old full pass's pace, and the sparklines' sample rate.
+const SYSTEM_INTERVAL: Duration = Duration::from_secs(2);
+/// A panel-driven scan's pace: the stream list, the Wi-Fi AP list,
+/// the Bluetooth device list, all only while their panel is open.
+const PANEL_INTERVAL: Duration = Duration::from_secs(2);
+/// The idle network state's pace, a bar widget or the settings
+/// applet being the consumer: NetworkManager's state changes a few
+/// times a day, and the three nmcli spawns should act like they
+/// know.
+const NETWORK_IDLE: Duration = Duration::from_secs(10);
+/// The idle Bluetooth adapter state's pace.
+const BLUETOOTH_IDLE: Duration = Duration::from_secs(5);
+/// The power profile's pace: a keybind or a panel writes the state
+/// directly, so the poll only reconciles outside changes.
+const PROFILE_INTERVAL: Duration = Duration::from_secs(5);
+/// The heartbeat of a pass whose gate is closed: short enough that
+/// an opening panel or a newly placed widget is noticed within a
+/// second, cheap enough (one gate check, no reads) to be free.
+const GATE_TICK: Duration = Duration::from_secs(1);
 
 /// The mute keys double-fire on some laptops: the mic key emitted
 /// pairs 14-18ms apart in the field. A mute toggle this soon after
@@ -1022,215 +1038,513 @@ async fn self_scan(this: gpui::WeakEntity<SysMon>, cx: &mut gpui::AsyncApp) {
 
 pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
     // the disk mount is user state: seeded once, then mirrored on
-    // settings changes (no re-mint needed, the poll reads it per tick)
+    // settings changes (no re-mint needed, the system pass reads the
+    // settings per tick)
     let mount = settings.read(cx).sysinfo.disk_mount.clone();
-    let full_wanted = settings.read(cx).full_pass_placed();
     state.update(cx, |sysmon, _| {
         sysmon.disk_mount = mount;
-        sysmon.full_wanted = full_wanted;
     });
     {
         let state = state.downgrade();
         cx.observe(settings, move |settings, cx| {
             let mount = settings.read(cx).sysinfo.disk_mount.clone();
-            let full_wanted = settings.read(cx).full_pass_placed();
             let _ = state.update(cx, |sysmon, _| {
                 if sysmon.disk_mount != mount {
                     sysmon.disk_mount = mount;
                 }
-                sysmon.full_wanted = full_wanted;
             });
         })
         .detach();
     }
 
-    let state = state.downgrade();
+    // One pass per subsystem, each with its own consumers, its own
+    // cadence, and its own turn on the background executor. The old
+    // single loop ran every read back to back on one clock: a
+    // panel-open scan (the stream dump, the Bluetooth device list)
+    // queued behind the full pass, and the fast AV pass — the OSD's
+    // and the keybinds' feedback path — waited behind all of it.
+    // See `pass_gates` for the consumer map.
+    spawn_av_pass(state.downgrade(), cx);
+    spawn_system_pass(state.downgrade(), settings.clone(), cx);
+    spawn_media_pass(state.downgrade(), settings.clone(), cx);
+    spawn_profile_pass(state.downgrade(), settings.clone(), cx);
+    spawn_network_pass(state.downgrade(), settings.clone(), cx);
+    spawn_bluetooth_pass(state.downgrade(), settings.clone(), cx);
+    spawn_streams_pass(state.downgrade(), settings.clone(), cx);
+}
+
+/// One subsystem tick's outcome.
+enum Tick {
+    /// the entity is gone: end the loop
+    Gone,
+    /// no consumer this tick: heartbeat, re-check the gate soon
+    Idle,
+    /// a read landed; sleep the subsystem's cadence
+    Read(Duration),
+}
+
+/// One tick of a per-subsystem pass. The gate runs on the main
+/// thread: `None` (nobody consumes the subsystem right now, or the
+/// slow cadence is not due yet) means a heartbeat tick; `Some`
+/// carries the read's arguments and the sleep after it. The read
+/// runs on the background executor; the absorb lands it on the
+/// entity and notifies when the state moved.
+async fn pass_tick<A2, V, G, R, A>(
+    state: &gpui::WeakEntity<SysMon>,
+    cx: &mut gpui::AsyncApp,
+    gate: G,
+    read: R,
+    absorb: A,
+) -> Tick
+where
+    G: FnOnce(&mut App) -> Option<(Duration, A2)>,
+    R: FnOnce(A2) -> V + Send + 'static,
+    A: FnOnce(&mut SysMon, V, &mut Context<SysMon>) + 'static,
+    A2: Send + 'static,
+    V: Send + 'static,
+{
+    let gated = cx.update(|app| gate(app));
+    let Some((cadence, args)) = gated else {
+        return Tick::Idle;
+    };
+    let value = cx.background_spawn(async move { read(args) }).await;
+    if state
+        .update(cx, |sysmon, cx| absorb(sysmon, value, cx))
+        .is_err()
+    {
+        return Tick::Gone;
+    }
+    Tick::Read(cadence)
+}
+
+/// The AV pass: only what a keybind or a hardware key changes out
+/// from under the shell, plus the recording indicator (an
+/// unconditional consumer: the dot renders whenever a recorder runs,
+/// widget or not, so its /proc read never gates). The confirm gate
+/// lives here: a read that differs from the state repeats before it
+/// applies, and while one is pending the pass re-checks on the
+/// short timer.
+fn spawn_av_pass(state: gpui::WeakEntity<SysMon>, cx: &mut App) {
     cx.spawn(async move |cx| {
-        let mut previous: Option<CpuSample> = None;
-        let mut tick = 0u32;
         loop {
-            tick = tick.wrapping_add(1);
-            let Ok(full_wanted) = state.update(cx, |sysmon, _| sysmon.full_wanted) else {
+            let Ok(sleep) = state.update(cx, |sysmon, cx| {
+                let snapshot = refresh_av();
+                // recording has no confirm gate to race: a /proc
+                // read cannot fight user intent the way a wpctl
+                // write can
+                let recording_changed = sysmon.recording != snapshot.recording;
+                sysmon.recording = snapshot.recording.clone();
+                let moved = sysmon.absorb_av(&snapshot) || recording_changed;
+                if moved {
+                    cx.notify();
+                }
+                if sysmon.av_confirming.is_some() {
+                    CONFIRM_RECHECK
+                } else {
+                    FAST_INTERVAL
+                }
+            }) else {
                 break;
             };
-            let Ok(disk_mount) = state.update(cx, |sysmon, _| sysmon.disk_mount.clone()) else {
-                break;
-            };
-            // no full-pass-fed widget placed: its scans (cpu cores,
-            // loadavg, temp, disk, battery, network, bluetooth,
-            // media, power profile) would run for nobody, so the
-            // pass skips. The AV pass rides on regardless: volume,
-            // mic, brightness, and the recording dot (the indicator
-            // renders with no widget placed)
-            let full = full_wanted && tick % FULL_PASS_EVERY == 0;
-            // the stream scan rides only while the volume panel is
-            // open: the status dump is the heaviest call in the pass.
-            // The same gate drives the Wi-Fi and Bluetooth panels'
-            // device scans.
-            let scan_streams = full
-                && cx
-                    .update(|cx| crate::panel::is_open(&crate::panel::PanelKind::Volume, cx));
-            let scan_wifi = full
-                && cx.update(|cx| {
-                    crate::panel::is_open(&crate::panel::PanelKind::Wifi, cx)
-                        || crate::panel::is_open(&crate::panel::PanelKind::Bluetooth, cx)
-                });
-            let (snapshot, previous_next) = cx
-                .background_spawn(async move {
-                    let mut previous = previous;
-                    let snapshot = if full {
-                        refresh(&mut previous, &disk_mount, scan_streams, scan_wifi)
-                    } else {
-                        refresh_av()
-                    };
-                    (snapshot, previous)
-                })
-                .await;
-            previous = previous_next;
-            let Ok(quick_recheck) = state.update(cx, |sysmon, cx| {
-                let moved = if full {
-                    // repaint only when something moved: the fields
-                    // are the render's inputs, and an equal snapshot
-                    // renders the identical bar
-                    if sysmon.last_full.as_ref() == Some(&snapshot) {
-                        false
-                    } else {
-                        sysmon.last_full = Some(snapshot.clone());
-                        sysmon.battery = snapshot.battery;
-                    sysmon.cpu = snapshot.cpu;
-                    sysmon.cpu_cores = snapshot.cpu_cores.clone();
-                    sysmon.loadavg = snapshot.loadavg;
-                    sysmon.uptime = snapshot.uptime;
-                    if let Some(usage) = snapshot.cpu {
+            cx.background_executor().timer(sleep).await;
+        }
+    })
+    .detach();
+}
+
+/// The system pass: the proc/sysfs and stat reads behind the sysinfo
+/// widgets and their panels. Histories push when the reading moved
+/// (the sparks advance on change, not on the clock); the entity
+/// stores the last reading for the compare.
+fn spawn_system_pass(state: gpui::WeakEntity<SysMon>, settings: Entity<Settings>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        // the cpu usage sample is a diff against the previous
+        // /proc/stat read: the sample rides into the background read
+        // and back out each pass
+        let mut previous: Option<CpuSample> = None;
+        loop {
+            let wanted = cx.update(|app| {
+                read_gates(&settings, app).system
+            });
+            if wanted {
+                let disk_mount = cx.update(|app| settings.read(app).sysinfo.disk_mount.clone());
+                let (reading, sample) = cx
+                    .background_spawn(async move {
+                        let usage = sample_cpu_usage(&mut previous);
+                        let reading = refresh_system(disk_mount, usage);
+                        (reading, previous)
+                    })
+                    .await;
+                previous = sample;
+                let Ok(()) = state.update(cx, |sysmon, cx| {
+                    if sysmon.last_system.as_ref() == Some(&reading) {
+                        return;
+                    }
+                    sysmon.last_system = Some(reading.clone());
+                    sysmon.battery = reading.battery;
+                    sysmon.cpu = reading.cpu;
+                    sysmon.cpu_cores = reading.cpu_cores.clone();
+                    sysmon.loadavg = reading.loadavg;
+                    sysmon.uptime = reading.uptime;
+                    if let Some(usage) = reading.cpu {
                         sysmon.cpu_history.push(usage);
                         if sysmon.cpu_history.len() > HISTORY_LEN {
                             sysmon.cpu_history.remove(0);
                         }
                     }
-                    if let Some(ram) = &snapshot.ram {
+                    if let Some(ram) = &reading.ram {
                         sysmon.ram_history.push(u32::from(ram.percent));
                         if sysmon.ram_history.len() > HISTORY_LEN {
                             sysmon.ram_history.remove(0);
                         }
                     }
-                    if let Some(temp) = snapshot.temp {
+                    if let Some(temp) = reading.temp {
                         sysmon.temp_history.push(temp);
                         if sysmon.temp_history.len() > HISTORY_LEN {
                             sysmon.temp_history.remove(0);
                         }
                     }
-                    if let Some(disk) = &snapshot.disk {
+                    if let Some(disk) = &reading.disk {
                         sysmon.disk_history.push(u32::from(disk.percent));
                         if sysmon.disk_history.len() > HISTORY_LEN {
                             sysmon.disk_history.remove(0);
                         }
                     }
-                    if let Some(battery) = &snapshot.battery {
+                    if let Some(battery) = &reading.battery {
                         sysmon.battery_history.push(u32::from(battery.percent));
                         if sysmon.battery_history.len() > HISTORY_LEN {
                             sysmon.battery_history.remove(0);
                         }
                     }
-                    sysmon.ram = snapshot.ram;
-                    sysmon.temp = snapshot.temp;
-                    sysmon.disk = snapshot.disk.clone();
-                    sysmon.streams = snapshot.streams.clone();
-                    sysmon.bluetooth = snapshot.bluetooth.clone();
-                    sysmon.network = snapshot.network.clone();
-                    sysmon.power_profile = snapshot.power_profile;
-                    sysmon.media = snapshot.media.clone();
-                    log::debug!("sysmon snapshot: {snapshot:?}");
-                    // the trio rides the same confirm gate as the
-                    // fast pass: the full pass doesn't get to
-                    // bypass it
-                    sysmon.absorb_av(&snapshot);
-                    true
-                    }
-                } else {
-                    // recording has no confirm gate to race: a /proc
-                    // read cannot fight user intent the way a wpctl
-                    // write can
-                    let recording_changed = sysmon.recording != snapshot.recording;
-                    sysmon.recording = snapshot.recording.clone();
-                    sysmon.absorb_av(&snapshot) || recording_changed
-                };
-                if moved {
+                    sysmon.ram = reading.ram;
+                    sysmon.temp = reading.temp;
+                    sysmon.disk = reading.disk;
                     cx.notify();
-                }
-                // a stored confirm candidate re-checks soon
-                sysmon.av_confirming.is_some()
-            }) else {
-                break;
-            };
-            if quick_recheck {
-                cx.background_executor().timer(CONFIRM_RECHECK).await;
-            } else {
-                cx.background_executor().timer(FAST_INTERVAL).await;
+                }) else {
+                    break;
+                };
+            }
+            cx.background_executor().timer(SYSTEM_INTERVAL).await;
+        }
+    })
+    .detach();
+}
+
+/// The media pass: playerctl's metadata, only while the bar's media
+/// widget is there to show it.
+fn spawn_media_pass(state: gpui::WeakEntity<SysMon>, settings: Entity<Settings>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            let tick = pass_tick(
+                &state,
+                cx,
+                |app| {
+                    read_gates(&settings, app)
+                        .media
+                        .then(|| (PANEL_INTERVAL, ()))
+                },
+                |()| read_media(),
+                |sysmon, media, cx| {
+                    if sysmon.media != media {
+                        sysmon.media = media;
+                        cx.notify();
+                    }
+                },
+            )
+            .await;
+            match tick {
+                Tick::Gone => break,
+                Tick::Idle => cx.background_executor().timer(GATE_TICK).await,
+                Tick::Read(cadence) => cx.background_executor().timer(cadence).await,
             }
         }
     })
     .detach();
 }
 
+/// The power profile's pass: a keybind or a panel writes the state
+/// directly, so the poll only reconciles outside changes, on the
+/// slow clock.
+fn spawn_profile_pass(state: gpui::WeakEntity<SysMon>, settings: Entity<Settings>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            let tick = pass_tick(
+                &state,
+                cx,
+                |app| {
+                    read_gates(&settings, app)
+                        .profile
+                        .then(|| (PROFILE_INTERVAL, ()))
+                },
+                |()| read_power_profile(),
+                |sysmon, profile, cx| {
+                    if sysmon.power_profile != profile {
+                        sysmon.power_profile = profile;
+                        cx.notify();
+                    }
+                },
+            )
+            .await;
+            match tick {
+                Tick::Gone => break,
+                Tick::Idle => cx.background_executor().timer(GATE_TICK).await,
+                Tick::Read(cadence) => cx.background_executor().timer(cadence).await,
+            }
+        }
+    })
+    .detach();
+}
+
+/// The network pass. Two cadences: the Wi-Fi panel's list wants the
+/// AP-and-saved scan every tick while it is open, and everyone else
+/// (the bar's internet widget, the settings applet) wants the
+/// state-only snapshot on the slow clock.
+fn spawn_network_pass(state: gpui::WeakEntity<SysMon>, settings: Entity<Settings>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let mut last_read: Option<Instant> = None;
+        loop {
+            let idle_due = last_read.is_none_or(|at| at.elapsed() >= NETWORK_IDLE);
+            let tick = pass_tick(
+                &state,
+                cx,
+                |app| {
+                    let gates = read_gates(&settings, app);
+                    if gates.wifi_scan {
+                        Some((PANEL_INTERVAL, true))
+                    } else if gates.network && idle_due {
+                        Some((NETWORK_IDLE, false))
+                    } else {
+                        None
+                    }
+                },
+                |scan_wifi| read_network(scan_wifi),
+                |sysmon, network, cx| {
+                    if sysmon.network != network {
+                        sysmon.network = network;
+                        cx.notify();
+                    }
+                },
+            )
+            .await;
+            match tick {
+                Tick::Gone => break,
+                Tick::Idle => cx.background_executor().timer(GATE_TICK).await,
+                Tick::Read(cadence) => {
+                    last_read = Some(Instant::now());
+                    cx.background_executor().timer(cadence).await;
+                }
+            }
+        }
+    })
+    .detach();
+}
+
+/// The Bluetooth pass, the same two cadences as the network's: the
+/// paired-device scan every tick while the panel is open, the
+/// adapter state on the slow clock for the widget and the settings
+/// applet.
+fn spawn_bluetooth_pass(state: gpui::WeakEntity<SysMon>, settings: Entity<Settings>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let mut last_read: Option<Instant> = None;
+        loop {
+            let idle_due = last_read.is_none_or(|at| at.elapsed() >= BLUETOOTH_IDLE);
+            let tick = pass_tick(
+                &state,
+                cx,
+                |app| {
+                    let gates = read_gates(&settings, app);
+                    if gates.bt_scan {
+                        Some((PANEL_INTERVAL, true))
+                    } else if gates.bluetooth && idle_due {
+                        Some((BLUETOOTH_IDLE, false))
+                    } else {
+                        None
+                    }
+                },
+                |scan_devices| read_bluetooth(scan_devices),
+                |sysmon, bluetooth, cx| {
+                    if sysmon.bluetooth != bluetooth {
+                        sysmon.bluetooth = bluetooth;
+                        cx.notify();
+                    }
+                },
+            )
+            .await;
+            match tick {
+                Tick::Gone => break,
+                Tick::Idle => cx.background_executor().timer(GATE_TICK).await,
+                Tick::Read(cadence) => {
+                    last_read = Some(Instant::now());
+                    cx.background_executor().timer(cadence).await;
+                }
+            }
+        }
+    })
+    .detach();
+}
+
+/// The stream list's pass: only while the volume panel is open (the
+/// status dump is the heaviest call in the house).
+fn spawn_streams_pass(state: gpui::WeakEntity<SysMon>, settings: Entity<Settings>, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            let tick = pass_tick(
+                &state,
+                cx,
+                |app| {
+                    read_gates(&settings, app)
+                        .streams
+                        .then(|| (PANEL_INTERVAL, ()))
+                },
+                |()| read_streams(),
+                |sysmon, streams, cx| {
+                    if sysmon.streams != streams {
+                        sysmon.streams = streams;
+                        cx.notify();
+                    }
+                },
+            )
+            .await;
+            match tick {
+                Tick::Gone => break,
+                Tick::Idle => cx.background_executor().timer(GATE_TICK).await,
+                Tick::Read(cadence) => cx.background_executor().timer(cadence).await,
+            }
+        }
+    })
+    .detach();
+}
+
+/// Which passes have a consumer right now: the bar widget placed, or
+/// a panel that reads the same state open. Each pass gates on its
+/// own consumers; the old single gate (one shared "any sysinfo
+/// widget" flag) took every scan down with the widgets, starving the
+/// settings applet and the OSD of state no pass was feeding.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PassGates {
+    /// cpu, cores, loadavg, uptime, ram, temp, disk, battery
+    system: bool,
+    media: bool,
+    profile: bool,
+    /// the network state, AP scan off
+    network: bool,
+    /// the Wi-Fi AP-and-saved scan: the panel's list
+    wifi_scan: bool,
+    /// the Bluetooth adapter state
+    bluetooth: bool,
+    /// the paired-device scan
+    bt_scan: bool,
+    /// the playback stream list
+    streams: bool,
+}
+
+/// The sysmon-relevant panel kinds, the ones a pass's gate reads.
+const GATED_PANELS: [PanelKind; 10] = [
+    PanelKind::Settings,
+    PanelKind::Volume,
+    PanelKind::PowerProfile,
+    PanelKind::Cpu,
+    PanelKind::Ram,
+    PanelKind::Temp,
+    PanelKind::Disk,
+    PanelKind::Battery,
+    PanelKind::Wifi,
+    PanelKind::Bluetooth,
+];
+
+fn pass_gates(placed: &[WidgetKind], open: &[PanelKind]) -> PassGates {
+    let widget_placed = |kinds: &[WidgetKind]| kinds.iter().any(|kind| placed.contains(kind));
+    let panel_open = |kind: PanelKind| open.contains(&kind);
+    PassGates {
+        system: widget_placed(&[
+            WidgetKind::Cpu,
+            WidgetKind::Ram,
+            WidgetKind::Temp,
+            WidgetKind::Disk,
+            WidgetKind::Battery,
+        ]) || [
+            PanelKind::Cpu,
+            PanelKind::Ram,
+            PanelKind::Temp,
+            PanelKind::Disk,
+            PanelKind::Battery,
+        ]
+        .iter()
+        .any(|kind| panel_open(*kind)),
+        media: widget_placed(&[WidgetKind::Media]),
+        profile: widget_placed(&[WidgetKind::PowerProfile])
+            || panel_open(PanelKind::PowerProfile)
+            || panel_open(PanelKind::Settings),
+        network: widget_placed(&[WidgetKind::Internet])
+            || panel_open(PanelKind::Settings)
+            || panel_open(PanelKind::Wifi),
+        wifi_scan: panel_open(PanelKind::Wifi),
+        bluetooth: widget_placed(&[WidgetKind::Bluetooth])
+            || panel_open(PanelKind::Bluetooth)
+            || panel_open(PanelKind::Settings),
+        bt_scan: panel_open(PanelKind::Bluetooth),
+        streams: panel_open(PanelKind::Volume),
+    }
+}
+
+/// The gate's inputs in one owned pair: the placed widget kinds and
+/// the panels open right now. `pass_gates` takes slices; this does
+/// the main-thread hop to fill them.
+fn read_gates(settings: &Entity<Settings>, cx: &mut App) -> PassGates {
+    let placed = settings.read(cx).placed_builtin_kinds();
+    let opened: Vec<PanelKind> = GATED_PANELS
+        .iter()
+        .copied()
+        .filter(|kind| is_open(kind, cx))
+        .collect();
+    pass_gates(&placed, &opened)
+}
+
+/// One poll read of the audio and brightness trio plus the recording
+/// dot: the fast pass's bundle.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Snapshot {
-    battery: Option<Battery>,
     volume: Option<Volume>,
     mic: Option<Mic>,
     brightness: Option<Brightness>,
+    recording: Option<RecordingState>,
+}
+
+/// One poll read of the system stats: the sysinfo widgets' inputs,
+/// gathered in one background pass and landed in one apply.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SystemReading {
+    battery: Option<Battery>,
     cpu: Option<f32>,
     cpu_cores: Option<Vec<f32>>,
     loadavg: Option<([f32; 3], u32)>,
     uptime: Option<u64>,
-    /// Playback streams, scanned only while the volume panel is open
-    /// (the status dump is too heavy for the idle shell).
-    streams: Vec<Stream>,
     ram: Option<Ram>,
     temp: Option<u32>,
     disk: Option<Disk>,
-    bluetooth: Option<BluetoothState>,
-    network: Option<NetworkState>,
-    power_profile: Option<PowerProfile>,
-    media: Option<MediaState>,
-    recording: Option<RecordingState>,
 }
 
-fn refresh(
-    previous: &mut Option<CpuSample>,
-    disk_mount: &std::path::Path,
-    scan_streams: bool,
-    scan_wifi: bool,
-) -> Snapshot {    let usage = sample_cpu_usage(previous);
-    Snapshot {
+/// The system pass's read: proc/sysfs walks and one stat per disk.
+/// The cpu usage sample arrives pre-diffed (its /proc/stat read
+/// happened in the same background pass, against the previous
+/// sample).
+fn refresh_system(disk_mount: std::path::PathBuf, usage: Option<CpuUsage>) -> SystemReading {
+    SystemReading {
         battery: read_battery(),
-        volume: read_volume(),
-        mic: read_mic(),
-        brightness: read_brightness(),
         cpu: usage.as_ref().map(|usage| usage.total),
         cpu_cores: usage.as_ref().map(|usage| usage.cores.clone()),
         loadavg: read_loadavg(),
         uptime: read_uptime(),
-        streams: if scan_streams {
-            read_streams()
-        } else {
-            Vec::new()
-        },
         ram: read_ram(),
         temp: read_cpu_temp(),
-        disk: read_disk(disk_mount),
-        bluetooth: read_bluetooth(scan_wifi),
-        network: read_network(scan_wifi),
-        power_profile: read_power_profile(),
-        media: read_media(),
-        recording: Default::default(),
+        disk: read_disk(&disk_mount),
     }
 }
 
 /// The fast pass: only what a keybind or a hardware key changes out
 /// from under the shell, plus the recording indicator (an
 /// unconditional consumer: the dot renders whenever a recorder runs,
-/// widget or not, so its /proc read rides here rather than behind the
-/// full pass's widget gate).
+/// widget or not, so its /proc read never gates).
 fn refresh_av() -> Snapshot {
     Snapshot {
         volume: read_volume(),
@@ -2266,6 +2580,59 @@ fn read_uptime() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_pass_gates_on_its_own_consumers() {
+        use crate::panel::PanelKind;
+        // no widgets placed, no panels open: nothing scans
+        let gates = pass_gates(&[], &[]);
+        assert!(!gates.system);
+        assert!(!gates.media);
+        assert!(!gates.profile);
+        assert!(!gates.network);
+        assert!(!gates.wifi_scan);
+        assert!(!gates.bluetooth);
+        assert!(!gates.bt_scan);
+        assert!(!gates.streams);
+
+        // each subsystem's own widget wakes it and nothing else
+        let gates = pass_gates(&[WidgetKind::Media], &[]);
+        assert!(gates.media);
+        assert!(!gates.system && !gates.profile && !gates.network && !gates.bluetooth);
+
+        // the dead-widget gate is dead: with no widget placed at all,
+        // the settings applet keeps profile, network, and bluetooth
+        // state fed (the OSD's profile card rides the keybind's own
+        // state write, so it needs no gate)
+        let opened = [PanelKind::Settings];
+        let gates = pass_gates(&[], &opened);
+        assert!(gates.profile && gates.network && gates.bluetooth);
+        assert!(!gates.system && !gates.media && !gates.streams);
+        assert!(!gates.wifi_scan && !gates.bt_scan);
+
+        // the wifi panel gets the AP scan; the bluetooth panel gets
+        // the device scan, and neither borrows the other's
+        let opened = [PanelKind::Wifi];
+        let gates = pass_gates(&[], &opened);
+        assert!(gates.network && gates.wifi_scan);
+        assert!(!gates.bt_scan && !gates.bluetooth);
+        let opened = [PanelKind::Bluetooth];
+        let gates = pass_gates(&[], &opened);
+        assert!(gates.bluetooth && gates.bt_scan);
+        assert!(!gates.wifi_scan && !gates.network);
+
+        // the volume panel drives the streams scan alone
+        let opened = [PanelKind::Volume];
+        let gates = pass_gates(&[], &opened);
+        assert!(gates.streams);
+        assert!(!gates.system && !gates.media && !gates.profile && !gates.network);
+
+        // a sysinfo panel stands in for its widget
+        let opened = [PanelKind::Cpu];
+        let gates = pass_gates(&[], &opened);
+        assert!(gates.system);
+        assert!(!gates.media && !gates.streams && !gates.profile);
+    }
 
     #[test]
     fn nmcli_ap_lines_parse() {
