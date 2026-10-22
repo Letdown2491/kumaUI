@@ -193,20 +193,25 @@ pub struct RecordingState {
 /// seconds, not that subsystem's updates for the rest of the session.
 
 fn read_recording() -> Option<RecordingState> {
-    // pgrep walks /proc: bounded like every other poll read, cheap as
-    // it normally is
-    let out = timed_output("pgrep", &["-x", "wf-recorder"], 5)
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let pid: u32 = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()?;
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // walk /proc directly: no pgrep subprocess. This read rides the
+    // 500ms AV pass (the recording indicator renders whenever a
+    // recorder runs, widget or not), and fork/exec per tick is
+    // exactly the churn the poller exists to avoid.
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let pid = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .find(|entry| {
+            std::fs::read_to_string(entry.path().join("comm"))
+                .map(|comm| comm.trim() == "wf-recorder")
+                .unwrap_or(false)
+        })?;
+    let stat = std::fs::read_to_string(pid.path().join("stat")).ok()?;
     let uptime: f64 = std::fs::read_to_string("/proc/uptime")
         .ok()?
         .split_whitespace()
@@ -264,7 +269,7 @@ pub struct SysMon {
     /// the settings' sysinfo section.
     pub disk_mount: std::path::PathBuf,
     /// Whether any widget the full pass feeds is placed (settings'
-    /// `sysinfo_placed`): false skips the pass, its five scans would
+    /// `full_pass_placed`): false skips the pass, its scans would
     /// run for nobody.
     pub full_wanted: bool,
     pub bluetooth: Option<BluetoothState>,
@@ -1019,7 +1024,7 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
     // the disk mount is user state: seeded once, then mirrored on
     // settings changes (no re-mint needed, the poll reads it per tick)
     let mount = settings.read(cx).sysinfo.disk_mount.clone();
-    let full_wanted = settings.read(cx).sysinfo_placed();
+    let full_wanted = settings.read(cx).full_pass_placed();
     state.update(cx, |sysmon, _| {
         sysmon.disk_mount = mount;
         sysmon.full_wanted = full_wanted;
@@ -1028,7 +1033,7 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
         let state = state.downgrade();
         cx.observe(settings, move |settings, cx| {
             let mount = settings.read(cx).sysinfo.disk_mount.clone();
-            let full_wanted = settings.read(cx).sysinfo_placed();
+            let full_wanted = settings.read(cx).full_pass_placed();
             let _ = state.update(cx, |sysmon, _| {
                 if sysmon.disk_mount != mount {
                     sysmon.disk_mount = mount;
@@ -1051,11 +1056,12 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
             let Ok(disk_mount) = state.update(cx, |sysmon, _| sysmon.disk_mount.clone()) else {
                 break;
             };
-            // nothing placed feeds the full pass: its five scans
-            // (cpu cores, loadavg, temp, disk, battery) would run
-            // for nobody, so the pass skips. The AV pass rides on:
-            // the OSD reads volume, mic, brightness, and the power
-            // profile with no widget placed
+            // no full-pass-fed widget placed: its scans (cpu cores,
+            // loadavg, temp, disk, battery, network, bluetooth,
+            // media, power profile) would run for nobody, so the
+            // pass skips. The AV pass rides on regardless: volume,
+            // mic, brightness, and the recording dot (the indicator
+            // renders with no widget placed)
             let full = full_wanted && tick % FULL_PASS_EVERY == 0;
             // the stream scan rides only while the volume panel is
             // open: the status dump is the heaviest call in the pass.
@@ -1133,7 +1139,6 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
                     sysmon.network = snapshot.network.clone();
                     sysmon.power_profile = snapshot.power_profile;
                     sysmon.media = snapshot.media.clone();
-                    sysmon.recording = snapshot.recording.clone();
                     log::debug!("sysmon snapshot: {snapshot:?}");
                     // the trio rides the same confirm gate as the
                     // fast pass: the full pass doesn't get to
@@ -1142,7 +1147,12 @@ pub fn run(state: &Entity<SysMon>, settings: &Entity<Settings>, cx: &mut App) {
                     true
                     }
                 } else {
-                    sysmon.absorb_av(&snapshot)
+                    // recording has no confirm gate to race: a /proc
+                    // read cannot fight user intent the way a wpctl
+                    // write can
+                    let recording_changed = sysmon.recording != snapshot.recording;
+                    sysmon.recording = snapshot.recording.clone();
+                    sysmon.absorb_av(&snapshot) || recording_changed
                 };
                 if moved {
                     cx.notify();
@@ -1212,17 +1222,21 @@ fn refresh(
         network: read_network(scan_wifi),
         power_profile: read_power_profile(),
         media: read_media(),
-        recording: read_recording(),
+        recording: Default::default(),
     }
 }
 
 /// The fast pass: only what a keybind or a hardware key changes out
-/// from under the shell. Everything else keeps the full pass's pace.
+/// from under the shell, plus the recording indicator (an
+/// unconditional consumer: the dot renders whenever a recorder runs,
+/// widget or not, so its /proc read rides here rather than behind the
+/// full pass's widget gate).
 fn refresh_av() -> Snapshot {
     Snapshot {
         volume: read_volume(),
         mic: read_mic(),
         brightness: read_brightness(),
+        recording: read_recording(),
         ..Default::default()
     }
 }

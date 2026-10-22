@@ -37,6 +37,13 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- Bar widgets the sysmon full pass feeds (internet, bluetooth,
+  media, power profile) rendered empty forever unless a sysinfo
+  widget was also placed: the pass's run gate checked only the
+  sysinfo five, while the same pass was their only data source. The
+  gate now covers every fed widget, and the recording indicator no
+  longer depends on it at all: its /proc read rides the fast pass
+  directly (in-process, the pgrep subprocess dropped).
 - Koguma's "Open Terminal Here" found no terminal on kumaOS: the
   candidate ladder named `$TERMINAL`, `xdg-terminal-exec`, and eight
   emulator binaries, none of which the image ships. kuma-term now sits

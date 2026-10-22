@@ -1115,11 +1115,14 @@ impl Settings {
         kinds
     }
 
-    /// Whether any bar widget the sysmon full pass feeds (cpu, ram,
-    /// temp, disk, battery) is placed. The lighter AV pass stays
-    /// unconditional: the OSD reads volume, mic, brightness, and the
-    /// power profile with no widget placed.
-    pub fn sysinfo_placed(&self) -> bool {
+    /// Whether any bar widget the sysmon full pass feeds is placed:
+    /// the sysinfo five (cpu, ram, temp, disk, battery) plus the other
+    /// full-pass-fed kinds (internet, bluetooth, media, power
+    /// profile). The lighter AV pass stays unconditional: the OSD
+    /// reads volume, mic, and brightness with no widget placed, and
+    /// the recording indicator (also an AV-pass read now) renders
+    /// whenever a recorder runs.
+    pub fn full_pass_placed(&self) -> bool {
         self.placed_builtin_kinds().iter().any(|kind| {
             matches!(
                 kind,
@@ -1128,6 +1131,10 @@ impl Settings {
                     | WidgetKind::Temp
                     | WidgetKind::Disk
                     | WidgetKind::Battery
+                    | WidgetKind::Internet
+                    | WidgetKind::Bluetooth
+                    | WidgetKind::Media
+                    | WidgetKind::PowerProfile
             )
         })
     }
@@ -1618,12 +1625,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sysinfo_placed_tracks_the_full_pass_widgets() {
+    fn full_pass_placed_tracks_the_full_pass_widgets() {
         // default bar: sysinfo widgets are placed (the defaults ship
         // a cpu widget), so the full pass runs
-        assert!(Settings::default().sysinfo_placed());
-        // a bar with no sysinfo widgets: the full pass would run for
-        // nobody
+        assert!(Settings::default().full_pass_placed());
+        // a bar with none of the full-pass-fed widgets: the full pass
+        // would run for nobody
         let mut settings = Settings::default();
         for section in [&mut settings.bar.left, &mut settings.bar.center, &mut settings.bar.right] {
             section.retain(|config| {
@@ -1635,17 +1642,22 @@ mod tests {
                             | WidgetKind::Temp
                             | WidgetKind::Disk
                             | WidgetKind::Battery
+                            | WidgetKind::Internet
+                            | WidgetKind::Bluetooth
+                            | WidgetKind::Media
+                            | WidgetKind::PowerProfile
                     )
                 )
             });
         }
-        assert!(!settings.sysinfo_placed());
-        assert!(!settings.sysinfo_placed());
-        assert!(!settings.sysinfo_placed());
+        assert!(!settings.full_pass_placed());
+        assert!(!settings.full_pass_placed());
+        assert!(!settings.full_pass_placed());
         // the kinds dedupe across sections, and a placed cpu feeds
-        // the pass again (the retained default bar holds eight
-        // distinct kinds)
-        assert_eq!(settings.placed_builtin_kinds().len(), 8);
+        // the pass again (the retained default bar holds seven
+        // distinct kinds: the default's media chip rode out with the
+        // full-pass-fed pruning)
+        assert_eq!(settings.placed_builtin_kinds().len(), 7);
         settings.bar.left.push(WidgetConfig {
             kind: WidgetRef::Builtin(WidgetKind::Cpu),
             mode: Default::default(),
@@ -1658,8 +1670,8 @@ mod tests {
             kind: WidgetRef::Builtin(WidgetKind::Cpu),
             mode: Default::default(),
         });
-        assert_eq!(settings.placed_builtin_kinds().len(), 9);
-        assert!(settings.sysinfo_placed());
+        assert_eq!(settings.placed_builtin_kinds().len(), 8);
+        assert!(settings.full_pass_placed());
     }
 
     #[test]
