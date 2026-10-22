@@ -92,7 +92,7 @@ fn has_auth_stack(text: &str) -> bool {
 
 /// One unlock attempt, on a blocking thread: start the first service in
 /// the chain, authenticate, validate the account.
-fn authenticate(user: &str, mut password: String) -> anyhow::Result<()> {
+fn authenticate(user: &str, mut password: String) -> Result<(), AuthError> {
     let mut last = None;
     for service in PAM_SERVICES {
         // Linux-PAM defers reading a service's stack to the first call and,
@@ -106,7 +106,7 @@ fn authenticate(user: &str, mut password: String) -> anyhow::Result<()> {
         }
         let conversation = PasswordConversation {
             password: CString::new(password.as_bytes())
-                .map_err(|_| anyhow::anyhow!("password contains a NUL byte"))?,
+                .map_err(|_| AuthError::Systemic("the password holds a NUL byte".into()))?,
         };
         // the password has reached its only consumer: what lives on from
         // here is the CString copy above, zeroized with the conversation
@@ -116,17 +116,66 @@ fn authenticate(user: &str, mut password: String) -> anyhow::Result<()> {
                 // A real stack's answer is final: wrong password, expired
                 // account, whatever; falling through would just repeat
                 // the deny in the next service.
-                context.authenticate(pam_client2::Flag::NONE)?;
-                context.acct_mgmt(pam_client2::Flag::NONE)?;
+                context
+                    .authenticate(pam_client2::Flag::NONE)
+                    .map_err(|err| classify_pam(&err))?;
+                context
+                    .acct_mgmt(pam_client2::Flag::NONE)
+                    .map_err(|err| classify_pam(&err))?;
                 return Ok(());
             }
             Err(err) => last = Some(err),
         }
     }
-    Err(anyhow::anyhow!(
-        "no PAM service in the chain starts: {}",
-        last.map(|err| err.to_string()).unwrap_or_default()
-    ))
+    Err(AuthError::Systemic(match last {
+        Some(err) => format!("no PAM service in the chain starts: {err}"),
+        None => "no PAM service in the chain is installed".to_string(),
+    }))
+}
+
+/// What a failed attempt means: the two read differently on the lock
+/// surface, because one is the user's typo and the other is a machine
+/// to fix. A broken PAM config must not look like a wrong password at
+/// the worst possible moment (locked out, retrying a correct password
+/// forever).
+#[derive(Debug, Clone)]
+enum AuthError {
+    /// PAM said no: the ordinary case, the terse line.
+    Rejected,
+    /// PAM failed some other way (service, account, module): the
+    /// machine's own text is the honest answer.
+    Systemic(String),
+}
+
+impl AuthError {
+    /// The line the lock surface shows: PAM's own description for the
+    /// machine's failures, the terse conventional one for a rejection.
+    fn surface_text(&self) -> String {
+        match self {
+            AuthError::Rejected => "wrong password".to_string(),
+            AuthError::Systemic(description) => {
+                let description = description.trim();
+                if description.is_empty() {
+                    "authentication is failing (see the journal)".to_string()
+                } else {
+                    description.to_string()
+                }
+            }
+        }
+    }
+}
+
+/// A PAM rejection is the password's answer; anything else is the
+/// machine's.
+fn classify_pam(err: &pam_client2::Error) -> AuthError {
+    match err.code() {
+        pam_client2::ErrorCode::AUTH_ERR | pam_client2::ErrorCode::PERM_DENIED => AuthError::Rejected,
+        _ => AuthError::Systemic(
+            err.message()
+                .map(str::to_string)
+                .unwrap_or_else(|| err.to_string()),
+        ),
+    }
 }
 
 /// The whole lock state: locked or not, the shared password field, one
@@ -324,9 +373,11 @@ impl LockState {
                 match result {
                     Ok(()) => this.unlock(cx),
                     Err(err) => {
-                        // generic message: PAM's own text can leak details
-                        log::info!("unlock attempt failed: {err:#}");
-                        this.message = Some("wrong password".into());
+                        // the journal keeps the whole case; the surface
+                        // shows the honest line (a rejection reads as
+                        // one, a machine failure says what broke)
+                        log::info!("unlock attempt failed: {err:?}");
+                        this.message = Some(err.surface_text().into());
                         this.password.zeroize();
                         cx.notify();
                     }
@@ -363,12 +414,13 @@ impl Focusable for LockView {
 }
 
 impl Render for LockView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let password_len = state.password.chars().count();
         let busy = state.busy;
         let message = state.message.clone();
         let wallpaper = state.wallpaper.clone();
+        let caps_on = window.capslock().on;
 
         let now = Local::now();
         let time = now.format("%H:%M").to_string();
@@ -390,6 +442,10 @@ impl Render for LockView {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 this.state
                     .update(cx, |state, cx| state.handle_key(event, cx));
+                // a repaint picks up the caps-lock state the platform
+                // just refreshed (the field's hint reads it at render);
+                // one notify per keydown on a lock surface is nothing
+                cx.notify();
             }))
             .bg(rgb(0x11111B))
             .when_some(wallpaper, |el, image| {
@@ -437,6 +493,14 @@ impl Render for LockView {
                             }))
                             .child(field),
                     )
+                    .when(caps_on, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(crate::theme::current().text_dim))
+                                .child("caps lock is on"),
+                        )
+                    })
                     .when_some(message, |el, message| {
                         el.child(
                             div()
@@ -677,7 +741,7 @@ async fn run_lock_listener(tx: Sender<LockEvent>, hint_rx: Receiver<bool>) -> an
 
 #[cfg(test)]
 mod tests {
-    use super::{has_auth_stack, needs_lock_surfaces};
+    use super::{has_auth_stack, needs_lock_surfaces, AuthError};
 
     #[test]
     fn a_pam_stack_counts_only_when_an_auth_rule_exists() {
@@ -705,5 +769,21 @@ mod tests {
         assert!(!needs_lock_surfaces(true, 2, 1));
         // displayless: there is nothing to attach to; wait
         assert!(!needs_lock_surfaces(true, 0, 0));
+    }
+
+    #[test]
+    fn the_surface_reads_rejections_as_typos_and_machine_failures_honestly() {
+        // a rejection is the terse conventional line, unchanged
+        assert_eq!(AuthError::Rejected.surface_text(), "wrong password");
+        // a machine failure says what broke, PAM's own text
+        assert_eq!(
+            AuthError::Systemic("Account expired".into()).surface_text(),
+            "Account expired"
+        );
+        // an empty description still says something honest
+        assert_eq!(
+            AuthError::Systemic("  ".into()).surface_text(),
+            "authentication is failing (see the journal)"
+        );
     }
 }

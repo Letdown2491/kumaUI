@@ -58,6 +58,11 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- The lock screen no longer blames every PAM failure on the password:
+  a rejection still reads "wrong password", but a machine failure
+  (broken PAM config, expired account, missing service) shows PAM's
+  own text, with the full chain in the journal. The password field
+  also shows a caps-lock hint while caps lock is on.
 - Esc inside an inline edit field cancels the edit only: the Wi-Fi
   password prompt and the weather location edit no longer close the
   whole panel with the cancel.
