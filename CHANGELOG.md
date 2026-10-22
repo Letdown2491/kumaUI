@@ -16,6 +16,12 @@ source's wrap points would pin the text to a narrow column.
 
 ### Added
 
+- The bar shows when the screen is being shared. Niri reports its
+  screencasts first-party, and the shell mirrors them into a sharing
+  indicator beside the recording dot: an amber dot naming the target
+  (output name or window title), a click ending the portal sessions.
+  Sharing and recording are distinct states, not merged; both can run
+  at once.
 - Audio files (mp3, flac, ogg, opus, wav, m4a) read like videos in
   the details pane: the header-only probe gains an audio-only variant
   and lands a length row, and embedded album art shows in the preview

@@ -33,6 +33,11 @@ struct WindowFocusChangedEvent {
     id: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct CastStoppedEvent {
+    stream_id: u64,
+}
+
 pub fn connect(state: &Entity<SessionState>, cx: &mut App) {
     crate::session::mirror(state, "niri", cx, run_event_stream);
 }
@@ -112,6 +117,13 @@ fn parse_event(line: &str) -> Result<Option<SessionEvent>> {
         "WindowFocusChanged" => SessionEvent::WindowFocusChanged(
             serde_json::from_value::<WindowFocusChangedEvent>(payload.clone())?.id,
         ),
+        "CastsChanged" => SessionEvent::Casts(serde_json::from_value(payload["casts"].clone())?),
+        "CastStartedOrChanged" => SessionEvent::CastStartedOrChanged(serde_json::from_value(
+            payload["cast"].clone(),
+        )?),
+        "CastStopped" => SessionEvent::CastStopped(
+            serde_json::from_value::<CastStoppedEvent>(payload.clone())?.stream_id,
+        ),
         _ => return Ok(None),
     };
     Ok(Some(event))
@@ -146,6 +158,13 @@ pub fn focus_workspace_index(index: u32) -> Result<()> {
 /// Focus one window: the dock's click action.
 pub fn focus_window(id: u64) -> Result<()> {
     send_action(json!({"FocusWindow": {"id": id}}))
+}
+
+/// Force-stop a screencast session: the bar's sharing indicator click.
+/// Niri stops PipeWire sessions only; a wlr-screencopy consumer owns
+/// its stream, and the indicator never offers the click for one.
+pub fn stop_cast(session_id: u64) -> Result<()> {
+    send_action(json!({"StopCast": {"session_id": session_id}}))
 }
 
 #[cfg(test)]
@@ -183,10 +202,43 @@ mod tests {
     #[test]
     fn ignores_unknown_events() {
         assert!(matches!(
-            parse_event(r#"{"CastStopped":{"stream_id":9}}"#).unwrap(),
+            parse_event(r#"{"ConfigLoaded":{"failed":false}}"#).unwrap(),
             None
         ));
         assert!(parse_event("not json").is_err());
+    }
+
+    #[test]
+    fn parses_cast_events() {
+        // Real niri 26.04 shapes, CastStartedOrChanged included: after
+        // the connect-time CastsChanged snapshot, niri updates the
+        // mirror incrementally and the state has to keep up.
+        assert!(matches!(
+            parse_event(
+                r#"{"CastsChanged":{"casts":[{"stream_id":1,"session_id":2,"kind":"PipeWire","target":{"Output":{"name":"DP-1"}},"is_dynamic_target":false,"is_active":true,"pid":null,"pw_node_id":77}]}}"#
+            )
+            .unwrap(),
+            Some(SessionEvent::Casts(ref casts))
+                if casts.len() == 1
+                    && casts[0].stream_id == 1
+                    && casts[0].session_id == 2
+                    && casts[0].kind == crate::session::CastKind::PipeWire
+        ));
+        assert!(matches!(
+            parse_event(
+                r#"{"CastStartedOrChanged":{"cast":{"stream_id":3,"session_id":4,"kind":"WlrScreencopy","target":{"Window":{"id":5}},"is_dynamic_target":false,"is_active":true,"pid":4242,"pw_node_id":null}}}"#
+            )
+            .unwrap(),
+            Some(SessionEvent::CastStartedOrChanged(ref cast))
+                if cast.stream_id == 3
+                    && matches!(cast.target, crate::session::CastTarget::Window { id: 5 })
+                    && cast.kind == crate::session::CastKind::WlrScreencopy
+                    && !cast.kind.stoppable()
+        ));
+        assert!(matches!(
+            parse_event(r#"{"CastStopped":{"stream_id":9}}"#).unwrap(),
+            Some(SessionEvent::CastStopped(9))
+        ));
     }
 
     #[test]

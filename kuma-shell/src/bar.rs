@@ -8,7 +8,7 @@ use gpui::{
 };
 use log::error;
 
-use crate::session::SessionState;
+use crate::session::{Cast, CastTarget, SessionState};
 use crate::settings::{
     BarAlign, BarPosition, BarRadius, CornerRounding, Section, Settings, WidgetConfig,
     WidgetIconSpec, WidgetKind, WidgetMode,
@@ -265,6 +265,9 @@ impl Render for ShellBar {
                 .child(self.render_section(Section::Right, cx, tooltips_on))
                 .when_some(self.sysmon.read(cx).recording.clone(), |el, rec| {
                     el.child(recording_indicator(&rec, cx, tooltips_on))
+                })
+                .when_some(sharing_state(self, cx), |el, (casts, what)| {
+                    el.child(sharing_indicator(&casts, &what, cx, tooltips_on))
                 })
                 .child(gear_button(cx, tooltips_on)),
         );
@@ -1647,6 +1650,101 @@ fn recording_indicator(
                 .text_size(px(12.))
                 .text_color(rgb(crate::theme::URGENT))
                 .child(format!("{mins}:{secs:02}")),
+        )
+}
+
+/// The sharing indicator's inputs, or None when nothing is streaming:
+/// the casts plus a human phrase for what they point at (output name,
+/// window title resolved against the session mirror).
+fn sharing_state(bar: &ShellBar, cx: &App) -> Option<(Vec<Cast>, String)> {
+    let niri = bar.niri.read(cx);
+    let casts = niri.casts();
+    if casts.is_empty() {
+        return None;
+    }
+    let what = casts
+        .iter()
+        .map(|cast| match &cast.target {
+            CastTarget::Output { name } => format!("output {name}"),
+            CastTarget::Window { id } => niri
+                .windows()
+                .into_iter()
+                .find(|window| window.id == *id)
+                .and_then(|window| window.title.clone())
+                .unwrap_or_else(|| format!("window {id}")),
+            CastTarget::Nothing {} => "starting".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some((casts, what))
+}
+
+/// The screen-sharing indicator: an amber dot beside the text of what
+/// is being shared, click to stop. Distinct from the recording dot on
+/// purpose: a wf-recorder and a browser share can run at once, and
+/// their stops are different actions.
+fn sharing_indicator(
+    casts: &[Cast],
+    what: &str,
+    cx: &mut Context<ShellBar>,
+    tooltips_on: bool,
+) -> gpui::Stateful<Div> {
+    // Dedup: one session can carry several streams, and a single stop
+    // ends them all. Only PipeWire sessions accept a stop; a
+    // wlr-screencopy consumer owns its stream, so the click sends what
+    // niri accepts and no more.
+    let mut sessions: Vec<u64> = casts
+        .iter()
+        .filter(|cast| cast.kind.stoppable())
+        .map(|cast| cast.session_id)
+        .collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    // the listener is an Fn (a click can happen again), so the list
+    // rides an Rc and each click clones it into its spawn
+    let sessions = Rc::new(sessions);
+    let paused = casts.iter().any(|cast| !cast.is_active);
+    let tooltip = if paused {
+        "Screen sharing (paused): click to stop"
+    } else {
+        "Screen sharing: click to stop"
+    };
+    div()
+        .id("sharing-indicator")
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_1()
+        .cursor_pointer()
+        .when(tooltips_on, |el| el.tooltip(text_tooltip(tooltip.into())))
+        .on_click(cx.listener({
+            let sessions = sessions.clone();
+            move |_, _, _, cx| {
+                let sessions = sessions.as_ref().clone();
+                cx.background_spawn(async move {
+                    for session_id in sessions {
+                        if let Err(err) = crate::niri::stop_cast(session_id) {
+                            error!("stopping screencast session {session_id} failed: {err:#}");
+                        }
+                    }
+                })
+                .detach();
+            }
+        }))
+        .child(
+            div()
+                .size(px(8.))
+                .rounded_full()
+                .bg(rgb(crate::theme::SHARING)),
+        )
+        .child(
+            div()
+                .h(px(16.))
+                .flex()
+                .items_center()
+                .text_size(px(12.))
+                .text_color(rgb(crate::theme::SHARING))
+                .child(what.to_string()),
         )
 }
 

@@ -91,6 +91,9 @@ pub const TEXT_DIM: u32 = 0x6C7086;
 pub const ACCENT: u32 = 0x89B4FA;
 pub const ACCENT_TEXT: u32 = 0x11111B;
 pub const URGENT: u32 = 0xF38BA8;
+// the sharing indicator's amber: a screencast is attention, not the
+// recording dot's alarm, and both can run at once
+pub const SHARING: u32 = 0xFAB387;
 
 pub const TEXT_SIZE: f32 = 12.;
 pub const TEXT_SIZE_SMALL: f32 = 11.;

@@ -54,6 +54,52 @@ pub struct SessionWindow {
     pub is_urgent: bool,
 }
 
+/// A screencast the compositor knows is running: a portal screen
+/// share, a wlr-screencopy capture. Niri reports these first-party
+/// (26.04), which is the honest signal the shell half of #66 asked
+/// for; no pipewire-graph guessing.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Cast {
+    /// Stream ID: uniquely identifies the cast; the state's key.
+    pub stream_id: u64,
+    /// Session ID: the stop unit. One session can carry several
+    /// streams, and only PipeWire sessions answer a stop.
+    pub session_id: u64,
+    pub kind: CastKind,
+    pub target: CastTarget,
+    /// False while the consumer paused the stream (an OBS scene
+    /// switch, for one). A paused cast is still a cast.
+    #[serde(default)]
+    pub is_active: bool,
+}
+
+/// How the cast is fed. Niri's wire names are "PipeWire" and
+/// "WlrScreencopy"; serde's unit-variant spelling matches as is.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub enum CastKind {
+    /// A portal screencast, typically xdg-desktop-portal-gnome.
+    PipeWire,
+    /// A direct capture: wf-recorder and friends.
+    WlrScreencopy,
+}
+
+impl CastKind {
+    /// Whether the compositor accepts a stop for this kind: the
+    /// sharing indicator's click only ends PipeWire sessions.
+    pub fn stoppable(self) -> bool {
+        matches!(self, CastKind::PipeWire)
+    }
+}
+
+/// What the cast is pointed at. Window casts carry niri's window id,
+/// which the bar resolves to a title against the session mirror.
+#[derive(Clone, Debug, Deserialize)]
+pub enum CastTarget {
+    Nothing {},
+    Output { name: String },
+    Window { id: u64 },
+}
+
 /// The compositor's session events, whatever compositor sent them.
 /// Adapters translate their wire format into this enum; the state
 /// applies it blind.
@@ -65,6 +111,9 @@ pub enum SessionEvent {
     WindowOpenedOrChanged(SessionWindow),
     WindowClosed(u64),
     WindowFocusChanged(Option<u64>),
+    Casts(Vec<Cast>),
+    CastStartedOrChanged(Cast),
+    CastStopped(u64),
 }
 
 #[derive(Default)]
@@ -72,6 +121,7 @@ pub struct SessionState {
     workspaces: Vec<Workspace>,
     windows: HashMap<u64, SessionWindow>,
     focused_window: Option<u64>,
+    casts: HashMap<u64, Cast>,
 }
 
 impl SessionState {
@@ -102,6 +152,14 @@ impl SessionState {
         let mut windows: Vec<&SessionWindow> = self.windows.values().collect();
         windows.sort_by_key(|window| window.id);
         windows
+    }
+
+    /// The live screencasts, in stable order (by stream id): what the
+    /// bar's sharing indicator reads.
+    pub fn casts(&self) -> Vec<Cast> {
+        let mut casts: Vec<Cast> = self.casts.values().cloned().collect();
+        casts.sort_by_key(|cast| cast.stream_id);
+        casts
     }
 
     pub(crate) fn apply(&mut self, event: SessionEvent) {
@@ -147,6 +205,18 @@ impl SessionState {
                 }
             }
             SessionEvent::WindowFocusChanged(id) => self.focused_window = id,
+            SessionEvent::Casts(casts) => {
+                self.casts = casts
+                    .into_iter()
+                    .map(|cast| (cast.stream_id, cast))
+                    .collect();
+            }
+            SessionEvent::CastStartedOrChanged(cast) => {
+                self.casts.insert(cast.stream_id, cast);
+            }
+            SessionEvent::CastStopped(stream_id) => {
+                self.casts.remove(&stream_id);
+            }
         }
         // transition-only: the mirror's own telemetry, and the smoke's
         // assertion surface. A summary that kept logging would spam
@@ -311,6 +381,34 @@ mod tests {
             is_focused: focused,
             is_urgent: false,
         }
+    }
+
+    fn cast(stream_id: u64, session_id: u64) -> Cast {
+        Cast {
+            stream_id,
+            session_id,
+            kind: CastKind::PipeWire,
+            target: CastTarget::Output {
+                name: "eDP-1".into(),
+            },
+            is_active: true,
+        }
+    }
+
+    #[test]
+    fn casts_replace_upsert_and_stop() {
+        let mut state = SessionState::default();
+        state.apply(SessionEvent::Casts(vec![cast(1, 10), cast(2, 10)]));
+        assert_eq!(state.casts().len(), 2);
+        state.apply(SessionEvent::CastStopped(1));
+        assert_eq!(state.casts().len(), 1);
+        // an upsert of the survivor's stream id refreshes it in place
+        state.apply(SessionEvent::CastStartedOrChanged(cast(2, 10)));
+        assert_eq!(state.casts().len(), 1);
+        // the full replacement drops what it does not name
+        state.apply(SessionEvent::Casts(vec![cast(3, 11)]));
+        assert_eq!(state.casts().len(), 1);
+        assert_eq!(state.casts()[0].session_id, 11);
     }
 
     #[test]
