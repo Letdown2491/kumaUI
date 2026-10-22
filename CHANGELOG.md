@@ -37,6 +37,11 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- The platform's plain niri exchange no longer trusts the socket
+  forever: a generous default timeout (10s) bounds a stuck peer, and
+  reply lines are capped at 1 MiB, so a broken niri cannot balloon
+  the buffer. Callers that install their own tighter timeout are
+  unchanged.
 - Config and state records (`write_atomic` and everything riding it:
   the shell's settings and updates state, Koguma's browsing state,
   marks, recents, and default-app choices) are fsynced before the

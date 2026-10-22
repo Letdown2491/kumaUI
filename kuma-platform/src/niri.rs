@@ -35,7 +35,10 @@ pub fn socket_path() -> Result<PathBuf> {
 
 /// Send one request line and return niri's Ok payload. The error path
 /// keeps niri's own answer text, which is what makes IPC failures
-/// diagnosable in the journal.
+/// diagnosable in the journal. Even without an explicit timeout the
+/// exchange is bounded: a generous default read/write timeout keeps a
+/// stuck socket from stalling the caller forever, and the reply line
+/// is capped (a broken peer must not balloon the buffer).
 pub fn request(request: &Value) -> Result<Value> {
     exchange(request, None)
 }
@@ -46,22 +49,40 @@ pub fn request_with_timeout(request: &Value, timeout: Duration) -> Result<Value>
     exchange(request, Some(timeout))
 }
 
+/// The plain path's timeout: generous, because some callers run on
+/// cold caches and slow disks (the greeter is pre-login), but not
+/// forever.
+const PLAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The reply cap, greetd-client style: one niri reply line (a session
+/// dump is the big case) sits comfortably under a megabyte.
+const MAX_REPLY: u64 = 1024 * 1024;
+
 fn exchange(request: &Value, timeout: Option<Duration>) -> Result<Value> {
+    let timeout = timeout.unwrap_or(PLAIN_TIMEOUT);
     let path = socket_path()?;
     let stream = UnixStream::connect(&path).context("failed to connect to niri IPC socket")?;
-    if let Some(timeout) = timeout {
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-    }
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
 
     let mut writer = &stream;
     writer.write_all(request.to_string().as_bytes())?;
     writer.write_all(b"\n")?;
 
     let mut reader = BufReader::new(stream);
-    let mut reply = String::new();
-    reader.read_line(&mut reply)?;
+    let reply = read_capped_reply(&mut reader)?;
     unwrap_envelope(&reply)
+}
+
+/// One reply line, capped: `take` bounds the read at cap+1, so an
+/// over-long line comes back without a newline and the length check
+/// turns it into an error instead of a ballooned buffer.
+fn read_capped_reply<R: std::io::BufRead>(mut reader: R) -> Result<String> {
+    let mut reply = String::new();
+    if reader.take(MAX_REPLY + 1).read_line(&mut reply)? > MAX_REPLY as usize {
+        bail!("niri reply exceeds the {}-byte cap", MAX_REPLY);
+    }
+    Ok(reply)
 }
 
 /// One reply line in, niri's Ok payload out. The `{"Err": ...}`
@@ -127,6 +148,25 @@ mod tests {
         assert!(err.to_string().contains("some mistake"), "{err:#}");
         assert!(unwrap_envelope("not json at all").is_err());
         assert!(unwrap_envelope("").is_err());
+    }
+
+    #[test]
+    fn a_reply_over_the_cap_is_an_error_not_a_balloon() {
+        // a normal line passes whole
+        let ok = read_capped_reply(&mut std::io::Cursor::new(b"{\"Ok\":null}\n".as_slice()))
+            .expect("a small reply reads");
+        assert_eq!(ok, "{\"Ok\":null}\n");
+
+        // a line over the cap fails rather than filling memory
+        let huge = "x".repeat((MAX_REPLY + 4096) as usize);
+        let bytes = format!("{huge}\n").into_bytes();
+        let err = read_capped_reply(&mut std::io::Cursor::new(bytes.as_slice()))
+            .expect_err("an over-cap reply fails");
+        assert!(err.to_string().contains("cap"), "{err:#}");
+
+        // a truncated peer (cap+1 bytes, no newline) fails the same way
+        let truncated: Vec<u8> = vec![b'y'; (MAX_REPLY + 1) as usize];
+        assert!(read_capped_reply(&mut std::io::Cursor::new(truncated.as_slice())).is_err());
     }
 
     #[test]
