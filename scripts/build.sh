@@ -84,9 +84,13 @@ if [ "${1:-}" = "build" ]; then
   # deal as the binaries: the release's files live together or the
   # compose refuses. Writing them here on every build keeps the
   # siblings from going silently stale on a packaging change (kumaOS
-  # #46); the stamp gate checks only the binaries.
+  # #46); the X-Kumaui-Stamp key is the identity the compose's gate
+  # reads — presence alone shipped a stale ride once (#42), and an
+  # entry can lie about behavior the same way a binary can.
+  ride=$(git rev-parse HEAD 2>/dev/null || echo unknown)
   for app in kuma-files kuma-term kuma-monitor; do
-    sed "s|@BIN@|/usr/bin|" "$app/packaging/$app.desktop.in" > ~/.local/bin/"$app".desktop
+    sed -e "s|@BIN@|/usr/bin|" -e "/^\[Desktop Entry\]/a X-Kumaui-Stamp=$ride" \
+      "$app/packaging/$app.desktop.in" > ~/.local/bin/"$app".desktop
     cp "$app/packaging/$app.png" ~/.local/bin/"$app".png
   done
 fi
