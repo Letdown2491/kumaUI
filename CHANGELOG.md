@@ -35,6 +35,14 @@ source's wrap points would pin the text to a narrow column.
   xdg-open keep opening the editor; only a direct `kuma-view
   notes.txt` lands the text rung.
 
+### Added
+
+- Paste in every shell text field: Ctrl+V inserts the clipboard into
+  the launcher query, the Wi-Fi and lock and greeter and polkit
+  passwords, and the settings edits (Ctrl+U kills the line). The
+  audit's #1 polish gap: a 40-char vault password no longer means
+  typing it by hand on the lock screen.
+
 ### Fixed
 
 - The platform's plain niri exchange no longer trusts the socket

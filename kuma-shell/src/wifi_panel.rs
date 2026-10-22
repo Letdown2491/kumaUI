@@ -2,6 +2,7 @@ use gpui::{Context, Div, Entity, FocusHandle, Render, Window, div, prelude::*, p
 
 use crate::controls;
 use crate::panel_kit as kit;
+use crate::paste;
 use crate::sysmon::{AccessPoint, SysMon};
 
 /// The Wi-Fi panel: the radio toggle, the network we are on, and the
@@ -49,7 +50,9 @@ impl WifiPanelView {
     }
 
     /// A password prompt's key handling: Enter joins with what is
-    /// typed, escape backs out, characters type silently.
+    /// typed, escape backs out, characters type silently, ctrl+v
+    /// pastes (a 40-char vault password is typed once, by the
+    /// password manager), ctrl+u starts over.
     fn password_key(
         &mut self,
         event: &gpui::KeyDownEvent,
@@ -76,6 +79,14 @@ impl WifiPanelView {
             }
             "space" => {
                 edit.text.push(' ');
+            }
+            "v" if event.keystroke.modifiers.control || event.keystroke.modifiers.platform => {
+                if let Some(text) = paste::pasted_text(cx) {
+                    edit.text.push_str(&text);
+                }
+            }
+            "u" if event.keystroke.modifiers.control || event.keystroke.modifiers.platform => {
+                edit.text.clear();
             }
             other if other.chars().count() == 1 && !event.keystroke.modifiers.modified() => {
                 edit.text.push_str(other);

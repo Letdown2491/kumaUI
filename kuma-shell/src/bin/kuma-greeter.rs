@@ -264,6 +264,23 @@ impl GreeterState {
                 self.message = None;
                 cx.notify();
             }
+            // paste into the focused field: a 40-char vault password
+            // is typed once, by the password manager
+            "v" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                if let Some(text) = kuma_shell::paste::pasted_text(cx) {
+                    self.focused_field_mut().push_str(&text);
+                    self.message = None;
+                    cx.notify();
+                }
+            }
+            // kill line: a fat-fingered paste starts over
+            "u" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                if !self.focused_field_mut().is_empty() {
+                    self.focused_field_mut().clear();
+                    self.message = None;
+                    cx.notify();
+                }
+            }
             // printable text into the focused field: shift+a and
             // caps-lock+a both report key "a" with key_char "A", so
             // the character, not the key name, is what lands (the

@@ -2228,6 +2228,20 @@ impl SettingsView {
                 edit.text.push(' ');
                 cx.notify();
             }
+            // paste a location or a key: modified keys are shortcuts,
+            // not text, so the field needs its own arm for them
+            "v" if event.keystroke.modifiers.control || event.keystroke.modifiers.platform => {
+                if let Some(text) = crate::paste::pasted_text(cx) {
+                    edit.text.push_str(&text);
+                    cx.notify();
+                }
+            }
+            "u" if event.keystroke.modifiers.control || event.keystroke.modifiers.platform => {
+                if !edit.text.is_empty() {
+                    edit.text.clear();
+                    cx.notify();
+                }
+            }
             // shift alone is a capital: the key name is the lowercase
             // letter, the shift flag says to raise it. Control and alt
             // stay shortcuts, not text.

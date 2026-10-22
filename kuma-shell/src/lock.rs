@@ -260,6 +260,24 @@ impl LockState {
                 cx.notify();
             }
             "tab" => {}
+            // paste: a 40-char vault password is typed once, by the
+            // password manager. A lock screen already trusts the
+            // session's clipboard as far as it trusts its keyboard.
+            "v" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                if let Some(text) = crate::paste::pasted_text(cx) {
+                    self.password.push_str(&text);
+                    self.message = None;
+                    cx.notify();
+                }
+            }
+            // kill line: a fat-fingered paste starts over
+            "u" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                if !self.password.is_empty() {
+                    self.password.clear();
+                    self.message = None;
+                    cx.notify();
+                }
+            }
             // Insert the typed character, not the key name: shift+a and
             // caps-lock+a both report key "a" with key_char "A", a composed
             // accent reports a dead-key name with key_char "á", and space

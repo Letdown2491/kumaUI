@@ -8,6 +8,7 @@ use gpui::{
 
 use crate::imaging::IconImage;
 use crate::panel_kit as kit;
+use crate::paste;
 
 /// The launcher grid's 22px cells decode at twice that for hidpi screens.
 const ICON_RESOLVE_SIZE: u32 = 44;
@@ -768,6 +769,28 @@ impl LauncherView {
                     self.selected = 0;
                     self.results_scroll.set_offset(point(px(0.), px(0.)));
                     cx.notify();
+                }
+            }
+            "v" if event.keystroke.modifiers.control || event.keystroke.modifiers.platform => {
+                // paste into the query: the shell's fields run no
+                // modified key to text, so ctrl+v needs its own arm
+                // everywhere text lands
+                if let Some(text) = paste::pasted_text(cx) {
+                    self.query.push_str(&text);
+                    self.selected = 0;
+                    self.results_scroll.set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }
+            "u" if event.keystroke.modifiers.control || event.keystroke.modifiers.platform => {
+                // kill line: a mistyped long query starts over
+                if !self.query.is_empty() {
+                    self.query.clear();
+                    self.selected = 0;
+                    self.results_scroll.set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                    cx.stop_propagation();
                 }
             }
             "space" => {

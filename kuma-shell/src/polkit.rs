@@ -267,6 +267,27 @@ impl PolkitState {
             "left" => self.cycle(-1, cx),
             "right" => self.cycle(1, cx),
             "tab" => {}
+            // paste: a long credential is typed once, by the password
+            // manager (the lock field's shape includes its paste arm)
+            "v" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                if let Some(text) = crate::paste::pasted_text(cx) {
+                    if let Some(prompt) = self.prompt.as_mut() {
+                        prompt.password.push_str(&text);
+                        prompt.note = None;
+                        cx.notify();
+                    }
+                }
+            }
+            // kill line: a fat-fingered paste starts over
+            "u" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                if let Some(prompt) = self.prompt.as_mut()
+                    && !prompt.password.is_empty()
+                {
+                    prompt.password.clear();
+                    prompt.note = None;
+                    cx.notify();
+                }
+            }
             // Insert the typed character, not the key name (ADR-0007, as
             // on the lock screen): shift+a reports key "a" with key_char
             // "A"; with modifiers held the key is a shortcut, not input.
