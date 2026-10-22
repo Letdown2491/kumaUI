@@ -37,6 +37,10 @@ source's wrap points would pin the text to a narrow column.
 
 ### Fixed
 
+- Untrusted image decodes carry strict dimension and allocation
+  limits (16K×16K, 64 MiB): a hostile oversized PNG in any browsed
+  directory or wallpaper folder no longer spikes a gigabyte and a
+  half of memory per decode.
 - The greeter and the polkit agent match the lock screen's password
   hygiene: the greeter's render never clones the secret (a masked
   count feeds the field) and both zeroize the password once the

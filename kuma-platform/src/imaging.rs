@@ -8,6 +8,20 @@
 use smallvec::SmallVec;
 use std::path::Path;
 
+/// The decode limits for untrusted input: without them, `image` 0.25
+/// caps allocation (512 MiB) but not dimensions, so a hostile
+/// 40000×40000 PNG in any browsed directory spikes ~1.5 GB per decode
+/// before the allocation cap notices. No desktop screen is near these
+/// bounds; a 16K×16K image still decodes whole.
+fn limits() -> image::Limits {
+    // non_exhaustive: build through the fields, not a literal
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16384);
+    limits.max_image_height = Some(16384);
+    limits.max_alloc = Some(64 << 20);
+    limits
+}
+
 /// The byte-order lore, one home: RGBA8 pixels in, the `RenderImage`
 /// gpui paints from out.
 pub fn render_image(rgba: image::RgbaImage) -> gpui::RenderImage {
@@ -20,12 +34,18 @@ pub fn render_image(rgba: image::RgbaImage) -> gpui::RenderImage {
 
 /// Open and decode a file, full size.
 pub fn open(path: &Path) -> Option<image::DynamicImage> {
-    image::ImageReader::open(path).ok()?.decode().ok()
+    let mut reader = image::ImageReader::open(path).ok()?;
+    reader.limits(limits());
+    reader.decode().ok()
 }
 
 /// Decode bytes in memory, full size.
 pub fn decode_bytes(bytes: &[u8]) -> Option<gpui::RenderImage> {
-    let image = image::load_from_memory(bytes).ok()?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits());
+    let image = reader.decode().ok()?;
     Some(render_image(image.to_rgba8()))
 }
 
@@ -52,6 +72,7 @@ pub fn decode_file(path: &Path) -> Option<gpui::RenderImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
 
     #[test]
     fn red_and_blue_swap_and_alpha_stays() {
@@ -72,5 +93,28 @@ mod tests {
         let rendered = fit(big, 48, 48);
         let size = rendered.size(0);
         assert!(size.width.0 <= 48 && size.height.0 <= 48);
+    }
+
+    #[test]
+    fn ordinary_images_still_decode_through_the_limits() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(8, 8, |_, _| {
+            image::Rgba([1u8, 2, 3, 255])
+        }));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .expect("encoding an 8x8 png");
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .expect("the magic bytes are a valid png");
+        reader.limits(limits());
+        let decoded = match reader.decode() {
+            Ok(decoded) => decoded,
+            Err(err) => panic!("decode failed: {err}; head: {:x?}", &bytes[..8.min(bytes.len())]),
+        };
+        assert_eq!(decoded.dimensions(), (8, 8));
+        let rendered = decode_bytes(&bytes).expect("decode_bytes matches the raw reader");
+        let size = rendered.size(0);
+        assert_eq!((size.width.0, size.height.0), (8, 8));
     }
 }
