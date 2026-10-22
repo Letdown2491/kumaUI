@@ -14,6 +14,32 @@ source's wrap points would pin the text to a narrow column.
 
 ## Unreleased
 
+### Added
+
+- Koguma's search gains a content rung: the banner's "names only"
+  chip flips to "names + contents", and files whose bytes carry the
+  query stream into the same result list in batches, each row
+  showing its folder and the first matching line. A content hit
+  stays visible no matter its name, and hidden files follow the
+  hidden-files toggle. The walk is bounded like the name walk and
+  stops the moment the query moves on.
+- Koguma's inspector shows directory sizes: selecting a folder
+  measures its tree in the background (regular files only,
+  depth-capped against mount cycles), caches the total keyed by the
+  folder's mtime, and repaints the size row when the walk lands.
+- Koguma's listing sniffs unrecognized files by magic bytes: the
+  background listing task reads the first 4 KB of files whose
+  extension says nothing, and the row gets an honest icon and type
+  (an extensionless png shows as an image; a jpeg wearing a .txt
+  name keeps its bytes).
+
+### Changed
+
+- Koguma sorts names naturally: digit runs compare as numbers, so
+  file2 sits before file10. The list also gains a Type sort key and
+  column (folder, image, text, video, audio, archive, and friends),
+  ordering by the full mime with a natural-order tiebreak.
+
 ### Changed
 
 - The terminal's snapshot tracks damage per viewport line: only the

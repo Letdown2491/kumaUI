@@ -308,6 +308,17 @@ struct Entry {
     /// the tab's directory, shown as a dim second line. `None` for
     /// rows the flat listing produced.
     rel: Option<String>,
+    /// A magic-byte sniff's verdict for files whose extension says
+    /// nothing: the listing task reads the first 4 KB and classifies.
+    /// `None` when the extension settled it, the file is not a
+    /// regular file, or the bytes matched nothing known.
+    mime: Option<&'static str>,
+    /// A content-search hit: the row came from a bytes match, not a
+    /// name match, so the name filter must not drop it from view.
+    content_hit: bool,
+    /// The content hit's first matching line, trimmed and capped,
+    /// shown after the folder path on the row's second line.
+    hit_line: Option<String>,
 }
 
 #[derive(Clone)]
@@ -329,6 +340,7 @@ enum SortKey {
     Name,
     Size,
     Modified,
+    Type,
 }
 
 impl PartialEq for Source {
@@ -2014,6 +2026,10 @@ pub(crate) struct Browser {
     search_gen: u64,
     /// A search walker is in flight; drives the banner's indicator.
     searching: bool,
+    /// The search banner's content rung: when on, the recursive
+    /// search also greps file contents and streams the hits into
+    /// the same result list. Off means names only.
+    content_search: bool,
     /// Whether niri has the browser window inside the tiling layout:
     /// the titlebar folds on it. The xdg tiled states never carry it
     /// (on niri they are a CSD hint, and this client negotiates CSD),
@@ -2022,6 +2038,10 @@ pub(crate) struct Browser {
     /// The running file operation's shared state: the Cancel button
     /// sets its flag, the ticker reads its counters. None while idle.
     run_state: Option<Arc<RunState>>,
+    /// The inspector's directory du cache: total tree bytes keyed by
+    /// path, with the directory's mtime as the validity witness
+    /// (`None` mtime marks a walk in flight).
+    dir_sizes: Arc<Mutex<HashMap<PathBuf, (Option<i64>, u64)>>>,
 }
 
 impl Focusable for Browser {
@@ -2130,8 +2150,10 @@ impl Browser {
             places_refresh: Instant::now(),
             search_gen: 0,
             searching: false,
+            content_search: false,
             niri_tiled: false,
             run_state: None,
+            dir_sizes: Arc::new(Mutex::new(HashMap::new())),
         };
         // the epub reading pane's indicator follows the wheel: the
         // chapter under the visible top becomes the position, so the
@@ -2724,6 +2746,53 @@ impl Browser {
         cx.notify();
     }
 
+    /// The inspector's size for a directory: a cached du, or a
+    /// background walk just started. The walk is deduped with an
+    /// in-flight marker and keyed by the directory's mtime, so a
+    /// changed tree re-measures and a pending one never respawns.
+    /// `None` while nothing measured yet (the row shows an ellipsis
+    /// until the notify repaints it).
+    fn dir_size_for(&self, path: &Path, cx: &mut Context<Self>) -> Option<u64> {
+        let mtime = fs::metadata(path)
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        let mut cache = self.dir_sizes.lock().unwrap_or_else(|p| p.into_inner());
+        match cache.get(path) {
+            Some((Some(at), bytes)) if *at == mtime => return Some(*bytes),
+            // a walk is already in flight (or its start raced a
+            // change and the finished walk will settle it)
+            Some((None, _)) => return None,
+            _ => {}
+        }
+        // mark in flight before spawning: the render loop calls this
+        // again before the walk lands
+        cache.insert(path.to_path_buf(), (None, 0));
+        drop(cache);
+        let key = path.to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let dir = key.clone();
+            let bytes = cx
+                .background_spawn(async move { dir_size_tree(&dir, 0).unwrap_or(0) })
+                .await;
+            let update = this.update(cx, |this, cx| {
+                this.dir_sizes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(key, (Some(mtime), bytes));
+                cx.notify();
+            });
+            if let Err(err) = update {
+                log::error!("dir size update failed: {err:#}");
+            }
+        })
+        .detach();
+        None
+    }
+
     fn open_trash(&mut self, cx: &mut Context<Self>) {
         self.load_source(Source::Trash, cx);
     }
@@ -3080,6 +3149,13 @@ impl Browser {
             .iter()
             .enumerate()
             .filter_map(|(ix, entry)| {
+                // a content hit stays visible no matter its name:
+                // the name filter has no voice over what the bytes
+                // matched (score 0 lands these rows after the
+                // scored ones, in walk order)
+                if entry.content_hit {
+                    return Some((0, ix));
+                }
                 let haystack = Utf32String::from(entry.name.as_str());
                 pattern
                     .score(haystack.slice(..), &mut matcher)
@@ -3105,6 +3181,21 @@ impl Browser {
         std::sync::Arc::make_mut(&mut self.tab_mut().entries).extend(matches);
     }
 
+    /// Append a content-walk batch to the listing, skipping files
+    /// the listing already shows (the flat rows and the name walk
+    /// claim a file before the bytes do).
+    fn land_content_batch(&mut self, batch: Vec<Entry>) {
+        if batch.is_empty() {
+            return;
+        }
+        let entries = std::sync::Arc::make_mut(&mut self.tab_mut().entries);
+        for entry in batch {
+            if entries.iter().any(|shown| shown.key == entry.key) {
+                continue;
+            }
+            entries.push(entry);
+        }
+    }
     /// After a filter edit the cursor must sit on a visible entry.
     fn snap_cursor_visible(&mut self) {
         let visible = self.visible_indices();
@@ -3139,6 +3230,7 @@ impl Browser {
         let generation = self.search_gen;
         let filter = self.filter.clone();
         let show_hidden = self.show_hidden;
+        let content = self.content_search;
         cx.spawn(async move |this, cx| {
             // coalesce fast typing into one walk
             cx.background_executor()
@@ -3150,6 +3242,8 @@ impl Browser {
             if !still_current {
                 return;
             }
+            let content_root = root.clone();
+            let content_filter = filter.clone();
             let matches =
                 cx.background_spawn(async move { search_subtree(&root, &filter, show_hidden) })
                     .await;
@@ -3157,7 +3251,9 @@ impl Browser {
                 if this.search_gen != generation {
                     return; // the listing moved on; results are stale
                 }
-                this.searching = false;
+                if !content {
+                    this.searching = false;
+                }
                 // replace the deep rows only when the walk brought
                 // something new, or the watcher's re-runs flicker
                 let fresh: Vec<PathBuf> = matches.iter().map(|e| e.key.clone()).collect();
@@ -3181,6 +3277,57 @@ impl Browser {
             });
             if let Err(err) = update {
                 log::error!("search results update failed: {err:#}");
+            }
+            if !content {
+                return;
+            }
+            // the content rung: grep the subtree's files and stream
+            // the hits in as they come (the name walk landed above;
+            // these rows join it in batches)
+            let (tx, mut rx) = futures::channel::mpsc::unbounded::<Entry>();
+            cx.background_spawn(async move {
+                search_content_stream(&content_root, &content_filter, show_hidden, &tx)
+            })
+            .detach();
+            use futures::StreamExt as _;
+            let mut pending: Vec<Entry> = Vec::new();
+            let mut count = 0usize;
+            while let Some(entry) = rx.next().await {
+                pending.push(entry);
+                count += 1;
+                if count < CONTENT_STREAM_BATCH {
+                    continue;
+                }
+                count = 0;
+                let batch = std::mem::take(&mut pending);
+                let alive = this
+                    .update(cx, |this, cx| {
+                        if this.search_gen != generation {
+                            return false;
+                        }
+                        this.land_content_batch(batch);
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    // the receiver drops here and the walker's next
+                    // send fails, so it stops
+                    return;
+                }
+            }
+            let tail = pending;
+            let update = this.update(cx, |this, cx| {
+                if this.search_gen != generation {
+                    return;
+                }
+                this.land_content_batch(tail);
+                this.searching = false;
+                this.snap_cursor_visible();
+                cx.notify();
+            });
+            if let Err(err) = update {
+                log::error!("content results update failed: {err:#}");
             }
         })
         .detach();
@@ -4812,6 +4959,7 @@ impl Browser {
                 ("sort", "name") => sort = Some(SortKey::Name),
                 ("sort", "size") => sort = Some(SortKey::Size),
                 ("sort", "modified") => sort = Some(SortKey::Modified),
+                ("sort", "type") => sort = Some(SortKey::Type),
                 ("asc", "true") => sort_asc = true,
                 ("asc", "false") => sort_asc = false,
                 ("hidden", "true") => self.show_hidden = true,
@@ -4899,6 +5047,7 @@ impl Browser {
             SortKey::Name => "name",
             SortKey::Size => "size",
             SortKey::Modified => "modified",
+            SortKey::Type => "type",
         };
         let text = format!(
             "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\ninspector-lock={}\naccent={}\nscale={}\n",
@@ -6008,6 +6157,9 @@ impl Tab {
                         modified: Some(recent.modified),
                         item: None,
                         rel: None,
+                        mime: None,
+                        content_hit: false,
+                        hit_line: None,
                     });
                 }
                 entries
@@ -6041,6 +6193,9 @@ impl Tab {
                         modified: Some(item.time_deleted),
                         item: Some(item),
                         rel: None,
+                        mime: None,
+                        content_hit: false,
+                        hit_line: None,
                     });
                 }
                 entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -6108,6 +6263,17 @@ impl Tab {
                         .ok()
                         .map(|d| d.as_secs() as i64)
                 });
+            // extension says nothing: the first 4 KB gets a vote.
+            // Only regular files (a FIFO would block the open) and
+            // only when the extension mapped to the generic mime
+            let sniffed = if !is_dir
+                && mime_for_ext(&ext_of(&name)) == "application/octet-stream"
+                && fs::metadata(&path).is_ok_and(|m| m.is_file())
+            {
+                sniff_mime(&path)
+            } else {
+                None
+            };
             entries.push(Entry {
                 key: path.clone(),
                 path,
@@ -6117,6 +6283,9 @@ impl Tab {
                 modified,
                 item: None,
                 rel: None,
+                mime: sniffed,
+                content_hit: false,
+                hit_line: None,
             });
         }
         sort_entries(&mut entries, sort_key, sort_asc);
@@ -7247,7 +7416,10 @@ impl Browser {
                         .truncate()
                         .text_size(px(11. * s))
                         .text_color(theme::text_dim())
-                        .child(rel.clone()),
+                        .child(entry.hit_line.as_ref().map_or_else(
+                            || rel.clone(),
+                            |line| format!("{rel} · {line}"),
+                        )),
                 )
         } else {
             div().id("name-plain").flex_1().min_w_0().truncate().child(entry.name.clone())
@@ -7260,6 +7432,15 @@ impl Browser {
 
         base.child(self.entry_icon(entry, px(16. * s)))
             .child(name_child)
+            .child(
+                div()
+                    .w(px(60. * s))
+                    .flex_none()
+                    .text_size(px(12. * s))
+                    .text_color(theme::text_dim())
+                    .truncate()
+                    .child(type_label(entry)),
+            )
             .child(
                 div()
                     .w(px(72. * s))
@@ -7283,7 +7464,12 @@ impl Browser {
 
     /// The tinted type icon for an entry, at any size.
     fn entry_icon(&self, entry: &Entry, size: Pixels) -> AnyElement {
-        let icon_path = icons::icon_path_for(&entry.name, entry.is_dir);
+        // a sniffed mime outranks the name: an extensionless png is
+        // an image to the eyes, not a generic file
+        let icon_path = entry
+            .mime
+            .map(icon_for_mime)
+            .unwrap_or_else(|| icons::icon_path_for(&entry.name, entry.is_dir));
         let color = match icons::ink_for(icon_path) {
             icons::IconInk::Folder => theme::accent(),
             icons::IconInk::Doc => theme::text(),
@@ -7717,6 +7903,18 @@ impl Browser {
             )
             .child(
                 div()
+                    .id("sort-type")
+                    .w(px(60. * s))
+                    .flex_none()
+                    .cursor_pointer()
+                    .hover(|this| this.text_color(theme::text()))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_sort(SortKey::Type, cx);
+                    }))
+                    .child(format!("Type{}", arrow(SortKey::Type))),
+            )
+            .child(
+                div()
                     .id("sort-size")
                     .w(px(72. * s))
                     .flex_none()
@@ -7908,6 +8106,14 @@ impl Browser {
                 meta.as_ref().map(|m| m.len())
             }
         });
+        // a directory's du: cached, measured on demand in the
+        // background (never for trash rows, whose paths point at
+        // the live originals)
+        let dir_size = if is_dir && !matches!(self.tab().source, Source::Trash | Source::Recent) {
+            entry.and_then(|e| self.dir_size_for(&e.path, cx).map(human_size))
+        } else {
+            None
+        };
 
         // preview: the video slot (the animated loop, or its
         // while-decoding static stand-ins), image thumb, text
@@ -8109,7 +8315,8 @@ impl Browser {
                 prop_row(
                     "size",
                     size.map(human_size)
-                        .unwrap_or_else(|| if is_dir { "folder".into() } else { "0 B".into() }),
+                        .or(dir_size)
+                        .unwrap_or_else(|| if is_dir { "…".into() } else { "0 B".into() }),
                 )
             }))
             .children(entry.map(|_| {
@@ -9840,9 +10047,8 @@ impl Render for Browser {
         // twenty thousand element trees per frame. The two spacers
         // stand in for the rows above and below the window, so the
         // scroll extent and the scrollbar stay the listing's real
-        // size. Icon view still paints every cell: its wrap-grid
-        // geometry is pinned and its thumbnail decodes are already
-        // viewport-gated.
+        // size. Icon view windows whole grid rows the same way; its
+        // thumbnail decodes are viewport-gated on top of that.
         let pitch = LIST_ROW_PITCH * self.scale;
         let vis_count = visible.len();
         let is_list = self.tab().view_mode == ViewMode::List;
@@ -10589,9 +10795,34 @@ impl Render for Browser {
                                     "· {here} here, {deep} in subfolders of {dir_label}"
                                 )))
                                 .children(self.searching.then(|| {
-                                    div().child("searching subfolders…")
+                                    div().child(if self.content_search {
+                                        "searching file contents…"
+                                    } else {
+                                        "searching subfolders…"
+                                    })
                                 }))
                                 .child(div().flex_1())
+                                .child(
+                                    div()
+                                        .id("search-content-toggle")
+                                        .px_1()
+                                        .cursor_pointer()
+                                        .text_color(if self.content_search {
+                                            theme::accent()
+                                        } else {
+                                            theme::text_dim()
+                                        })
+                                        .hover(|this| this.text_color(theme::text()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.content_search = !this.content_search;
+                                            this.filter_changed(cx);
+                                        }))
+                                        .child(if self.content_search {
+                                            "names + contents"
+                                        } else {
+                                            "names only"
+                                        }),
+                                )
                                 .child(div().child("Esc clears"))
                                 .child(
                                     div()
@@ -11027,6 +11258,141 @@ const SEARCH_MAX_DEPTH: usize = 6;
 /// counts every fs entry visited; matches cap what the listing keeps.
 const SEARCH_MAX_WALKED: usize = 4000;
 const SEARCH_MAX_MATCHES: usize = 200;
+/// The content rung reads at most this much of a file, and streams
+/// landed rows in batches of this many.
+const CONTENT_MAX_READ: usize = 1 << 20;
+const CONTENT_STREAM_BATCH: usize = 16;
+
+/// The content rung of the type-in filter: walk `root`'s subtree
+/// reading the files the name filter has no claim on, streaming
+/// every file whose bytes contain the query through `tx` as it
+/// goes. Bounded like the name walk (one hit per file, the first
+/// line carried along); a failed send (the receiver is gone) ends
+/// the walk. Runs on the background executor.
+fn search_content_stream(
+    root: &Path,
+    query: &str,
+    show_hidden: bool,
+    tx: &futures::channel::mpsc::UnboundedSender<Entry>,
+) {
+    let needle = query.trim().to_string();
+    if needle.is_empty() {
+        return;
+    }
+    let mut matches = 0usize;
+    let mut walked = 0usize;
+    // (dir, depth below root, dir's path relative to root)
+    let mut stack = vec![(root.to_path_buf(), 0usize, String::new())];
+    while let Some((dir, depth, rel_prefix)) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in read.flatten() {
+            walked += 1;
+            if walked > SEARCH_MAX_WALKED || matches >= SEARCH_MAX_MATCHES {
+                return;
+            }
+            let name = item.file_name().to_string_lossy().into_owned();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            let path = item.path();
+            if item.file_type().is_ok_and(|t| t.is_dir()) {
+                if depth < SEARCH_MAX_DEPTH {
+                    let child_rel = if rel_prefix.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{rel_prefix}/{name}")
+                    };
+                    stack.push((path, depth + 1, child_rel));
+                }
+                continue;
+            }
+            let Some(hit_line) = file_first_hit(&path, &needle) else {
+                continue;
+            };
+            let meta = fs::symlink_metadata(&path).ok();
+            let size = meta.as_ref().map(|meta| meta.len());
+            let modified = meta.and_then(|meta| {
+                meta.modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+            });
+            let rel = if rel_prefix.is_empty() {
+                ".".to_string()
+            } else {
+                rel_prefix.clone()
+            };
+            matches += 1;
+            if tx
+                .unbounded_send(Entry {
+                    key: path.clone(),
+                    path,
+                    name,
+                    is_dir: false,
+                    size,
+                    modified,
+                    item: None,
+                    rel: Some(rel),
+                    mime: None,
+                    content_hit: true,
+                    hit_line: Some(hit_line),
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+}
+
+/// Read a file's first `CONTENT_MAX_READ` bytes and report its first
+/// line containing the needle (case-insensitive on ASCII, exact on
+/// the rest), trimmed and capped for the row's second line. `None`
+/// when the needle never appears.
+fn file_first_hit(path: &Path, needle: &str) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut data = Vec::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                if data.len() >= CONTENT_MAX_READ {
+                    data.truncate(CONTENT_MAX_READ);
+                    break;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    let nl = needle.as_bytes();
+    if nl.is_empty() || data.len() < nl.len() {
+        return None;
+    }
+    let at = (0..=data.len() - nl.len())
+        .find(|i| data[*i..*i + nl.len()].eq_ignore_ascii_case(nl))?;
+    let start = data[..at]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |p| p + 1);
+    let end = data[at..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(data.len(), |p| at + p);
+    let bound = String::from_utf8_lossy(&data[start..end]);
+    let line = bound.trim();
+    let mut cut = 0;
+    for (n, c) in line.chars().enumerate() {
+        if n == 120 {
+            break;
+        }
+        cut += c.len_utf8();
+    }
+    Some(line[..cut].to_string())
+}
 
 /// The recursive half of the type-in filter: walk `root`'s subtree
 /// looking for names the fuzzy filter scores, best first. Runs on the
@@ -11106,6 +11472,9 @@ fn search_subtree(root: &Path, filter: &str, show_hidden: bool) -> Vec<Entry> {
                     } else {
                         rel_prefix.clone()
                     }),
+                    mime: None,
+                    content_hit: false,
+                    hit_line: None,
                 },
             ));
         }
@@ -12337,14 +12706,201 @@ fn key_columns() -> (&'static [(&'static str, &'static str)], &'static [(&'stati
     (&KEY_HINTS[..half], &KEY_HINTS[half..])
 }
 
+/// Natural order: digit runs compare as numbers (file2 before
+/// file10), everything else case-insensitively. A digit run longer
+/// than u64 saturates, which only matters for absurd names.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ac = a.chars().peekable();
+    let mut bc = b.chars().peekable();
+    loop {
+        match (ac.peek(), bc.peek()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(&x), Some(&y)) => {
+                if x.is_ascii_digit() && y.is_ascii_digit() {
+                    let mut na: u64 = 0;
+                    let mut nb: u64 = 0;
+                    while let Some(c) = ac.peek()
+                        && c.is_ascii_digit()
+                    {
+                        na = na
+                            .saturating_mul(10)
+                            .saturating_add(c.to_digit(10).unwrap_or(0) as u64);
+                        ac.next();
+                    }
+                    while let Some(c) = bc.peek()
+                        && c.is_ascii_digit()
+                    {
+                        nb = nb
+                            .saturating_mul(10)
+                            .saturating_add(c.to_digit(10).unwrap_or(0) as u64);
+                        bc.next();
+                    }
+                    if na != nb {
+                        return na.cmp(&nb);
+                    }
+                } else {
+                    let (x, y) = (ac.next().unwrap(), bc.next().unwrap());
+                    let (lx, ly) = (
+                        x.to_lowercase().next().unwrap_or(x),
+                        y.to_lowercase().next().unwrap_or(y),
+                    );
+                    if lx != ly {
+                        return lx.cmp(&ly);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Collapse a mime to one word for the Type column: the major class,
+/// with the application subclasses that matter to a file manager
+/// called out.
+fn kind_of_mime(mime: &str) -> &'static str {
+    match mime.split_once('/') {
+        Some(("image", _)) => "image",
+        Some(("text", _)) => "text",
+        Some(("video", _)) => "video",
+        Some(("audio", _)) => "audio",
+        Some(("application", _)) => match mime {
+            "application/pdf" => "pdf",
+            "application/zip" | "application/x-tar" | "application/gzip"
+            | "application/x-bzip2" | "application/x-xz" | "application/x-7z-compressed"
+            | "application/vnd.rar" => "archive",
+            "application/json" | "application/toml" | "application/yaml" | "application/xml" => {
+                "config"
+            }
+            _ => "other",
+        },
+        _ => "other",
+    }
+}
+
+/// A file's extension, lowercase, no dot. Empty for none.
+fn ext_of(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// Total bytes of a directory tree: regular files only, errors
+/// skipped, depth-capped like the copy walk so a mount cycle errors
+/// out instead of spinning. Symlinks are not followed (the entry's
+/// own file type is the voice, so a link is neither counted nor
+/// walked).
+fn dir_size_tree(dir: &Path, depth: usize) -> io::Result<u64> {
+    if depth > COPY_DEPTH_CAP {
+        return Err(io::Error::other("directory tree too deep (a mount cycle?)"));
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            total += dir_size_tree(&entry.path(), depth + 1).unwrap_or(0);
+        } else if ft.is_file() {
+            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    Ok(total)
+}
+
+/// Magic-byte sniff for files whose extension says nothing: the
+/// first 4 KB against the formats a file manager meets. Unknown
+/// bytes stay `None` and the row keeps its generic icon.
+fn sniff_mime(path: &Path) -> Option<&'static str> {
+    let mut buf = [0u8; 4096];
+    let n = fs::File::open(path).ok()?.read(&mut buf).ok()?;
+    let b = &buf[..n];
+    if b.starts_with(b"\x89PNG") {
+        Some("image/png")
+    } else if b.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if b.starts_with(b"GIF8") {
+        Some("image/gif")
+    } else if b.starts_with(b"RIFF")
+        && b.len() >= 12
+        && (&b[8..12] == b"WEBP" || &b[8..12] == b"WAVE")
+    {
+        Some(if &b[8..12] == b"WEBP" {
+            "image/webp"
+        } else {
+            "audio/x-wav"
+        })
+    } else if b.starts_with(b"%PDF") {
+        Some("application/pdf")
+    } else if b.starts_with(b"PK\x03\x04") {
+        Some("application/zip")
+    } else if b.starts_with(b"\x1f\x8b") {
+        Some("application/gzip")
+    } else if b.starts_with(b"BZh")
+        && b.len() >= 3
+        && b[2].is_ascii_digit()
+        && (b'1'..=b'9').contains(&b[2])
+    {
+        Some("application/x-bzip2")
+    } else if b.starts_with(b"\xfd7zXZ\x00") {
+        Some("application/x-xz")
+    } else if b.starts_with(b"7z\xbc\xaf\x27\x1c") {
+        Some("application/x-7z-compressed")
+    } else if b.starts_with(b"Rar!\x1a\x07") {
+        Some("application/vnd.rar")
+    } else if b.starts_with(b"ID3")
+        || (b.len() >= 2 && b[0] == 0xff && (b[1] & 0xe0) == 0xe0)
+    {
+        Some("audio/mpeg")
+    } else if b.starts_with(b"fLaC") {
+        Some("audio/flac")
+    } else if b.starts_with(b"OggS") {
+        Some("audio/ogg")
+    } else if b.starts_with(b"\x1a\x45\xdf\xa3") {
+        Some("video/webm")
+    } else {
+        None
+    }
+}
+
+/// The icon for a sniffed mime: by class, the archive and document
+/// formats called out. Extensionless files get honest icons this
+/// way instead of the generic one.
+fn icon_for_mime(mime: &str) -> &'static str {
+    match mime.split_once('/') {
+        Some(("image", _)) => "icons/image.svg",
+        Some(("text", _)) => "icons/file_text_filled.svg",
+        Some(("application", _)) => match mime {
+            "application/pdf" => "icons/file_doc.svg",
+            "application/zip" | "application/x-tar" | "application/gzip"
+            | "application/x-bzip2" | "application/x-xz" | "application/x-7z-compressed"
+            | "application/vnd.rar" => "icons/archive.svg",
+            _ => "icons/file_generic.svg",
+        },
+        _ => "icons/file_generic.svg",
+    }
+}
+
+/// The Type column's one-word label; the sort itself orders by the
+/// full mime string.
+fn type_label(entry: &Entry) -> &'static str {
+    if entry.is_dir {
+        return "folder";
+    }
+    kind_of_mime(mime_for_type(entry))
+}
+
 fn sort_entries(entries: &mut [Entry], key: SortKey, asc: bool) {
     entries.sort_by(|a, b| {
         // directories always first, then the chosen key
         b.is_dir.cmp(&a.is_dir).then_with(|| {
             let ord = match key {
-                SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortKey::Name => natural_cmp(&a.name, &b.name),
                 SortKey::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
                 SortKey::Modified => a.modified.unwrap_or(0).cmp(&b.modified.unwrap_or(0)),
+                SortKey::Type => mime_for_type(a)
+                    .cmp(&mime_for_type(b))
+                    .then_with(|| natural_cmp(&a.name, &b.name)),
             };
             if asc {
                 ord
@@ -12353,6 +12909,17 @@ fn sort_entries(entries: &mut [Entry], key: SortKey, asc: bool) {
             }
         })
     });
+}
+
+/// The entry's mime: the listing's sniff verdict first (a
+/// mislabeled extension loses to its bytes), then the extension.
+fn mime_for_type(entry: &Entry) -> &'static str {
+    if entry.is_dir {
+        return "folder";
+    }
+    entry
+        .mime
+        .unwrap_or_else(|| mime_for_ext(&ext_of(&entry.name)))
 }
 
 /// Relative mtime for the details column: minutes/hours/days ago, then
@@ -16843,5 +17410,149 @@ mod browser_scroll_repro {
             Browser::thumb_window(-1800., 950., 120., 14, 350),
             182..350
         );
+    }
+}
+
+/// The polish batch's pieces: natural order, the mime sniff, the
+/// content-search rung, and the directory du walk.
+#[cfg(test)]
+mod polish {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("koguma-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn natural_order_puts_file2_before_file10() {
+        use std::cmp::Ordering;
+        assert_eq!(natural_cmp("file2", "file10"), Ordering::Less);
+        assert_eq!(natural_cmp("file10", "file2"), Ordering::Greater);
+        assert_eq!(natural_cmp("file2", "file2"), Ordering::Equal);
+        // case-insensitive, like the old lowercase compare
+        assert_eq!(natural_cmp("File2", "file2"), Ordering::Equal);
+        // equal numbers with different padding still tie
+        assert_eq!(natural_cmp("img001", "img1"), Ordering::Equal);
+        assert_eq!(natural_cmp("x2y", "x10a"), Ordering::Less);
+        assert_eq!(natural_cmp("a", "b"), Ordering::Less);
+    }
+
+    #[test]
+    fn the_sniff_reads_extensionless_bytes() {
+        let dir = test_dir("sniff");
+        let png = dir.join("no-ext");
+        fs::write(&png, b"\x89PNG\r\n\x1a\n followed by junk").unwrap();
+        assert_eq!(sniff_mime(&png), Some("image/png"));
+        // a jpeg even with a lying extension
+        let lie = dir.join("photo.txt");
+        fs::write(&lie, b"\xff\xd8\xff\xe0 rest of the jpeg").unwrap();
+        assert_eq!(sniff_mime(&lie), Some("image/jpeg"));
+        // text bytes match nothing known: the extension keeps its
+        // voice
+        let plain = dir.join("plain");
+        fs::write(&plain, "just words\n").unwrap();
+        assert_eq!(sniff_mime(&plain), None);
+
+        // the listing wires it in: extensionless bytes get a mime,
+        // recognized extensions do not spend the read
+        let hits = Tab::read_dir_listing(&dir, false, SortKey::Name, true);
+        assert_eq!(
+            hits.iter().find(|e| e.name == "no-ext").unwrap().mime,
+            Some("image/png")
+        );
+        assert_eq!(hits.iter().find(|e| e.name == "plain").unwrap().mime, None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_walk_streams_hits_with_their_lines() {
+        let dir = test_dir("content-search");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub/hit.txt"), "first line\nhas the NEEDLE inside\nlast\n")
+            .unwrap();
+        fs::write(dir.join("sub/miss.txt"), "nothing here\n").unwrap();
+        fs::write(dir.join(".hidden.txt"), "a hidden needle\n").unwrap();
+        fs::write(dir.join("loose.txt"), "top level needle\n").unwrap();
+
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<Entry>();
+        search_content_stream(&dir, "needle", false, &tx);
+        drop(tx);
+        let mut hits: Vec<Entry> = Vec::new();
+        while let Ok(entry) = rx.try_recv() {
+            hits.push(entry);
+        }
+        // walk order is not sorted (a stack over readdir); the set
+        // is what matters, and the hidden file stays out
+        let mut names: Vec<&str> = hits.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["hit.txt", "loose.txt"]);
+        let hit = hits.iter().find(|e| e.name == "hit.txt").unwrap();
+        assert_eq!(hit.rel.as_deref(), Some("sub"));
+        assert!(hit.content_hit);
+        assert_eq!(hit.hit_line.as_deref(), Some("has the NEEDLE inside"));
+
+        // hidden files join when asked
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<Entry>();
+        search_content_stream(&dir, "needle", true, &tx);
+        drop(tx);
+        let mut count = 0;
+        while let Ok(_) = rx.try_recv() {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_dir_walk_sums_regular_files_only() {
+        let dir = test_dir("dir-size");
+        fs::create_dir_all(dir.join("sub/deeper")).unwrap();
+        fs::write(dir.join("a.bin"), [0u8; 1000]).unwrap();
+        fs::write(dir.join("sub").join("b.bin"), [0u8; 250]).unwrap();
+        fs::write(dir.join("sub").join("deeper").join("c.bin"), [0u8; 40]).unwrap();
+        std::os::unix::fs::symlink(dir.join("a.bin"), dir.join("link.bin")).unwrap();
+        assert_eq!(dir_size_tree(&dir, 0).unwrap(), 1000 + 250 + 40);
+    }
+
+    #[test]
+    fn type_labels_and_sort_follow_the_mime() {
+        let entry = |name: &str, is_dir: bool| Entry {
+            key: PathBuf::from(name),
+            path: PathBuf::from(name),
+            name: name.into(),
+            is_dir,
+            size: None,
+            modified: None,
+            item: None,
+            rel: None,
+            mime: None,
+            content_hit: false,
+            hit_line: None,
+        };
+        assert_eq!(type_label(&entry("things", true)), "folder");
+        assert_eq!(type_label(&entry("photo.jpg", false)), "image");
+        assert_eq!(type_label(&entry("notes.txt", false)), "text");
+        assert_eq!(type_label(&entry("blob.bin", false)), "other");
+
+        let mut entries = vec![
+            entry("zebra.txt", false),
+            entry("apple.png", false),
+            entry("banana.unknownext", false),
+        ];
+        sort_entries(&mut entries, SortKey::Type, true);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // mime order is alphabetical: application (the unknown's
+        // octet-stream) before image before text
+        assert_eq!(names, ["banana.unknownext", "apple.png", "zebra.txt"]);
+
+        // natural order through the Name key: file2 beats file10
+        let mut entries = vec![entry("file10", false), entry("file2", false)];
+        sort_entries(&mut entries, SortKey::Name, true);
+        assert_eq!(entries[0].name, "file2");
     }
 }
