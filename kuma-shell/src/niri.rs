@@ -218,6 +218,12 @@ pub fn stop_cast(session_id: u64) -> Result<()> {
     send_action(json!({"StopCast": {"session_id": session_id}}))
 }
 
+/// Power the monitors off: the idle watcher's ScreenOff clause. Niri
+/// wakes the outputs at the next input.
+pub fn power_off_monitors() -> Result<()> {
+    send_action(json!({"PowerOffMonitors": null}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

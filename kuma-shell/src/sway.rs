@@ -349,6 +349,14 @@ pub fn focus_window(id: u64) -> Result<()> {
     run_command(&mut ipc, &format!("[con_id={id}] focus"))
 }
 
+/// Power the monitors off: the idle watcher's ScreenOff clause, the
+/// DPMS equivalent niri's power-off action answers to. Sway wakes
+/// its outputs at the next input, the same way niri does.
+pub fn power_off_monitors() -> Result<()> {
+    let mut ipc = Ipc::connect()?;
+    run_command(&mut ipc, "output * power off")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

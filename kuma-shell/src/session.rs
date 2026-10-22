@@ -393,6 +393,17 @@ pub fn focus_window(id: u64) -> Result<()> {
     )
 }
 
+/// Power the monitors off: the idle watcher's ScreenOff clause. Each
+/// adapter speaks its own blank (niri's action, sway's DPMS power
+/// off); a compositor with neither socket fails here, and the
+/// caller decides how loudly.
+pub fn power_off_monitors() -> Result<()> {
+    with_adapter(
+        || crate::niri::power_off_monitors(),
+        || crate::sway::power_off_monitors(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

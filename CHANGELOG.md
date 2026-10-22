@@ -14,6 +14,16 @@ source's wrap points would pin the text to a narrow column.
 
 ## Unreleased
 
+### Fixed
+
+- The idle watcher's screen-off blanked monitors only on niri: it
+  shelled out to `niri msg` regardless of compositor, so sway sessions
+  (explicitly supported) went dark-never, silently. The blank now
+  routes through the session adapter seam like the focus commands
+  (niri's power-off action, sway's `output * power off`), and a
+  compositor with neither socket logs the gap once instead of failing
+  mute every timeout.
+
 ### Added
 
 - Kamuy can act on what it watches: the arrow keys walk the table (wrapping, the view following), `ctrl+k` sends the cursor row's process one SIGTERM, and pressing `ctrl+k` on the same row again arms a confirm card whose Enter sends SIGKILL, since a process that ignored the polite ask is killed on purpose or not at all. Group headers and the background summary have no single pid and are skipped. The footer says what was signaled, or why nothing was.

@@ -10,7 +10,7 @@
 //! polling input cannot see and exactly why the protocol exists.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::os::fd::AsRawFd;
 
@@ -84,9 +84,18 @@ pub fn run(settings: &Entity<Settings>, lock: &Entity<lock::LockState>, cx: &mut
                 IdleEvent::Lock => lock::engage(&lock, cx),
                 IdleEvent::ScreenOff => cx
                     .background_spawn(async {
-                        let _ = std::process::Command::new("niri")
-                            .args(["msg", "action", "power-off-monitors"])
-                            .output();
+                        // the adapter seam routes the blank: niri's
+                        // action on niri, sway's DPMS power off on
+                        // sway. A compositor with neither socket
+                        // would reach this every timeout, so the
+                        // first failure says so in the journal and
+                        // the rest stay quiet.
+                        if let Err(err) = crate::session::power_off_monitors() {
+                            static WARNED: AtomicBool = AtomicBool::new(false);
+                            if !WARNED.swap(true, Ordering::Relaxed) {
+                                log::warn!("monitor power-off unavailable: {err:#}");
+                            }
+                        }
                     })
                     .detach(),
             });
