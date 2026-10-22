@@ -156,6 +156,17 @@ pub(crate) fn is_video(name: &str) -> bool {
     matches!(ext.as_str(), "mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v")
 }
 
+/// Audio-only files: no frames to present, so they stay outside the
+/// video pane's claims and the grid thumbs. The details pane reads
+/// their header instead (duration, embedded album art).
+pub(crate) fn is_audio(name: &str) -> bool {
+    let ext = Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(), "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a")
+}
+
 /// Decode a file into a BGRA `RenderImage` no larger than the bounds, the
 /// byte order gpui expects. Same contract as kuma-shell's imaging module.
 pub(crate) fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<gpui::RenderImage> {
@@ -407,6 +418,14 @@ mod tests {
         assert!(is_video("clip.webm"));
         assert!(!is_video("clip.txt"));
         assert!(!is_video("song.mp3"));
+        // audio-only files ride the details pane, not the panes
+        assert!(is_audio("song.mp3"));
+        assert!(is_audio("SONG.FLAC"));
+        assert!(is_audio("song.ogg"));
+        assert!(is_audio("song.opus"));
+        assert!(is_audio("song.wav"));
+        assert!(is_audio("song.m4a"));
+        assert!(!is_audio("clip.mp4"));
         assert!(is_thumbable("clip.mp4"));
         assert!(is_thumbable("scan.pdf"));
         assert!(is_thumbable("SCAN.PDF"));

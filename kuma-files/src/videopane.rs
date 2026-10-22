@@ -6,6 +6,11 @@
 //! sync algorithm itself (the due threshold, the generation floor,
 //! the scrub's landing) has one home here.
 //!
+//! Files with only an audio stream (mp3, flac, ogg audio) do not
+//! reach the pane: there are no frames to present, and the pane has
+//! no audio-only still yet. Audio playback, and the metadata the
+//! details pane could show for audio files, are tracked in #70.
+//!
 //! The module compiles against the engine's portability stub too:
 //! without the `video` feature `Player::open` always errs and every
 //! pane stands in its card.

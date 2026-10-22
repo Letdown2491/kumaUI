@@ -210,12 +210,10 @@ mod imp {
         Some((index as usize, par))
     }
 
-    /// The container header's facts: duration in seconds when the
-    /// container reports one, plus the coded dimensions, straight
-    /// from the codec parameters: no frame is decoded and no decoder
-    /// is opened, so the facts land even where libav lacks the
-    /// codec's decoder.
-    pub(crate) fn probe(path: &Path) -> Option<(f64, u32, u32)> {
+    /// Open a container and read its stream table, nothing decoded:
+    /// the header read both probe functions share. `FormatInput`
+    /// owns the close.
+    fn open_header(path: &Path) -> Option<FormatInput> {
         quiet_logs();
         let path = cpath(path)?;
         unsafe {
@@ -233,11 +231,35 @@ mod imp {
             if sys::avformat_find_stream_info(input.0, std::ptr::null_mut()) < 0 {
                 return None;
             }
+            Some(input)
+        }
+    }
+
+    /// The container header's facts: duration in seconds when the
+    /// container reports one, plus the coded dimensions, straight
+    /// from the codec parameters: no frame is decoded and no decoder
+    /// is opened, so the facts land even where libav lacks the
+    /// codec's decoder.
+    pub(crate) fn probe(path: &Path) -> Option<(f64, u32, u32)> {
+        let input = open_header(path)?;
+        unsafe {
             let raw = (*input.0).duration;
             let duration = (raw >= 0).then(|| raw as f64 / 1_000_000.0)?;
             let (_, par) = best_video_stream(input.0)?;
             let (width, height) = ((*par).width as u32, (*par).height as u32);
             (width > 0 && height > 0).then_some((duration, width, height))
+        }
+    }
+
+    /// The container's duration from the header alone, any stream
+    /// layout: audio-only files (mp3, flac) report one with no video
+    /// stream present, which `probe`'s dimensions gate rejects. No
+    /// frame is decoded and no decoder is opened.
+    pub(crate) fn probe_duration(path: &Path) -> Option<f64> {
+        let input = open_header(path)?;
+        unsafe {
+            let raw = (*input.0).duration;
+            (raw >= 0).then(|| raw as f64 / 1_000_000.0)
         }
     }
 
@@ -1585,7 +1607,9 @@ mod imp {
 }
 
 #[cfg(feature = "video")]
-pub(crate) use imp::{Player, PlayerMsg, decode_poster, decode_preview, poster_dynamic, probe};
+pub(crate) use imp::{
+    Player, PlayerMsg, decode_poster, decode_preview, poster_dynamic, probe, probe_duration,
+};
 
 #[cfg(not(feature = "video"))]
 mod imp {
@@ -1597,6 +1621,10 @@ mod imp {
     use std::path::Path;
 
     pub(crate) fn probe(_path: &Path) -> Option<(f64, u32, u32)> {
+        None
+    }
+
+    pub(crate) fn probe_duration(_path: &Path) -> Option<f64> {
         None
     }
 
@@ -1670,7 +1698,9 @@ mod imp {
 }
 
 #[cfg(not(feature = "video"))]
-pub(crate) use imp::{Player, PlayerMsg, decode_poster, decode_preview, poster_dynamic, probe};
+pub(crate) use imp::{
+    Player, PlayerMsg, decode_poster, decode_preview, poster_dynamic, probe, probe_duration,
+};
 
 /// Test helper (the `video` feature on, test builds only): a raw
 /// H.264 elementary stream whose container parses but whose codec

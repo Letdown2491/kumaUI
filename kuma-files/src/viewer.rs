@@ -1,10 +1,13 @@
 //! The standalone open surface: a full-window viewer for the types
 //! kuma-files claims as the system default opener (images, pdf, and
-//! video). The peek (spacebar in the grid) and this window share
-//! everything underneath: the same decode arms, the same zoom and
-//! pan math, the same fail-soft honesty, and (for video) the same
-//! player pane the Quick Look drives. The peek is transient and
-//! grid-coupled; this one is a plain window an xdg-open can land in.
+//! video), plus a text rung for files handed to it directly (text
+//! stays unclaimed: the editor keeps the mime). The peek (spacebar
+//! in the grid) and this window share everything underneath: the
+//! same decode arms, the same zoom and pan math, the same fail-soft
+//! honesty, the same capped text read and reading pane, and (for
+//! video) the same player pane the Quick Look drives. The peek is
+//! transient and grid-coupled; this one is a plain window an
+//! xdg-open can land in.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,7 +22,8 @@ use gpui::{
 };
 
 use crate::browser::{
-    parse_pdf_pages, ql_clamp_pan, ql_fit_scale, write_recent, Browser, QL_DECODE_MAX, QL_ZOOM_MAX,
+    csv_lines, human_size, line_list_pane, parse_pdf_pages, ql_clamp_pan, ql_fit_scale,
+    read_text_capped, text_kind, write_recent, Browser, QL_DECODE_MAX, QL_ZOOM_MAX, TextKind,
 };
 use crate::videopane;
 use crate::{icons, theme};
@@ -166,6 +170,14 @@ pub(crate) struct Viewer {
     /// The player has been asked for the current video (one ask per
     /// open path; reset on file flips and teardown).
     video_asked: bool,
+    /// The text rung: the landed lines and the path they belong to.
+    /// Text stays unclaimed (the editor keeps the mime), so this
+    /// only fills when a text file lands by direct CLI call.
+    text: Option<(PathBuf, Arc<Vec<String>>)>,
+    /// The text read in flight, keyed by path.
+    text_inflight: Option<PathBuf>,
+    /// The text rung's scroll.
+    text_scroll: gpui::UniformListScrollHandle,
     /// A failed open lands here, keyed by path: the named card's
     /// codec-missing line.
     video_fail: Option<(PathBuf, crate::video::PosterFail)>,
@@ -204,6 +216,9 @@ impl Viewer {
             counting: false,
             video: None,
             video_asked: false,
+            text: None,
+            text_inflight: None,
+            text_scroll: gpui::UniformListScrollHandle::new(),
             video_fail: None,
             fullscreen: false,
             focus,
@@ -239,6 +254,8 @@ impl Viewer {
         self.index = self.siblings.iter().position(|p| *p == self.path).unwrap_or(0);
         self.render = None;
         self.inflight = None;
+        self.text = None;
+        self.text_inflight = None;
         self.failed = false;
         self.stop_video(cx);
         self.video_fail = None;
@@ -287,6 +304,52 @@ impl Viewer {
         });
     }
 
+    /// The text rung: the peek's capped whole-file read, off the UI
+    /// thread. Lines land the shared reading pane (csv rows align at
+    /// decode, like Quick Look's; markdown shows its raw lines, the
+    /// styled blocks stay the peek's surface). A binary smell (a NUL
+    /// in the head) or an unreadable file lands the failed card.
+    fn request_text(&mut self, cx: &mut Context<Self>) {
+        if self.text.as_ref().is_some_and(|(p, _)| *p == self.path)
+            || self.text_inflight.as_ref() == Some(&self.path)
+        {
+            return;
+        }
+        let path = self.path.clone();
+        self.text_inflight = Some(path.clone());
+        let kind = text_kind(&path);
+        cx.spawn(async move |this, cx| {
+            let bg_path = path.clone();
+            let lines = cx
+                .background_spawn(async move {
+                    read_text_capped(bg_path).map(|(mut lines, capped, total)| {
+                        if kind == TextKind::Csv {
+                            lines = csv_lines(&lines);
+                        }
+                        if capped {
+                            lines.push(format!("… the file continues ({})", human_size(total)));
+                        }
+                        lines
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.text_inflight = None;
+                // a stale landing (the window moved to another file
+                // mid-read) drops
+                if this.path != path {
+                    return;
+                }
+                match lines {
+                    Some(lines) => this.text = Some((path, Arc::new(lines))),
+                    None => this.failed = true,
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// The video pane's teardown: the held frame tile drops (the
     /// registry owns tile lifetime, ADR-0016), the Player's drop
     /// wakes the decode thread, and the ask flag resets so a reopen
@@ -315,9 +378,9 @@ impl Viewer {
         let page = if is_pdf { self.page } else { 0 };
         if !is_pdf && !is_image && !is_svg && !is_video {
             // an unclaimed type landed here via a direct CLI call:
-            // the failed card is the honest surface
-            self.failed = true;
-            cx.notify();
+            // try the text rung; a binary smell (or an unreadable
+            // file) lands the failed card when the read reports back
+            self.request_text(cx);
             return;
         }
         if is_video {
@@ -634,16 +697,22 @@ impl Render for Viewer {
         } else {
             None
         };
+        let text_lines = self
+            .text
+            .as_ref()
+            .filter(|(p, _)| *p == self.path)
+            .map(|(_, lines)| lines.clone());
         let hint = if is_video {
             "Space pause · J/L seek · +/- volume · F11 full screen · Esc closes".to_string()
         } else if is_pdf {
             "PgUp/PgDn pages · Esc closes".to_string()
+        } else if text_lines.is_some() {
+            "Esc closes".to_string()
         } else {
             "←/→ files · +/- zoom · R rotate · Esc closes".to_string()
         };
         let failed = self.failed;
-        let held = self
-            .render
+        let held = self            .render
             .as_ref()
             .filter(|(p, pg, _)| *p == self.path && *pg == if is_pdf { self.page } else { 0 })
             .map(|(_, _, render)| render.clone());
@@ -802,6 +871,9 @@ impl Render for Viewer {
                         .mt(px(pan_y))
                         .mb(px(-pan_y)),
                 )
+        } else if let Some(lines) = text_lines {
+            // the text rung: the peek's reading pane, shared
+            line_list_pane(lines, &self.text_scroll).id("viewer-text")
         } else {
             // the decode failed or the type has no decoder here:
             // say so, never a blank window
@@ -1226,20 +1298,45 @@ mod tests {
     }
 
     #[test]
-    fn viewer_fails_soft_on_an_unsupported_type() {
+    fn viewer_fails_soft_on_a_binary_file() {
         let lab = Lab::new("unsupported");
-        fs::write(lab.dir.join("notes.txt"), b"plain text").unwrap();
+        // a NUL in the head: the binary smell the text rung reads
+        fs::write(lab.dir.join("blob.dat"), b"bin\0ary").unwrap();
         let mut app = gpui::TestApp::with_text_system_and_assets(
             Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
             Arc::new(crate::icons::Assets),
         );
-        let mut window = open_viewer(&mut app, &lab.dir.join("notes.txt"));
+        let mut window = open_viewer(&mut app, &lab.dir.join("blob.dat"));
+        app.run_until_parked(); // the text read reports back
         window.update(|viewer, window, cx| {
             assert!(viewer.failed);
             // no same-kind siblings: the arrows clamp instead of
             // panicking on an empty walk
             viewer.route_key(&key("right"), window, cx);
-            assert_eq!(viewer.path, lab.dir.join("notes.txt"));
+            assert_eq!(viewer.path, lab.dir.join("blob.dat"));
+        });
+    }
+
+    #[test]
+    fn viewer_renders_a_text_file_handed_to_it_directly() {
+        let lab = Lab::new("viewer-text");
+        fs::write(lab.dir.join("notes.txt"), "first line\nsecond line\n").unwrap();
+        // text stays unclaimed: the grid and xdg-open keep handing
+        // it to the editor; only a direct CLI call lands here
+        assert!(!is_openable("notes.txt"));
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(crate::icons::Assets),
+        );
+        let mut window = open_viewer(&mut app, &lab.dir.join("notes.txt"));
+        app.run_until_parked(); // the text read lands
+        window.update(|viewer, _, _| {
+            assert!(!viewer.failed);
+            let (_, lines) = viewer.text.as_ref().expect("the text rung never landed");
+            assert_eq!(
+                lines.as_slice(),
+                &["first line".to_string(), "second line".to_string()]
+            );
         });
     }
 }

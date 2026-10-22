@@ -14,6 +14,34 @@ source's wrap points would pin the text to a narrow column.
 
 ## Unreleased
 
+### Added
+
+- Audio files (mp3, flac, ogg, opus, wav, m4a) read like videos in
+  the details pane: the header-only probe gains an audio-only variant
+  and lands a length row, and embedded album art shows in the preview
+  slot when the file carries it (the icon stands in when it does
+  not). Nothing plays and nothing is claimed: audio keeps opening in
+  the system's player, and the panes stay video-only.
+- The standalone viewer (kuma-view) renders text files handed to it
+  directly: Quick Look's capped whole-file read and reading pane,
+  shared, with csv rows aligned like the peek's. Binary files still
+  land the failed card. Text stays unclaimed, so double-click and
+  xdg-open keep opening the editor; only a direct `kuma-view
+  notes.txt` lands the text rung.
+
+### Fixed
+
+- Koguma's "Open Terminal Here" found no terminal on kumaOS: the
+  candidate ladder named `$TERMINAL`, `xdg-terminal-exec`, and eight
+  emulator binaries, none of which the image ships. kuma-term now sits
+  right after `$TERMINAL` in the ladder.
+- Directories on gvfs-FUSE mounts (samba, sftp) refresh when files
+  change on the remote side. The bridge delivers no inotify events for
+  remote writes, so such a listing stayed stale until F5 or a
+  navigation; the idle tick now polls the directory's mtime and
+  rescans on movement. A remote append to an existing file moves no
+  directory mtime and still wants F5.
+
 ## v0.5.2 (2026-10-21)
 
 kuma-shell 0.5.2

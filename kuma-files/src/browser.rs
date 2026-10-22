@@ -1240,6 +1240,60 @@ fn mount_label(raw: &str) -> String {
     }
 }
 
+/// The "Open Terminal Here" candidate ladder: $TERMINAL wins, then
+/// the image's own terminal (kumaOS bakes exactly one, and ships no
+/// others to fall back to), then the freedesktop executor, then the
+/// usual suspects by prevalence.
+fn terminal_candidates(custom: Option<String>) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(custom) = custom {
+        candidates.push(custom);
+    }
+    candidates.extend([
+        "kuma-term".into(),
+        "xdg-terminal-exec".into(),
+        "ptyxis".into(),
+        "kgx".into(),
+        "gnome-terminal".into(),
+        "konsole".into(),
+        "alacritty".into(),
+        "foot".into(),
+        "kitty".into(),
+        "wezterm".into(),
+    ]);
+    candidates
+}
+
+/// The gvfs mtime poll's decision, given the stored stamp and a
+/// fresh probe of the active directory.
+enum PollOutcome {
+    /// First sighting of this directory: the navigation just built
+    /// that listing, so record the stamp and do nothing else.
+    Baseline,
+    /// The same directory's mtime moved since the last probe: the
+    /// remote side changed it, rescan.
+    Rescan,
+    /// Nothing moved since the last probe.
+    Quiet,
+}
+
+fn poll_outcome(
+    stamp: &Option<(PathBuf, std::time::SystemTime)>,
+    dir: &std::path::Path,
+    mtime: std::time::SystemTime,
+) -> PollOutcome {
+    match stamp {
+        Some((path, seen)) if path == dir => {
+            if *seen != mtime {
+                PollOutcome::Rescan
+            } else {
+                PollOutcome::Quiet
+            }
+        }
+        _ => PollOutcome::Baseline,
+    }
+}
+
 /// Is this path inside the session's gvfs-FUSE root?
 fn is_gvfs_path(path: &std::path::Path) -> bool {
     std::env::var_os("XDG_RUNTIME_DIR")
@@ -1599,6 +1653,14 @@ pub(crate) struct Browser {
     /// Last seen mtime of the shell's palette file, so wallpaper
     /// changes are noticed on the regular refresh tick.
     palette_mtime: Option<std::time::SystemTime>,
+    /// Last seen mtime of the active directory when it sits on a
+    /// gvfs-FUSE mount: the remote side sends no inotify events
+    /// through the bridge, so the idle tick polls this stat instead
+    /// of a watch. Keyed by path; a navigation re-baselines.
+    gvfs_mtime: Option<(PathBuf, std::time::SystemTime)>,
+    /// The gvfs mtime probe is in flight (a slow remote link can
+    /// stat for seconds): skip piling another on the next tick.
+    gvfs_probe_inflight: bool,
     theme_refresh: Instant,
     accent_picker: bool,
     /// The keybindings modal (the sidebar button opens it).
@@ -1821,6 +1883,8 @@ impl Browser {
             inspector_lock: None,
             accent: None,
             palette_mtime: None,
+            gvfs_mtime: None,
+            gvfs_probe_inflight: false,
             theme_refresh: Instant::now(),
             accent_picker: false,
             keys_modal: false,
@@ -1978,6 +2042,60 @@ impl Browser {
                             this.niri_tiled = tiled;
                             cx.notify();
                         }
+                    }
+                    // a gvfs-FUSE mount delivers no inotify events for
+                    // changes made on the remote side (local writes
+                    // through the bridge still fire): probe the
+                    // directory's mtime every tick as a stand-in for
+                    // the watch, and rescan on movement. A remote
+                    // append to an existing file moves no directory
+                    // mtime; F5 stays the last word there.
+                    if !this.gvfs_probe_inflight
+                        && let Some(dir) = this.tab().current_dir().map(Path::to_path_buf)
+                        && is_gvfs_path(&dir)
+                    {
+                        this.gvfs_probe_inflight = true;
+                        let probe_dir = dir.clone();
+                        cx.spawn(async move |this, cx| {
+                            let probe = cx
+                                .background_spawn(async move {
+                                    fs::metadata(&probe_dir)
+                                        .ok()
+                                        .and_then(|m| m.modified().ok())
+                                })
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.gvfs_probe_inflight = false;
+                                let Some(mtime) = probe else {
+                                    return;
+                                };
+                                // navigated away mid-probe: nothing to
+                                // compare
+                                if this.tab().current_dir().map(Path::to_path_buf).as_ref()
+                                    != Some(&dir)
+                                {
+                                    return;
+                                }
+                                match poll_outcome(&this.gvfs_mtime, &dir, mtime) {
+                                    PollOutcome::Baseline => {
+                                        // first sighting of this
+                                        // directory: the navigation just
+                                        // built the listing, so store the
+                                        // baseline only
+                                        this.gvfs_mtime = Some((dir, mtime));
+                                    }
+                                    PollOutcome::Rescan => {
+                                        this.gvfs_mtime = Some((dir.clone(), mtime));
+                                        log::info!(
+                                            "gvfs mount changed on the remote side, rescanning"
+                                        );
+                                        this.spawn_rescan(dir, cx);
+                                    }
+                                    PollOutcome::Quiet => {}
+                                }
+                            });
+                        })
+                        .detach();
                     }
                     if palette || places || connect_tick {
                         cx.notify();
@@ -2968,52 +3086,55 @@ impl Browser {
                         let Some(dir) = current else {
                             return;
                         };
-                        let (show_hidden, sort_key, sort_asc) =
-                            (this.show_hidden, this.tab().sort_key, this.tab().sort_asc);
-                        let filtering = !this.filter.is_empty();
-                        this.rescan_seq = this.rescan_seq.wrapping_add(1);
-                        let seq = this.rescan_seq;
-                        // the read_dir + stat walk runs off the UI
-                        // thread; the land is an Arc swap guarded by
-                        // the scan's sequence number and the tab's
-                        // directory, so a stale scan (a navigation or a
-                        // newer event won) is dropped whole
-                        let guard_dir = dir.clone();
-                        cx.spawn(async move |this, cx| {
-                            let listing = cx
-                                .background_spawn(async move {
-                                    Tab::read_dir_listing(&dir, show_hidden, sort_key, sort_asc)
-                                })
-                                .await;
-                            let _ = this.update(cx, |this, cx| {
-                                if this.rescan_seq != seq
-                                    || this.tab().current_dir() != Some(guard_dir.as_path())
-                                {
-                                    return;
-                                }
-                                // the user may have re-sorted mid-scan
-                                let (key, asc) = (this.tab().sort_key, this.tab().sort_asc);
-                                let mut listing = listing;
-                                if (key, asc) != (sort_key, sort_asc) {
-                                    sort_entries(&mut listing, key, asc);
-                                }
-                                this.tab_mut().land_listing(listing);
-                                // the flat listing was rebuilt; deep rows
-                                // died with it, so re-run a live search
-                                if filtering {
-                                    this.filter_changed(cx);
-                                }
-                                log::info!("dir changed externally, rescanned off the ui thread");
-                                cx.notify();
-                            });
-                        })
-                        .detach();
+                        this.spawn_rescan(dir, cx);
                     }
                 });
                 if update.is_err() {
                     return;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Rescan the active tab's directory off the UI thread. The
+    /// read_dir + stat walk runs in the background; the land is an
+    /// Arc swap guarded by the scan's sequence number and the tab's
+    /// directory, so a stale scan (a navigation or a newer scan won)
+    /// drops whole. The watcher's external events and the gvfs mtime
+    /// poll both land here.
+    fn spawn_rescan(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let (show_hidden, sort_key, sort_asc) =
+            (self.show_hidden, self.tab().sort_key, self.tab().sort_asc);
+        let filtering = !self.filter.is_empty();
+        self.rescan_seq = self.rescan_seq.wrapping_add(1);
+        let seq = self.rescan_seq;
+        let guard_dir = dir.clone();
+        cx.spawn(async move |this, cx| {
+            let listing = cx
+                .background_spawn(async move {
+                    Tab::read_dir_listing(&dir, show_hidden, sort_key, sort_asc)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.rescan_seq != seq || this.tab().current_dir() != Some(guard_dir.as_path()) {
+                    return;
+                }
+                // the user may have re-sorted mid-scan
+                let (key, asc) = (this.tab().sort_key, this.tab().sort_asc);
+                let mut listing = listing;
+                if (key, asc) != (sort_key, sort_asc) {
+                    sort_entries(&mut listing, key, asc);
+                }
+                this.tab_mut().land_listing(listing);
+                // the flat listing was rebuilt; deep rows
+                // died with it, so re-run a live search
+                if filtering {
+                    this.filter_changed(cx);
+                }
+                log::info!("dir changed externally, rescanned off the ui thread");
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -3338,31 +3459,17 @@ impl Browser {
     }
 
     /// Spawn the user's terminal in the current directory. $TERMINAL
-    /// wins, then the freedesktop launcher, then the usual suspects.
-    /// Each candidate is tried with the terminal's own cwd inheritance,
-    /// which every emulator honors.
+    /// wins, then the image's own terminal, then the freedesktop
+    /// launcher, then the usual suspects. Each candidate is tried
+    /// with the terminal's own cwd inheritance, which every emulator
+    /// honors.
     fn open_terminal(&mut self, cx: &mut Context<Self>) {
         let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
             self.status = "no folder to open a terminal in".into();
             cx.notify();
             return;
         };
-        let mut candidates: Vec<String> = Vec::new();
-        if let Ok(custom) = env::var("TERMINAL") {
-            candidates.push(custom);
-        }
-        candidates.extend([
-            "xdg-terminal-exec".into(),
-            "ptyxis".into(),
-            "kgx".into(),
-            "gnome-terminal".into(),
-            "konsole".into(),
-            "alacritty".into(),
-            "foot".into(),
-            "kitty".into(),
-            "wezterm".into(),
-        ]);
-        for name in candidates {
+        for name in terminal_candidates(env::var("TERMINAL").ok()) {
             match Command::new(&name).current_dir(&dir).spawn() {
                 Ok(mut child) => {
                     log::info!("terminal: spawned {name} in {}", dir.display());
@@ -5381,49 +5488,16 @@ impl Browser {
         {
             return;
         }
-        let Ok(meta) = fs::symlink_metadata(&path) else {
+        if fs::symlink_metadata(&path).is_err() {
             self.ql_text_failed = Some(path);
             return;
         };
         self.ql_text_inflight = Some(path.clone());
         let kind = text_kind(&path);
-        let total = meta.len();
         cx.spawn(async move |this, cx| {
             let bg_path = path.clone();
             let read = cx
-                .background_spawn(async move {
-                    let mut file = fs::File::open(&bg_path).ok()?;
-                    // the head doubles as the binary smell test
-                    let mut head = vec![0u8; 4096];
-                    let mut filled = io::Read::read(&mut file, &mut head).unwrap_or(0);
-                    if head[..filled].contains(&0) {
-                        return None;
-                    }
-                    let capped = total > TEXT_READ_MAX as u64;
-                    let mut buf = vec![0u8; TEXT_READ_MAX];
-                    buf[..filled].copy_from_slice(&head[..filled]);
-                    while filled < buf.len() {
-                        let n = io::Read::read(&mut file, &mut buf[filled..]).ok()?;
-                        if n == 0 {
-                            break;
-                        }
-                        filled += n;
-                    }
-                    // the read may cut mid-char; lossy conversion
-                    // plus a boundary trim keeps the tail clean
-                    let mut text = String::from_utf8_lossy(&buf[..filled]).into_owned();
-                    while !text.is_char_boundary(text.len()) {
-                        text.pop();
-                    }
-                    let lines: Vec<String> = text
-                        .lines()
-                        .map(|line| match line.char_indices().nth(TEXT_LINE_MAX) {
-                            Some((cut, _)) => format!("{}\u{2026}", &line[..cut]),
-                            None => line.to_string(),
-                        })
-                        .collect();
-                    Some((lines, capped, total))
-                })
+                .background_spawn(async move { read_text_capped(bg_path) })
                 .await;
             let update = this.update(cx, |this, cx| {
                 if this.ql_text_inflight.as_ref() == Some(&path) {
@@ -7263,14 +7337,15 @@ impl Browser {
 
     /// The modal overlay for unresolved paste conflicts. `None` (rendered
     /// as no child) when no paste is waiting on a decision.
-    /// Render-time sync for the details pane's video slot: while a
-    /// video sits selected with the pane open, arm a settle kick on
-    /// the first paint and spawn one preview decode (the bounded
-    /// head loop at 256, poster fallback inside) plus one header
-    /// read once the selection has rested out the delay. A fast
-    /// arrow-through a video folder therefore spends one or two
-    /// in-process decodes, not one per entry passed. The grid and
-    /// the search preview keep type icons, always.
+    /// Render-time sync for the details pane's media slot: while a
+    /// media file (video, or audio-only) sits selected with the pane
+    /// open, arm a settle kick on the first paint and spawn one
+    /// preview decode (the bounded head loop at 256, poster fallback
+    /// inside; an mp3's embedded art lands through the same path)
+    /// plus one header read once the selection has rested out the
+    /// delay. A fast arrow-through a media folder therefore spends
+    /// one or two in-process decodes, not one per entry passed. The
+    /// grid and the search preview keep type icons, always.
     fn sync_sel_video(&mut self, cx: &mut Context<Self>) {
         if !self.inspector || self.quicklook.is_some() {
             // nothing feeds while the pane is closed or Quick Look
@@ -7283,9 +7358,12 @@ impl Browser {
             .cursor
             .and_then(|ix| self.tab().entries.get(ix).cloned());
         let entry = match entry {
-            Some(entry) if !entry.is_dir && icons::is_video(&entry.name) => entry,
+            Some(entry)
+                if !entry.is_dir
+                    && (icons::is_video(&entry.name) || icons::is_audio(&entry.name)) =>
+            entry,
             _ => {
-                // not a video under the cursor: nothing may paint
+                // not a media file under the cursor: nothing may paint
                 // from a stale slot, and a resting timer must learn
                 // it lost the race
                 if let Some((_, poster)) = self.sel_video.take()
@@ -7333,9 +7411,14 @@ impl Browser {
             let bg_path = path.clone();
             let len = cx
                 .background_spawn(async move {
-                    crate::video::probe(&bg_path).and_then(|(secs, _, _)| {
-                        crate::video::duration_label(secs)
-                    })
+                    // videos read the header through the poster's
+                    // probe (which also lands the dimensions); an
+                    // audio-only file has no video stream, so the
+                    // duration-only read stands in
+                    crate::video::probe(&bg_path)
+                        .map(|(secs, _, _)| secs)
+                        .or_else(|| crate::video::probe_duration(&bg_path))
+                        .and_then(crate::video::duration_label)
                 })
                 .await;
             let update = this.update(cx, |this, cx| {
@@ -7371,8 +7454,8 @@ impl Browser {
         .detach();
     }
 
-    /// The length row's value for the selected video, when its
-    /// header read landed under the entry's key.
+    /// The length row's value for the selected media file (video or
+    /// audio-only), when its header read landed under the entry's key.
     fn video_len_label(&self, entry: &Entry) -> Option<String> {
         self.sel_video_len
             .as_ref()
@@ -11129,7 +11212,7 @@ fn friendly_kind(name: &str, is_dir: bool) -> String {
 
 /// How to style a text snippet in the info panel.
 #[derive(Clone, Copy, PartialEq)]
-enum TextKind {
+pub(crate) enum TextKind {
     Plain,
     Code,
     Csv,
@@ -11207,7 +11290,48 @@ impl videopane::Host for Browser {
     }
 }
 
-fn text_kind(path: &Path) -> TextKind {
+/// Read a text-ish file whole, capped: the head doubles as the
+/// binary smell test (a NUL anywhere in the head means None), the
+/// byte cap bounds the read, lines cap individually (one enormous
+/// line must not become one enormous layout), and a mid-char cut
+/// trims back to a char boundary. Returns (lines, capped, total).
+/// Quick Look's reading pane and the viewer's text rung share it.
+pub(crate) fn read_text_capped(path: PathBuf) -> Option<(Vec<String>, bool, u64)> {
+    let mut file = fs::File::open(&path).ok()?;
+    let total = fs::symlink_metadata(&path).ok()?.len();
+    // the head doubles as the binary smell test
+    let mut head = vec![0u8; 4096];
+    let mut filled = io::Read::read(&mut file, &mut head).unwrap_or(0);
+    if head[..filled].contains(&0) {
+        return None;
+    }
+    let capped = total > TEXT_READ_MAX as u64;
+    let mut buf = vec![0u8; TEXT_READ_MAX];
+    buf[..filled].copy_from_slice(&head[..filled]);
+    while filled < buf.len() {
+        let n = io::Read::read(&mut file, &mut buf[filled..]).ok()?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    // the read may cut mid-char; lossy conversion
+    // plus a boundary trim keeps the tail clean
+    let mut text = String::from_utf8_lossy(&buf[..filled]).into_owned();
+    while !text.is_char_boundary(text.len()) {
+        text.pop();
+    }
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| match line.char_indices().nth(TEXT_LINE_MAX) {
+            Some((cut, _)) => format!("{}\u{2026}", &line[..cut]),
+            None => line.to_string(),
+        })
+        .collect();
+    Some((lines, capped, total))
+}
+
+pub(crate) fn text_kind(path: &Path) -> TextKind {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -11232,7 +11356,10 @@ fn preview_line(line: String) -> Div {
 /// is tens of thousands of lines). The wrapper is a flex column and
 /// the list grows into it: an Auto-sized deferred element is a
 /// zero-content div to taffy and paints nothing without a height.
-fn line_list_pane(lines: Arc<Vec<String>>, scroll: &gpui::UniformListScrollHandle) -> Div {
+pub(crate) fn line_list_pane(
+    lines: Arc<Vec<String>>,
+    scroll: &gpui::UniformListScrollHandle,
+) -> Div {
     let count = lines.len();
     div().flex_1().overflow_hidden().m_3().flex().flex_col().child(
         uniform_list("quicklook-text-list", count, move |range, _, _| {
@@ -11387,7 +11514,7 @@ fn code_line(line: &str) -> Div {
 
 /// A csv preview: cells padded into an aligned mono table, first row
 /// as the header. Quote handling is out of scope for a glance.
-fn csv_lines(lines: &[String]) -> Vec<String> {
+pub(crate) fn csv_lines(lines: &[String]) -> Vec<String> {
     let rows: Vec<Vec<String>> = lines
         .iter()
         .map(|line| line.split(',').map(str::to_string).collect())
@@ -11914,6 +12041,57 @@ impl Render for Ghost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_ladder_names_the_image_terminal_and_honors_overrides() {
+        // no $TERMINAL: kuma-term first, the freedesktop executor
+        // second, prevalence after that
+        let ladder = terminal_candidates(None);
+        assert_eq!(ladder.first().map(String::as_str), Some("kuma-term"));
+        assert_eq!(ladder[1], "xdg-terminal-exec");
+
+        // $TERMINAL set: it wins, the image terminal stays second
+        let ladder = terminal_candidates(Some("myterm".into()));
+        assert_eq!(ladder.first().map(String::as_str), Some("myterm"));
+        assert_eq!(ladder[1], "kuma-term");
+    }
+
+    #[test]
+    fn gvfs_poll_baselines_then_rescans_on_remote_movement() {
+        let dir = Path::new("/run/user/1000/gvfs/sftp:host=server");
+        let (t0, t1) = (
+            std::time::SystemTime::UNIX_EPOCH,
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        );
+
+        // first probe: baseline only, the navigation just built the
+        // listing
+        assert!(matches!(
+            poll_outcome(&None, dir, t0),
+            PollOutcome::Baseline
+        ));
+
+        // same directory, mtime unchanged: quiet
+        let stamp = Some((dir.to_path_buf(), t0));
+        assert!(matches!(
+            poll_outcome(&stamp, dir, t0),
+            PollOutcome::Quiet
+        ));
+
+        // same directory, mtime moved: rescan
+        assert!(matches!(
+            poll_outcome(&stamp, dir, t1),
+            PollOutcome::Rescan
+        ));
+
+        // a stamp from a directory we since navigated away from
+        // never reads as movement for this one
+        let stamp = Some((PathBuf::from("/run/user/1000/gvfs/smb-share:server=X"), t0));
+        assert!(matches!(
+            poll_outcome(&stamp, dir, t0),
+            PollOutcome::Baseline
+        ));
+    }
 
     #[test]
     fn thumb_eviction_drops_the_oldest_and_reports_the_droplets() {
@@ -14167,6 +14345,55 @@ mod browser_ux_keys {
             assert_eq!(browser.video_len_label(&entry).as_deref(), Some("3:25"));
             let other = browser.tab().entries[1].clone();
             assert_eq!(browser.video_len_label(&other), None);
+        });
+    }
+
+    #[test]
+    fn details_audio_length_lands_and_skips_the_poster() {
+        let lab = Lab::new("details-audio");
+        // a hand-built 2s mono wav: the header read lands a length
+        // row through the audio-only probe; no video stream means no
+        // poster, and the icon stands in (fail-soft, kick spent)
+        let samples = 44100usize * 2;
+        let data_len = samples * 2; // 16-bit mono
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // pcm
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&44100u32.to_le_bytes());
+        wav.extend_from_slice(&(44100u32 * 2).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data_len as u32).to_le_bytes());
+        wav.extend_from_slice(&vec![0u8; data_len]);
+        fs::write(lab.dir.join("tone.wav"), wav).unwrap();
+
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.dir);
+        window.update(|browser, _, cx| {
+            // dirs first: sub, a.txt, b.txt, c.txt, tone.wav
+            browser.jump_cursor(4, cx);
+        });
+        app.run_until_parked(); // the render arms the settle kick
+        app.advance_clock(std::time::Duration::from_millis(250));
+        app.run_until_parked(); // the header read lands
+        window.update(|browser, _, _| {
+            let len = browser.sel_video_len.as_ref().map(|(_, len)| len.clone());
+            assert_eq!(
+                len.as_deref(),
+                Some("0:02"),
+                "the wav's header duration landed"
+            );
+            // no video stream: no poster, the icon stands in
+            assert!(browser.sel_video.is_none());
         });
     }
 
