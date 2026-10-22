@@ -14,6 +14,13 @@ source's wrap points would pin the text to a narrow column.
 
 ## Unreleased
 
+## v0.6.0 (2026-10-22)
+
+kuma-shell 0.6.0
+kuma-files 0.5.0
+kuma-term 0.4.0
+kuma-monitor 0.3.0
+
 ### Added
 
 - Koguma's search gains a content rung: the banner's "names only"
