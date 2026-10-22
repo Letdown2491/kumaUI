@@ -3,7 +3,9 @@
 //! [`TrayState`] for the bar. Clicks ride a request channel back out to the
 //! dbus task. DBusMenu is not spoken yet: clicks Activate the item.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use futures_lite::StreamExt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,8 +18,9 @@ use crate::imaging::{self, IconImage};
 
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 const ITEM_PATH: &str = "/StatusNotifierItem";
-/// Item property polls ride the same 2s cadence as the system monitors.
-const POLL: Duration = Duration::from_secs(2);
+/// The tray heartbeat: item signals own the fast path; this slow
+/// sweep catches silent items and reaps dead ones (their polls fail).
+const HEARTBEAT: Duration = Duration::from_secs(60);
 /// Themed icons decode at twice the bar's painted 16px for hidpi screens.
 const ICON_RESOLVE_SIZE: u32 = 32;
 
@@ -69,6 +72,8 @@ enum TrayRequest {
 enum TrayInput {
     Wake,
     Request(TrayRequest),
+    /// A registry service's bus name lost its owner: the item is gone.
+    Expired(String),
 }
 
 /// The whole tray state, on the main thread.
@@ -294,7 +299,11 @@ trait StatusNotifierItem {
 
 /// Poll one item into a snapshot. A dbus failure means the item is gone:
 /// `Ok(None)` drops it.
-async fn poll_item(connection: &zbus::Connection, service: &str) -> Option<TrayItem> {
+async fn poll_item(
+    connection: &zbus::Connection,
+    service: &str,
+    previous: Option<&TrayItem>,
+) -> Option<TrayItem> {
     let proxy = StatusNotifierItemProxy::builder(connection)
         .destination(service)
         .ok()?
@@ -331,18 +340,43 @@ async fn poll_item(connection: &zbus::Connection, service: &str) -> Option<TrayI
         .unwrap_or_default();
     let has_menu = proxy.menu().await.is_ok();
 
-    let (icon, pixmap_hash) = resolve_icon(
-        if status == TrayStatus::NeedsAttention && !attention_icon_name.is_empty() {
-            &attention_icon_name
-        } else {
-            &icon_name
-        },
-        icon_pixmap,
-    );
     let tooltip = if tooltip.is_empty() {
         title.clone()
     } else {
         tooltip
+    };
+
+    let wanted_name = if status == TrayStatus::NeedsAttention && !attention_icon_name.is_empty() {
+        &attention_icon_name
+    } else {
+        &icon_name
+    };
+
+    // named icons resolve cheap (a registry Arc clone), so only the
+    // raster conversion is worth skipping: when the pixmap bytes hash
+    // to what the last snapshot already converted, reuse its tile
+    let named = if wanted_name.is_empty() {
+        None
+    } else {
+        imaging::resolve(wanted_name, ICON_RESOLVE_SIZE).map(|icon| icon.clone_shared())
+    };
+    let (icon, pixmap_hash) = match named {
+        Some(icon) => (Some(icon), 0),
+        None => match previous
+            .filter(|previous| {
+                previous.status == status
+                    && previous.pixmap_hash != 0
+                    && previous.pixmap_hash == pixmap_hash(&icon_pixmap)
+                    && matches!(previous.icon, Some(IconImage::Raster(_)))
+            })
+            .map(|previous| (previous.icon.clone(), previous.pixmap_hash))
+        {
+            Some(reused) => reused,
+            None => {
+                let (icon, pixmap_hash) = resolve_icon(wanted_name, icon_pixmap);
+                (icon, pixmap_hash)
+            }
+        },
     };
     Some(TrayItem {
         service: service.to_string(),
@@ -353,6 +387,19 @@ async fn poll_item(connection: &zbus::Connection, service: &str) -> Option<TrayI
         pixmap_hash,
         has_menu,
     })
+}
+
+/// The pixmap's content hash: identity for the conversion skip and
+/// the state side's raster pin. Zero means no pixmap at all.
+fn pixmap_hash(pixmap: &Option<(i32, i32, Vec<u8>)>) -> u64 {
+    match pixmap {
+        Some((width, height, data)) => {
+            let mut hash = std::hash::DefaultHasher::new();
+            (width, height, data).hash(&mut hash);
+            hash.finish()
+        }
+        None => 0,
+    }
 }
 
 /// Named icons resolve through the image registry (stable Arcs: one atlas
@@ -368,18 +415,15 @@ fn resolve_icon(
     {
         return (Some(icon.clone_shared()), 0);
     }
-    pixmap
-        .map(|(width, height, data)| {
-            let mut hash = std::hash::DefaultHasher::new();
-            data.hash(&mut hash);
-            (
-                imaging::argb_to_render_image(width, height, data)
-                    .map(Arc::new)
-                    .map(IconImage::Raster),
-                hash.finish(),
-            )
-        })
-        .unwrap_or((None, 0))
+    let hash = pixmap_hash(&pixmap);
+    (
+        pixmap.and_then(|(width, height, data)| {
+            imaging::argb_to_render_image(width, height, data)
+                .map(Arc::new)
+                .map(IconImage::Raster)
+        }),
+        hash,
+    )
 }
 
 /// The dbus task: serve the watcher, poll items on the monitor cadence (and
@@ -403,40 +447,239 @@ async fn run_tray(
         .await?;
     log::info!("tray watcher online at {WATCHER_PATH}");
 
+    // the last snapshot per service, and which services have a signal
+    // watcher running
+    let items: Arc<Mutex<HashMap<String, TrayItem>>> = Arc::new(Mutex::new(HashMap::new()));
+    let watched: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // bus departures reap items as they happen: a tray process exiting
+    // shows up here as its name losing its owner, not at the heartbeat
+    let dbus = zbus::fdo::DBusProxy::new(&connection).await?;
+    let mut owners = dbus.receive_name_owner_changed().await?;
+
     loop {
-        // input, or the poll tick; None is the tick's sentinel
-        match smol::future::or(async { input_rx.recv().await.ok() }, async {
-            smol::Timer::after(POLL).await;
+        // input (wake, request, or a bus departure), or the heartbeat;
+        // None is the heartbeat's sentinel
+        let input = smol::future::or(
+            async { input_rx.recv().await.ok() },
+            async {
+                loop {
+                    let event = owners.next().await?;
+                    let args = event.args().ok()?;
+                    // an empty new owner is a departure; anything else
+                    // is a name changing hands, which the tray does
+                    // not care about
+                    let gone = {
+                        let new_owner: Option<zbus::names::UniqueName> = args.new_owner.into();
+                        new_owner
+                            .map(|owner| owner.as_str().is_empty())
+                            .unwrap_or(true)
+                    };
+                    if gone {
+                        return Some(TrayInput::Expired(args.name.to_string()));
+                    }
+                }
+            },
+        );
+        match smol::future::or(input, async {
+            smol::Timer::after(HEARTBEAT).await;
             None
         })
         .await
         {
-            Some(TrayInput::Wake) => poll_and_publish(&connection, &registry, &updates).await,
+            Some(TrayInput::Wake) => {
+                reconcile(&connection, &registry, &items, &watched, &updates);
+            }
             Some(TrayInput::Request(request)) => {
                 handle_request(&connection, request).await;
             }
-            None => poll_and_publish(&connection, &registry, &updates).await,
+            Some(TrayInput::Expired(service)) => {
+                let registered = registry
+                    .lock()
+                    .expect("tray registry poisoned")
+                    .iter()
+                    .any(|row| row == &service);
+                if registered {
+                    forget_item(&service, &items, &registry, &watched, &updates);
+                }
+            }
+            None => poll_all(&connection, &registry, &items, &watched, &updates).await,
         }
     }
 }
 
-/// Poll every registered item; dead items drop out of the registry.
-async fn poll_and_publish(
+/// Spawn a signal watcher for every registered service without one;
+/// the watcher interface wakes this on registration.
+fn reconcile(
     connection: &zbus::Connection,
     registry: &Arc<Mutex<Vec<String>>>,
+    items: &Arc<Mutex<HashMap<String, TrayItem>>>,
+    watched: &Arc<Mutex<HashSet<String>>>,
     updates: &Sender<Vec<TrayItem>>,
 ) {
     let services = registry.lock().expect("tray registry poisoned").clone();
-    let mut items = Vec::new();
-    let mut alive = Vec::new();
     for service in services {
-        if let Some(item) = poll_item(connection, &service).await {
-            alive.push(service);
-            items.push(item);
+        let fresh = watched
+            .lock()
+            .expect("tray watched poisoned")
+            .insert(service.clone());
+        if fresh {
+            let task = watch_item(
+                connection.clone(),
+                service,
+                items.clone(),
+                registry.clone(),
+                watched.clone(),
+                updates.clone(),
+            );
+            connection.executor().spawn(task, "tray item");
         }
     }
-    *registry.lock().expect("tray registry poisoned") = alive;
-    let _ = updates.try_send(items);
+}
+
+/// One item's watcher: a first read lands the snapshot the moment the
+/// item registers, then the item's own signals re-poll it (the SNI
+/// update signals and the generic PropertiesChanged both count). A
+/// dead poll reaps the item and ends the watcher; a silent item waits
+/// for the heartbeat.
+async fn watch_item(
+    connection: zbus::Connection,
+    service: String,
+    items: Arc<Mutex<HashMap<String, TrayItem>>>,
+    registry: Arc<Mutex<Vec<String>>>,
+    watched: Arc<Mutex<HashSet<String>>>,
+    updates: Sender<Vec<TrayItem>>,
+) {
+    if !repoll(&connection, &service, &items, &registry, &updates).await {
+        forget_item(&service, &items, &registry, &watched, &updates);
+        return;
+    }
+    let proxy = match item_proxy(&connection, &service).await {
+        Ok(proxy) => proxy,
+        // no one to listen to: the heartbeat owns this item now
+        Err(_) => return,
+    };
+    let Ok(mut signals) = proxy.receive_all_signals().await else {
+        return;
+    };
+    while let Some(msg) = signals.next().await {
+        let header = msg.header();
+        let Some(member) = header.member() else {
+            continue;
+        };
+        if !matches!(
+            member.as_str(),
+            "PropertiesChanged" | "NewTitle" | "NewIcon" | "NewAttentionIcon" | "NewToolTip"
+                | "NewStatus"
+        ) {
+            continue;
+        }
+        if !repoll(&connection, &service, &items, &registry, &updates).await {
+            forget_item(&service, &items, &registry, &watched, &updates);
+            return;
+        }
+    }
+    // the signal stream ended without a verdict: retire the watcher
+    // and let the heartbeat re-poll until the item proves itself
+    watched.lock().expect("tray watched poisoned").remove(&service);
+}
+
+/// The untyped signal source for one item: caching off, the same seam
+/// the nm watcher uses, since reads happen live on the event.
+async fn item_proxy(connection: &zbus::Connection, service: &str) -> zbus::Result<zbus::Proxy<'static>> {
+    zbus::proxy::Builder::<zbus::Proxy>::new(connection)
+        .destination(service.to_string())?
+        .path(ITEM_PATH.to_string())?
+        .interface("org.kde.StatusNotifierItem".to_string())?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+}
+
+/// Re-read one item and land it if it moved. False means the item is
+/// gone.
+async fn repoll(
+    connection: &zbus::Connection,
+    service: &str,
+    items: &Arc<Mutex<HashMap<String, TrayItem>>>,
+    registry: &Arc<Mutex<Vec<String>>>,
+    updates: &Sender<Vec<TrayItem>>,
+) -> bool {
+    let previous = items
+        .lock()
+        .expect("tray items poisoned")
+        .get(service)
+        .cloned();
+    let Some(item) = poll_item(connection, service, previous.as_ref()).await else {
+        return false;
+    };
+    let moved = {
+        let mut all = items.lock().expect("tray items poisoned");
+        match all.get(service) {
+            Some(last) if last.same_snapshot(&item) => false,
+            _ => {
+                all.insert(service.to_string(), item);
+                true
+            }
+        }
+    };
+    if moved {
+        publish(registry, items, updates);
+    }
+    true
+}
+
+/// A dead item: drop its snapshot and registry row, publish, retire
+/// the watcher.
+fn forget_item(
+    service: &str,
+    items: &Arc<Mutex<HashMap<String, TrayItem>>>,
+    registry: &Arc<Mutex<Vec<String>>>,
+    watched: &Arc<Mutex<HashSet<String>>>,
+    updates: &Sender<Vec<TrayItem>>,
+) {
+    items.lock().expect("tray items poisoned").remove(service);
+    registry
+        .lock()
+        .expect("tray registry poisoned")
+        .retain(|row| row != service);
+    watched
+        .lock()
+        .expect("tray watched poisoned")
+        .remove(service);
+    publish(registry, items, updates);
+}
+
+/// The heartbeat sweep: re-poll every registered item (silent items
+/// and missed signals land here), dropping the dead.
+async fn poll_all(
+    connection: &zbus::Connection,
+    registry: &Arc<Mutex<Vec<String>>>,
+    items: &Arc<Mutex<HashMap<String, TrayItem>>>,
+    watched: &Arc<Mutex<HashSet<String>>>,
+    updates: &Sender<Vec<TrayItem>>,
+) {
+    let services = registry.lock().expect("tray registry poisoned").clone();
+    for service in services {
+        if !repoll(connection, &service, items, registry, updates).await {
+            forget_item(&service, items, registry, watched, updates);
+        }
+    }
+}
+
+/// Publish the snapshot vec in registration order.
+fn publish(
+    registry: &Arc<Mutex<Vec<String>>>,
+    items: &Arc<Mutex<HashMap<String, TrayItem>>>,
+    updates: &Sender<Vec<TrayItem>>,
+) {
+    let snapshots = items.lock().expect("tray items poisoned");
+    let rows = registry.lock().expect("tray registry poisoned").clone();
+    let published: Vec<TrayItem> = rows
+        .iter()
+        .filter_map(|service| snapshots.get(service).cloned())
+        .collect();
+    let _ = updates.try_send(published);
 }
 
 async fn handle_request(connection: &zbus::Connection, request: TrayRequest) {

@@ -1,5 +1,7 @@
 use std::{
+    path::PathBuf,
     process::Command,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -294,7 +296,7 @@ pub struct SysMon {
     /// for the next read to confirm it (see `absorb_av`).
     av_confirming: Option<AvRead>,
     /// The serialized av worker's queue, started by the first request.
-    av_sender: Option<smol::channel::Sender<AvRequest>>,
+    av_sender: Option<AvQueue>,
     /// The Wi-Fi panel's last connect/forget failure: the panel shows
     /// it inline; the next action or scan clears it.
     pub wifi_error: Option<String>,
@@ -356,6 +358,110 @@ enum AvRequest {
     StreamVolume(u32, u8),
     /// A stream's mute toggle: the panel's mute button.
     StreamMute(u32),
+}
+
+/// The pending half of the av executor: a slot queue coalesced on
+/// insert, woken by a one-slot notify. A drag against a wedged
+/// PipeWire leaves one absolute write behind, not a drag's worth
+/// replaying for minutes.
+#[derive(Clone)]
+struct AvQueue {
+    pending: Arc<Mutex<Vec<AvRequest>>>,
+    notify: smol::channel::Sender<()>,
+}
+
+impl AvQueue {
+    /// The one worker: woken by pushes, it drains the coalesced queue
+    /// in submission order (each request is an absolute write; a
+    /// raced completion order would land the wrong final value).
+    fn spawn(cx: &mut Context<SysMon>) -> Self {
+        let (notify, notify_rx) = smol::channel::bounded::<()>(1);
+        let pending = Arc::new(Mutex::new(Vec::<AvRequest>::new()));
+        let drain = pending.clone();
+        cx.spawn(async move |this, cx| {
+            while let Ok(()) = notify_rx.recv().await {
+                let requests = std::mem::take(&mut *drain.lock().expect("av queue poisoned"));
+                for request in requests {
+                    request.execute(&this, cx).await;
+                }
+            }
+        })
+        .detach();
+        Self { pending, notify }
+    }
+
+    /// Line up one request, collapsing it into the pending slot of
+    /// its kind when it can be.
+    fn push(&self, request: AvRequest) {
+        {
+            let mut pending = self.pending.lock().expect("av queue poisoned");
+            coalesce_request(&mut pending, request);
+        }
+        // a full notify slot means the worker is already waking
+        let _ = self.notify.try_send(());
+    }
+}
+
+/// What a request collapses by: two requests sharing a key coalesce
+/// into one. Toggles have no key: two queued flips are two state
+/// changes, and one flip is one.
+#[derive(Clone, Copy, PartialEq)]
+enum AvKind {
+    VolumeSet,
+    VolumeChange,
+    VolumeMute,
+    MicVolume,
+    BrightnessChange,
+    BrightnessSet,
+    Stream(u32),
+}
+
+impl AvRequest {
+    fn coalesce_kind(&self) -> Option<AvKind> {
+        match self {
+            AvRequest::Volume(VolumeRequest::Set(_), _) => Some(AvKind::VolumeSet),
+            AvRequest::Volume(VolumeRequest::Change(_), _) => Some(AvKind::VolumeChange),
+            // a named mute target is an absolute write; None is a
+            // toggle, which does not coalesce
+            AvRequest::Volume(VolumeRequest::Mute(Some(_)), _) => Some(AvKind::VolumeMute),
+            AvRequest::Volume(VolumeRequest::Mute(None), _) => None,
+            AvRequest::MicVolume(_, _) => Some(AvKind::MicVolume),
+            AvRequest::BrightnessDelta(_, _) => Some(AvKind::BrightnessChange),
+            AvRequest::BrightnessAbsolute(_, _) => Some(AvKind::BrightnessSet),
+            AvRequest::StreamVolume(id, _) => Some(AvKind::Stream(*id)),
+            AvRequest::Mic(_) | AvRequest::StreamMute(_) => None,
+        }
+    }
+}
+
+/// Insert one request into the pending queue. Same-kind requests
+/// collapse: absolute writes into the newest value, relative steps
+/// into their sum (the queued write to run is what the newest call
+/// meant, and the oldest read's rollback still names the state to
+/// restore on failure).
+fn coalesce_request(pending: &mut Vec<AvRequest>, request: AvRequest) {
+    let Some(kind) = request.coalesce_kind() else {
+        pending.push(request);
+        return;
+    };
+    if let Some(slot) = pending
+        .iter_mut()
+        .find(|existing| existing.coalesce_kind() == Some(kind))
+    {
+        match (slot, request) {
+            (
+                AvRequest::Volume(VolumeRequest::Change(old), _),
+                AvRequest::Volume(VolumeRequest::Change(new), _),
+            ) => *old += new,
+            (
+                AvRequest::BrightnessDelta(old, _),
+                AvRequest::BrightnessDelta(new, _),
+            ) => *old += new,
+            (slot, request) => *slot = request,
+        }
+        return;
+    }
+    pending.push(request);
 }
 
 impl AvRequest {
@@ -448,25 +554,18 @@ impl AvRequest {
 
 impl SysMon {
     /// The serialized av executor's queue side: the first request
-    /// starts the one worker; every request lines up behind it.
+    /// starts the one worker; every request lines up behind it in the
+    /// coalescing slot queue.
     fn queue(&mut self, request: AvRequest, cx: &mut Context<Self>) {
-        let sender = match &self.av_sender {
-            Some(sender) => sender.clone(),
+        let queue = match &self.av_sender {
+            Some(queue) => queue.clone(),
             None => {
-                let (sender, receiver) = smol::channel::unbounded::<AvRequest>();
-                self.av_sender = Some(sender.clone());
-                cx.spawn(async move |this, cx| {
-                    while let Ok(request) = receiver.recv().await {
-                        request.execute(&this, cx).await;
-                    }
-                })
-                .detach();
-                sender
+                let queue = AvQueue::spawn(cx);
+                self.av_sender = Some(queue.clone());
+                queue
             }
         };
-        if let Err(err) = sender.send_blocking(request) {
-            log::error!("queueing av request failed: {err:#}");
-        }
+        queue.push(request);
     }
 
     /// One request seam for volume changes (ADR-0006): optimistic snapshot
@@ -2298,9 +2397,33 @@ fn parse_meminfo(text: &str) -> Option<Ram> {
 /// the CPU preferred (coretemp on Intel, k10temp or zenpower on AMD),
 /// its hottest zone speaking; thermal zones that name a cpu are the
 /// fallback. Degrees, not milli-degrees.
+/// The resolved CPU sensor path, probed once and re-probed only when
+/// the file stops answering: the walk is dozens of file reads for a
+/// number that moves a degree a second.
+static CPU_SENSOR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 fn read_cpu_temp() -> Option<u32> {
+    let mut resolved = CPU_SENSOR.lock().ok()?;
+    if let Some(path) = &*resolved {
+        if let Some(temp) = read_milli_degrees(path) {
+            return Some(temp);
+        }
+        // the sensor stopped answering (a hwmon module reloaded):
+        // forget it and walk again
+        *resolved = None;
+    }
+    let path = probe_cpu_sensor()?;
+    let temp = read_milli_degrees(&path);
+    *resolved = Some(path);
+    temp
+}
+
+/// The walk: hwmon chips named for CPUs (priority 1) and the
+/// thermal_zone fallback (x86_pkg_temp, soc thermal). The hottest
+/// sensor among the top priority wins.
+fn probe_cpu_sensor() -> Option<PathBuf> {
     const CPU_CHIPS: [&str; 3] = ["coretemp", "k10temp", "zenpower"];
-    let mut candidates: Vec<(u8, u32)> = Vec::new();
+    let mut candidates: Vec<(u8, u32, PathBuf)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
             let dir = entry.path();
@@ -2315,7 +2438,7 @@ fn read_cpu_temp() -> Option<u32> {
                 let file = zone.file_name().to_string_lossy().to_string();
                 if file.starts_with("temp") && file.ends_with("_input") {
                     if let Some(temp) = read_milli_degrees(&zone.path()) {
-                        candidates.push((priority, temp));
+                        candidates.push((priority, temp, zone.path()));
                     }
                 }
             }
@@ -2339,14 +2462,14 @@ fn read_cpu_temp() -> Option<u32> {
                 continue;
             }
             if let Some(temp) = read_milli_degrees(&entry.path()) {
-                candidates.push((1, temp));
+                candidates.push((1, temp, entry.path()));
             }
         }
     }
     // a named CPU chip outranks a thermal zone; the hottest zone wins
     // within a chip
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-    candidates.first().map(|(_, temp)| *temp)
+    candidates.into_iter().next().map(|(_, _, path)| path)
 }
 
 /// One hwmon/thermal reading: milli-degrees in, degrees out. A
@@ -2586,6 +2709,64 @@ fn read_uptime() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_writes_collapse_into_the_newest() {
+        let mut pending = Vec::new();
+        coalesce_request(&mut pending, AvRequest::Volume(VolumeRequest::Set(20), None));
+        coalesce_request(&mut pending, AvRequest::Volume(VolumeRequest::Set(30), None));
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            &pending[0],
+            AvRequest::Volume(VolumeRequest::Set(30), None)
+        ));
+        // a different absolute kind keeps its own row
+        coalesce_request(&mut pending, AvRequest::BrightnessAbsolute(50, None));
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn relative_steps_sum_and_keep_the_oldest_rollback() {
+        let previous = Some(Volume {
+            percent: 40,
+            muted: false,
+        });
+        let mut pending = Vec::new();
+        coalesce_request(
+            &mut pending,
+            AvRequest::Volume(VolumeRequest::Change(5), previous.clone()),
+        );
+        coalesce_request(
+            &mut pending,
+            AvRequest::Volume(VolumeRequest::Change(5), None),
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            &pending[0],
+            AvRequest::Volume(VolumeRequest::Change(10), prev) if *prev == previous
+        ));
+    }
+
+    #[test]
+    fn toggles_never_collapse_and_streams_coalesce_per_id() {
+        let mut pending = Vec::new();
+        // two queued flips are two state changes
+        coalesce_request(&mut pending, AvRequest::Mic(None));
+        coalesce_request(&mut pending, AvRequest::Mic(None));
+        coalesce_request(&mut pending, AvRequest::StreamMute(7));
+        assert_eq!(pending.len(), 3);
+        // but a stream's volume writes collapse per stream
+        coalesce_request(&mut pending, AvRequest::StreamVolume(1, 50));
+        coalesce_request(&mut pending, AvRequest::StreamVolume(2, 60));
+        coalesce_request(&mut pending, AvRequest::StreamVolume(1, 70));
+        // three toggles plus two per-stream rows (the (1,50) write
+        // collapsed into the (1,70) replacement)
+        assert_eq!(pending.len(), 5);
+        assert!(pending.iter().any(|request| matches!(
+            request,
+            AvRequest::StreamVolume(1, 70)
+        )));
+    }
 
     #[test]
     fn each_pass_gates_on_its_own_consumers() {

@@ -65,6 +65,20 @@ source's wrap points would pin the text to a narrow column.
 
 ### Changed
 
+- The tray went signal-driven: item snapshots ride the item's own SNI
+  update signals (and bus departures reap items as they exit) instead
+  of a 2s property re-poll of every item, with a 60s heartbeat sweep
+  standing behind the signals as the silent-item fallback. A pixmap
+  whose bytes hash to the tile the last read already converted is no
+  longer re-converted per read.
+- Smaller per-render and per-pass costs from the same audit: a slider
+  drag against a wedged PipeWire coalesces the queued audio writes
+  into the newest value instead of replaying every intermediate one,
+  the CPU temperature sensor is resolved once and re-probed only when
+  it stops answering, the wallpaper view resolves its path once per
+  settings change instead of statting per render (its per-render logs
+  demoted to debug), and the bar borrows each section's widget list
+  instead of cloning it per render.
 - The shell's network state (online, connected device, ssid, wifi
   radio) rides NetworkManager's own D-Bus signals instead of
   spawning nmcli three times every two seconds: the watcher listens

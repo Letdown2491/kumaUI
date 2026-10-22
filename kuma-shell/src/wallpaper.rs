@@ -8,15 +8,24 @@ use std::time::{Duration, Instant};
 
 pub struct WallpaperView {
     settings: Entity<Settings>,
+    /// The wallpaper to show, resolved once per settings change: a
+    /// render must not stat the folder looking for it.
+    wanted: PathBuf,
     image: Option<Arc<RenderImage>>,
     shown: Option<PathBuf>,
 }
 
 impl WallpaperView {
     pub fn new(settings: Entity<Settings>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&settings, |_, _, cx| cx.notify()).detach();
+        let wanted = settings.read(cx).background.current_path();
+        cx.observe(&settings, |this, _, cx| {
+            this.wanted = this.settings.read(cx).background.current_path();
+            cx.notify();
+        })
+        .detach();
         Self {
             settings,
+            wanted,
             image: None,
             shown: None,
         }
@@ -70,8 +79,8 @@ pub fn run(settings: &Entity<Settings>, cx: &mut App) {
 
 impl Render for WallpaperView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let wanted = self.settings.read(cx).background.current_path();
-        log::info!(
+        let wanted = self.wanted.clone();
+        log::debug!(
             "wallpaper render: want={wanted:?} have_image={}",
             self.image.is_some()
         );
@@ -83,9 +92,9 @@ impl Render for WallpaperView {
             cx.spawn(async move |this, cx| {
                 let image = cx
                     .background_spawn(async move {
-                        log::info!("wallpaper decode start: {wanted:?}");
+                        log::debug!("wallpaper decode start: {wanted:?}");
                         let image = crate::imaging::decode_file(&wanted).map(Arc::new);
-                        log::info!("wallpaper decoded: {}", image.is_some());
+                        log::debug!("wallpaper decoded: {}", image.is_some());
                         image
                     })
                     .await;

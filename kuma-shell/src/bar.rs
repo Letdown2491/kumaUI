@@ -391,10 +391,13 @@ fn sysmon_tooltip(
 pub use crate::panel_kit::text_tooltip;
 
 impl ShellBar {
-    fn render_section(&self, section: Section, cx: &mut Context<Self>, tooltips_on: bool) -> Div {
-        let widgets: Vec<WidgetConfig> = self.settings.read(cx).widgets(section).to_vec();
+    fn render_section(&self, section: Section, cx: &Context<Self>, tooltips_on: bool) -> Div {
+        // the settings' own slice, borrowed: the widgets clone was a
+        // per-render copy of a Vec that never changed between frames
+        let settings = self.settings.read(cx);
         div().flex().flex_row().items_center().gap_1p5().children(
-            widgets
+            settings
+                .widgets(section)
                 .iter()
                 .filter_map(|widget| self.render_widget(widget, cx, tooltips_on)),
         )
@@ -405,7 +408,7 @@ impl ShellBar {
     fn render_widget(
         &self,
         widget: &WidgetConfig,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
         tooltips_on: bool,
     ) -> Option<AnyElement> {
         let niri = self.niri.read(cx);
@@ -1279,7 +1282,7 @@ impl ShellBar {
     fn render_custom(
         &self,
         widget: &WidgetConfig,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
         tooltips_on: bool,
     ) -> Option<AnyElement> {
         let id = widget.kind.custom()?.to_string();
@@ -1371,7 +1374,7 @@ impl ShellBar {
 /// One tray item: its icon, tooltip, and click-through to dbus Activate.
 fn tray_icon(
     item: &crate::tray::TrayItem,
-    cx: &mut Context<ShellBar>,
+    cx: &Context<ShellBar>,
     tooltips_on: bool,
 ) -> gpui::Stateful<Div> {
     let service = item.service.clone();
@@ -1512,7 +1515,7 @@ fn sys_widget(
 
 fn workspaces_widget(
     items: &[WorkspaceItem],
-    cx: &mut Context<ShellBar>,
+    cx: &Context<ShellBar>,
     tooltips_on: bool,
 ) -> Div {
     div()
@@ -1589,7 +1592,7 @@ fn window_title_widget(title: &str, tooltips_on: bool) -> gpui::Stateful<Div> {
 
 fn recording_indicator(
     rec: &RecordingState,
-    cx: &mut Context<ShellBar>,
+    cx: &Context<ShellBar>,
     tooltips_on: bool,
 ) -> gpui::Stateful<Div> {
     let mins = rec.elapsed_secs / 60;
@@ -1660,7 +1663,7 @@ fn sharing_state(bar: &ShellBar, cx: &App) -> Option<(Vec<Cast>, String)> {
 fn sharing_indicator(
     casts: &[Cast],
     what: &str,
-    cx: &mut Context<ShellBar>,
+    cx: &Context<ShellBar>,
     tooltips_on: bool,
 ) -> gpui::Stateful<Div> {
     // Dedup: one session can carry several streams, and a single stop
@@ -1722,7 +1725,7 @@ fn sharing_indicator(
         )
 }
 
-fn gear_button(cx: &mut Context<ShellBar>, tooltips_on: bool) -> gpui::Stateful<Div> {
+fn gear_button(cx: &Context<ShellBar>, tooltips_on: bool) -> gpui::Stateful<Div> {
     div()
         .id("settings-gear")
         .cursor_pointer()
