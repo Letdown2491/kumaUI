@@ -13645,15 +13645,25 @@ mod browser_ux_keys {
             assert!(vid.playing, "a seek while playing keeps playing");
         });
         // the landing: the first frame of the new generation ends the
-        // scrub; everything the ring held before it drops unheard
+        // scrub; everything the ring held before it drops unheard.
+        // The decode thread needs wall-clock time even as the test
+        // clock runs virtual frames: without the sleep, a busy test
+        // machine burns the whole budget before the frame arrives
         let mut landed = false;
         for _ in 0..200 {
             window.update(|browser, _, cx| {
                 videopane::pump(browser, cx);
-                if let Some(vid) = browser.ql_video.as_ref()
-                    && vid.seeking.is_none()
-                    && vid.frame.as_ref().is_some_and(|(_, pts)| *pts > 0.35)
-                {
+                let landed_here = browser.ql_video.as_ref().is_some_and(|vid| {
+                    vid.seeking.is_none()
+                        && vid.frame.as_ref().is_some_and(|(_, pts)| *pts > 0.35)
+                });
+                if landed_here {
+                    // stop the stream the moment the scrub lands: the
+                    // clip has at most a tenth of a second left and
+                    // the audio clock runs on wall time, so the ended
+                    // rest would drop the pane before the absolute
+                    // seek below runs (the once-observed flake)
+                    browser.route_key(&key("space"), cx);
                     landed = true;
                 }
             });
@@ -13662,6 +13672,7 @@ mod browser_ux_keys {
             }
             window.update(|_, window, cx| window.simulate_next_frame(cx));
             app.run_until_parked();
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(landed, "the scrub never landed");
         // the absolute path clamps a decisecond short of the
@@ -13857,6 +13868,8 @@ mod browser_ux_keys {
             assert!(browser.ql_video.is_none(), "the old player must drop");
         });
         app.run_until_parked(); // the fresh player lands
+        // same wall-clock note as the scrub landing above: the replay
+        // frame comes from a real decode thread
         let mut landed = false;
         for _ in 0..200 {
             window.update(|browser, _, cx| {
@@ -13874,6 +13887,7 @@ mod browser_ux_keys {
             }
             window.update(|_, window, cx| window.simulate_next_frame(cx));
             app.run_until_parked();
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(landed, "the replay never landed on its target");
     }
