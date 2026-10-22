@@ -16,10 +16,13 @@ use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::color;
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{RenderableContent, Term, TermMode};
 use alacritty_terminal::tty;
-use alacritty_terminal::vte::ansi::{Processor, Rgb};
+use alacritty_terminal::vte::ansi::{Color, Processor, Rgb};
+use rustc_hash::FxHasher;
+use std::hash::Hasher;
 
 /// The cursor shape rides through the term seam so the view never
 /// touches alacritty directly.
@@ -199,7 +202,7 @@ pub struct SelectSpan {
 /// Input-mode flags (alt screen, bracketed paste) are read on demand
 /// through their accessors: no consumer needs them per frame.
 pub struct Snapshot {
-    pub rows: Vec<Row>,
+    pub rows: Vec<Arc<Row>>,
     pub cursor: Option<CursorSpot>,
     /// how far the viewport is scrolled back into history (0 = live)
     pub display_offset: usize,
@@ -565,6 +568,21 @@ pub struct Engine {
     /// how the current selection started, so the snapshot projects its
     /// spans the way the gesture expects (a line select fills whole rows)
     selection_mode: Option<SelectMode>,
+    /// The last snapshot's line decode: per viewport row, the raw-grid
+    /// hash the decode answered to and the Arc it landed in. A line
+    /// whose hash repeats hands back the same Arc undecoded, so a
+    /// stream that moves one line decodes one line, not the screen.
+    /// Cleared on theme changes and resize; every other decode input
+    /// (cells, flags, raw colors, dynamic color overrides, the block
+    /// cursor's bake facts) rides the line's hash itself.
+    line_cache: Vec<CachedLine>,
+}
+
+/// One viewport row's cached decode: the hash of everything the line's
+/// decode reads, and the decoded row behind that hash.
+struct CachedLine {
+    hash: u64,
+    row: Arc<Row>,
 }
 
 impl Engine {
@@ -662,6 +680,7 @@ impl Engine {
             window_size,
             theme,
             selection_mode: None,
+            line_cache: Vec::new(),
         })
     }
 
@@ -669,6 +688,9 @@ impl Engine {
     /// snapshot picks it up.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+        // theme colors ride every line's decode: the cache's hashes
+        // speak for the old palette, so the whole decode starts over
+        self.line_cache.clear();
     }
 
     /// Queue bytes for the PTY (user input, query replies). The write
@@ -840,10 +862,12 @@ impl Engine {
     pub fn row_cells(&self, row: usize) -> Option<Vec<RenderCell>> {
         let term = self.term.lock();
         let content = term.renderable_content();
-        let mut rows: Vec<Row> = (0..term.screen_lines())
-            .map(|_| Row { cells: Vec::new() })
-            .collect();
-        fill_rows(&self.theme, content, &mut rows, Some(row));
+        let lines = term.screen_lines();
+        let mut rows: Vec<Row> =
+            (0..lines).map(|_| Row { cells: Vec::new() }).collect();
+        let mut mask = vec![false; lines];
+        mask[row] = true;
+        fill_rows(&self.theme, content, &mut rows, Some(&mask));
         rows.into_iter().nth(row).map(|row| row.cells)
     }
 
@@ -852,50 +876,146 @@ impl Engine {
     /// `cursor_visible` says whether a blinking style is in its lit
     /// phase right now (the view folds in focus and typing); the block
     /// bakes its colors into the cell only when it would paint.
-    pub fn snapshot(&self, cursor_visible: bool) -> Snapshot {
+    ///
+    /// Damage tracked per viewport row: a raw-cell hash pass decides
+    /// which lines changed since the last snapshot, and only those
+    /// decode. An unchanged line hands back the same `Arc<Row>` it
+    /// handed out before, so a stream that moves one line pays one
+    /// decode, not the screen's.
+    pub fn snapshot(&mut self, cursor_visible: bool) -> Snapshot {
         let term = self.term.lock();
         let content = term.renderable_content();
         let offset = content.display_offset;
         let screen_lines = term.screen_lines();
         let columns = term.columns();
 
-        let mut rows: Vec<Row> = Vec::with_capacity(screen_lines);
-        for _ in 0..screen_lines {
-            rows.push(Row { cells: Vec::with_capacity(columns) });
-        }
-
-        // the cursor: decided before the cell walk, baked after it
-        // (the bake below lands on the filled cells; before the walk
-        // the rows are empty, there is nothing to restyle yet). The
-        // block restyles the cell under it (cursor color behind, the
-        // theme's cursor text on the glyph); the bar, underline, and
-        // hollow shapes paint as overlays in the view so the cell's
-        // own colors survive. The spot carries the shape and blink
-        // flag either way, so the view can paint the overlays and
-        // gate them on the blink phase.
+        // the cursor: decided before any decode, so the block's bake
+        // facts can ride the one line they restyle. The block restyles
+        // the cell under it (cursor color behind, the theme's cursor
+        // text on the glyph); the bar, underline, and hollow shapes
+        // paint as overlays in the view so the cell's own colors
+        // survive. With the line cache the bake lands inside the
+        // decode of the line that carries the cursor: that line's
+        // hash folds the bake's inputs in, so a stable cursor line's
+        // Arc is already baked from the frame that decoded it, and a
+        // moved or blinked cursor re-decodes exactly that line
         let cursor = if offset == 0 {
             cursor_spot(&term, &content)
         } else {
             None
         };
 
-        fill_rows(&self.theme, content, &mut rows, None);
-        // the block's bake lands on the filled cells; a ragged row (a
-        // renderer seam that ever yields one) skips the bake instead of
-        // panicking the paint
-        if let Some(spot) = &cursor {
-            if cursor_visible && spot.shape == CursorShape::Block {
-                if let Some(cell) = rows
-                    .get_mut(spot.row)
-                    .and_then(|row| row.cells.get_mut(spot.col))
+        // a line count that moved (a resize) is a new grid wholesale:
+        // the cache starts over, every line decoding once
+        if self.line_cache.len() != screen_lines {
+            self.line_cache.clear();
+            self.line_cache.resize_with(screen_lines, || CachedLine {
+                // a sentinel no frame's hash matches: the first
+                // snapshot after a resize decodes every line
+                hash: u64::MAX,
+                row: Arc::new(Row { cells: Vec::new() }),
+            });
+        }
+
+        // the dynamic-color overrides ride every line's decode (raw
+        // Named and Indexed colors resolve through them), so they
+        // fold into every line's hash as one per-frame seed
+        let mut seeder = FxHasher::default();
+        for index in 0..color::COUNT {
+            if let Some(rgb) = &content.colors[index] {
+                seeder.write_u8(index as u8);
+                seeder.write_u8(rgb.r);
+                seeder.write_u8(rgb.g);
+                seeder.write_u8(rgb.b);
+            }
+        }
+        let colors_seed = seeder.finish();
+
+        // pass one: the raw cells hash per viewport row, nothing
+        // decodes. Everything fill_rows reads lands here: the char,
+        // the flags (INVERSE, HIDDEN, DIM, the width flags, the
+        // styles), the raw colors it resolves, the per-frame color
+        // seed, and, on the line the block cursor would bake onto,
+        // the bake's own inputs
+        let mut hashes: Vec<u64> = vec![0; screen_lines];
+        {
+            let mut hashers: Vec<FxHasher> =
+                (0..screen_lines).map(|_| FxHasher::default()).collect();
+            for indexed in content.display_iter {
+                let viewport_row = indexed.point.line.0 + offset as i32;
+                if viewport_row < 0 {
+                    continue;
+                }
+                let viewport_row = viewport_row as usize;
+                if viewport_row >= screen_lines {
+                    continue;
+                }
+                let hasher = &mut hashers[viewport_row];
+                let cell = indexed.cell;
+                hasher.write_u32(cell.c as u32);
+                hasher.write_u16(cell.flags.bits());
+                hash_color(hasher, cell.fg);
+                hash_color(hasher, cell.bg);
+            }
+            for (row, hasher) in hashers.into_iter().enumerate() {
+                let mut hasher = hasher;
+                hasher.write_u64(colors_seed);
+                if let Some(spot) = &cursor
+                    && spot.row == row
+                {
+                    hasher.write_u8(cursor_visible as u8);
+                    hasher.write_usize(spot.col);
+                    hasher.write_u8(match spot.shape {
+                        CursorShape::Block => 0,
+                        CursorShape::Beam => 1,
+                        CursorShape::Underline => 2,
+                        CursorShape::HollowBlock => 3,
+                        CursorShape::Hidden => 4,
+                    });
+                }
+                hashes[row] = hasher.finish();
+            }
+        }
+
+        // pass two: the changed lines decode into scratch rows and
+        // move into the cache; the rest keep their Arcs
+        let changed: Vec<bool> = self
+            .line_cache
+            .iter()
+            .zip(&hashes)
+            .map(|(line, hash)| line.hash != *hash)
+            .collect();
+        if changed.iter().any(|changed| *changed) {
+            // the first pass moved its iterator: a fresh one for the
+            // decode pass, over the same locked grid
+            let content = term.renderable_content();
+            let mut rows: Vec<Row> =
+                (0..screen_lines).map(|_| Row { cells: Vec::new() }).collect();
+            fill_rows(&self.theme, content, &mut rows, Some(&changed));
+            for (row, changed_line) in changed.iter().enumerate() {
+                if !changed_line {
+                    continue;
+                }
+                if let Some(spot) = &cursor
+                    && spot.row == row
+                    && cursor_visible
+                    && spot.shape == CursorShape::Block
+                    && let Some(cell) = rows[row].cells.get_mut(spot.col)
                 {
                     // cursor color behind, the theme's cursor text color
                     // for the glyph, regardless of what the cell wore
                     cell.bg = self.theme.cursor;
                     cell.fg = self.theme.cursor_text;
                 }
+                self.line_cache[row] = CachedLine {
+                    hash: hashes[row],
+                    row: Arc::new(std::mem::take(&mut rows[row])),
+                };
             }
         }
+
+        let rows: Vec<Arc<Row>> =
+            self.line_cache.iter().map(|line| line.row.clone()).collect();
 
         // the active selection, as viewport row spans for the renderer
         let selection = match (&term.selection, self.selection_mode) {
@@ -921,6 +1041,28 @@ impl Engine {
     }
 }
 
+/// Hash one raw cell color: the discriminant plus the payload, so a
+/// Named hue, a truecolor Spec, and an Indexed palette slot never
+/// collide into one hash.
+fn hash_color(hasher: &mut FxHasher, color: Color) {
+    match color {
+        Color::Named(named) => {
+            hasher.write_u8(0);
+            hasher.write_u8(named as u8);
+        }
+        Color::Spec(rgb) => {
+            hasher.write_u8(1);
+            hasher.write_u8(rgb.r);
+            hasher.write_u8(rgb.g);
+            hasher.write_u8(rgb.b);
+        }
+        Color::Indexed(index) => {
+            hasher.write_u8(2);
+            hasher.write_u8(index);
+        }
+    }
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         // The pty's drop sends SIGHUP and then blocks in wait() until
@@ -941,14 +1083,15 @@ impl Drop for Engine {
 /// The visible-grid cell walk behind `snapshot` and `row_cells`: decodes
 /// each grid cell into a viewport `RenderCell` (INVERSE swaps, HIDDEN
 /// blanks, DIM dims, wide-char spacers as blank two-wide slots).
-/// `only_row` decodes just that viewport row's cells and leaves the other
+/// `only_rows` decodes just the masked viewport rows' cells and leaves
+/// the other
 /// rows empty: the URL hover reads one row per mouse move and has no
 /// business materializing the whole frame.
 fn fill_rows(
     theme: &Theme,
     content: RenderableContent,
     rows: &mut [Row],
-    only_row: Option<usize>,
+    only_rows: Option<&[bool]>,
 ) {
     let offset = content.display_offset;
     for indexed in content.display_iter {
@@ -956,8 +1099,8 @@ fn fill_rows(
         if viewport_row < 0 || viewport_row as usize >= rows.len() {
             continue;
         }
-        if let Some(only_row) = only_row
-            && viewport_row != only_row as i32
+        if let Some(mask) = only_rows
+            && !mask[viewport_row as usize]
         {
             continue;
         }
@@ -1142,7 +1285,9 @@ mod tests {
         // only the targeted viewport row decodes; the others stay empty
         let content = term.renderable_content();
         let mut rows: Vec<Row> = (0..3).map(|_| Row { cells: Vec::new() }).collect();
-        fill_rows(&theme, content, &mut rows, Some(1));
+        let mut mask = vec![false; 3];
+        mask[1] = true;
+        fill_rows(&theme, content, &mut rows, Some(&mask));
         assert!(rows[0].cells.is_empty());
         assert!(rows[1].cells.iter().any(|c| c.c == 'r'));
         assert!(rows[2].cells.is_empty());
@@ -1158,7 +1303,7 @@ mod tests {
         // the walk never indexes it
         let content = term.renderable_content();
         let mut rows: Vec<Row> = (0..3).map(|_| Row { cells: Vec::new() }).collect();
-        fill_rows(&theme, content, &mut rows, Some(5));
+        fill_rows(&theme, content, &mut rows, Some(&[false; 3]));
         assert!(rows.iter().all(|row| row.cells.is_empty()));
     }
 
@@ -1615,5 +1760,112 @@ mod tests {
         assert!(!saw_hook, "the env hook leaked past an explicit -e");
         assert!(saw_exit, "pump never reported the child exit");
         engine.resize(19, 4);
+    }
+
+    #[test]
+    fn snapshot_reuses_unchanged_lines_and_decodes_the_rest() {
+        if std::env::var("KUMA_TERM_SKIP_PTY_TEST").is_ok() {
+            return;
+        }
+        let window_size = WindowSize {
+            num_cols: 20,
+            num_lines: 5,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        // the lock keeps the other engine tests from spawning beside
+        // this one (three live PTYs race the same shell startup)
+        let _env = crate::PTY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // the command rides the -e argument, not the env hook: the env
+        // var is process-global and would redirect the other engine
+        // tests' shells running beside this one
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+        let mut engine = Engine::new(
+            window_size,
+            crate::theme::Theme::builtin(),
+            tx,
+            Some(vec!["sh".to_string(), "-c".to_string(), "echo one; sleep 30".to_string()]),
+        )
+        .expect("engine");
+
+        // wait for the shell's echo to land on the grid
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match futures::executor::block_on(rx.next()) {
+                Some(UiEvent::Wakeup) => {
+                    if engine.snapshot(true).rows.iter().any(|r| {
+                        r.cells.iter().map(|c| c.c).collect::<String>().contains("one")
+                    }) {
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+
+        // two snapshots over a still grid: every line hands back the
+        // Arc it handed out before, nothing decodes twice
+        let first = engine.snapshot(true);
+        let second = engine.snapshot(true);
+        assert!(
+            first.rows.iter().zip(&second.rows).all(|(a, b)| Arc::ptr_eq(a, b)),
+            "a still grid must reuse every line"
+        );
+
+        // type at the shell: the grid moves, most of it does not
+        engine.input(b"echo two\r".to_vec());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let third = loop {
+            if std::time::Instant::now() >= deadline {
+                panic!("the echo never reached the grid");
+            }
+            match futures::executor::block_on(rx.next()) {
+                Some(UiEvent::Wakeup) => {
+                    let snap = engine.snapshot(true);
+                    if snap
+                        .rows
+                        .iter()
+                        .any(|r| r.cells.iter().map(|c| c.c).collect::<String>().contains("two"))
+                    {
+                        break snap;
+                    }
+                }
+                Some(_) => {}
+                None => panic!("the pump died mid-test"),
+            }
+        };
+        let reused = third
+            .rows
+            .iter()
+            .zip(&second.rows)
+            .filter(|(a, b)| Arc::ptr_eq(a, b))
+            .count();
+        assert!(
+            reused < third.rows.len(),
+            "a moved grid must re-decode at least one line"
+        );
+        assert!(
+            reused > 0,
+            "a few-lines move must not re-decode the whole screen"
+        );
+
+        // a theme change decodes everything again: the cache's hashes
+        // spoke for the old palette
+        engine.set_theme(crate::theme::Theme::builtin());
+        let fourth = engine.snapshot(true);
+        assert!(
+            !fourth
+                .rows
+                .iter()
+                .zip(&third.rows)
+                .any(|(a, b)| Arc::ptr_eq(a, b)),
+            "a theme change must re-decode the screen"
+        );
+
+        // a resize resets the cache too, and the frame follows the grid
+        engine.resize(19, 4);
+        let fifth = engine.snapshot(true);
+        assert_eq!(fifth.rows.len(), 4);
     }
 }

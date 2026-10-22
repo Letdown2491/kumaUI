@@ -14,6 +14,15 @@ source's wrap points would pin the text to a narrow column.
 
 ## Unreleased
 
+### Changed
+
+- The terminal's snapshot tracks damage per viewport line: only the
+  lines the grid actually moved re-decode (an unchanged line hands the
+  renderer the same row it painted last frame), so a fast-emitting
+  stream pays one line's decode instead of the screen's, and the
+  paint buckets its selection and search washes per row instead of
+  filtering every span against every row.
+
 ### Fixed
 
 - The idle watcher's screen-off blanked monitors only on niri: it

@@ -1297,7 +1297,7 @@ impl Render for TerminalView {
         // facts so the block only restyles its cell when it would paint.
         let focused = window.is_window_active();
         let cursor_visible = focused && (!self.cursor_blinking || self.blink_visible);
-        let snapshot = self.active().engine.snapshot(cursor_visible);
+        let snapshot = self.active_mut().engine.snapshot(cursor_visible);
 
         // a fresh blinking style starts lit, not mid-off
         let blinking_now = snapshot.cursor.as_ref().is_some_and(|spot| spot.blinking);
@@ -2024,7 +2024,7 @@ fn search_view_spans(
     matches: &[SearchMatch],
     current: usize,
     offset: usize,
-    rows: &[Row],
+    rows: &[Arc<Row>],
 ) -> (Vec<SelectSpan>, Vec<SelectSpan>) {
     let screen_lines = rows.len();
     if screen_lines == 0 {
@@ -2113,6 +2113,19 @@ fn search_bar(search: &SearchState, theme: &Theme, family: &gpui::SharedString) 
 /// glyphs as quads, each row's text shaped and painted. No flex layout in
 /// the hot path, and the data is rebuilt from the engine snapshot every
 /// frame.
+/// Bucket a wash's spans per viewport row: the paint walks one row's
+/// bucket instead of filtering every span against every row, which
+/// made a lit screen's paint O(rows x spans).
+fn spans_by_row(spans: &[SelectSpan], rows: usize) -> Vec<Vec<(usize, usize)>> {
+    let mut buckets: Vec<Vec<(usize, usize)>> = vec![Vec::new(); rows];
+    for span in spans {
+        if let Some(bucket) = buckets.get_mut(span.row) {
+            bucket.push((span.start, span.len));
+        }
+    }
+    buckets
+}
+
 struct GridPaint {
     rows: Vec<Arc<RowRender>>,
     font_size: Pixels,
@@ -2141,6 +2154,12 @@ struct GridPaint {
 impl GridPaint {
     fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) {
         let origin = bounds.origin;
+        // the washes bucket per row once, at paint start: filtering
+        // every span against every row made the paint O(rows x spans)
+        // when a selection or a search lit up the screen
+        let selection = spans_by_row(&self.selection, self.rows.len());
+        let search = spans_by_row(&self.search, self.rows.len());
+        let search_current = spans_by_row(&self.search_current, self.rows.len());
         for (iy, row) in self.rows.iter().enumerate() {
             let row_y = origin.y + px(iy as f32 * self.cell_h);
 
@@ -2154,37 +2173,28 @@ impl GridPaint {
             }
 
             // the selection wash sits over cell backgrounds, under text;
-            // only this row's spans, so nothing overdraws per iteration
-            for span in &self.selection {
-                if span.row != iy {
-                    continue;
-                }
+            // this row's bucket only, so nothing overdraws per iteration
+            for &(start, len) in &selection[iy] {
                 let quad_bounds = Bounds::new(
-                    point(origin.x + px(span.start as f32 * self.cell_w), row_y),
-                    size(px(span.len as f32 * self.cell_w), px(self.cell_h)),
+                    point(origin.x + px(start as f32 * self.cell_w), row_y),
+                    size(px(len as f32 * self.cell_w), px(self.cell_h)),
                 );
                 window.paint_quad(fill(quad_bounds, self.selection_color));
             }
 
             // search washes at the same depth: dim over every visible
             // match, strong over the one enter is parked on
-            for span in &self.search {
-                if span.row != iy {
-                    continue;
-                }
+            for &(start, len) in &search[iy] {
                 let quad_bounds = Bounds::new(
-                    point(origin.x + px(span.start as f32 * self.cell_w), row_y),
-                    size(px(span.len as f32 * self.cell_w), px(self.cell_h)),
+                    point(origin.x + px(start as f32 * self.cell_w), row_y),
+                    size(px(len as f32 * self.cell_w), px(self.cell_h)),
                 );
                 window.paint_quad(fill(quad_bounds, self.search_color));
             }
-            for span in &self.search_current {
-                if span.row != iy {
-                    continue;
-                }
+            for &(start, len) in &search_current[iy] {
                 let quad_bounds = Bounds::new(
-                    point(origin.x + px(span.start as f32 * self.cell_w), row_y),
-                    size(px(span.len as f32 * self.cell_w), px(self.cell_h)),
+                    point(origin.x + px(start as f32 * self.cell_w), row_y),
+                    size(px(len as f32 * self.cell_w), px(self.cell_h)),
                 );
                 window.paint_quad(fill(quad_bounds, self.search_current_color));
             }
@@ -2309,6 +2319,22 @@ mod tests {
 
     fn theme() -> Theme {
         Theme::builtin()
+    }
+
+    #[test]
+    fn washes_bucket_per_row_for_the_paint() {
+        let spans = vec![
+            SelectSpan { row: 0, start: 1, len: 2 },
+            SelectSpan { row: 2, start: 0, len: 5 },
+            SelectSpan { row: 0, start: 9, len: 1 },
+            // a span past the bucket count drops: the paint never
+            // indexes a row the frame does not have
+            SelectSpan { row: 9, start: 0, len: 1 },
+        ];
+        let buckets = spans_by_row(&spans, 3);
+        assert_eq!(buckets[0], vec![(1, 2), (9, 1)]);
+        assert!(buckets[1].is_empty());
+        assert_eq!(buckets[2], vec![(0, 5)]);
     }
 
     #[test]
@@ -2480,7 +2506,7 @@ mod tests {
 
     #[test]
     fn search_spans_project_with_display_offset() {
-        let rows: Vec<Row> = (0..3).map(|_| row_of("find me xx")).collect();
+        let rows: Vec<Arc<Row>> = (0..3).map(|_| Arc::new(row_of("find me xx"))).collect();
         let matches = vec![search_hit((-2, 0), (-2, 3)), search_hit((1, 5), (1, 6))];
         // scrolled back two lines: the history match rides up to row 0,
         // the screen match falls off the bottom of the viewport
@@ -2496,9 +2522,9 @@ mod tests {
     #[test]
     fn search_spans_expand_wrapped_matches() {
         let rows = vec![
-            row_of("abcdefghij"),
-            row_of("kl        "),
-            row_of("mn        "),
+            Arc::new(row_of("abcdefghij")),
+            Arc::new(row_of("kl        ")),
+            Arc::new(row_of("mn        ")),
         ];
         let (all, focused) = search_view_spans(&[search_hit((0, 7), (2, 1))], 0, 0, &rows);
         assert!(all.is_empty());
@@ -2519,7 +2545,7 @@ mod tests {
         // a match ending on a wide char grows over its spacer column
         let mut cells = vec![cell('a'), cell('漢'), cell(' '), cell('b')];
         cells[2].spacer = true;
-        let rows = vec![Row { cells }];
+        let rows = vec![Arc::new(Row { cells })];
         let (all, focused) = search_view_spans(&[search_hit((0, 1), (0, 1))], 0, 0, &rows);
         assert!(all.is_empty());
         assert_eq!(focused, vec![SelectSpan { row: 0, start: 1, len: 2 }]);
@@ -2760,7 +2786,7 @@ mod tests {
         let mut landed = false;
         for _ in 0..100 {
             landed = window.update(|view, _, _| {
-                view.active().engine.snapshot(false).rows.iter().any(|r| {
+                view.active_mut().engine.snapshot(false).rows.iter().any(|r| {
                     let text: String = r.cells.iter().map(|c| c.c).collect();
                     text.contains("a.b") && text.contains("axb")
                 })
