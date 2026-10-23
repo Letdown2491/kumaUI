@@ -1,4 +1,6 @@
-use gpui::{Context, Div, Entity, FocusHandle, Render, Window, div, prelude::*, px, rgb, rgba};
+use gpui::{
+    Context, Div, Entity, FocusHandle, Render, SharedString, Window, div, prelude::*, px, rgb, rgba,
+};
 
 use crate::controls;
 use crate::panel_kit as kit;
@@ -299,9 +301,12 @@ impl Render for WifiPanelView {
                 "icons/wifi.svg",
                 "Wi-Fi radio",
                 enabled,
-                move |_, _, cx| {
-                    sysmon_handle
-                        .update(cx, |sysmon, cx| sysmon.request_wifi_toggle(cx));
+                {
+                    let sysmon_handle = sysmon_handle.clone();
+                    move |_, _, cx| {
+                        sysmon_handle
+                            .update(cx, |sysmon, cx| sysmon.request_wifi_toggle(cx));
+                    }
                 },
             ));
 
@@ -313,6 +318,75 @@ impl Render for WifiPanelView {
             ));
             return self.measured(content, window, cx);
         };
+
+        // the VPN section, above the radio's gate: a wired machine (or
+        // one with the radio off) still toggles its tunnel here. One
+        // row per defined connection, the active one named connected.
+        if !network.vpn_defined.is_empty() {
+            let mut rows = Vec::new();
+            for name in &network.vpn_defined {
+                let active = network.vpn.as_deref() == Some(name.as_str());
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("vpn-row-{name}")))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .child(
+                            gpui::svg()
+                                .path("icons/shield.svg")
+                                .size(px(16.))
+                                .text_color(rgb(if active {
+                                    crate::theme::current().accent
+                                } else {
+                                    crate::theme::current().text_dim
+                                })),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(12.5))
+                                .text_color(rgb(crate::theme::current().text))
+                                .truncate()
+                                .child(name.clone()),
+                        )
+                        .when(active, |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(crate::theme::current().text_dim))
+                                    .child("connected"),
+                            )
+                        })
+                        .child(kit::button(
+                            SharedString::from(format!("vpn-toggle-{name}")),
+                            if active { "Disconnect" } else { "Connect" },
+                            None,
+                            if active {
+                                kit::ButtonVariant::Ghost
+                            } else {
+                                kit::ButtonVariant::Primary
+                            },
+                            {
+                                let name = name.clone();
+                                let up = !active;
+                                let sysmon_handle = sysmon_handle.clone();
+                                move |_, _, cx| {
+                                    sysmon_handle.update(cx, |sysmon, cx| {
+                                        sysmon.request_vpn(&name, up, cx)
+                                    })
+                                }
+                            },
+                        )),
+                );
+            }
+            content = content
+                .child(kit::card_title("VPN"))
+                .children(rows);
+        }
 
         if !enabled {
             content = content.child(kit::empty_state(

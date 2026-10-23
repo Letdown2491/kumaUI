@@ -1094,6 +1094,48 @@ impl ShellBar {
                 }))
                 .into_any_element()
             }),
+            WidgetKind::Vpn => {
+                let net = sysmon.network.clone();
+                // the existence gate: no VPN connections defined in
+                // NetworkManager means this widget never renders, not
+                // even as a dim chip
+                let defined = net.as_ref().is_some_and(|net| !net.vpn_defined.is_empty());
+                if !defined {
+                    return None;
+                }
+                let active = net.as_ref().and_then(|net| net.vpn.clone());
+                let lit = active.is_some();
+                Some(
+                    sys_widget(
+                        kind,
+                        widget.mode,
+                        if lit { active } else { Some("off".into()) },
+                        if lit { crate::theme::current().text } else { crate::theme::TEXT_DIM },
+                        move |sysmon: &SysMon, _| match sysmon
+                            .network
+                            .as_ref()
+                            .and_then(|net| net.vpn.clone())
+                        {
+                            Some(name) => format!("VPN: {name}").into(),
+                            None => "VPN: off".into(),
+                        },
+                        widget_icon(kind),
+                        tooltips_on,
+                        self.sysmon.clone(),
+                        None,
+                    )
+                    .cursor_pointer()
+                    .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                        let anchor = f32::from(event.position().x);
+                        crate::panel::toggle_panel_anchored(
+                            crate::panel::PanelKind::Wifi,
+                            anchor,
+                            cx,
+                        )
+                    }))
+                    .into_any_element(),
+                )
+            }
             WidgetKind::Notifications => {
                 let state = self.notifications.read(cx);
                 let unread = state.unread;

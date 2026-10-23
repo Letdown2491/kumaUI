@@ -121,6 +121,8 @@ async fn read_state(connection: &zbus::Connection) -> zbus::Result<NetworkState>
         wifi_enabled,
         access_points: Vec::new(),
         saved: Vec::new(),
+        vpn: None,
+        vpn_defined: Vec::new(),
     };
     let mut probed = Vec::with_capacity(devices.len());
     for path in &devices {
@@ -137,6 +139,28 @@ async fn read_state(connection: &zbus::Connection) -> zbus::Result<NetworkState>
     if let Some(kind) = pick_device(&probed) {
         network.wifi = kind == TYPE_WIFI;
         network.ssid = find_connection_id(connection, &devices, kind).await;
+    }
+    // the active tunnel: an ActiveConnection whose Vpn flag (or
+    // wireguard type) says so. The manager's list, not the devices':
+    // a VPN's backing device's type varies by plugin
+    if let Ok(active_conns) = manager
+        .get_property::<Vec<OwnedObjectPath>>("ActiveConnections")
+        .await
+    {
+        for path in active_conns {
+            let Some(active) = proxy(connection, path.as_str(), ACTIVE).await.ok() else {
+                continue;
+            };
+            let vpn_flag: bool = active.get_property("Vpn").await.unwrap_or(false);
+            let ctype: String = active.get_property("Type").await.unwrap_or_default();
+            if !vpn_flag && ctype != "vpn" && ctype != "wireguard" {
+                continue;
+            }
+            if let Ok(id) = active.get_property::<String>("Id").await {
+                network.vpn = Some(id);
+                break;
+            }
+        }
     }
     Ok(network)
 }
@@ -197,6 +221,9 @@ async fn land(state: &gpui::WeakEntity<SysMon>, cx: &mut gpui::AsyncApp, mut net
     let _ = state.update(cx, |sysmon, cx| {
         if let Some(current) = &sysmon.network {
             network.saved = current.saved.clone();
+            // the defined-VPN list is the poll's read: the watcher has
+            // no cheap road to it, so a landing preserves the last one
+            network.vpn_defined = current.vpn_defined.clone();
             if network.wifi_enabled {
                 network.access_points = current.access_points.clone();
             }

@@ -107,6 +107,14 @@ pub struct NetworkState {
     pub access_points: Vec<AccessPoint>,
     /// The remembered wireless connections, same scan gate.
     pub saved: Vec<String>,
+    /// The active VPN connection's name, when one is up: the bar's
+    /// VPN widget lights on this. The D-Bus watcher reads it off the
+    /// ActiveConnections, the nmcli road off the device status.
+    pub vpn: Option<String>,
+    /// The defined VPN connections (vpn-plugin and wireguard
+    /// profiles): the gate the widget and the panel's VPN section
+    /// read. None defined means the widget does not exist.
+    pub vpn_defined: Vec<String>,
 }
 
 /// One visible access point from `nmcli dev wifi list`.
@@ -1008,6 +1016,44 @@ impl SysMon {
         .detach();
     }
 
+    /// Connect or disconnect one VPN connection by name. Optimistic
+    /// flip with rollback, the wifi toggle's shape: the click reads
+    /// connected before nmcli answers, and a failed bring-up (secrets
+    /// it cannot get, a dead gateway) steps back and lets the next
+    /// poll reconcile. Bring-up is slow on purpose, so the bound is
+    /// generous; a hung nmcli rolls the flip back too.
+    pub fn request_vpn(&mut self, name: &str, up: bool, cx: &mut Context<Self>) {
+        let previous = self.network.clone();
+        if let Some(network) = &mut self.network {
+            network.vpn = if up { Some(name.to_string()) } else { None };
+            cx.notify();
+        }
+        let name = name.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let verb = if up { "up" } else { "down" };
+                    let output =
+                        timed_output("nmcli", &["connection", verb, &name], 90)?;
+                    anyhow::ensure!(
+                        output.status.success(),
+                        "nmcli connection {verb} failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                    Ok(())
+                })
+                .await;
+            if let Err(err) = result {
+                log::error!("vpn toggle failed: {err:#}");
+                let _ = this.update(cx, |sysmon, cx| {
+                    sysmon.network = previous; // rollback; the next poll reconciles
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     /// Toggle Bluetooth power. Optimistic flip with rollback; with no
     /// snapshot, reads live first.
     pub fn request_bluetooth_toggle(&mut self, cx: &mut Context<Self>) {
@@ -1580,7 +1626,7 @@ fn pass_gates(placed: &[WidgetKind], open: &[PanelKind]) -> PassGates {
         profile: widget_placed(&[WidgetKind::PowerProfile])
             || panel_open(PanelKind::PowerProfile)
             || panel_open(PanelKind::Settings),
-        network: widget_placed(&[WidgetKind::Internet])
+        network: widget_placed(&[WidgetKind::Internet, WidgetKind::Vpn])
             || panel_open(PanelKind::Settings)
             || panel_open(PanelKind::Wifi),
         wifi_scan: panel_open(PanelKind::Wifi),
@@ -2016,6 +2062,8 @@ fn read_network(scan_wifi: bool) -> Option<NetworkState> {
         wifi_enabled: read_wifi_radio().unwrap_or(false),
         access_points: Vec::new(),
         saved: Vec::new(),
+        vpn: None,
+        vpn_defined: Vec::new(),
     };
     if let Ok(status) = timed_output(
         "nmcli",
@@ -2025,6 +2073,11 @@ fn read_network(scan_wifi: bool) -> Option<NetworkState> {
     {
         apply_device_status(&mut network, &String::from_utf8_lossy(&status.stdout));
     }
+    // the defined VPNs: one connection-list read per network pass,
+    // the same weight as the device status beside it. The widget's
+    // whole existence rides it (none defined means no widget), so it
+    // is not panel-gated like the AP scan.
+    network.vpn_defined = read_saved_vpn();
     // the AP list and the saved connections ride the panel-open gate:
     // two more nmcli calls, only paid while someone is picking
     if scan_wifi && network.wifi_enabled {
@@ -2080,6 +2133,39 @@ fn read_saved_wifi() -> Vec<String> {
             let fields = split_nmcli_line(line);
             let kind = fields.get(1)?;
             if kind == "802-11-wireless" || kind == "wifi" {
+                fields.into_iter().next()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The defined VPN connections: vpn-plugin and wireguard profiles in
+/// `nmcli -t -f NAME,TYPE connection show`. Names come through the
+/// same unescape as the wifi list. This is the VPN widget's existence
+/// gate: none defined means the widget never renders.
+fn read_saved_vpn() -> Vec<String> {
+    let Ok(output) = timed_output("nmcli", &["-t", "-f", "NAME,TYPE", "connection", "show"], 10)
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_vpn_connections(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pure core of [`read_saved_vpn`]: the connection names whose type
+/// speaks VPN.
+fn parse_vpn_connections(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let fields = split_nmcli_line(line);
+            let kind = fields.get(1)?;
+            if kind == "vpn" || kind == "wireguard" {
                 fields.into_iter().next()
             } else {
                 None
@@ -2168,6 +2254,10 @@ pub fn set_power_profile(profile: PowerProfile) -> anyhow::Result<()> {
 
 // `nmcli -t` device lines: TYPE:STATE:CONNECTION with short type names
 fn apply_device_status(network: &mut NetworkState, output: &str) {
+    // the first connected wifi-or-ethernet device speaks; vpn rows
+    // never decide that and never stop the scan, because a device
+    // list puts the tunnel after the transport it rides
+    let mut decided = false;
     for line in output.lines() {
         // the split goes through the nmcli unescape: a connection
         // named with a literal colon arrives as `\:` and renders
@@ -2176,14 +2266,23 @@ fn apply_device_status(network: &mut NetworkState, output: &str) {
         if fields.len() == 3 && fields[1] == "connected" {
             match fields[0].as_str() {
                 "wifi" | "802-11-wireless" => {
-                    network.wifi = true;
-                    network.ssid = Some(fields[2].clone());
-                    return;
+                    if !decided {
+                        network.wifi = true;
+                        network.ssid = Some(fields[2].clone());
+                        decided = true;
+                    }
                 }
                 "ethernet" | "802-3-ethernet" => {
-                    network.wifi = false;
-                    network.ssid = None;
-                    return;
+                    if !decided {
+                        network.wifi = false;
+                        network.ssid = None;
+                        decided = true;
+                    }
+                }
+                "vpn" | "wireguard" => {
+                    if network.vpn.is_none() {
+                        network.vpn = Some(fields[2].clone());
+                    }
                 }
                 _ => {}
             }
@@ -3086,6 +3185,57 @@ mod tests {
         );
         assert!(!network.wifi);
         assert!(network.ssid.is_none());
+    }
+
+    #[test]
+    fn vpn_rows_land_alongside_the_transport() {
+        // the device list puts the tunnel after the transport it rides:
+        // the old early return would have stopped at the wifi row and
+        // the vpn row after it never landed
+        let mut network = NetworkState::default();
+        apply_device_status(
+            &mut network,
+            "wifi:connected:The Vixen\nvpn:connected:Northwind\nlo:unmanaged:",
+        );
+        assert!(network.wifi);
+        assert_eq!(network.ssid.as_deref(), Some("The Vixen"));
+        assert_eq!(network.vpn.as_deref(), Some("Northwind"));
+
+        // wireguard is a device type of its own; it counts
+        let mut network = NetworkState::default();
+        apply_device_status(
+            &mut network,
+            "ethernet:connected:Wired\nwireguard:connected:wing",
+        );
+        assert!(!network.wifi);
+        assert_eq!(network.vpn.as_deref(), Some("wing"));
+
+        // two tunnels at once: v1 names the first connected one, and
+        // a tunnel that is merely connecting (state not "connected")
+        // is not up
+        let mut network = NetworkState::default();
+        apply_device_status(
+            &mut network,
+            "vpn:connecting (configuring):First\nwireguard:connected:Second",
+        );
+        assert_eq!(network.vpn.as_deref(), Some("Second"));
+        let mut network = NetworkState::default();
+        apply_device_status(
+            &mut network,
+            "vpn:connected:First\nwireguard:connected:Second",
+        );
+        assert_eq!(network.vpn.as_deref(), Some("First"));
+    }
+
+    #[test]
+    fn vpn_connection_lists_parse_names_from_types() {
+        // the existence gate: only vpn-plugin and wireguard profiles
+        // count, an escaped colon rides, empty lines drop
+        let text = "HomeNet:802-11-wireless\nNorthwind:vpn\nwing:wireguard\nVPN\\: Split:vpn\n\nWired:802-3-ethernet\n";
+        assert_eq!(
+            parse_vpn_connections(text),
+            vec!["Northwind", "wing", "VPN: Split"]
+        );
     }
 
     #[test]
