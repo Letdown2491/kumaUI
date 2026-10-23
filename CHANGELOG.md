@@ -6,7 +6,7 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ### Fixed
 
-- kuma-greeter: a failed login shows "wrong username or password" instead of greetd's raw pam text; the technical description goes to the journal.
+- kuma-greeter: a failed login shows a plain card ("wrong username or password"; a lockout and a nologin denial say so) instead of greetd's raw pam text; the technical description goes to the journal.
 - kuma-files: pressing an arrow key in icon view no longer crashes the window when the listing shrank (say, mid cleanup): the horizontal step still counted a partial last row's missing columns and indexed one past the end.
 
 ## v0.6.0 (2026-10-22)

@@ -374,10 +374,36 @@ impl GreeterState {
 /// greetd's failure text is raw pam output, and a wrong username
 /// reads like a system fault (the mzrtin login of 2026-10-23: one
 /// fat-fingered key showed a pam error card and a reboot followed).
-/// The card says one honest line instead; the caller logs the
-/// technical description for diagnosis.
-fn short_auth_failure(_description: &str) -> String {
-    "wrong username or password".to_string()
+/// Cards by shape: the credential shapes (authentication failure,
+/// user unknown, the keyring's user lookup) say one honest line; a
+/// failure naming itself a lockout says so, because blaming the
+/// password invites retries into a deeper lockout; a nologin denial
+/// is the machine declining logins, not the reader's typing. Pam
+/// often reduces a lockout to the same authentication-failure text
+/// as any other denial, and no card can fix that: the journal keeps
+/// the technical description for diagnosis either way.
+fn short_auth_failure(description: &str) -> String {
+    let description = description.to_ascii_lowercase();
+    if description.contains("too many")
+        || description.contains("locked")
+        || description.contains("faillock")
+    {
+        return "account temporarily locked; wait a minute and try again".to_string();
+    }
+    if description.contains("permitted to log in") || description.contains("nologin") {
+        return "sign-in failed: the system is not accepting logins".to_string();
+    }
+    let credential = description.is_empty()
+        || description.contains("auth_err")
+        || description.contains("authentication failure")
+        || description.contains("wrong password")
+        || description.contains("user unknown")
+        || description.contains("user information");
+    if credential {
+        "wrong username or password".to_string()
+    } else {
+        "sign-in failed".to_string()
+    }
 }
 
 // ---------- view ----------
@@ -628,9 +654,9 @@ mod tests {
 
     #[test]
     fn an_auth_failure_card_never_carries_raw_pam_text() {
-        // every failure shape greets the same: a typo'd username and
-        // a wrong password are the same fact to PAM, and neither is
-        // the machine's fault
+        // credential shapes greet the same: a typo'd username and a
+        // wrong password are the same fact to PAM, and neither is the
+        // machine's fault
         for description in [
             "",
             "pam_unix(greetd:auth): authentication failure",
@@ -639,5 +665,25 @@ mod tests {
         ] {
             assert_eq!(short_auth_failure(description), "wrong username or password");
         }
+        // a lockout that names itself is not a wrong password:
+        // blaming the typing invites retries into a deeper lockout
+        for description in [
+            "pam_faillock: too many authentication failures",
+            "account is locked",
+        ] {
+            assert_eq!(
+                short_auth_failure(description),
+                "account temporarily locked; wait a minute and try again"
+            );
+        }
+        // a nologin denial is the machine declining logins
+        assert_eq!(
+            short_auth_failure(
+                "system is booting up; unprivileged users are not permitted to log in"
+            ),
+            "sign-in failed: the system is not accepting logins"
+        );
+        // unrecognised shapes stay generic rather than guess
+        assert_eq!(short_auth_failure("something else entirely"), "sign-in failed");
     }
 }
