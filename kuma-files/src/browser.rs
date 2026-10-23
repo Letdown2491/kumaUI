@@ -327,6 +327,15 @@ enum Source {
     Trash,
     /// Virtual listing backed by ~/.local/share/recently-used.xbel
     Recent,
+    /// One snapshot's copy of the folder the live tree holds at
+    /// `live`: the listing reads `<target>/.snapshots/<id>/…` (the
+    /// road `snapshots::KumaSnapshots::resolve` splices), the entry
+    /// paths point into the store, and the only write back is
+    /// restore-to-live, a copy op. `target` is the declared snapshot
+    /// root and `live` the live folder this view mirrors, both kept on
+    /// the source so the listing, navigation down, and
+    /// restore-to-live need no other lookup.
+    Snapshot { target: PathBuf, live: PathBuf, id: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -349,6 +358,18 @@ impl PartialEq for Source {
             (Source::Dir(a), Source::Dir(b)) => a == b,
             (Source::Trash, Source::Trash) => true,
             (Source::Recent, Source::Recent) => true,
+            (
+                Source::Snapshot {
+                    target: a,
+                    live: b,
+                    id: x,
+                },
+                Source::Snapshot {
+                    target: c,
+                    live: d,
+                    id: y,
+                },
+            ) => a == c && b == d && x == y,
             _ => false,
         }
     }
@@ -364,6 +385,18 @@ impl Source {
                 ),
             Source::Trash => "Trash".into(),
             Source::Recent => "Recent".into(),
+            Source::Snapshot { target: _, live, id } => {
+                let name = live
+                    .file_name()
+                    .map_or_else(
+                        || live.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
+                format!(
+                    "{name} ({})",
+                    crate::snapshots::humanize(id)
+                )
+            }
         }
     }
 }
@@ -1071,6 +1104,16 @@ enum MenuAction {
     Unbookmark(PathBuf),
     /// Drop a file from the recency list.
     Forget,
+    /// Open one snapshot's copy of the current folder: the id names
+    /// the store directory, the target and live folder come from the
+    /// current view.
+    BrowseSnapshot(String),
+    /// Leave the snapshot view, back to the live folder it mirrors.
+    LiveFolder,
+    /// Copy the selection in a snapshot view back over the live tree.
+    /// Collisions go through the conflict dialog, so Replace steps the
+    /// old live file aside and Ctrl+Z brings it back.
+    Restore,
     /// Disconnect a network mount or eject a removable one:
     /// `gio mount -u` on the mount point; the kind picks the verb.
     Unmount(PathBuf, MountKind),
@@ -2007,6 +2050,9 @@ pub(crate) struct Browser {
     titled: Option<PathBuf>,
     watcher: Option<notify::RecommendedWatcher>,
     watched: Option<PathBuf>,
+    /// The snapshot store of the declared target: the toolbar's
+    /// timeline surface reads it, and BrowseSnapshot rides its target.
+    snapshots: crate::snapshots::KumaSnapshots,
     /// Current-name filter, typed straight into the listing.
     filter: String,
     /// Where the icon-grid rubber band started and now sits, in window
@@ -2141,6 +2187,7 @@ impl Browser {
             titled: None,
             watcher: None,
             watched: None,
+            snapshots: crate::snapshots::KumaSnapshots::discover(),
             filter: String::new(),
             rubber_origin: None,
             rubber_current: None,
@@ -3018,6 +3065,98 @@ impl Browser {
         cx.notify();
     }
 
+    /// The toolbar's snapshot surface: a clock between the creation
+    /// buttons and the path bar, present only where the timeline has
+    /// something to say (a live folder with snapshots, or a snapshot
+    /// view already open, where the menu is the way out). The click
+    /// opens a menu of the folder's snapshots, newest first.
+    fn snapshot_toolbar_button(&mut self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let in_snapshot = matches!(&self.tab().source, Source::Snapshot { .. });
+        let has_snapshots = in_snapshot
+            || match self.tab().current_dir() {
+                Some(dir) => !self.snapshots.snapshots_for(dir).is_empty(),
+                None => false,
+            };
+        if !has_snapshots {
+            return None;
+        }
+        Some(
+            div()
+                .id("snapshots")
+                .cursor_pointer()
+                .hover(|this| this.text_color(theme::text()))
+                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                    let position = event.position();
+                    this.open_snapshot_menu(f32::from(position.x), f32::from(position.y), cx);
+                }))
+                .child(
+                    svg()
+                        .path("icons/clock.svg")
+                        .size(px(16.))
+                        .text_color(if in_snapshot {
+                            theme::accent()
+                        } else {
+                            theme::text_dim()
+                        }),
+                ),
+        )
+    }
+
+    /// The strip a snapshot view wears: what moment is being looked
+    /// at, that it cannot change, and the one way out. The shape is
+    /// the search banner's.
+    fn snapshot_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Source::Snapshot { live, id, .. } = &self.tab().source else {
+            return None;
+        };
+        let when = crate::snapshots::humanize(id);
+        let folder = live
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| live.display().to_string());
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_color(theme::border())
+                .bg(theme::row())
+                .child(
+                    svg()
+                        .path("icons/clock.svg")
+                        .size(px(14.))
+                        .text_color(theme::accent()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_dim())
+                        .truncate()
+                        .child(format!(
+                            "Viewing {folder} as it was {when} (read-only)"
+                        )),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("back-to-live")
+                        .px_1()
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .text_color(theme::accent())
+                        .hover(|this| this.text_color(theme::text()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.run_menu_action(MenuAction::LiveFolder, cx)
+                        }))
+                        .child("Back to live"),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The path bar as clickable crumbs: every ancestor is a jump
     /// target, the current segment opens the path editor. A
     /// home-prefixed path renders from ~ onward.
@@ -3465,6 +3604,16 @@ impl Browser {
     /// render, so it stays correct through any navigation path.
     fn arm_watcher(&mut self) {
         let Some(dir) = self.tab().current_dir().map(Path::to_path_buf) else {
+            // a snapshot view (or trash, or recents) has no watchable
+            // folder: drop the old watch so background churn in the
+            // last live folder cannot even queue a rescan the guards
+            // would have to throw away
+            if let Some(old) = self.watched.take()
+                && let Some(watcher) = self.watcher.as_mut()
+                && let Err(err) = watcher.unwatch(&old)
+            {
+                log::error!("unwatch {}: {err}", old.display());
+            }
             return;
         };
         if self.watched.as_ref() == Some(&dir) {
@@ -3940,6 +4089,13 @@ impl Browser {
     }
 
     fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        // a cut whose source is the read-only store can only fail at
+        // paste time; refusing here keeps the clipboard honest
+        if let Source::Snapshot { .. } = &self.tab().source {
+            self.status = "a snapshot is read-only; use Restore".into();
+            cx.notify();
+            return;
+        }
         let paths: Vec<PathBuf> = self
             .tab()
             .entries
@@ -4758,6 +4914,103 @@ impl Browser {
         .detach();
     }
 
+    /// Restore the snapshot view's selection back over the live tree:
+    /// a planned copy per entry, riding the same conflict dialog as
+    /// paste, so a live collision offers Replace (the replace-copy
+    /// steps the old live file aside, and Ctrl+Z walks it back), Keep
+    /// both, or Skip. The snapshot's own copy never moves.
+    fn restore_selection(&mut self, cx: &mut Context<Self>) {
+        let Source::Snapshot { live, .. } = &self.tab().source else {
+            return;
+        };
+        let live = live.clone();
+        let mut ops = Vec::new();
+        let mut conflicts = Vec::new();
+        let mut can_replace_all = true;
+        for entry in self.tab().entries.iter() {
+            if !self.tab().selection.contains(&entry.key) {
+                continue;
+            }
+            let to = live.join(&entry.name);
+            let conflict = to.exists();
+            let can_replace = entry.path.is_file() && to.is_file();
+            can_replace_all &= !conflict || can_replace;
+            ops.push(PlannedOp {
+                kind: OpKind::Copy,
+                from: entry.path.clone(),
+                to,
+                replace: false,
+                state: if conflict {
+                    PlanState::Conflict
+                } else {
+                    PlanState::Ready
+                },
+            });
+            if conflict {
+                conflicts.push(ops.len() - 1);
+            }
+        }
+        if ops.is_empty() {
+            return;
+        }
+        if conflicts.is_empty() {
+            self.enqueue(ops.into_iter().map(PlannedOp::into_op).collect(), cx);
+            self.status = "restored to the live folder".into();
+        } else {
+            self.conflict_dialog = Some(ConflictDialog {
+                ops,
+                conflicts,
+                can_replace_all,
+                ix: 0,
+                apply_all: false,
+                is_cut: false,
+            });
+            self.status = "a file with that name already exists".into();
+        }
+        cx.notify();
+    }
+
+    /// The toolbar's snapshot picker: a menu of the current folder's
+    /// snapshots, newest first, the one being viewed dimmed. Read at
+    /// click time, not render time: the store prunes, and a menu built
+    /// from a stale read would offer ghosts.
+    fn open_snapshot_menu(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let source = self.tab().source.clone();
+        let (live, in_snapshot, current_id) = match &source {
+            Source::Dir(dir) => (Some(dir.clone()), false, None),
+            Source::Snapshot { live, id, .. } => {
+                (Some(live.clone()), true, Some(id.clone()))
+            }
+            _ => (None, false, None),
+        };
+        let Some(live) = live else {
+            return;
+        };
+        let target = match &source {
+            Source::Snapshot { target, .. } => target.clone(),
+            _ => self.snapshots.target.clone(),
+        };
+        let snaps = crate::snapshots::KumaSnapshots { target }
+            .snapshots_for(&live);
+        if snaps.is_empty() {
+            self.status = "no snapshots yet".into();
+            cx.notify();
+            return;
+        }
+        let mut items = Vec::new();
+        if in_snapshot {
+            items.push(MenuItem::new("Live folder (now)", MenuAction::LiveFolder));
+        }
+        for snap in snaps {
+            let dim = current_id.as_deref() == Some(snap.id.as_str());
+            let mut item = MenuItem::new(snap.when, MenuAction::BrowseSnapshot(snap.id));
+            item.dim = dim;
+            items.push(item);
+        }
+        self.open_menu(x, y, items);
+        cx.notify();
+    }
+
     fn paste(&mut self, cx: &mut Context<Self>) {
         let Source::Dir(dest_dir) = self.tab().source.clone() else {
             self.status = "paste goes to a folder; trash has no paste".into();
@@ -4895,6 +5148,13 @@ impl Browser {
     fn trash_selection(&mut self, cx: &mut Context<Self>) {
         if self.tab().source == Source::Trash {
             self.purge_selection(cx);
+            return;
+        }
+        // a snapshot row is a memory, not a file: trash would try to
+        // write into the read-only store. Restore is the way back.
+        if let Source::Snapshot { .. } = &self.tab().source {
+            self.status = "a snapshot is read-only; use Restore".into();
+            cx.notify();
             return;
         }
         let paths: Vec<PathBuf> = self
@@ -5098,6 +5358,11 @@ impl Browser {
     /// Shift+Delete in a directory view: skip the trash entirely. Same
     /// arm-then-confirm pattern as purge, because it is just as final.
     fn delete_selection(&mut self, cx: &mut Context<Self>) {
+        if let Source::Snapshot { .. } = &self.tab().source {
+            self.status = "a snapshot is read-only; use Restore".into();
+            cx.notify();
+            return;
+        }
         let paths: Vec<PathBuf> = self
             .tab()
             .entries
@@ -6128,6 +6393,17 @@ impl Tab {
         let (sort_key, sort_asc) = (self.sort_key, self.sort_asc);
         let entries = match &self.source {
             Source::Dir(dir) => Self::read_dir_listing(dir, show_hidden, sort_key, sort_asc),
+            Source::Snapshot { target, live, id } => {
+                // the store's copy of this folder, read like any other
+                // directory: a snapshot is a plain (read-only) tree to
+                // a listing. A pruned or unresolvable id lists empty,
+                // which is what the folder holds now.
+                let store = crate::snapshots::KumaSnapshots {
+                    target: target.clone(),
+                };
+                let resolved = store.resolve(live, id).unwrap_or_default();
+                Self::read_dir_listing(&resolved, show_hidden, sort_key, sort_asc)
+            }
             Source::Recent => {
                 // the xbel store is the listing, newest first; capped
                 // well below what the store may hold so we do not stat
@@ -6295,7 +6571,11 @@ impl Tab {
     fn current_dir(&self) -> Option<&Path> {
         match &self.source {
             Source::Dir(dir) => Some(dir.as_path()),
-            Source::Trash | Source::Recent => None,
+            // a snapshot's folder is not addressable for writes: the
+            // path bar falls back to the label and the write-shaped
+            // actions (new folder, paste, terminal here) all gate on
+            // this and go quiet
+            Source::Trash | Source::Recent | Source::Snapshot { .. } => None,
         }
     }
 }
@@ -7049,7 +7329,18 @@ impl Browser {
             return;
         }
         if entry.is_dir {
-            self.load_source(Source::Dir(entry.path.clone()), cx);
+            // inside a snapshot, down is more snapshot: the store path
+            // the entry carries maps back to the mirrored live folder,
+            // and the same id reads the next level down
+            let source = match self.tab().source.clone() {
+                Source::Snapshot { target, live, id } => Source::Snapshot {
+                    target,
+                    live: live.join(&entry.name),
+                    id,
+                },
+                _ => Source::Dir(entry.path.clone()),
+            };
+            self.load_source(source, cx);
         } else if crate::viewer::is_openable(&entry.name) {
             // the open surface: kuma-files claims these kinds as the
             // system default, so Enter opens in-process instead of
@@ -7067,8 +7358,13 @@ impl Browser {
                     });
                     self.status = format!("opened {}", entry.name);
                     // freedesktop recency: other file managers and the
-                    // shell read the same store
-                    self.note_recent(&entry.path);
+                    // shell read the same store. A snapshot's interior
+                    // stays out of it: the store prunes, and a recent
+                    // entry that points at a pruned snapshot is dead
+                    // weight in every manager that reads the store
+                    if !matches!(self.tab().source, Source::Snapshot { .. }) {
+                        self.note_recent(&entry.path);
+                    }
                 }
                 Err(err) => {
                     log::error!("xdg-open {}: {err}", entry.path.display());
@@ -7299,6 +7595,8 @@ impl Browser {
                         Self::trash_menu_items()
                     } else if this.tab().source == Source::Recent {
                         Self::recent_menu_items()
+                    } else if let Source::Snapshot { .. } = &this.tab().source {
+                        Self::snapshot_menu_items(entry_is_dir)
                     } else {
                         let bookmarked = Self::dir_is_bookmarked(&menu_key);
                         Self::row_menu_items(
@@ -7632,6 +7930,8 @@ impl Browser {
                         Self::trash_menu_items()
                     } else if this.tab().source == Source::Recent {
                         Self::recent_menu_items()
+                    } else if let Source::Snapshot { .. } = &this.tab().source {
+                        Self::snapshot_menu_items(entry_is_dir)
                     } else {
                         let bookmarked = Self::dir_is_bookmarked(&menu_key);
                         Self::row_menu_items(
@@ -9609,6 +9909,26 @@ impl Browser {
             MenuAction::Forget => self.forget_recent(cx),
             MenuAction::Unmount(path, kind) => self.unmount(path, kind, cx),
             MenuAction::Reconnect(path) => self.reconnect_place(path, cx),
+            MenuAction::BrowseSnapshot(id) => {
+                // the live folder the menu was opened over: the live
+                // view carries it as the dir, a snapshot view as the
+                // mirror, and switching snapshots inside a snapshot
+                // stays on the same mirror
+                let source = match self.tab().source.clone() {
+                    Source::Dir(dir) => Some((self.snapshots.target.clone(), dir)),
+                    Source::Snapshot { target, live, .. } => Some((target, live)),
+                    _ => None,
+                };
+                if let Some((target, live)) = source {
+                    self.load_source(Source::Snapshot { target, live, id }, cx);
+                }
+            }
+            MenuAction::LiveFolder => {
+                if let Source::Snapshot { live, .. } = self.tab().source.clone() {
+                    self.load_source(Source::Dir(live), cx);
+                }
+            }
+            MenuAction::Restore => self.restore_selection(cx),
             MenuAction::AccentPicker => {
                 self.menu = None;
                 self.accent_picker = true;
@@ -9636,6 +9956,8 @@ impl Browser {
             Self::recent_menu_items()
         } else if matches!(self.tab().source, Source::Trash) {
             Self::trash_menu_items()
+        } else if let Source::Snapshot { .. } = &self.tab().source {
+            Self::snapshot_menu_items(entry.is_dir)
         } else {
             let bookmarked = Self::dir_is_bookmarked(&entry.path);
             Self::row_menu_items(
@@ -9722,6 +10044,28 @@ impl Browser {
         ]
     }
 
+    /// A row inside a snapshot: reading is everything, restore is the
+    /// one write, and it lands on the live tree, not the store. No
+    /// rename, trash, delete, cut, compress, or extract: the store is
+    /// read-only, and refusing at the menu keeps the keys honest too
+    /// (trash/delete/rename guard their own roads regardless).
+    fn snapshot_menu_items(is_dir: bool) -> Vec<MenuItem> {
+        let mut items = vec![MenuItem::new("Open", MenuAction::Open)];
+        if !is_dir {
+            items.push(MenuItem::new("Open With…", MenuAction::OpenWith));
+        }
+        items.push(MenuItem::new(
+            "Restore to live folder",
+            MenuAction::Restore,
+        ));
+        items.extend([
+            MenuItem::new("Copy Path", MenuAction::CopyPath),
+            MenuItem::new("Copy URI", MenuAction::CopyUri),
+            MenuItem::new("Properties", MenuAction::Info),
+        ]);
+        items
+    }
+
     fn empty_menu_items(source: &Source) -> Vec<MenuItem> {
         let mut items = Vec::new();
         match source {
@@ -9747,6 +10091,9 @@ impl Browser {
                 MenuItem::new("New File", MenuAction::NewFile),
                 MenuItem::new("Paste", MenuAction::Paste),
             ]),
+            // a snapshot's empty space: nothing to create or paste
+            // into; the sort and hidden toggles below still apply
+            Source::Snapshot { .. } => {}
             Source::Recent => {}
         }
         items.extend([
@@ -10623,6 +10970,7 @@ impl Render for Browser {
                                             .text_color(theme::text_dim()),
                                     ),
                             )
+                            .children(self.snapshot_toolbar_button(cx))
                             .child(if self.path_editing {
                                 div()
                                     .id("path-edit")
@@ -10844,6 +11192,7 @@ impl Render for Browser {
                                 )
                         }),
                     )
+                    .children(self.snapshot_banner(cx))
                     .child({
                         // list flows as rows under sortable headers, icons
                         // as a wrapping grid. Empty space is a dedicated
@@ -14266,6 +14615,199 @@ mod browser_ux_keys {
         });
         let _ = fs::remove_dir_all(dir.parent().unwrap());
         let _ = fs::remove_dir_all(one.parent().unwrap());
+    }
+
+    /// A synthesized snapshot store over one live folder: the target
+    /// root plays /var/home, the store holds one engine-shaped id, and
+    /// the snapshot's copy of Documents carries one file. Standalone
+    /// dirs (not Lab, which seeds its own entries).
+    struct SnapLab {
+        base: PathBuf,
+        live: PathBuf,
+    }
+
+    impl SnapLab {
+        const ID: &str = "2026-08-08T134347";
+
+        fn new(name: &str) -> Self {
+            let base =
+                std::env::temp_dir().join(format!("koguma-snap-ux-{name}-{}", std::process::id()));
+            let live = base.join("home/martin/Documents");
+            let store_doc = base
+                .join(".snapshots")
+                .join(Self::ID)
+                .join("home/martin/Documents");
+            fs::create_dir_all(&live).unwrap();
+            fs::create_dir_all(&store_doc).unwrap();
+            fs::write(store_doc.join("notes.txt"), "snapshot version").unwrap();
+            Self { base, live }
+        }
+
+        fn snapshots(&self) -> crate::snapshots::KumaSnapshots {
+            crate::snapshots::KumaSnapshots {
+                target: self.base.clone(),
+            }
+        }
+    }
+
+    impl Drop for SnapLab {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[test]
+    fn a_snapshot_tab_lists_the_store_copy() {
+        let lab = SnapLab::new("reload");
+        let mut tab = Tab::new(Source::Snapshot {
+            target: lab.base.clone(),
+            live: lab.live.clone(),
+            id: SnapLab::ID.into(),
+        });
+        tab.reload(false);
+        assert_eq!(
+            tab.entries.len(),
+            1,
+            "the listing reads the snapshot, not the live tree"
+        );
+        let entry = &tab.entries[0];
+        assert_eq!(entry.name, "notes.txt");
+        // the entry's road points into the store: opening and copying
+        // read the snapshot's version, never the live one
+        assert!(entry.path.starts_with(lab.base.join(".snapshots")));
+    }
+
+    #[test]
+    fn a_pruned_snapshot_lists_empty_instead_of_failing() {
+        let lab = SnapLab::new("pruned");
+        let mut tab = Tab::new(Source::Snapshot {
+            target: lab.base.clone(),
+            live: lab.live.clone(),
+            id: "2025-01-01T000000".into(),
+        });
+        tab.reload(false);
+        assert!(
+            tab.entries.is_empty(),
+            "an id the store never held is an empty folder, not an error"
+        );
+    }
+
+    #[test]
+    fn restore_copies_back_over_a_missing_live_file() {
+        let lab = SnapLab::new("restore");
+        // the accident restore answers: the live file is gone
+        fs::write(lab.live.join("notes.txt"), "live version").unwrap();
+        fs::remove_file(lab.live.join("notes.txt")).unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.live);
+        window.update(|browser, _, cx| {
+            browser.snapshots = lab.snapshots();
+            browser.load_source(
+                Source::Snapshot {
+                    target: lab.base.clone(),
+                    live: lab.live.clone(),
+                    id: SnapLab::ID.into(),
+                },
+                cx,
+            );
+            browser.route_key(&key("ctrl-a"), cx);
+            browser.restore_selection(cx);
+        });
+        app.run_until_parked();
+        app.advance_clock(std::time::Duration::from_secs(2));
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            assert_eq!(
+                fs::read_to_string(lab.live.join("notes.txt")).unwrap(),
+                "snapshot version",
+                "restore copies the snapshot's version back to the live tree"
+            );
+        });
+    }
+
+    #[test]
+    fn restore_over_a_live_file_asks_first() {
+        let lab = SnapLab::new("restore-conflict");
+        // the live file survived: restoring over it is a data-loss
+        // surface, so the plan must open the conflict dialog rather
+        // than enqueue a silent overwrite
+        fs::write(lab.live.join("notes.txt"), "live version").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.live);
+        window.update(|browser, _, cx| {
+            browser.snapshots = lab.snapshots();
+            browser.load_source(
+                Source::Snapshot {
+                    target: lab.base.clone(),
+                    live: lab.live.clone(),
+                    id: SnapLab::ID.into(),
+                },
+                cx,
+            );
+            browser.route_key(&key("ctrl-a"), cx);
+            browser.restore_selection(cx);
+            assert!(
+                browser.conflict_dialog.is_some(),
+                "a collision goes through the conflict dialog"
+            );
+            // Replace: the replace-copy steps the old live file aside,
+            // so the overwrite is undoable after all
+            browser.conflict_decide(ConflictDecision::Replace, cx);
+        });
+        app.run_until_parked();
+        app.advance_clock(std::time::Duration::from_secs(2));
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            assert_eq!(
+                fs::read_to_string(lab.live.join("notes.txt")).unwrap(),
+                "snapshot version"
+            );
+        });
+    }
+
+    #[test]
+    fn snapshot_rows_refuse_the_destructive_roads() {
+        let lab = SnapLab::new("readonly");
+        fs::write(lab.live.join("notes.txt"), "live version").unwrap();
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        let mut window = open_browser(&mut app, &lab.live);
+        window.update(|browser, _, cx| {
+            browser.snapshots = lab.snapshots();
+            browser.load_source(
+                Source::Snapshot {
+                    target: lab.base.clone(),
+                    live: lab.live.clone(),
+                    id: SnapLab::ID.into(),
+                },
+                cx,
+            );
+            browser.route_key(&key("ctrl-a"), cx);
+            // delete and trash must not touch the read-only store,
+            // however the request arrived (menu, key, gesture)
+            browser.route_key(&key("delete"), cx);
+            browser.route_key(&key("shift-delete"), cx);
+        });
+        app.run_until_parked();
+        window.update(|browser, _, _| {
+            assert_eq!(
+                browser.tab().entries.len(),
+                1,
+                "the snapshot's listing survives the destructive keys"
+            );
+            assert!(
+                browser.tab().source.clone() != Source::Trash,
+                "nothing lands in the trash either"
+            );
+        });
     }
 
     #[test]

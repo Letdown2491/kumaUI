@@ -7,6 +7,7 @@ Entries land with the change they describe; the next tag takes this section as i
 ### Added
 
 - The nostr panel gains a Vault tab: generate or import an identity in the panel (secrets ride stdin, never a command line), export a backup (0600, never overwritten), lock and unlock with the inactivity window on show, and destroy with the dry run's cost quoted and an export offered first.
+- Koguma reads kumaOS's snapshot store: a clock in the toolbar opens the folder's timeline (newest first), a banner says which moment is on show, browsing inside a snapshot is read-only, and "Restore to live folder" copies back over the live tree through the conflict dialog, so the old file steps aside undoably.
 
 ### Fixed
 

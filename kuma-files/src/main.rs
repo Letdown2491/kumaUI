@@ -11,6 +11,7 @@ mod icons;
 mod video;
 mod videopane;
 mod input;
+mod snapshots;
 mod theme;
 mod viewer;
 
