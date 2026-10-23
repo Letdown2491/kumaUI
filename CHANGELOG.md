@@ -4,6 +4,10 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+### Fixed
+
+- kuma-files: pressing an arrow key in icon view no longer crashes the window when the listing shrank (say, mid cleanup): the horizontal step still counted a partial last row's missing columns and indexed one past the end.
+
 ## v0.6.0 (2026-10-22)
 
 kuma-shell 0.6.0

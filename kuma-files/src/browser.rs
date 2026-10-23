@@ -6983,7 +6983,13 @@ impl Browser {
                     if col < 0 || col as usize >= per_line {
                         return;
                     }
-                    (pos / per_line) * per_line + col as usize
+                    let next = (pos / per_line) * per_line + col as usize;
+                    // a partial last row's phantom cells: the column
+                    // exists in the grid's shape but not in the listing
+                    if next >= visible.len() {
+                        return;
+                    }
+                    next
                 } else {
                     (pos as isize + d_row * per_line as isize)
                         .clamp(0, visible.len() as isize - 1) as usize
@@ -14206,6 +14212,60 @@ mod browser_ux_keys {
         window.update(|browser, _, _| {
             assert!(browser.tab().entries.is_empty(), "the listing never emptied");
         });
+    }
+
+    #[test]
+    fn grid_right_arrow_at_a_partial_last_row_stays_put() {
+        // the field report: deleting files shrank the icon grid, and
+        // the right arrow's horizontal step still counted the last
+        // row's missing columns, so the index went one past the
+        // listing's end (three crashes in the journal, each the
+        // instant before a relaunch).
+        let mut app = gpui::TestApp::with_text_system_and_assets(
+            Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
+            Arc::new(icons::Assets),
+        );
+        // 7 entries at 4 per line: the last row holds three, so
+        // right from its middle cell reads a phantom fourth
+        let dir = std::env::temp_dir()
+            .join(format!("koguma-ux-grid-partial-{}", std::process::id()))
+            .join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..7 {
+            fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let mut window = open_browser(&mut app, &dir);
+        window.update(|browser, _, cx| {
+            use crate::browser::ViewMode;
+            browser.tab_mut().view_mode = ViewMode::Icons;
+            browser.jump_cursor(6, cx);
+            browser.move_cursor_grid(1, 0, 4, cx);
+            assert_eq!(
+                browser.tab().cursor,
+                Some(6),
+                "right past a partial row's end must stay put"
+            );
+        });
+        // a one-entry grid's single right arrow was the same crash
+        // at len 1
+        let one = std::env::temp_dir()
+            .join(format!("koguma-ux-grid-single-{}", std::process::id()))
+            .join("dir");
+        fs::create_dir_all(&one).unwrap();
+        fs::write(one.join("only.txt"), "x").unwrap();
+        let mut window = open_browser(&mut app, &one);
+        window.update(|browser, _, cx| {
+            use crate::browser::ViewMode;
+            browser.tab_mut().view_mode = ViewMode::Icons;
+            browser.jump_cursor(0, cx);
+            browser.move_cursor_grid(1, 0, 4, cx);
+            assert_eq!(browser.tab().cursor, Some(0));
+            // left past the row's start was already guarded, but pin it
+            browser.move_cursor_grid(-1, 0, 4, cx);
+            assert_eq!(browser.tab().cursor, Some(0));
+        });
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+        let _ = fs::remove_dir_all(one.parent().unwrap());
     }
 
     #[test]
