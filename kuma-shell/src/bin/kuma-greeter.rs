@@ -352,6 +352,10 @@ impl GreeterState {
                 }
                 Ok(LoginOutcome::AuthFailed(description)) => {
                     this.busy = false;
+                    // the technical text stays out of the card but not
+                    // out of the journal, where a failed-login diagnosis
+                    // needs it
+                    log::info!("greeter: auth failed: {}", description.trim());
                     this.message = Some(short_auth_failure(&description).into());
                     cx.notify();
                 }
@@ -367,15 +371,13 @@ impl GreeterState {
     }
 }
 
-/// PAM's failure text can be long and technical: the greeter shows
-/// greetd's own line, the log gets the context around it.
-fn short_auth_failure(description: &str) -> String {
-    let description = description.trim();
-    if description.is_empty() {
-        "wrong password".to_string()
-    } else {
-        description.to_string()
-    }
+/// greetd's failure text is raw pam output, and a wrong username
+/// reads like a system fault (the mzrtin login of 2026-10-23: one
+/// fat-fingered key showed a pam error card and a reboot followed).
+/// The card says one honest line instead; the caller logs the
+/// technical description for diagnosis.
+fn short_auth_failure(_description: &str) -> String {
+    "wrong username or password".to_string()
 }
 
 // ---------- view ----------
@@ -622,5 +624,20 @@ mod tests {
             "niri-session".to_string(),
             "-V".to_string(),
         ]));
+    }
+
+    #[test]
+    fn an_auth_failure_card_never_carries_raw_pam_text() {
+        // every failure shape greets the same: a typo'd username and
+        // a wrong password are the same fact to PAM, and neither is
+        // the machine's fault
+        for description in [
+            "",
+            "pam_unix(greetd:auth): authentication failure",
+            "pam_authenticate: AUTH_ERR",
+            "error looking up user information",
+        ] {
+            assert_eq!(short_auth_failure(description), "wrong username or password");
+        }
     }
 }
