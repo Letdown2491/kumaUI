@@ -4,6 +4,10 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+### Added
+
+- The nostr panel gains a Vault tab: generate or import an identity in the panel (secrets ride stdin, never a command line), export a backup (0600, never overwritten), lock and unlock with the inactivity window on show, and destroy with the dry run's cost quoted and an export offered first.
+
 ### Fixed
 
 - kuma-greeter: a failed login shows a plain card ("wrong username or password"; a lockout and a nologin denial say so) instead of greetd's raw pam text; the technical description goes to the journal.

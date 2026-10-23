@@ -99,6 +99,9 @@ pub struct InactivityFact {
 }
 
 /// What `status --json` reports about the vault under its `vault` key.
+/// The identity fields (pubkey, relays, connected) are what the Vault
+/// pane's cards show; all default, because older daemons answered
+/// before they existed.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct VaultFact {
     #[serde(default)]
@@ -107,6 +110,13 @@ pub struct VaultFact {
     pub unlocked: bool,
     #[serde(default)]
     pub inactivity: Option<InactivityFact>,
+    /// The identity, as the daemon spells it: an npub.
+    #[serde(default)]
+    pub pubkey: Option<String>,
+    #[serde(default)]
+    pub relays: Vec<String>,
+    #[serde(default)]
+    pub connected: Vec<String>,
 }
 
 /// The signer's shared snapshot: last-known answers from the CLI, the
@@ -182,7 +192,23 @@ impl NostrState {
     /// One act of the panel (approve, deny, revoke, level, rotate),
     /// with the keep-alive riding along and a failed act saying so.
     /// The refresh follows in both cases: the answer moves the lists.
-    pub fn act(&mut self, mut args: Vec<String>, cx: &mut Context<Self>) {
+    pub fn act(&mut self, args: Vec<String>, cx: &mut Context<Self>) {
+        self.act_with_stdin(args, Vec::new(), cx)
+    }
+
+    /// One act whose CLI reads its secrets from stdin, one line per
+    /// answer (import's secret and, for an ncryptsec, its passphrase;
+    /// export's new passphrase). A secret's only road is stdin, never
+    /// argv: a command line lands in shell history and in `ps`, and
+    /// neither forgets. The lines are zeroized once written; a failed
+    /// act says so through the same toast the argv acts use.
+    pub fn act_with_stdin(
+        &mut self,
+        mut args: Vec<String>,
+        mut lines: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        use zeroize::Zeroize;
         self.touch();
         args.insert(0, "kuma-nostr".into());
         let notifications = self.notifications.clone();
@@ -194,12 +220,39 @@ impl NostrState {
             bounded.append(&mut args);
             let output = cx
                 .background_spawn(async move {
-                    Command::new(&bounded[0]).args(&bounded[1..]).output()
+                    use std::io::Write;
+                    use std::process::Stdio;
+                    let mut child = match Command::new(&bounded[0])
+                        .args(&bounded[1..])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                    {
+                        Ok(child) => child,
+                        Err(_) => {
+                            lines.zeroize();
+                            return None;
+                        }
+                    };
+                    if let Some(mut stdin) = child.stdin.take() {
+                        for line in &lines {
+                            let _ = stdin.write_all(line.as_bytes());
+                            let _ = stdin.write_all(b"\n");
+                        }
+                        // the write end must close: the CLI's
+                        // pipe reads end at EOF, not at a count
+                        drop(stdin);
+                    }
+                    // the secrets are on the pipe; the heap copies
+                    // have no reason to outlive the write
+                    lines.zeroize();
+                    child.wait_with_output().ok()
                 })
                 .await;
             let failure = match output {
-                Err(_) => Some("the act could not run".to_string()),
-                Ok(out) if !out.status.success() => {
+                None => Some("the act could not run".to_string()),
+                Some(out) if !out.status.success() => {
                     let said = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
                     let why = if !out.stderr.is_empty() {
                         said(&out.stderr)
@@ -210,7 +263,7 @@ impl NostrState {
                     };
                     Some(why)
                 }
-                Ok(_) => None,
+                Some(_) => None,
             };
             if let Some(why) = failure {
                 notifications.update(cx, |state, cx| {
@@ -524,6 +577,12 @@ mod tests {
         let vault: VaultFact = serde_json::from_value(doc["vault"].clone()).unwrap();
         assert!(vault.exists && vault.unlocked);
         assert!(vault.inactivity.is_none());
+        assert_eq!(vault.pubkey.as_deref(), Some("npub"));
+        assert!(vault.relays.is_empty() && vault.connected.is_empty());
+        // an older daemon's answer carries none of the identity fields
+        let bare: serde_json::Value = serde_json::from_str(r#"{"exists": true}"#).unwrap();
+        let vault: VaultFact = serde_json::from_value(bare).unwrap();
+        assert!(vault.exists && !vault.unlocked && vault.pubkey.is_none());
     }
 
     #[test]

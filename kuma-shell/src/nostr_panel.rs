@@ -15,9 +15,10 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::Local;
 use gpui::{
-    AppContext, ClickEvent, Context, Div, Entity, FontWeight, IntoElement, ObjectFit, Render,
-    SharedString, Window, div, img, prelude::*, px, rgb,
+    AppContext, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, FontWeight, IntoElement,
+    KeyDownEvent, ObjectFit, Render, SharedString, Window, div, img, prelude::*, px, rgb, rgba,
 };
+use zeroize::Zeroize;
 
 use crate::imaging::IconImage;
 use crate::nostr::{self, NostrState, PairedApp, Prompt, VaultFact};
@@ -36,6 +37,7 @@ enum Tab {
     Apps,
     Log,
     Pair,
+    Vault,
 }
 
 impl Tab {
@@ -45,6 +47,7 @@ impl Tab {
             Tab::Apps => "apps",
             Tab::Log => "log",
             Tab::Pair => "pair",
+            Tab::Vault => "vault",
         }
     }
 
@@ -54,6 +57,7 @@ impl Tab {
             "apps" => Some(Tab::Apps),
             "log" => Some(Tab::Log),
             "pair" => Some(Tab::Pair),
+            "vault" => Some(Tab::Vault),
             _ => None,
         }
     }
@@ -64,6 +68,7 @@ impl Tab {
             Tab::Apps => "Paired apps",
             Tab::Log => "Activity",
             Tab::Pair => "Pair",
+            Tab::Vault => "Vault",
         }
     }
 
@@ -73,6 +78,55 @@ impl Tab {
             Tab::Apps => "icons/apps.svg",
             Tab::Log => "icons/history.svg",
             Tab::Pair => "icons/link.svg",
+            Tab::Vault => "icons/shield.svg",
+        }
+    }
+}
+
+/// The Vault tab's form state: the one place the panel holds secret
+/// text, and only while a person is mid-form. Every secret String is
+/// zeroized on drop; a completed or cancelled form leaves no heap
+/// copy behind (the lock screen's discipline; a panel runs beside
+/// everything, where freed heap is still exposure).
+#[derive(PartialEq)]
+enum VaultForm {
+    None,
+    /// Bring an identity: the secret (nsec, hex, mnemonic, or
+    /// ncryptsec) and, when the secret is an ncryptsec, the
+    /// passphrase it was wrapped in. Both ride stdin, one line each.
+    Import {
+        secret: String,
+        passphrase: String,
+        field: usize,
+    },
+    /// Wrap the key under a fresh passphrase and write the backup:
+    /// the phrase (twice, matched here before the CLI sees it) and
+    /// where the file lands.
+    Export {
+        passphrase: String,
+        confirm: String,
+        path: String,
+        field: usize,
+    },
+    /// The destroy card, opened by the dry run's answer.
+    DestroyConfirm { would: String },
+}
+
+impl Drop for VaultForm {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        match self {
+            VaultForm::Import { secret, passphrase, .. } => {
+                secret.zeroize();
+                passphrase.zeroize();
+            }
+            VaultForm::Export {
+                passphrase, confirm, ..
+            } => {
+                passphrase.zeroize();
+                confirm.zeroize();
+            }
+            VaultForm::None | VaultForm::DestroyConfirm { .. } => {}
         }
     }
 }
@@ -99,6 +153,14 @@ pub struct NostrSignerView {
     /// Avatar fetches already started this view's life: a missing
     /// avatar is downloaded once, not once per render.
     downloads: HashSet<String>,
+    /// The Vault tab's mid-form state, secrets and all.
+    form: VaultForm,
+    /// The form's one-line problem (a mismatch, an empty field): shown
+    /// under the fields, cleared on the next keystroke.
+    form_note: Option<&'static str>,
+    /// The keyboard: the form's fields take the typing while a form
+    /// is open; without one nothing in this panel wants keys.
+    focus_handle: FocusHandle,
 }
 
 impl NostrSignerView {
@@ -162,6 +224,9 @@ impl NostrSignerView {
             seen_offer: None,
             avatars: HashMap::new(),
             downloads: HashSet::new(),
+            form: VaultForm::None,
+            form_note: None,
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -394,7 +459,7 @@ impl Render for NostrSignerView {
             .gap_2()
             .w(px(48.))
             .flex_shrink_0()
-            .children([Tab::Asks, Tab::Apps, Tab::Log, Tab::Pair].map(|tab| {
+            .children([Tab::Asks, Tab::Apps, Tab::Log, Tab::Pair, Tab::Vault].map(|tab| {
                 let active = self.tab == tab;
                 let count = (tab == Tab::Asks && !prompts.is_empty()).then_some(prompts.len());
                 kit::rail_tab(
@@ -439,6 +504,7 @@ impl Render for NostrSignerView {
             Tab::Apps => apps_pane(&apps, self, cx),
             Tab::Log => log_pane(&log, &apps),
             Tab::Pair => pair_pane(&vault, &offered_uri, cx),
+            Tab::Vault => vault_pane(vault.as_ref(), self, cx),
         }
         .into_any_element();
 
@@ -462,11 +528,252 @@ impl Render for NostrSignerView {
             .p(px(14.))
             .size_full()
             .min_h_0()
+            // the Vault form's fields take the typing while a form is
+            // open; focus rides the handle, the keys ride the bubble
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.vault_key(event, cx);
+            }))
             .child(rail)
             .child(pane);
 
         crate::panel::chrome(self.geometry, window, cx, content)
     }
+}
+
+// ── the vault form's keyboard and roads ─────────────────────────────
+
+impl Focusable for NostrSignerView {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl NostrSignerView {
+    /// The Vault form's keyboard: the lock screen's handler with more
+    /// than one field. Tab moves between them, Enter submits, and the
+    /// insert rules are the same ones (the character, not the key
+    /// name; paste and kill-line included).
+    fn vault_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.form == VaultForm::None {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "tab" => {
+                self.cycle_field(cx);
+            }
+            "enter" => self.submit_form(cx),
+            "backspace" => {
+                if let Some(field) = self.field_mut() {
+                    field.pop();
+                }
+                self.form_note = None;
+                cx.notify();
+            }
+            "v" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                if let (Some(field), Some(text)) =
+                    (self.field_mut(), crate::paste::pasted_text(cx))
+                {
+                    field.push_str(&text);
+                    self.form_note = None;
+                    cx.notify();
+                }
+            }
+            "u" if keystroke.modifiers.control || keystroke.modifiers.platform => {
+                if let Some(field) = self.field_mut() {
+                    field.clear();
+                    self.form_note = None;
+                    cx.notify();
+                }
+            }
+            _ if !keystroke.modifiers.control
+                && !keystroke.modifiers.alt
+                && !keystroke.modifiers.platform
+                && !keystroke.modifiers.function =>
+            {
+                if let (Some(field), Some(character)) =
+                    (self.field_mut(), keystroke.key_char.as_deref())
+                {
+                    field.push_str(character);
+                    self.form_note = None;
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The field the typing lands in: the form's active one.
+    fn field_mut(&mut self) -> Option<&mut String> {
+        match &mut self.form {
+            VaultForm::Import {
+                secret,
+                passphrase,
+                field,
+            } => Some(if *field == 0 { secret } else { passphrase }),
+            VaultForm::Export {
+                passphrase,
+                confirm,
+                path,
+                field,
+            } => Some(match *field {
+                0 => passphrase,
+                1 => confirm,
+                _ => path,
+            }),
+            VaultForm::None | VaultForm::DestroyConfirm { .. } => None,
+        }
+    }
+
+    fn cycle_field(&mut self, cx: &mut Context<Self>) {
+        match &mut self.form {
+            VaultForm::Import { field, .. } => *field = (*field + 1) % 2,
+            VaultForm::Export { field, .. } => *field = (*field + 1) % 3,
+            VaultForm::None | VaultForm::DestroyConfirm { .. } => return,
+        }
+        cx.notify();
+    }
+
+    /// Enter's road: validate the form the way the CLI would (the
+    /// mismatch, the empty field), then send it. The secrets leave as
+    /// stdin lines and are zeroized inside the transport; the form
+    /// closes either way, the toast says if the act failed.
+    fn submit_form(&mut self, cx: &mut Context<Self>) {
+        match &self.form {
+            VaultForm::Import { .. } => {
+                let VaultForm::Import {
+                    secret, passphrase, ..
+                } = &self.form
+                else {
+                    unreachable!("matched the form above")
+                };
+                let (secret, passphrase) = (secret.clone(), passphrase.clone());
+                if secret.trim().is_empty() {
+                    self.form_note = Some("paste or type the secret to import");
+                    cx.notify();
+                    return;
+                }
+                if secret.starts_with("ncryptsec1") && passphrase.trim().is_empty() {
+                    self.form_note = Some("an ncryptsec needs the passphrase it was wrapped with");
+                    cx.notify();
+                    return;
+                }
+                let lines = import_lines(&secret, &passphrase);
+                let mut secret = secret;
+                let mut passphrase = passphrase;
+                secret.zeroize();
+                passphrase.zeroize();
+                self.form = VaultForm::None;
+                self.nostr.update(cx, |state, cx| {
+                    state.act_with_stdin(vec!["import".into()], lines, cx)
+                });
+            }
+            VaultForm::Export { .. } => {
+                let VaultForm::Export {
+                    passphrase,
+                    confirm,
+                    path,
+                    ..
+                } = &self.form
+                else {
+                    unreachable!("matched the form above")
+                };
+                let (passphrase, confirm, path) =
+                    (passphrase.clone(), confirm.clone(), path.clone());
+                if passphrase.trim().is_empty() {
+                    self.form_note = Some("choose a passphrase for the exported file");
+                    cx.notify();
+                    return;
+                }
+                if passphrase.trim() != confirm.trim() {
+                    self.form_note = Some("the two passphrases do not match");
+                    cx.notify();
+                    return;
+                }
+                if path.trim().is_empty() {
+                    self.form_note = Some("name the file the backup lands in");
+                    cx.notify();
+                    return;
+                }
+                let lines = vec![passphrase.clone()];
+                let mut passphrase = passphrase;
+                let mut confirm = confirm;
+                passphrase.zeroize();
+                confirm.zeroize();
+                self.form = VaultForm::None;
+                self.nostr.update(cx, |state, cx| {
+                    state.act_with_stdin(
+                        vec!["export".into(), "--output".into(), path],
+                        lines,
+                        cx,
+                    )
+                });
+            }
+            // the destroy card confirms by button only: Enter is too
+            // easy a way to cross an unrecoverable line
+            VaultForm::None | VaultForm::DestroyConfirm { .. } => {}
+        }
+    }
+
+    /// The destroy road's first step: the dry run, whose "would" text
+    /// is what the confirm card quotes. A dry run that cannot run
+    /// (daemon wedged, vault already gone) leaves a note instead of a
+    /// card, because a confirm built on an unreadable premise
+    /// confirms nothing.
+    fn dry_destroy(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let would = cx
+                .background_spawn(async move {
+                    let output = kuma_platform::process::timed_output(
+                        "kuma-nostr",
+                        &["destroy", "--json"],
+                        15,
+                    )
+                    .ok()?;
+                    if !output.status.success() {
+                        return None;
+                    }
+                    let doc: serde_json::Value =
+                        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
+                            .ok()?;
+                    doc["would"].as_str().map(str::to_string)
+                })
+                .await;
+            let _ = this.update(cx, |this, _cx| match would {
+                Some(would) => {
+                    this.form = VaultForm::DestroyConfirm { would };
+                }
+                None => {
+                    this.form_note = Some("the dry run could not run; nothing is confirmed yet");
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+/// The import's stdin payload: the secret, and for an ncryptsec the
+/// passphrase it was wrapped in as the second line. The CLI reads a
+/// pipe as one line per answer, so the line count is the contract.
+fn import_lines(secret: &str, passphrase: &str) -> Vec<String> {
+    let mut lines = vec![secret.to_string()];
+    if secret.starts_with("ncryptsec1") {
+        lines.push(passphrase.to_string());
+    }
+    lines
+}
+
+/// The export's suggested landing: a datestamped file in the home
+/// directory. Datestamped, because the CLI never overwrites and a
+/// yesterday's backup by the same name would refuse today's.
+fn export_default_path() -> String {
+    export_path_in(&std::env::var("HOME").unwrap_or_default())
+}
+
+fn export_path_in(home: &str) -> String {
+    let date = Local::now().format("%Y-%m-%d");
+    format!("{home}/kuma-nostr-{date}.ncryptsec")
 }
 
 // ── the panes ────────────────────────────────────────────────────────
@@ -1038,9 +1345,9 @@ fn pair_pane(
         return pair_ready(offered_uri, None, cx);
     };
     if !vault.exists {
-        // The fresh machine: no identity yet, and unlock is not the
-        // road; it fails with "no vault exists" and the person is
-        // stuck. Setup is the road, and it asks which one.
+        // The fresh machine: no identity yet. Setup's roads moved into
+        // the panel (the Vault tab): a fresh key is one act, and an
+        // import is a form whose fields ride stdin.
         return wrap_pane(
             div()
                 .flex()
@@ -1054,9 +1361,8 @@ fn pair_pane(
                         .child("No identity yet."),
                 )
                 .child(div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
-                    "Run kuma-nostr setup; it asks which road: a fresh key, or one you \
-                             already hold (nsec, hex, a recovery phrase, or an ncryptsec and its \
-                             passphrase).",
+                    "Generate a key or import one on the Vault tab; pairing waits on an \
+                             identity.",
                 )),
         );
     }
@@ -1074,9 +1380,8 @@ fn pair_pane(
                         .child("The bunker is locked."),
                 )
                 .child(div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
-                    "Unlock from a terminal: kuma-nostr unlock. The keyring is open in \
-                             this session, so it costs nothing, and the pairing URI comes with \
-                             the unlock.",
+                    "Unlock it on the Vault tab. The keyring is open in this session, so \
+                             it costs nothing, and the pairing URI comes with the unlock.",
                 )),
         );
     }
@@ -1137,6 +1442,583 @@ fn pair_ready(
             ))
     }));
     wrap_pane(pane)
+}
+
+/// The Vault tab: the whole vault's life in one pane, the roads the
+/// CLI held alone before this. The state machine reads off the vault
+/// fact: not yet known (the status has not landed), no vault (setup's
+/// two roads), locked (unlock), unlocked (identity, session, backup,
+/// danger). A mid-form render wins over all of it: the form's card
+/// replaces the body until it is sent or cancelled.
+fn vault_pane(
+    vault: Option<&VaultFact>,
+    view: &mut NostrSignerView,
+    cx: &mut Context<NostrSignerView>,
+) -> gpui::Div {
+    if let Some(note) = view.form_note {
+        return wrap_pane(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2p5()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(crate::theme::URGENT))
+                        .child(note),
+                )
+                .child(cancel_button(view, cx)),
+        );
+    }
+    let Some(vault) = vault else {
+        // the status has not landed this open; the poll brings it
+        return wrap_pane(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(crate::theme::current().text_dim))
+                .child("Reading the vault's state."),
+        );
+    };
+    if !vault.exists {
+        return setup_pane(view, cx);
+    }
+    if !vault.unlocked {
+        return locked_pane(vault, view, cx);
+    }
+    unlocked_pane(vault, view, cx)
+}
+
+/// The fresh machine: setup's two roads live here instead of a
+/// terminal detour. Generate is one act; import opens the form whose
+/// fields ride stdin.
+fn setup_pane(view: &mut NostrSignerView, cx: &mut Context<NostrSignerView>) -> gpui::Div {
+    if let VaultForm::Import { .. } = view.form {
+        return import_form_pane(view, cx);
+    }
+    wrap_pane(
+        div()
+            .flex()
+            .flex_col()
+            .gap_2p5()
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(crate::theme::current().text))
+                    .child("No identity yet."),
+            )
+            .child(
+                div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
+                    "Generate a fresh key, or import one you already hold: an nsec, a hex \
+                     key, a recovery phrase, or an ncryptsec file and its passphrase.",
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(kit::button(
+                        "vault-generate",
+                        "Generate a new identity",
+                        Some("icons/shield.svg"),
+                        ButtonVariant::Primary,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.nostr
+                                .update(cx, |state, cx| state.act(vec!["generate".into()], cx));
+                        }),
+                    ))
+                    .child(kit::button(
+                        "vault-import-open",
+                        "Import one you hold",
+                        None,
+                        ButtonVariant::Ghost,
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.form = VaultForm::Import {
+                                secret: String::new(),
+                                passphrase: String::new(),
+                                field: 0,
+                            };
+                            this.focus_handle.focus(window, cx);
+                            cx.notify();
+                        }),
+                    )),
+            ),
+    )
+}
+
+/// The vault is there and locked: one act gets it back, and the
+/// identity is named so the person knows which vault they hold.
+fn locked_pane(
+    vault: &VaultFact,
+    _view: &mut NostrSignerView,
+    cx: &mut Context<NostrSignerView>,
+) -> gpui::Div {
+    wrap_pane(
+        div()
+            .flex()
+            .flex_col()
+            .gap_2p5()
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(crate::theme::current().text))
+                    .child("The vault is locked."),
+            )
+            .children(vault.pubkey.as_deref().map(|npub| {
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(crate::theme::current().text_dim))
+                    .child(format!("identity {}", nostr::short(npub)))
+            }))
+            .child(
+                div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
+                    "Signing, pairing and export all wait on the unlock. The keyring is open \
+                     in this session, so it costs nothing.",
+                ),
+            )
+            .child(
+                kit::button(
+                    "vault-unlock",
+                    "Unlock",
+                    Some("icons/shield-lock.svg"),
+                    ButtonVariant::Primary,
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.nostr
+                            .update(cx, |state, cx| state.act(vec!["unlock".into()], cx));
+                    }),
+                ),
+            ),
+    )
+}
+
+/// The unlocked vault: the identity, the session with its inactivity
+/// switch, the backup that makes destroy survivable, and the danger
+/// zone that quotes the dry run.
+fn unlocked_pane(
+    vault: &VaultFact,
+    view: &mut NostrSignerView,
+    cx: &mut Context<NostrSignerView>,
+) -> gpui::Div {
+    // a form mid-flight replaces the body: the fields are the pane
+    // until they are sent or cancelled
+    match &view.form {
+        VaultForm::Export { .. } => return export_form_pane(view, cx),
+        VaultForm::DestroyConfirm { .. } => return destroy_confirm_pane(view, cx),
+        _ => {}
+    }
+
+    let identity = kit::card("vault-identity")
+        .child(
+            div()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(crate::theme::current().text))
+                .child("Identity"),
+        )
+        .children(vault.pubkey.as_deref().map(|npub| {
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(crate::theme::current().text_dim))
+                .truncate()
+                .child(npub.to_string())
+        }))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(crate::theme::current().text_dim))
+                .child(format!(
+                    "{} relays configured, {} connected",
+                    vault.relays.len(),
+                    vault.connected.len()
+                )),
+        );
+
+    let session = kit::card("vault-session")
+        .child(
+            div()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(crate::theme::current().text))
+                .child("Session"),
+        )
+        .children(vault.inactivity.as_ref().map(|switch| {
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(crate::theme::current().text_dim))
+                .child(format!(
+                    "self-locks in {}s of its {}s window; this panel being here keeps it alive",
+                    switch.remaining_secs, switch.window_secs
+                ))
+        }))
+        .child(
+            kit::button(
+                "vault-lock",
+                "Lock now",
+                Some("icons/lock.svg"),
+                ButtonVariant::Ghost,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.nostr
+                        .update(cx, |state, cx| state.act(vec!["lock".into()], cx));
+                }),
+            ),
+        );
+
+    let backup = kit::card("vault-backup")
+        .child(
+            div()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(crate::theme::current().text))
+                .child("Backup"),
+        )
+        .child(
+            div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
+                "Wrap the key under a passphrase you choose and write the ncryptsec file. \
+                 The file is created private and never overwritten; importing it back is \
+                 the import road on any machine.",
+            ),
+        )
+        .child(
+            kit::button(
+                "vault-export-open",
+                "Export a backup",
+                Some("icons/download.svg"),
+                ButtonVariant::Primary,
+                cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.form = VaultForm::Export {
+                        passphrase: String::new(),
+                        confirm: String::new(),
+                        path: export_default_path(),
+                        field: 0,
+                    };
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                }),
+            ),
+        );
+
+    let danger = kit::card("vault-danger")
+        .child(
+            div()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(crate::theme::URGENT))
+                .child("Danger zone"),
+        )
+        .child(
+            div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
+                "Delete the vault outright. The key is unrecoverable afterwards; the dry \
+                 run names the cost before anything is asked twice.",
+            ),
+        )
+        .child(
+            kit::button(
+                "vault-destroy-dry",
+                "Destroy the vault",
+                None,
+                ButtonVariant::Destructive,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.dry_destroy(cx);
+                }),
+            ),
+        );
+
+    wrap_pane(
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(identity)
+            .child(session)
+            .child(backup)
+            .child(danger),
+    )
+}
+
+/// The import form: the secret, masked, and the ncryptsec's
+/// passphrase when the secret says it needs one. Both leave through
+/// stdin, one line each; neither ever touches a command line.
+fn import_form_pane(view: &mut NostrSignerView, cx: &mut Context<NostrSignerView>) -> gpui::Div {
+    let VaultForm::Import {
+        secret,
+        passphrase,
+        field,
+    } = &view.form
+    else {
+        unreachable!("the import pane renders the import form")
+    };
+    let is_ncryptsec = secret.starts_with("ncryptsec1");
+    let mut card = kit::card("vault-import-form")
+        .child(
+            div()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(crate::theme::current().text))
+                .child("Import an identity"),
+        )
+        .child(vault_field(
+            "vault-import-secret",
+            secret,
+            field == &0,
+            "nsec, hex key, or recovery phrase (an ncryptsec works too)",
+            true,
+        ))
+        .when(is_ncryptsec, |el| {
+            el.child(vault_field(
+                "vault-import-passphrase",
+                passphrase,
+                field == &1,
+                "the passphrase the ncryptsec was wrapped with",
+                true,
+            ))
+        })
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(crate::theme::current().text_dim))
+                .child("Tab moves between the fields; the secret rides stdin, never a command line."),
+        );
+    card = card.child(
+        div()
+            .flex()
+            .gap_2()
+            .child(kit::button(
+                "vault-import-send",
+                "Import",
+                Some("icons/check.svg"),
+                ButtonVariant::Primary,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.submit_form(cx);
+                }),
+            ))
+            .child(cancel_button(view, cx)),
+    );
+    wrap_pane(div().child(card))
+}
+
+/// The export form: the fresh passphrase twice, the file's road, and
+/// the CLI's honesty carried onto the card (0600 at write, never an
+/// overwrite).
+fn export_form_pane(view: &mut NostrSignerView, cx: &mut Context<NostrSignerView>) -> gpui::Div {
+    let VaultForm::Export {
+        passphrase,
+        confirm,
+        path,
+        field,
+    } = &view.form
+    else {
+        unreachable!("the export pane renders the export form")
+    };
+    let (passphrase, confirm, path, field) =
+        (passphrase.clone(), confirm.clone(), path.clone(), *field);
+    let mut card = kit::card("vault-export-form")
+        .child(
+            div()
+                .text_size(px(12.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(crate::theme::current().text))
+                .child("Export a backup"),
+        )
+        .child(vault_field(
+            "vault-export-passphrase",
+            &passphrase,
+            field == 0,
+            "a passphrase for the file (16+ characters, letters and digits)",
+            true,
+        ))
+        .child(vault_field(
+            "vault-export-confirm",
+            &confirm,
+            field == 1,
+            "the same passphrase again",
+            true,
+        ))
+        .child(vault_field(
+            "vault-export-path",
+            &path,
+            field == 2,
+            "where the backup lands",
+            false,
+        ))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(crate::theme::current().text_dim))
+                .child("The vault must be unlocked to export; the file is created 0600 and an existing file is never overwritten."),
+        );
+    card = card.child(
+        div()
+            .flex()
+            .gap_2()
+            .child(kit::button(
+                "vault-export-send",
+                "Write the backup",
+                Some("icons/check.svg"),
+                ButtonVariant::Primary,
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.submit_form(cx);
+                }),
+            ))
+            .child(cancel_button(view, cx)),
+    );
+    wrap_pane(div().child(card))
+}
+
+/// The destroy card, opened by the dry run: the cost named in the
+/// daemon's own words, the way out (a backup) one click away, and the
+/// unrecoverable button last.
+fn destroy_confirm_pane(view: &mut NostrSignerView, cx: &mut Context<NostrSignerView>) -> gpui::Div {
+    let VaultForm::DestroyConfirm { would } = &view.form else {
+        unreachable!("the destroy pane renders the confirm card")
+    };
+    let would = would.clone();
+    wrap_pane(div().child(
+        kit::card("vault-destroy-confirm")
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(crate::theme::URGENT))
+                    .child("Destroy the vault?"),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(crate::theme::current().text))
+                    .child(would),
+            )
+            .child(
+                div().text_size(px(12.)).text_color(rgb(crate::theme::current().text_dim)).child(
+                    "The key is unrecoverable after this. Every paired app loses the \
+                     signer; nothing brings the identity back except a backup you made.",
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(kit::button(
+                        "vault-destroy-export",
+                        "Export a backup first",
+                        Some("icons/download.svg"),
+                        ButtonVariant::Ghost,
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.form = VaultForm::Export {
+                                passphrase: String::new(),
+                                confirm: String::new(),
+                                path: export_default_path(),
+                                field: 0,
+                            };
+                            this.focus_handle.focus(window, cx);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(cancel_button(view, cx))
+                    .child(kit::button(
+                        "vault-destroy-yes",
+                        "Destroy for good",
+                        None,
+                        ButtonVariant::Destructive,
+                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.form = VaultForm::None;
+                            this.nostr.update(cx, |state, cx| {
+                                state.act(vec!["destroy".into(), "--yes".into()], cx)
+                            });
+                        }),
+                    )),
+            ),
+    ))
+}
+
+fn cancel_button(
+    _view: &mut NostrSignerView,
+    cx: &mut Context<NostrSignerView>,
+) -> gpui::Stateful<Div> {
+    kit::button(
+        "vault-cancel",
+        "Cancel",
+        None,
+        ButtonVariant::Ghost,
+        cx.listener(|this, _: &ClickEvent, _, cx| {
+            this.form = VaultForm::None;
+            this.form_note = None;
+            cx.notify();
+        }),
+    )
+}
+
+/// One form field: the lock screen's masked shape at the panel's
+/// width. `masked` renders dots over the value (the path field is the
+/// exception: a road is not a secret); the outline answers to focus.
+fn vault_field(
+    id: &str,
+    value: &str,
+    focused: bool,
+    placeholder: &str,
+    masked: bool,
+) -> gpui::Stateful<Div> {
+    let shown: SharedString = if value.is_empty() {
+        placeholder.into()
+    } else if masked {
+        "•".repeat(value.chars().count()).into()
+    } else {
+        value.to_string().into()
+    };
+    div()
+        .id(id.to_string())
+        .flex()
+        .items_center()
+        .w_full()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .bg(rgba(crate::theme::current().panel_bg))
+        .border_1()
+        .border_color(rgb(if focused {
+            crate::theme::current().accent
+        } else {
+            crate::theme::current().divider
+        }))
+        .text_size(px(12.5))
+        .text_color(rgb(if value.is_empty() {
+            crate::theme::current().text_dim
+        } else {
+            crate::theme::current().text
+        }))
+        .truncate()
+        .child(shown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_import_pipes_one_line_per_answer_the_cli_reads() {
+        // the nsec road: one line. The ncryptsec road: the secret and
+        // the passphrase it was wrapped in, in that order, because the
+        // CLI's pipe reads answers by position.
+        assert_eq!(import_lines("nsec1abc", ""), vec!["nsec1abc"]);
+        assert_eq!(
+            import_lines("ncryptsec1abc", "lakeCreature"),
+            vec!["ncryptsec1abc", "lakeCreature"]
+        );
+        // a passphrase typed for a plain nsec is dropped, not sent:
+        // the daemon asks nothing on that road
+        assert_eq!(import_lines("nsec1abc", "ignored"), vec!["nsec1abc"]);
+    }
+
+    #[test]
+    fn the_export_path_is_datestamped_in_the_home() {
+        // datestamped so a rerun never lands on yesterday's file: the
+        // CLI refuses an existing target, and a refused backup should
+        // read as a feature, not a fault
+        let path = export_path_in("/var/home/martin");
+        assert!(path.starts_with("/var/home/martin/"));
+        assert!(path.ends_with(".ncryptsec"));
+        assert!(path.contains("kuma-nostr-"));
+    }
 }
 
 fn mint_cli() -> Option<serde_json::Value> {
