@@ -9,6 +9,7 @@ Entries land with the change they describe; the next tag takes this section as i
 - The nostr panel gains a Vault tab: generate or import an identity in the panel (secrets ride stdin, never a command line), export a backup (0600, never overwritten), lock and unlock with the inactivity window on show, and destroy with the dry run's cost quoted and an export offered first.
 - Koguma reads kumaOS's snapshot store: a clock in the toolbar opens the folder's timeline (newest first), a banner says which moment is on show, browsing inside a snapshot is read-only, and "Restore to live folder" copies back over the live tree through the conflict dialog, so the old file steps aside undoably.
 - The bar gains a VPN widget, sibling of Internet: absent when NetworkManager defines no VPN connections, dim when none is up, lit with the connection's name when one is, and the Wi-Fi panel's new VPN section connects and disconnects each defined connection (optimistic flip, rollback on a failed bring-up).
+- The session mirror carries the compositor's keyboard layouts: a bar widget shows the live layout once more than one is configured (hidden otherwise, click cycles), and `kuma-shell msg layout <next|prev|n>` switches it, working even with the shell down; niri and sway both speak.
 
 ### Fixed
 

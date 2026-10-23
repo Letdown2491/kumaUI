@@ -121,6 +121,18 @@ pub enum SessionEvent {
     Casts(Vec<Cast>),
     CastStartedOrChanged(Cast),
     CastStopped(u64),
+    KeyboardLayouts(KeyboardLayouts),
+}
+
+/// The compositor's configured keyboard layouts: the names in their
+/// configured order, and which index is live. The bar's layout widget
+/// reads this; a single layout is nothing to indicate, so it hides.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct KeyboardLayouts {
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub current_idx: usize,
 }
 
 #[derive(Default)]
@@ -129,6 +141,7 @@ pub struct SessionState {
     windows: HashMap<u64, SessionWindow>,
     focused_window: Option<u64>,
     casts: HashMap<u64, Cast>,
+    keyboard_layouts: Option<KeyboardLayouts>,
 }
 
 impl SessionState {
@@ -167,6 +180,12 @@ impl SessionState {
         let mut casts: Vec<Cast> = self.casts.values().cloned().collect();
         casts.sort_by_key(|cast| cast.stream_id);
         casts
+    }
+
+    /// The keyboard layouts the compositor reports: what the bar's
+    /// layout widget reads. None until the adapter's first report.
+    pub fn keyboard_layouts(&self) -> Option<&KeyboardLayouts> {
+        self.keyboard_layouts.as_ref()
     }
 
     pub(crate) fn apply(&mut self, event: SessionEvent) {
@@ -224,6 +243,7 @@ impl SessionState {
             SessionEvent::CastStopped(stream_id) => {
                 self.casts.remove(&stream_id);
             }
+            SessionEvent::KeyboardLayouts(layouts) => self.keyboard_layouts = Some(layouts),
         }
         // transition-only: the mirror's own telemetry, and the smoke's
         // assertion surface. A summary that kept logging would spam
@@ -404,6 +424,37 @@ pub fn power_off_monitors() -> Result<()> {
     )
 }
 
+/// Which layout to switch to: the neutral spelling both adapters
+/// translate. Next and Prev step the configured order; Index is the
+/// 0-based position in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutTarget {
+    Next,
+    Prev,
+    Index(u8),
+}
+
+/// The MSG CLI's layout argument: `next`, `prev`, or a 0-based index.
+/// `layout 2` is the third configured layout.
+pub fn parse_layout_target(argument: &str) -> Option<LayoutTarget> {
+    match argument {
+        "next" => Some(LayoutTarget::Next),
+        "prev" => Some(LayoutTarget::Prev),
+        other => other.parse::<u8>().ok().map(LayoutTarget::Index),
+    }
+}
+
+/// Switch the keyboard layout: the msg verb's road and the bar
+/// widget's click cycle. Speaks to whichever compositor's socket
+/// exists; a session with neither fails here, and the caller decides
+/// how loudly.
+pub fn switch_layout(target: LayoutTarget) -> Result<()> {
+    with_adapter(
+        || crate::niri::switch_layout(target),
+        || crate::sway::switch_layout(target),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +509,40 @@ mod tests {
         state.apply(SessionEvent::Casts(vec![cast(3, 11)]));
         assert_eq!(state.casts().len(), 1);
         assert_eq!(state.casts()[0].session_id, 11);
+    }
+
+    #[test]
+    fn keyboard_layouts_lie_down_on_apply() {
+        let mut state = SessionState::default();
+        assert!(state.keyboard_layouts().is_none());
+        state.apply(SessionEvent::KeyboardLayouts(crate::session::KeyboardLayouts {
+            names: vec!["English (US)".into(), "German".into()],
+            current_idx: 1,
+        }));
+        let layouts = state.keyboard_layouts().unwrap();
+        assert_eq!(layouts.current_idx, 1);
+        // a fresh report replaces the last one whole: the compositor
+        // re-reads its config, the list follows
+        state.apply(SessionEvent::KeyboardLayouts(crate::session::KeyboardLayouts {
+            names: vec!["German".into()],
+            current_idx: 0,
+        }));
+        assert_eq!(state.keyboard_layouts().unwrap().names.len(), 1);
+    }
+
+    #[test]
+    fn the_layout_argument_parses_three_ways() {
+        assert_eq!(
+            parse_layout_target("next"),
+            Some(LayoutTarget::Next)
+        );
+        assert_eq!(parse_layout_target("prev"), Some(LayoutTarget::Prev));
+        assert_eq!(parse_layout_target("2"), Some(LayoutTarget::Index(2)));
+        // a garbage argument is not a target, and neither is a
+        // negative: the indices are unsigned
+        assert_eq!(parse_layout_target("sideways"), None);
+        assert_eq!(parse_layout_target("-1"), None);
+        assert_eq!(parse_layout_target(""), None);
     }
 
     #[test]

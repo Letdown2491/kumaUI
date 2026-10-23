@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use smol::channel::Sender;
 
-use crate::session::{SessionEvent, SessionState, SessionWindow, Workspace};
+use crate::session::{KeyboardLayouts, SessionEvent, SessionState, SessionWindow, Workspace};
 
 const MAGIC: &[u8; 6] = b"i3-ipc";
 /// A ceiling on the payload a length prefix may claim, so a corrupted
@@ -33,8 +33,11 @@ const RUN_COMMAND: u32 = 0;
 const GET_WORKSPACES: u32 = 1;
 const SUBSCRIBE: u32 = 2;
 const GET_TREE: u32 = 4;
+/// i3's input list: the keyboards and their xkb layouts.
+const GET_INPUTS: u32 = 101;
 const EVENT_WORKSPACE: u32 = 0x8000_0000;
 const EVENT_WINDOW: u32 = 0x8000_0003;
+const EVENT_INPUT: u32 = 0x8000_0005;
 
 pub fn connect(state: &Entity<SessionState>, cx: &mut App) {
     crate::session::mirror(state, "sway", cx, run_event_stream);
@@ -169,9 +172,30 @@ fn fetch_windows(ipc: &mut Ipc) -> Result<std::collections::HashMap<u64, Session
         .collect())
 }
 
+/// The keyboard layouts sway knows: the first keyboard input's
+/// configured layout names and the live index. No keyboard in the
+/// reply (a headless seat) is None, and the mirror keeps what it had.
+fn fetch_layouts(ipc: &mut Ipc) -> Result<Option<KeyboardLayouts>> {
+    let reply = ipc.request(GET_INPUTS, b"")?;
+    Ok(inputs_to_layouts(&reply))
+}
+
+/// Pure core of [`fetch_layouts`]: the first keyboard's xkb layouts
+/// out of a GET_INPUTS reply.
+fn inputs_to_layouts(reply: &Value) -> Option<KeyboardLayouts> {
+    let inputs = reply.as_array()?;
+    let keyboard = inputs
+        .iter()
+        .find(|input| input["type"].as_str() == Some("keyboard"))?;
+    Some(KeyboardLayouts {
+        names: serde_json::from_value(keyboard["xkb_layout_names"].clone()).ok()?,
+        current_idx: keyboard["xkb_active_layout_index"].as_u64()? as usize,
+    })
+}
+
 fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
     let mut ipc = Ipc::connect()?;
-    let subscribed = ipc.request(SUBSCRIBE, br#"["workspace","window"]"#)?;
+    let subscribed = ipc.request(SUBSCRIBE, br#"["workspace","window","input"]"#)?;
     if !subscribed["success"].as_bool().unwrap_or(false) {
         bail!("sway rejected the event subscription");
     }
@@ -180,6 +204,11 @@ fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
     // snapshot so a shell starting mid-session sees the session
     event_tx.send_blocking(SessionEvent::Workspaces(fetch_workspaces(&mut ipc)?))?;
     event_tx.send_blocking(SessionEvent::Windows(fetch_windows(&mut ipc)?))?;
+    // the layouts ride the same seed; no keyboard (a headless seat)
+    // leaves the field None, and the layout widget stays hidden
+    if let Some(layouts) = fetch_layouts(&mut ipc)? {
+        event_tx.send_blocking(SessionEvent::KeyboardLayouts(layouts))?;
+    }
 
     loop {
         let (kind, value) = ipc.next_event()?;
@@ -193,6 +222,16 @@ fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
             EVENT_WINDOW => {
                 if let Some(event) = window_event(&value) {
                     event_tx.send_blocking(event)?;
+                }
+            }
+            EVENT_INPUT => {
+                // only the xkb_layout change says anything the widgets
+                // read, and the event's input object is not the whole
+                // truth: refetch, the workspace events' own discipline
+                if value["change"].as_str() == Some("xkb_layout") {
+                    if let Some(layouts) = fetch_layouts(&mut ipc)? {
+                        event_tx.send_blocking(SessionEvent::KeyboardLayouts(layouts))?;
+                    }
                 }
             }
             _ => {}
@@ -357,6 +396,20 @@ pub fn power_off_monitors() -> Result<()> {
     run_command(&mut ipc, "output * power off")
 }
 
+/// Switch the keyboard layout: sway's own next/prev/index spelling.
+pub fn switch_layout(target: crate::session::LayoutTarget) -> Result<()> {
+    let mut ipc = Ipc::connect()?;
+    let argument = match target {
+        crate::session::LayoutTarget::Next => "next".to_string(),
+        crate::session::LayoutTarget::Prev => "prev".to_string(),
+        crate::session::LayoutTarget::Index(index) => index.to_string(),
+    };
+    run_command(
+        &mut ipc,
+        &format!("input type:keyboard xkb_switch_layout {argument}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +497,32 @@ mod tests {
         // the root, output, workspace, and split container are not windows
         assert_eq!(ids, vec![4, 6, 7, 8]);
         assert!(windows.iter().find(|w| w.id == 4).unwrap().is_focused);
+    }
+
+    #[test]
+    fn inputs_reply_names_the_first_keyboard() {
+        // the real GET_INPUTS shape: pointers, keyboards, and the
+        // touchpads in between; the first keyboard's xkb fields speak
+        let reply = json!([
+            {"identifier": "1:1:AT_Translated_Set_2_keyboard", "type": "keyboard",
+             "xkb_active_layout_index": 1,
+             "xkb_active_layout_name": "German",
+             "xkb_layout_names": ["English (US)", "German"]},
+            {"identifier": "2:2:PIXART_USB_OPTICAL_MOUSE", "type": "pointer"}
+        ]);
+        let layouts = inputs_to_layouts(&reply).unwrap();
+        assert_eq!(layouts.names, vec!["English (US)", "German"]);
+        assert_eq!(layouts.current_idx, 1);
+
+        // a pointer before the keyboard does not win: find skips it
+        let reply = json!([
+            {"identifier": "2:2:PIXART", "type": "pointer"},
+            {"identifier": "1:1:AT", "type": "keyboard",
+             "xkb_active_layout_index": 0, "xkb_layout_names": ["English (US)"]}
+        ]);
+        assert_eq!(inputs_to_layouts(&reply).unwrap().names.len(), 1);
+
+        // no keyboard (the displayless smoke's bare seat) is None
+        assert!(inputs_to_layouts(&json!([])).is_none());
     }
 }

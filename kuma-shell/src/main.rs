@@ -316,10 +316,29 @@ fn run_cli(args: &[String]) -> i32 {
             };
             kuma_shell::session::focus_workspace_index(number)
         }
+        // the keyboard layout: `msg layout next|prev|<0-based index>`.
+        // The compositor's own road, the workspace verb's shape: no
+        // shell round trip, a keybind works even mid-restart of the
+        // shell, and the mirror hears of the switch through the
+        // compositor's own event.
+        "layout" => {
+            let Some(argument) = iter.next() else {
+                eprintln!("usage: kuma-shell msg layout <next|prev|0-based layout index>");
+                return 1;
+            };
+            match kuma_shell::session::parse_layout_target(argument) {
+                Some(target) => kuma_shell::session::switch_layout(target),
+                None => {
+                    eprintln!("kuma-shell: unknown layout {argument:?}");
+                    eprintln!("usage: kuma-shell msg layout <next|prev|0-based layout index>");
+                    return 1;
+                }
+            }
+        }
         other => {
             eprintln!("kuma-shell: unknown command {other:?}");
             eprintln!(
-                "usage: kuma-shell [msg] volume-up | volume-down | volume-mute | mute | mic-mute | launcher-toggle | settings | updates | notifications | notifications-dnd | nostr [uri] | media <play-pause|stop|next|previous> | brightness-up [step] | brightness-down [step] | workspace <n>"
+                "usage: kuma-shell [msg] volume-up | volume-down | volume-mute | mute | mic-mute | launcher-toggle | settings | updates | notifications | notifications-dnd | nostr [uri] | media <play-pause|stop|next|previous> | brightness-up [step] | brightness-down [step] | workspace <n> | layout <next|prev|n>"
             );
             return 1;
         }

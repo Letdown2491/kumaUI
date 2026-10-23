@@ -33,6 +33,7 @@ pub enum WidgetKind {
     Bluetooth,
     Internet,
     Vpn,
+    KeyboardLayout,
     Notifications,
     Tray,
     Nostr,
@@ -174,6 +175,12 @@ pub const WIDGETS: &[WidgetSpec] = &[
         kind: WidgetKind::Vpn,
         label: "VPN",
         icon: Some(WidgetIconSpec::Path("icons/shield.svg")),
+        modes: MODES_CHIP,
+    },
+    WidgetSpec {
+        kind: WidgetKind::KeyboardLayout,
+        label: "Keyboard layout",
+        icon: Some(WidgetIconSpec::Path("icons/keyboard.svg")),
         modes: MODES_CHIP,
     },
     WidgetSpec {
@@ -2017,7 +2024,7 @@ kind = \"nostr\"
             WidgetKind::Cpu.icon_spec(),
             Some(WidgetIconSpec::Path("icons/cpu.svg"))
         );
-        assert_eq!(WIDGETS.len(), 22);
+        assert_eq!(WIDGETS.len(), 23);
 
         // every widget's default mode is one its own dial offers, and
         // the dials read as designed: the apps button is icon-only

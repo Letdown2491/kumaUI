@@ -175,6 +175,9 @@ fn parse_event(line: &str) -> Result<Option<SessionEvent>> {
         "CastStopped" => SessionEvent::CastStopped(
             serde_json::from_value::<CastStoppedEvent>(payload.clone())?.stream_id,
         ),
+        "KeyboardLayoutsChanged" => SessionEvent::KeyboardLayouts(serde_json::from_value(
+            payload["keyboard_layouts"].clone(),
+        )?),
         _ => return Ok(None),
     };
     Ok(Some(event))
@@ -222,6 +225,26 @@ pub fn stop_cast(session_id: u64) -> Result<()> {
 /// wakes the outputs at the next input.
 pub fn power_off_monitors() -> Result<()> {
     send_action(json!({"PowerOffMonitors": null}))
+}
+
+/// Switch the keyboard layout: next, prev, or a 0-based index into the
+/// configured list. The wire's struct-variant shape (`{"layout": …}`)
+/// is niri's own serde: a bare `{"SwitchLayout":"Next"}` reads as a
+/// parse error, this does not.
+pub fn switch_layout(target: crate::session::LayoutTarget) -> Result<()> {
+    send_action(switch_layout_action(target))
+}
+
+/// The action's wire value, pure for the test that pins it: the
+/// shape took a live probe to get right, and a future niri must not
+/// take it apart unnoticed.
+fn switch_layout_action(target: crate::session::LayoutTarget) -> Value {
+    let layout = match target {
+        crate::session::LayoutTarget::Next => json!("Next"),
+        crate::session::LayoutTarget::Prev => json!("Prev"),
+        crate::session::LayoutTarget::Index(index) => json!({"Index": index}),
+    };
+    json!({"SwitchLayout": {"layout": layout}})
 }
 
 #[cfg(test)]
@@ -299,6 +322,43 @@ mod tests {
             None
         ));
         assert!(parse_event("not json").is_err());
+    }
+
+    #[test]
+    fn parses_keyboard_layouts_event() {
+        // the real niri 26.04 shape, straight off the event stream:
+        // the layouts ride in a `keyboard_layouts` field, and the
+        // action wire's struct-variant spelling is pinned here so the
+        // next niri cannot silently reshape it
+        let event = parse_event(
+            r#"{"KeyboardLayoutsChanged":{"keyboard_layouts":{"names":["English (US)","German"],"current_idx":1}}}"#,
+        )
+        .unwrap();
+        match event {
+            Some(SessionEvent::KeyboardLayouts(layouts)) => {
+                assert_eq!(layouts.names, vec!["English (US)", "German"]);
+                assert_eq!(layouts.current_idx, 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // the layouts arrive as serde defaults: an event that omits
+        // `names` is an empty list, not an error
+        let event = parse_event(r#"{"KeyboardLayoutsChanged":{"keyboard_layouts":{}}}"#).unwrap();
+        match event {
+            Some(SessionEvent::KeyboardLayouts(layouts)) => assert!(layouts.names.is_empty()),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_switch_layout_action_builds_niris_struct_variant() {
+        // the wire shape this probed out: `SwitchLayout` is a struct
+        // variant in niri's Action enum, so every spelling without the
+        // `layout` field answers {"Err":"error parsing request"}
+        let action = switch_layout_action(crate::session::LayoutTarget::Next);
+        assert_eq!(action, json!({"SwitchLayout": {"layout": "Next"}}));
+        let action = switch_layout_action(crate::session::LayoutTarget::Index(2));
+        assert_eq!(action, json!({"SwitchLayout": {"layout": {"Index": 2}}}));
     }
 
     #[test]

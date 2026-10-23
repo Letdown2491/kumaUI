@@ -445,6 +445,64 @@ impl ShellBar {
                     .unwrap_or_else(|| "kuma".to_string());
                 Some(window_title_widget(&title, tooltips_on).into_any_element())
             }
+            WidgetKind::KeyboardLayout => {
+                // the mirror's layout report: a session with no report,
+                // or with a single layout, has nothing to indicate
+                let layouts = niri
+                    .keyboard_layouts()
+                    .filter(|layouts| layouts.names.len() >= 2)?;
+                let name = layouts
+                    .names
+                    .get(layouts.current_idx)
+                    .cloned()
+                    .unwrap_or_else(|| "layout".into());
+                Some(
+                    div()
+                        .id("widget-keyboard-layout")
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            // the click cycles: the compositor's own
+                            // next is the native model for an ordered
+                            // list, and the tooltip says so
+                            cx.background_spawn(async move {
+                                if let Err(err) = crate::session::switch_layout(
+                                    crate::session::LayoutTarget::Next,
+                                ) {
+                                    error!("switch-layout failed: {err:#}");
+                                }
+                            })
+                            .detach();
+                        }))
+                        .when(tooltips_on, |el| {
+                            el.tooltip(text_tooltip(
+                                format!("Keyboard layout: {name} (click to cycle)").into(),
+                            ))
+                        })
+                        .when(widget.mode != WidgetMode::Text, |el| {
+                            el.child(
+                                svg()
+                                    .path("icons/keyboard.svg")
+                                    .size(px(16.))
+                                    .text_color(rgb(crate::theme::current().text)),
+                            )
+                        })
+                        .when(widget.mode != WidgetMode::Icon, |el| {
+                            el.child(
+                                div()
+                                    .h(px(16.))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(crate::theme::current().text))
+                                    .child(name),
+                            )
+                        })
+                        .into_any_element(),
+                )
+            }
             WidgetKind::Apps => Some(
                 div()
                     .id("widget-apps")
