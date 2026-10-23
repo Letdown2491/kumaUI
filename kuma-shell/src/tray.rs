@@ -316,12 +316,13 @@ async fn poll_item(
     // per-property tolerances: a missing prop is an empty tray item, a
     // failing call is a dead one
     let title = proxy.title().await.unwrap_or_default();
-    if title.is_empty() && proxy.status().await.is_err() {
+    // the liveness probe's answer doubles as the status: an untitled
+    // item pays one round trip for both, not two
+    let status_answer = proxy.status().await;
+    if title.is_empty() && status_answer.is_err() {
         return None; // unresponsive and untitled: dead
     }
-    let status = proxy
-        .status()
-        .await
+    let status = status_answer
         .map(|s| TrayItem::parse_status(&s))
         .unwrap_or_default();
     let icon_name = proxy.icon_name().await.unwrap_or_default();

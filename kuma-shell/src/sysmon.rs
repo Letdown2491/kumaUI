@@ -1164,7 +1164,10 @@ async fn self_scan(this: gpui::WeakEntity<SysMon>, cx: &mut gpui::AsyncApp) {
         .background_spawn(async move {
             let mut network = NetworkState::default();
             network.access_points = read_access_points();
-            network.saved = read_saved_wifi();
+            network.saved = read_connection_list()
+                .as_deref()
+                .map(parse_saved_wifi)
+                .unwrap_or_default();
             for point in &mut network.access_points {
                 point.known = network.saved.contains(&point.ssid);
             }
@@ -1275,8 +1278,13 @@ where
 fn spawn_av_pass(state: gpui::WeakEntity<SysMon>, cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
+            // the read is two wpctl spawns plus a /proc walk over
+            // every pid; it belongs on the background executor like
+            // every other pass's read, so a wedged PipeWire (the
+            // reads are bounded at 2s each) costs a poll tick and
+            // not the paint
+            let snapshot = cx.background_spawn(async move { refresh_av() }).await;
             let Ok(sleep) = state.update(cx, |sysmon, cx| {
-                let snapshot = refresh_av();
                 // recording has no confirm gate to race: a /proc
                 // read cannot fight user intent the way a wpctl
                 // write can
@@ -2073,21 +2081,59 @@ fn read_network(scan_wifi: bool) -> Option<NetworkState> {
     {
         apply_device_status(&mut network, &String::from_utf8_lossy(&status.stdout));
     }
-    // the defined VPNs: one connection-list read per network pass,
-    // the same weight as the device status beside it. The widget's
-    // whole existence rides it (none defined means no widget), so it
-    // is not panel-gated like the AP scan.
-    network.vpn_defined = read_saved_vpn();
-    // the AP list and the saved connections ride the panel-open gate:
-    // two more nmcli calls, only paid while someone is picking
+    // the connection list: one read feeds both the defined-VPN gate
+    // and (when the panel scan runs) the saved-wifi filter
+    let connections = read_connection_list();
+    network.vpn_defined = connections
+        .as_deref()
+        .map(parse_vpn_connections)
+        .unwrap_or_default();
+    // the AP list rides the panel-open gate: one more nmcli call,
+    // only paid while someone is picking
     if scan_wifi && network.wifi_enabled {
         network.access_points = read_access_points();
-        network.saved = read_saved_wifi();
+        network.saved = connections
+            .as_deref()
+            .map(parse_saved_wifi)
+            .unwrap_or_default();
         for point in &mut network.access_points {
             point.known = network.saved.contains(&point.ssid);
         }
     }
     Some(network)
+}
+
+/// The connection list both the saved-wifi filter and the defined-VPN
+/// gate read: `nmcli -t -f NAME,TYPE connection show`'s raw output.
+/// One spawn feeds the two parsers (the panel cadence used to pay it
+/// twice).
+fn read_connection_list() -> Option<String> {
+    let output = timed_output("nmcli", &["-t", "-f", "NAME,TYPE", "connection", "show"], 10).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Pure core of the saved-wifi filter: the connection names whose
+/// type is the wifi one. Names come through the same unescape as the
+/// scan list: a literal colon in an SSID arrives as `\:`, and the
+/// saved and scanned spellings must match or the panel re-prompts
+/// for a password on a known network.
+fn parse_saved_wifi(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let fields = split_nmcli_line(line);
+            let kind = fields.get(1)?;
+            if kind == "802-11-wireless" || kind == "wifi" {
+                fields.into_iter().next()
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// The visible access points: SSID, signal, security, and whether the
@@ -2111,49 +2157,6 @@ fn read_access_points() -> Vec<AccessPoint> {
         return Vec::new();
     }
     parse_access_points(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// The remembered wireless connections: names whose type is the
-/// wifi one in `nmcli -t -f NAME,TYPE connection show`. Names come
-/// through the same unescape as the scan list: a literal colon in an
-/// SSID arrives as `\:`, and the saved and scanned spellings must
-/// match or the panel re-prompts for a password on a known network.
-fn read_saved_wifi() -> Vec<String> {
-    let Ok(output) = timed_output("nmcli", &["-t", "-f", "NAME,TYPE", "connection", "show"], 10)
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| {
-            let fields = split_nmcli_line(line);
-            let kind = fields.get(1)?;
-            if kind == "802-11-wireless" || kind == "wifi" {
-                fields.into_iter().next()
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// The defined VPN connections: vpn-plugin and wireguard profiles in
-/// `nmcli -t -f NAME,TYPE connection show`. Names come through the
-/// same unescape as the wifi list. This is the VPN widget's existence
-/// gate: none defined means the widget never renders.
-fn read_saved_vpn() -> Vec<String> {
-    let Ok(output) = timed_output("nmcli", &["-t", "-f", "NAME,TYPE", "connection", "show"], 10)
-    else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    parse_vpn_connections(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Pure core of [`read_saved_vpn`]: the connection names whose type
@@ -2498,22 +2501,42 @@ fn parse_meminfo(text: &str) -> Option<Ram> {
 /// fallback. Degrees, not milli-degrees.
 /// The resolved CPU sensor path, probed once and re-probed only when
 /// the file stops answering: the walk is dozens of file reads for a
-/// number that moves a degree a second.
-static CPU_SENSOR: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// number that moves a degree a second. A machine with no sensor at
+/// all re-walks on a slow clock, not every pass.
+static CPU_SENSOR: Mutex<Option<CpuSensor>> = Mutex::new(None);
+
+enum CpuSensor {
+    Found(PathBuf),
+    /// No sensor answered; re-probe no faster than the retry clock.
+    Absent(Instant),
+}
+
+const CPU_SENSOR_RETRY: Duration = Duration::from_secs(60);
 
 fn read_cpu_temp() -> Option<u32> {
     let mut resolved = CPU_SENSOR.lock().ok()?;
-    if let Some(path) = &*resolved {
-        if let Some(temp) = read_milli_degrees(path) {
-            return Some(temp);
+    match &*resolved {
+        Some(CpuSensor::Found(path)) => {
+            if let Some(temp) = read_milli_degrees(path) {
+                return Some(temp);
+            }
+            // the sensor stopped answering (a hwmon module reloaded):
+            // forget it and walk again
+            *resolved = None;
         }
-        // the sensor stopped answering (a hwmon module reloaded):
-        // forget it and walk again
-        *resolved = None;
+        Some(CpuSensor::Absent(since)) => {
+            if since.elapsed() < CPU_SENSOR_RETRY {
+                return None;
+            }
+        }
+        None => {}
     }
-    let path = probe_cpu_sensor()?;
+    let Some(path) = probe_cpu_sensor() else {
+        *resolved = Some(CpuSensor::Absent(Instant::now()));
+        return None;
+    };
     let temp = read_milli_degrees(&path);
-    *resolved = Some(path);
+    *resolved = Some(CpuSensor::Found(path));
     temp
 }
 
@@ -3236,6 +3259,14 @@ mod tests {
             parse_vpn_connections(text),
             vec!["Northwind", "wing", "VPN: Split"]
         );
+    }
+
+    #[test]
+    fn saved_wifi_parses_names_from_types() {
+        // the same list, the wifi filter: the escaped colon must land
+        // unescaped or a known network re-prompts for its password
+        let text = "HomeNet:802-11-wireless\nNorthwind:vpn\nSSID\\: Split:wifi\n\nWired:802-3-ethernet\n";
+        assert_eq!(parse_saved_wifi(text), vec!["HomeNet", "SSID: Split"]);
     }
 
     #[test]

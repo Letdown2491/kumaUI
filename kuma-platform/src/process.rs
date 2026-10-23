@@ -132,7 +132,10 @@ pub fn bounded_output(
 fn reader<R: Read + Send + 'static>(mut stream: R, max: usize) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut kept = Vec::with_capacity(max.min(1024 * 1024));
+        // no up-front capacity: the cap is a ceiling, not a hint, and
+        // a 1 MiB reservation per reader turned every short-lived
+        // spawn into a page-fault party
+        let mut kept = Vec::new();
         let mut sink = [0u8; 8192];
         loop {
             match stream.read(&mut sink) {

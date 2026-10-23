@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use gpui::{
     AnyElement, App, Bounds, Context, Div, Element, ElementId, Global, GlobalElementId,
@@ -39,6 +42,41 @@ pub fn cove_side_for(placement: PanelPlacement, bar: crate::settings::BarPositio
             crate::settings::BarPosition::Bottom => CoveSide::Bottom,
         },
     }
+}
+
+/// The silhouette cache: a panel's geometry is fixed per kind and the
+/// path is pure string work keyed by numbers that rarely move. One
+/// build per shape, not one per frame (the host wrapper renders every
+/// frame the panel is open).
+fn cached_drawer_silhouette(
+    width: f32,
+    height: f32,
+    cove: f32,
+    radius: f32,
+    side: CoveSide,
+) -> Arc<[u8]> {
+    static CACHE: OnceLock<
+        Mutex<HashMap<(u32, u32, u32, u32, u8), Arc<[u8]>>>,
+    > = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (
+        width.to_bits(),
+        height.to_bits(),
+        cove.to_bits(),
+        radius.to_bits(),
+        // the side rides as its discriminant: CoveSide is not Hash
+        match side {
+            CoveSide::Top => 0,
+            CoveSide::Bottom => 1,
+            CoveSide::Left => 2,
+            CoveSide::Right => 3,
+        },
+    );
+    let mut cache = cache.lock().expect("drawer silhouette cache");
+    cache
+        .entry(key)
+        .or_insert_with(|| drawer_silhouette(width, height, cove, radius, side))
+        .clone()
 }
 
 /// One continuous drawer silhouette: concave coves flaring out toward
@@ -363,12 +401,7 @@ impl PanelKind {
                 .into(),
             PanelKind::Launcher => cx
                 .new(|cx| {
-                    crate::launcher::LauncherView::new(
-                        crate::launcher::load_apps(),
-                        window,
-                        cx,
-                        geometry,
-                    )
+                    crate::launcher::LauncherView::new(window, cx, geometry)
                 })
                 .into(),
             PanelKind::Calendar => cx
@@ -941,7 +974,10 @@ pub fn chrome(
     };
     // map the input region to the body rect: the cove slivers at the
     // attachment edge stay click-through, so the exclusion runs along
-    // the attachment edge's axis
+    // the attachment edge's axis. The Wayland request is per-frame
+    // work the compositor notices; only re-issue it when the rect
+    // actually moves (per window: every panel open builds a new
+    // surface, and a fresh window must make its own first request).
     let input_region = match cove_side {
         CoveSide::Top | CoveSide::Bottom => Bounds {
             origin: point(px(drawer_left + cove), px(drawer_top)),
@@ -952,7 +988,23 @@ pub fn chrome(
             size: size(px(width), px(height - 2. * cove)),
         },
     };
-    window.set_input_region(Some(&[input_region]));
+    let region_key = (
+        window.window_handle().window_id().as_u64(),
+        drawer_left,
+        drawer_top,
+        width,
+        height,
+        cove,
+        cove_side,
+    );
+    {
+        static LAST: Mutex<Option<(u64, f32, f32, f32, f32, f32, CoveSide)>> = Mutex::new(None);
+        let mut last = LAST.lock().expect("panel input region key");
+        if *last != Some(region_key) {
+            window.set_input_region(Some(&[input_region]));
+            *last = Some(region_key);
+        }
+    }
     div()
         .id("panel-chrome")
         .size_full()
@@ -964,7 +1016,9 @@ pub fn chrome(
         })
         .child(
             svg()
-                .data(&drawer_silhouette(width, height, cove, CORNER_RADIUS, cove_side))
+                .data(&cached_drawer_silhouette(
+                    width, height, cove, CORNER_RADIUS, cove_side,
+                ))
                 .absolute()
                 .top(px(drawer_top))
                 .left(px(drawer_left))

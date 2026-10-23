@@ -126,8 +126,11 @@ impl ShellBar {
 
 impl Render for ShellBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = self.settings.read(cx).clone();
-        let bar = settings.bar.clone();
+        // only the bar's own section rides the render: the whole
+        // settings document used to deep-clone here every frame (the
+        // weather, dock, and idle configs included), and the sections
+        // re-read the entity for their slices anyway
+        let bar = self.settings.read(cx).bar.clone();
 
         // consume a panel transition: tooltips gate off from this frame,
         // pinned to where the pointer sat: the compositor's synthesized
@@ -250,8 +253,7 @@ impl Render for ShellBar {
                 .gap_1p5()
                 .overflow_hidden()
                 .children(
-                    settings
-                        .widgets(Section::Center)
+                    bar.center
                         .iter()
                         .filter_map(|widget| self.render_widget(widget, cx, tooltips_on)),
                 ),
@@ -1355,7 +1357,9 @@ impl ShellBar {
                 )
             }
             WidgetKind::Tray => {
-                let items = self.tray.read(cx).items().to_vec();
+                // borrowed, not copied: the item list is stable between
+                // polls and the render only reads it
+                let items = self.tray.read(cx).items();
                 if items.is_empty() {
                     return None;
                 }
@@ -1537,13 +1541,30 @@ fn widget_icon(kind: WidgetKind) -> Option<WidgetIcon> {
     }
 }
 
+/// The battery glyph cache: the level moves one point at a time and
+/// the shape only changes at thresholds, so each (percent, charging,
+/// on-ac) triple is rendered once and re-parsed never. The keys are
+/// bounded (101 x 2 x 2); a full map is smaller than one frame's
+/// string churn.
 fn battery_icon_svg(percent: u8, charging: bool, on_ac: bool) -> std::sync::Arc<[u8]> {
-    // the battery's traditional narrow glyph (body x 6..18, like the
-    // original): it is not a feather icon, it is a battery, and the
-    // level readout inside is what carries the meaning
-    // level fills the body interior (y 7..19) in steps; while charging
-    // the interior is full with a bolt cut out of it; on AC (held at
-    // threshold) it also shows full
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u8, bool, bool), std::sync::Arc<[u8]>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache.lock().expect("battery glyph cache");
+    cache
+        .entry((percent, charging, on_ac))
+        .or_insert_with(|| render_battery_svg(percent, charging, on_ac))
+        .clone()
+}
+
+/// Pure core of [`battery_icon_svg`]: the traditional narrow glyph
+/// (body x 6..18, like the original): it is not a feather icon, it is
+/// a battery, and the level readout inside is what carries the
+/// meaning. Level fills the body interior (y 7..19) in steps; while
+/// charging the interior is full with a bolt cut out of it; on AC
+/// (held at threshold) it also shows full.
+fn render_battery_svg(percent: u8, charging: bool, on_ac: bool) -> std::sync::Arc<[u8]> {
     let level = (percent.min(100) as f32) / 100. * 12.;
     let y = 19. - level;
     let fill = if charging || on_ac {

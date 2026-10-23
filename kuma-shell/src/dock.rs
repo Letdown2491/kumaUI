@@ -414,26 +414,38 @@ impl DockView {
         cx.observe(&niri, |_, _, cx| cx.notify()).detach();
         cx.observe(&settings, |_, _, cx| cx.notify()).detach();
 
-        let apps = load_apps();
-        let icon_keys: Vec<(String, String)> = apps
-            .iter()
-            .map(|app| (app.desktop_path.clone(), app.icon.clone()))
-            .collect();
+        // the desktop scan is a readdir over several trees plus a read
+        // of every .desktop file: it belongs off construction, and the
+        // dock paints its cells when the scan lands (the rescan below
+        // keeps it fresh after that)
         cx.spawn(async move |this, cx| {
+            let apps = cx.background_spawn(async move { load_apps() }).await;
+            let Ok(icon_keys) = this.update(cx, |this, cx| {
+                this.apps = apps;
+                cx.notify();
+                this.apps
+                    .iter()
+                    .map(|app| (app.desktop_path.clone(), app.icon.clone()))
+                    .collect()
+            }) else {
+                return;
+            };
             let decoded = cx.background_spawn(async move { decode_icons(icon_keys) }).await;
             for (desktop_path, icon) in decoded {
-                let _ = this.update(cx, |this, cx| {
+                let _ = this.update(cx, |this, _| {
                     this.icons.insert(desktop_path, icon);
-                    cx.notify();
                 });
             }
+            // one notify for the batch: per-icon notifies would wake
+            // every observer once per icon for a repaint each
+            let _ = this.update(cx, |_, cx| cx.notify());
         })
         .detach();
 
         Self {
             niri,
             settings,
-            apps,
+            apps: Vec::new(),
             icons: HashMap::new(),
             last_app_scan: None,
             scan_in_flight: false,

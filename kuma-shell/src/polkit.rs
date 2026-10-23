@@ -150,6 +150,15 @@ struct Prompt {
     reply: Sender<Outcome>,
 }
 
+impl Drop for Prompt {
+    fn drop(&mut self) {
+        // a dismissed or superseded prompt scrubs its typed password:
+        // the lock screen and the vault form leave no heap copy behind,
+        // and neither does this one
+        self.password.zeroize();
+    }
+}
+
 pub struct PolkitState {
     lock: Entity<LockState>,
     prompt: Option<Prompt>,

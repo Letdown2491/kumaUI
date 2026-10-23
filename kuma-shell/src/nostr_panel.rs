@@ -18,7 +18,6 @@ use gpui::{
     AppContext, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, FontWeight, IntoElement,
     KeyDownEvent, ObjectFit, Render, SharedString, Window, div, img, prelude::*, px, rgb, rgba,
 };
-use zeroize::Zeroize;
 
 use crate::imaging::IconImage;
 use crate::nostr::{self, NostrState, PairedApp, Prompt, VaultFact};
@@ -648,7 +647,9 @@ impl NostrSignerView {
                 else {
                     unreachable!("matched the form above")
                 };
-                let (secret, passphrase) = (secret.clone(), passphrase.clone());
+                // validate against the form first: a failed validation
+                // must not clone a secret into a String the early
+                // return drops un-scrubbed
                 if secret.trim().is_empty() {
                     self.form_note = Some("paste or type the secret to import");
                     cx.notify();
@@ -659,11 +660,7 @@ impl NostrSignerView {
                     cx.notify();
                     return;
                 }
-                let lines = import_lines(&secret, &passphrase);
-                let mut secret = secret;
-                let mut passphrase = passphrase;
-                secret.zeroize();
-                passphrase.zeroize();
+                let lines = import_lines(secret, passphrase);
                 self.form = VaultForm::None;
                 self.nostr.update(cx, |state, cx| {
                     state.act_with_stdin(vec!["import".into()], lines, cx)
@@ -679,8 +676,7 @@ impl NostrSignerView {
                 else {
                     unreachable!("matched the form above")
                 };
-                let (passphrase, confirm, path) =
-                    (passphrase.clone(), confirm.clone(), path.clone());
+                // same discipline: validate before anything copies
                 if passphrase.trim().is_empty() {
                     self.form_note = Some("choose a passphrase for the exported file");
                     cx.notify();
@@ -697,17 +693,10 @@ impl NostrSignerView {
                     return;
                 }
                 let lines = vec![passphrase.clone()];
-                let mut passphrase = passphrase;
-                let mut confirm = confirm;
-                passphrase.zeroize();
-                confirm.zeroize();
+                let args = vec!["export".into(), "--output".into(), path.clone()];
                 self.form = VaultForm::None;
                 self.nostr.update(cx, |state, cx| {
-                    state.act_with_stdin(
-                        vec!["export".into(), "--output".into(), path],
-                        lines,
-                        cx,
-                    )
+                    state.act_with_stdin(args, lines, cx)
                 });
             }
             // the destroy card confirms by button only: Enter is too

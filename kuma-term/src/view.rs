@@ -544,8 +544,14 @@ impl TerminalView {
                 }
                 cx.notify();
             }
-            UiEvent::Title(title) => self.tabs[index].title = Some(title),
-            UiEvent::ResetTitle => self.tabs[index].title = None,
+            UiEvent::Title(title) => {
+                self.tabs[index].title = Some(title);
+                cx.notify();
+            }
+            UiEvent::ResetTitle => {
+                self.tabs[index].title = None;
+                cx.notify();
+            }
             UiEvent::Bell => log::info!("bell"),
             UiEvent::Exit => {
                 // one session's shell exiting closes that tab; the last

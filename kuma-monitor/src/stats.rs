@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 /// One beat of the machine's state, at the same 1s tick as the table.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Vitals {
     /// 1, 5 and 15 minute load averages.
     pub load: [f32; 3],

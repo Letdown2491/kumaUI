@@ -38,6 +38,11 @@ const TYPE_WIFI: u32 = 2;
 /// the portal states count as online, matching the old nmcli read
 /// where anything but "none" was online.
 const CONNECTIVITY_NONE: u32 = 2;
+/// How long the watcher swallows a signal burst before one state
+/// read. A connect or disconnect emits one property change per device
+/// and per active connection; 100ms covers a burst without a human
+/// noticing the latency.
+const NM_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Set once the watcher has landed its first read. The sysmon
 /// network pass stands its idle state reads down while it holds.
@@ -78,6 +83,20 @@ async fn run(state: gpui::WeakEntity<SysMon>, cx: &mut gpui::AsyncApp) -> anyhow
         if header.member().map(|m| m.as_str()) != Some("PropertiesChanged") {
             continue;
         }
+        // a connect or disconnect emits one change per device and per
+        // active connection; a full device walk per packet is
+        // unbounded work. Swallow the rest of the burst for a quiet
+        // window, then read once: the read lands fresher than every
+        // change it covers, and the next burst re-syncs anyway.
+        let drain = async {
+            while let Some(msg) = signals.next().await {
+                let _ = msg.header().member();
+            }
+        };
+        smol::future::or(drain, async {
+            smol::Timer::after(NM_QUIET_WINDOW).await;
+        })
+        .await;
         match read_state(&connection).await {
             Ok(network) => land(&state, cx, network).await,
             // a missed read (NM restarting under us) is not fatal:

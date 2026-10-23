@@ -11,6 +11,7 @@
 //! events alone cannot clear a workspace the mirror already holds.
 
 use std::{
+    collections::VecDeque,
     io::{BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
@@ -65,7 +66,7 @@ struct Ipc {
     writer: UnixStream,
     reader: BufReader<UnixStream>,
     /// Events read while a reply was expected, dispatched later.
-    stashed: Vec<(u32, Value)>,
+    stashed: VecDeque<(u32, Value)>,
 }
 
 impl Ipc {
@@ -76,7 +77,7 @@ impl Ipc {
         Ok(Self {
             writer,
             reader: BufReader::new(stream),
-            stashed: Vec::new(),
+            stashed: VecDeque::new(),
         })
     }
 
@@ -119,7 +120,7 @@ impl Ipc {
         loop {
             let (message_kind, value) = self.read_message()?;
             if message_kind & 0x8000_0000 != 0 {
-                self.stashed.push((message_kind, value));
+                self.stashed.push_back((message_kind, value));
                 continue;
             }
             return Ok(value);
@@ -128,7 +129,11 @@ impl Ipc {
 
     /// The next event to dispatch, popping stashed ones first.
     fn next_event(&mut self) -> Result<(u32, Value)> {
-        if let Some(stashed) = self.stashed.pop() {
+        // FIFO: events read while a reply was pending are dispatched
+        // in arrival order, the order sway emitted them (a LIFO pop
+        // dispatched newest-first and could apply a close before the
+        // open it followed)
+        if let Some(stashed) = self.stashed.pop_front() {
             return Ok(stashed);
         }
         loop {

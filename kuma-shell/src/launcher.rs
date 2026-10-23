@@ -622,15 +622,24 @@ fn sectioned_items(apps: &[AppEntry], query: &str) -> Vec<LauncherItem> {
 
 impl LauncherView {
     pub fn new(
-        apps: Vec<AppEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
         geometry: crate::panel::PanelGeometry,
     ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
-        let icon_keys: Vec<String> = apps.iter().map(|app| app.icon.clone()).collect();
         cx.spawn(async move |this, cx| {
+            // the desktop scan is a readdir over several trees plus a
+            // read of every .desktop file: it belongs off the open
+            // path, and the grid paints empty for the frames it takes
+            let apps = cx.background_spawn(async move { load_apps() }).await;
+            let Ok(icon_keys) = this.update(cx, |this, cx| {
+                this.apps = apps;
+                cx.notify();
+                this.apps.iter().map(|app| app.icon.clone()).collect::<Vec<String>>()
+            }) else {
+                return;
+            };
             // the registry makes re-opens a map lookup and pins one atlas
             // tile per icon; these Arcs are shared with the dock's (and the
             // grid's icons decode at the grid's size, not the theme's)
@@ -648,17 +657,19 @@ impl LauncherView {
                 })
                 .await;
             for (key, icon) in decoded {
-                let _ = this.update(cx, |this, cx| {
+                let _ = this.update(cx, |this, _| {
                     this.icons.insert(key, icon);
-                    cx.notify();
                 });
             }
+            // one notify for the batch: per-icon notifies would wake
+            // every observer once per icon for a repaint each
+            let _ = this.update(cx, |_, cx| cx.notify());
         })
         .detach();
         Self {
             focus_handle,
             geometry,
-            apps,
+            apps: Vec::new(),
             icons: HashMap::new(),
             results_scroll: gpui::ScrollHandle::new(),
             query: String::new(),

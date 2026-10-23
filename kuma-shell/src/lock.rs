@@ -93,6 +93,15 @@ fn has_auth_stack(text: &str) -> bool {
 /// One unlock attempt, on a blocking thread: start the first service in
 /// the chain, authenticate, validate the account.
 fn authenticate(user: &str, mut password: String) -> Result<(), AuthError> {
+    // every road out leaves the original scrubbed: PAM's copy rides the
+    // conversation (Drop-scrubbed), and the wrapper scrubs the original
+    // on the NUL-byte path and the no-service path alike
+    let result = authenticate_chain(user, &password);
+    password.zeroize();
+    result
+}
+
+fn authenticate_chain(user: &str, password: &str) -> Result<(), AuthError> {
     let mut last = None;
     for service in PAM_SERVICES {
         // Linux-PAM defers reading a service's stack to the first call and,
@@ -108,9 +117,6 @@ fn authenticate(user: &str, mut password: String) -> Result<(), AuthError> {
             password: CString::new(password.as_bytes())
                 .map_err(|_| AuthError::Systemic("the password holds a NUL byte".into()))?,
         };
-        // the password has reached its only consumer: what lives on from
-        // here is the CString copy above, zeroized with the conversation
-        password.zeroize();
         match pam_client2::Context::new(service, Some(user), conversation) {
             Ok(mut context) => {
                 // A real stack's answer is final: wrong password, expired

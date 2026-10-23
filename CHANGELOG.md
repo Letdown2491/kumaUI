@@ -15,6 +15,16 @@ Entries land with the change they describe; the next tag takes this section as i
 
 - kuma-greeter: a failed login shows a plain card ("wrong username or password"; a lockout and a nologin denial say so) instead of greetd's raw pam text; the technical description goes to the journal.
 - kuma-files: pressing an arrow key in icon view no longer crashes the window when the listing shrank (say, mid cleanup): the horizontal step still counted a partial last row's missing columns and indexed one past the end.
+- kuma-shell: the sway adapter dispatches the events it stashed during a reply in arrival order instead of newest-first, so a rapid open-and-close no longer leaves a phantom window in the dock.
+- kuma-shell: the audio pass (volume, mic, recording) reads its wpctl probes and /proc walk on the background executor, so a wedged PipeWire costs a poll tick instead of the bar's paint.
+- kuma-shell: one NetworkManager read feeds both the saved-wifi filter and the VPN widget's existence gate per network pass instead of two spawns, the NetworkManager watcher folds a connect burst into a single state read, and a machine with no CPU temperature sensor stops re-walking the whole hwmon tree every pass.
+- kuma-shell: the bar re-renders with the bar's own config instead of a deep clone of the whole settings document every frame, caches the battery glyph per level (one SVG build per shape, not per frame), borrows the tray items, and rebuilds a panel's drawer silhouette once per shape instead of once per frame; the input region is re-issued only when the drawer rect moves.
+- kuma-shell: the launcher and dock scan desktop entries and decode their icons off the UI thread (a re-open paints its grid immediately), batch icon repaints into one notify, and the tray's status fetch doubles as the liveness probe instead of paying it twice.
+- kuma-shell: the polkit agent's prompt zeroizes its typed password on dismissal or replacement, and the lock screen's password is scrubbed on every exit path (a NUL byte in the password, no PAM service installed) instead of only the success and wrong-password paths.
+- kuma-files: a header-click sort re-sorts the cached listing instead of re-reading the directory from disk, a hidden-files toggle reloads only the visible tab (background tabs reload when activated), and watcher bursts coalesce into one rescan instead of stacking one full listing per event batch.
+- kuma-files: the state file saves once per 300ms of quiet instead of one fsync per knob, the sniffs of extensionless files are cached per mtime and size, copies preserve the source's Modified time (a pasted tree sorted by Modified no longer shows the paste time), and moving a file to another filesystem copies it instead of failing with an error.
+- Kamuy: the filter saves its state once per half second instead of one fsync per keystroke, and a moving temperature or load average repaints again on an otherwise idle machine (the equal-beat gate now compares the vitals too).
+- kuma-term: a window title set or reset by the running program repaints immediately instead of at the next unrelated event.
 
 ## v0.6.0 (2026-10-22)
 

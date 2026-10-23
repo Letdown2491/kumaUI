@@ -709,14 +709,21 @@ pub fn start(settings: Entity<Settings>, cx: &mut App) -> Entity<NotificationSta
     .detach();
 
     // the quiet-hours clock: a slow tick re-evaluates the window, so a
-    // boundary crossing needs no other excuse to flip the schedule
-    let tick_state = state.clone();
+    // boundary crossing needs no other excuse to flip the schedule.
+    // The weak handle is the exit: when the entity is released, the
+    // tick stops, the session's other loops' shape.
+    let tick_state = state.downgrade();
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor()
                 .timer(Duration::from_secs(30))
                 .await;
-            tick_state.update(cx, |state, cx| state.evaluate_schedule(cx));
+            if tick_state
+                .update(cx, |state, cx| state.evaluate_schedule(cx))
+                .is_err()
+            {
+                break;
+            }
         }
     })
     .detach();

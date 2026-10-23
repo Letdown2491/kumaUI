@@ -414,6 +414,10 @@ struct Tab {
     view_mode: ViewMode,
     sort_key: SortKey,
     sort_asc: bool,
+    /// A hidden-toggle reload this tab owes its next activation: a
+    /// background tab is not rendered, so paying a full listing per
+    /// toggle per tab bought nothing.
+    stale_hidden: bool,
 }
 
 /// A queued file operation. `run` executes it and returns its inverse,
@@ -545,6 +549,13 @@ fn copy_file_progress(from: &Path, to: &Path, state: &RunState) -> io::Result<u6
         copied += n as u64;
         state.done.fetch_add(n as u64, Ordering::Relaxed);
     }
+    // the source's Modified rides along: a pasted tree sorted by
+    // Modified showed the paste time instead of the file's own
+    // history, and a snapshot aside copy inverted the very order it
+    // was meant to preserve
+    if let Ok(modified) = meta.modified() {
+        let _ = dst.set_times(fs::FileTimes::new().set_modified(modified));
+    }
     drop(dst);
     fs::set_permissions(to, meta.permissions())?;
     Ok(copied)
@@ -554,6 +565,44 @@ fn copy_file_progress(from: &Path, to: &Path, state: &RunState) -> io::Result<u6
 /// loop is I/O bound, small enough that a cancel lands within a
 /// fraction of a second and the progress line moves every tick.
 const COPY_CHUNK: usize = 256 * 1024;
+
+/// The move that survives a filesystem boundary: rename answers
+/// CrossesDevices when from and to straddle mounts, and the queue
+/// treated that as a plain failure. Copy the tree instead (the
+/// bounded walker, so the progress counter, the cancel flag, and the
+/// FIFO guard all hold) and drop the source. The queue's undo is a
+/// Move back, which rides the same fallback.
+fn move_entry(from: &Path, to: &Path, state: &RunState) -> io::Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::CrossesDevices => {
+            let meta = fs::symlink_metadata(from)?;
+            let outcome = if meta.is_dir() {
+                copy_dir_all_bounded(from, to, 0, state).and_then(|()| fs::remove_dir_all(from))
+            } else if meta.is_file() {
+                copy_file_progress(from, to, state).and_then(|_| fs::remove_file(from))
+            } else {
+                // a symlink or special file: copying would follow what
+                // rename would have kept as a link; surface the
+                // refusal instead of moving the wrong thing
+                return Err(err);
+            };
+            if let Err(err) = outcome {
+                // a move is all-or-nothing: whatever the copy left at
+                // the target comes back out, and the source is whole
+                // to retry
+                if meta.is_dir() {
+                    let _ = fs::remove_dir_all(to);
+                } else {
+                    let _ = fs::remove_file(to);
+                }
+                return Err(err);
+            }
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
 
 /// The run's total bytes, walked before the first op so the progress
 /// line can show a fraction. Sources are walked (a directory paste
@@ -698,7 +747,7 @@ impl Op {
                     // loss, not an error message
                     let aside = move_aside_path(to);
                     fs::rename(to, &aside).map_err(|err| format!("move: {err}"))?;
-                    if let Err(err) = fs::rename(from, to) {
+                    if let Err(err) = move_entry(from, to, state) {
                         // the move failed: the destination goes back
                         let restore = fs::rename(&aside, to);
                         return Err(format!(
@@ -721,7 +770,7 @@ impl Op {
                         replace: false,
                     }));
                 }
-                fs::rename(from, to).map_err(|err| format!("move: {err}"))?;
+                move_entry(from, to, state).map_err(|err| format!("move: {err}"))?;
                 Ok(Some(Op::Move {
                     from: to.clone(),
                     to: from.clone(),
@@ -1896,6 +1945,17 @@ pub(crate) struct Browser {
     /// the landing checks it, so a superseded scan drops whole
     /// instead of overwriting a newer listing.
     rescan_seq: u64,
+    /// The directory an in-flight rescan is reading, if any: a burst
+    /// of watcher events (a big extract fires them for seconds) used
+    /// to stack one full listing per 50ms batch on the same folder.
+    rescan_inflight: Option<PathBuf>,
+    /// An event arrived while that scan was reading: the landing
+    /// re-arms the scan, so nothing the read raced is stale until
+    /// some later event happens to fix it.
+    rescan_owed: bool,
+    /// A knob save is queued behind the debounce clock (see
+    /// `save_state`).
+    save_pending: bool,
     /// The first visible-order position the list window built as real
     /// elements this frame: the prepaint capture skips the window's
     /// top spacer, so painted rows stay indexed by visible position.
@@ -2127,6 +2187,9 @@ impl Browser {
             text_preview: None,
             visible_cache: std::cell::RefCell::new(None),
             rescan_seq: 0,
+            rescan_inflight: None,
+            rescan_owed: false,
+            save_pending: false,
             list_window_start: Arc::new(AtomicUsize::new(0)),
             preview_key: None,
             preview_inflight: HashSet::new(),
@@ -2518,21 +2581,21 @@ impl Browser {
 
     fn zoom_in(&mut self, cx: &mut Context<Self>) {
         self.scale = ((self.scale * 1.25 * 100.).round() / 100.).min(2.0);
-        self.save_state();
+        self.save_state(cx);
         self.status = format!("zoom {}%", (self.scale * 100.) as i32);
         cx.notify();
     }
 
     fn zoom_out(&mut self, cx: &mut Context<Self>) {
         self.scale = ((self.scale / 1.25 * 100.).round() / 100.).max(0.75);
-        self.save_state();
+        self.save_state(cx);
         self.status = format!("zoom {}%", (self.scale * 100.) as i32);
         cx.notify();
     }
 
     fn zoom_reset(&mut self, cx: &mut Context<Self>) {
         self.scale = 1.0;
-        self.save_state();
+        self.save_state(cx);
         self.status = "zoom 100%".into();
         cx.notify();
     }
@@ -2753,11 +2816,16 @@ impl Browser {
 
     fn toggle_hidden(&mut self, cx: &mut Context<Self>) {
         self.show_hidden = !self.show_hidden;
-        self.save_state();
+        self.save_state(cx);
         let show_hidden = self.show_hidden;
+        // only the active tab is rendering: background tabs owe their
+        // reload until activation (refresh_if_stale), so a ten-tab
+        // session stopped paying ten full listings per toggle
         for tab in &mut self.tabs {
-            tab.reload(show_hidden);
+            tab.stale_hidden = true;
         }
+        self.tab_mut().stale_hidden = false;
+        self.tab_mut().reload(show_hidden);
         self.status = if self.show_hidden {
             "hidden files shown".into()
         } else {
@@ -2767,20 +2835,29 @@ impl Browser {
         cx.notify();
     }
 
+    /// A background tab deferred its hidden-toggle reload until now:
+    /// its listing only matters once its tab renders.
+    fn refresh_if_stale(&mut self) {
+        if self.tab().stale_hidden {
+            let show_hidden = self.show_hidden;
+            self.tab_mut().stale_hidden = false;
+            self.tab_mut().reload(show_hidden);
+        }
+    }
+
     fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
         let tab = self.tab_mut();
         if tab.view_mode != mode {
             tab.view_mode = mode;
             self.rubber_origin = None;
             self.rubber_current = None;
-            self.save_state();
+            self.save_state(cx);
             cx.notify();
         }
     }
 
     /// Header click: same key flips direction, a new key sorts ascending.
     fn set_sort(&mut self, key: SortKey, cx: &mut Context<Self>) {
-        let show_hidden = self.show_hidden;
         let tab = self.tab_mut();
         if tab.sort_key == key {
             tab.sort_asc = !tab.sort_asc;
@@ -2788,8 +2865,13 @@ impl Browser {
             tab.sort_key = key;
             tab.sort_asc = true;
         }
-        tab.reload(show_hidden);
-        self.save_state();
+        // the cached listing re-sorts in place: the entries already
+        // carry size, mtime, and mime, so a disk read per header
+        // click bought nothing (the watcher keeps them fresh)
+        let (sort_key, sort_asc) = (tab.sort_key, tab.sort_asc);
+        let entries = std::sync::Arc::make_mut(&mut tab.entries);
+        sort_entries(entries, sort_key, sort_asc);
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -2987,7 +3069,7 @@ impl Browser {
         self.accent = hex;
         self.accent_picker = false;
         self.apply_theme();
-        self.save_state();
+        self.save_state(cx);
         self.status = match hex {
             Some(_) => "accent set".into(),
             None => {
@@ -3017,7 +3099,7 @@ impl Browser {
             .collect();
         self.place_order = apply_place_order(self.place_order.clone(), &live, &dragged, &target);
         self.refresh_places_now();
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -3565,6 +3647,14 @@ impl Browser {
     /// drops whole. The watcher's external events and the gvfs mtime
     /// poll both land here.
     fn spawn_rescan(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        // one scan per directory at a time: an event while the read
+        // runs is folded into it if it landed before the read, and
+        // re-arms the scan at the land otherwise (rescan_owed)
+        if self.rescan_inflight.as_ref() == Some(&dir) {
+            self.rescan_owed = true;
+            return;
+        }
+        self.rescan_inflight = Some(dir.clone());
         let (show_hidden, sort_key, sort_asc) =
             (self.show_hidden, self.tab().sort_key, self.tab().sort_asc);
         let filtering = !self.filter.is_empty();
@@ -3577,7 +3667,9 @@ impl Browser {
                     Tab::read_dir_listing(&dir, show_hidden, sort_key, sort_asc)
                 })
                 .await;
+            let mut landed = None;
             let _ = this.update(cx, |this, cx| {
+                landed = this.rescan_inflight.take();
                 if this.rescan_seq != seq || this.tab().current_dir() != Some(guard_dir.as_path()) {
                     return;
                 }
@@ -3596,6 +3688,18 @@ impl Browser {
                 log::info!("dir changed externally, rescanned off the ui thread");
                 cx.notify();
             });
+            // an event raced the read: go again, the listing above is
+            // the fresher base either way (the seq guard still drops
+            // it if a navigation won the race)
+            let rearm = this.update(cx, |this, cx| {
+                if this.rescan_owed {
+                    this.rescan_owed = false;
+                    if let Some(dir) = landed {
+                        this.spawn_rescan(dir, cx);
+                    }
+                }
+            });
+            let _ = rearm;
         })
         .detach();
     }
@@ -3834,7 +3938,7 @@ impl Browser {
         self.reset_list_scroll();
         // the filter survives navigation; search the new tree too
         self.filter_changed(cx);
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -3854,10 +3958,12 @@ impl Browser {
         let count = self.tabs.len() as isize;
         let next = (self.active as isize + step).rem_euclid(count);
         self.active = next as usize;
+        // the incoming tab may owe its hidden-toggle reload
+        self.refresh_if_stale();
         // the incoming tab needs its own deep rows for a live filter
         self.reset_list_scroll();
         self.filter_changed(cx);
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -3874,7 +3980,7 @@ impl Browser {
         self.tabs.last_mut().unwrap().reload(self.show_hidden);
         self.reset_list_scroll();
         self.status.clear();
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -3895,7 +4001,7 @@ impl Browser {
         self.active = self.tabs.len() - 1;
         self.tabs.last_mut().unwrap().reload(self.show_hidden);
         self.reset_list_scroll();
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -3918,9 +4024,11 @@ impl Browser {
             } else if ix < self.active {
                 self.active -= 1;
             }
+            // the tab that took focus may owe its hidden-toggle reload
+            self.refresh_if_stale();
             self.reset_list_scroll();
         }
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -5292,7 +5400,26 @@ impl Browser {
         }
     }
 
-    fn save_state(&self) {
+    /// The knobs' save, debounced: a slider drag, a run of tab
+    /// switches, or a sort click-race paid a create + fsync + rename
+    /// apiece on the UI thread. One write per 300ms of quiet; a crash
+    /// inside the window costs the newest knob tweak, and nothing
+    /// else. The immediate shape is [`Self::save_state_now`].
+    fn save_state(&mut self, cx: &mut Context<Self>) {
+        self.save_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(300)).await;
+            let _ = this.update(cx, |this, _| {
+                if this.save_pending {
+                    this.save_pending = false;
+                    this.save_state_now();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn save_state_now(&self) {
         let Some(path) = Self::state_path() else {
             return;
         };
@@ -5470,7 +5597,7 @@ impl Browser {
         // in auto mode the next render would snap the dock straight
         // back, so a manual flip pins the panel where it is put
         self.inspector_lock = Some(self.inspector_bottom);
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -5487,7 +5614,7 @@ impl Browser {
             None => "pane follows the window width",
         };
         self.status = status.into();
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -5516,7 +5643,7 @@ impl Browser {
             self.preview_key = None;
             self.text_preview = None;
         }
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -6386,6 +6513,7 @@ impl Tab {
             view_mode: ViewMode::List,
             sort_key: SortKey::Name,
             sort_asc: true,
+            stale_hidden: false,
         }
     }
 
@@ -6532,6 +6660,7 @@ impl Tab {
                     Some(meta.len())
                 }
             });
+            let is_regular = meta.as_ref().is_some_and(|m| m.is_file());
             let modified = meta
                 .and_then(|meta| meta.modified().ok())
                 .and_then(|time| {
@@ -6541,12 +6670,23 @@ impl Tab {
                 });
             // extension says nothing: the first 4 KB gets a vote.
             // Only regular files (a FIFO would block the open) and
-            // only when the extension mapped to the generic mime
+            // only when the extension mapped to the generic mime.
+            // A regular file rides the verdict cache (keyed on
+            // mtime and size); a symlink still follows to decide,
+            // uncached, exactly as before
             let sniffed = if !is_dir
                 && mime_for_ext(&ext_of(&name)) == "application/octet-stream"
-                && fs::metadata(&path).is_ok_and(|m| m.is_file())
             {
-                sniff_mime(&path)
+                if is_regular {
+                    match (size, modified) {
+                        (Some(len), Some(mtime)) => sniff_mime_cached(&path, mtime, len),
+                        _ => sniff_mime(&path),
+                    }
+                } else if fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+                    sniff_mime(&path)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -7460,7 +7600,7 @@ impl Browser {
         tab.renaming = None;
         tab.reload(show_hidden);
         self.reset_list_scroll();
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -7477,7 +7617,7 @@ impl Browser {
         tab.renaming = None;
         tab.reload(show_hidden);
         self.reset_list_scroll();
-        self.save_state();
+        self.save_state(cx);
         cx.notify();
     }
 
@@ -10268,7 +10408,8 @@ impl Browser {
             .hover(|this| this.text_color(theme::text()))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active = ix;
-                this.save_state();
+                this.refresh_if_stale();
+                this.save_state(cx);
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, _, cx| {
@@ -13163,6 +13304,27 @@ fn dir_size_tree(dir: &Path, depth: usize) -> io::Result<u64> {
     Ok(total)
 }
 
+/// The sniff verdict cache: a rescan re-lists the whole directory,
+/// and every extensionless file in it paid a 4 KB open and read per
+/// listing. Keyed on mtime and size, so an edited file re-sniffs;
+/// hard-capped, so a session that wanders thousands of folders stays
+/// bounded. Only regular files come through here.
+fn sniff_mime_cached(path: &Path, mtime: i64, len: u64) -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(PathBuf, i64, u64), Option<&'static str>>>,
+    > = std::sync::OnceLock::new();
+    const CACHE_CAP: usize = 50_000;
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache.lock().expect("sniff cache");
+    if cache.len() >= CACHE_CAP {
+        cache.clear();
+    }
+    cache
+        .entry((path.to_path_buf(), mtime, len))
+        .or_insert_with(|| sniff_mime(path))
+        .clone()
+}
+
 /// Magic-byte sniff for files whose extension says nothing: the
 /// first 4 KB against the formats a file manager meets. Unknown
 /// bytes stay `None` and the row keeps its generic icon.
@@ -14223,6 +14385,64 @@ mod op_run {
         assert_eq!(state.done.load(Ordering::Relaxed), payload.len() as u64);
         let mode = fs::metadata(dir.join("out.bin")).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the source permissions did not ride along");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_file_progress_keeps_the_source_mtime() {
+        let dir = test_dir("copy-mtime");
+        let src = dir.join("old.bin");
+        fs::write(&src, "history matters").unwrap();
+        // a known past date: 2021-06-01, well before the test runs
+        let past = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_622_524_800);
+        let src_file = fs::OpenOptions::new().write(true).open(&src).unwrap();
+        src_file
+            .set_times(fs::FileTimes::new().set_modified(past))
+            .unwrap();
+        drop(src_file);
+
+        let state = RunState::new(1);
+        copy_file_progress(&src, &dir.join("out.bin"), &state).unwrap();
+        let kept = fs::metadata(dir.join("out.bin")).unwrap().modified().unwrap();
+        assert_eq!(
+            kept.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            1_622_524_800,
+            "the copy showed the paste time, not the file's history"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sniff_cache_re_sniffs_when_the_file_changes() {
+        let dir = test_dir("sniff-cache");
+        let src = dir.join("mystery");
+        fs::write(&src, [0x89, b'P', b'N', b'G']).unwrap();
+        let meta = fs::symlink_metadata(&src).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let len = meta.len();
+        assert_eq!(
+            sniff_mime_cached(&src, mtime, len),
+            Some("image/png"),
+            "the first sniff answers like the direct one"
+        );
+        // the same key: a second listing reads the cache, not the file
+        assert_eq!(sniff_mime_cached(&src, mtime, len), Some("image/png"));
+        // a different size is a different key: the verdict re-reads
+        fs::write(&src, [0x89, b'P', b'N', b'G', 0, 0, 0, 0]).unwrap();
+        let meta = fs::symlink_metadata(&src).unwrap();
+        assert_eq!(
+            sniff_mime_cached(&src, mtime, meta.len()),
+            Some("image/png"),
+            "the cached verdict survives a key change on the same verdict"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

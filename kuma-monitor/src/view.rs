@@ -237,6 +237,16 @@ pub(crate) struct MonitorView {
     /// The last beat that reached the state: an equal beat applies
     /// nothing, so an idle machine stops repainting once a second.
     last_beat: Option<Snapshot>,
+    /// The last vitals that reached the state, beside the snapshot:
+    /// the gate compares both, or a moving temperature or load
+    /// average would never repaint again on an otherwise idle
+    /// machine.
+    last_vitals: Option<Vitals>,
+    /// A knob save is queued behind the debounce clock: a filter
+    /// edit is a keystroke stream, and a create + fsync + rename per
+    /// keystroke stalled the paint under exactly the IO pressure
+    /// this window is open to watch.
+    save_pending: bool,
     /// The groups and rings as Arc snapshots for the render closure:
     /// the uniform list's items closure is 'static, and a per-render
     /// deep clone of the whole table was its price. Refreshed by
@@ -315,6 +325,8 @@ impl MonitorView {
             niri_tiled: kuma_platform::niri::own_windows().is_ok(),
             focus,
             last_beat: None,
+            last_vitals: None,
+            save_pending: false,
             groups_snap: Arc::new(Vec::new()),
             hists_snap: Arc::new(HashMap::new()),
             painted: true,
@@ -375,11 +387,16 @@ impl MonitorView {
         self.niri_tiled = out.niri_tiled;
         // an equal beat applies nothing: the table, the rings, and
         // the repaint are all skipped, so an idle machine stops
-        // repainting once a second
-        if self.last_beat.as_ref() == Some(&out.snap) {
+        // repainting once a second. Vitals ride the same gate: a
+        // snapshot-only compare let a moving temperature or load
+        // average freeze on an otherwise idle machine
+        if self.last_beat.as_ref() == Some(&out.snap)
+            && self.last_vitals.as_ref() == Some(&out.vitals)
+        {
             return;
         }
         self.last_beat = Some(out.snap.clone());
+        self.last_vitals = Some(out.vitals.clone());
         self.apply_snapshot(out.snap, out.vitals, out.cores);
         // the repaint gate: an occluded surface drops the beat
         // instead of queueing a paint nobody can see (sampling never
@@ -501,6 +518,27 @@ impl MonitorView {
         if let Err(err) = kuma_platform::files::write_atomic(path, self.state_text().as_bytes()) {
             log::error!("save state: {err}");
         }
+    }
+
+    /// The knobs' save, debounced: typing pays the fsync once per
+    /// half second of quiet instead of once per keystroke, and a
+    /// crash inside the window costs the tail of the filter text,
+    /// which the next launch's typing regenerates. Coalesced by a
+    /// flag, not a handle: extra wakeups see the queue empty.
+    fn save_soon(&mut self, cx: &mut Context<Self>) {
+        self.save_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            let _ = this.update(cx, |this, _| {
+                if this.save_pending {
+                    this.save_pending = false;
+                    this.save_state();
+                }
+            });
+        })
+        .detach();
     }
 
     // ---------- the kill path ----------
@@ -741,7 +779,7 @@ impl Render for MonitorView {
                     _ => {}
                 }
                 if this.filter_key(&event.keystroke) {
-                    this.save_state();
+                    this.save_soon(cx);
                     cx.notify();
                 }
             }))
