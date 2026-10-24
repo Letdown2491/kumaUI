@@ -141,7 +141,12 @@ pub fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<
 fn walk_icon_trees(roots: &[PathBuf]) -> (std::collections::HashMap<String, PathBuf>, u64) {
     let mut index: HashMap<String, (i32, PathBuf)> = HashMap::new();
     let mut dirs: Vec<(PathBuf, u64, Option<std::time::SystemTime>)> = Vec::new();
-    let mut stack: Vec<PathBuf> = roots.to_vec();
+    // pop takes from the end, so seed the stack reversed: the walk then
+    // consumes the roots in the declared order (user first), and a
+    // same-rank tie below keeps the earlier root's copy. Walking the
+    // stack directly handed the system trees the tie, so a user
+    // reinstall of an icon the image also ships changed nothing.
+    let mut stack: Vec<PathBuf> = roots.iter().rev().cloned().collect();
     // a symlink cycle (`ln -s .. loop`) must not walk forever: the
     // walk runs under the themed-index lock, so an unbounded loop is
     // the whole shell frozen at the next icon resolve
@@ -569,6 +574,24 @@ mod tests {
         let (map, moved) = walk_icon_trees(&[tree.0.clone()]);
         assert_ne!(fingerprint, moved, "an added icon file moves the fingerprint");
         assert!(map.contains_key("alpha") && map.contains_key("beta"));
+    }
+
+    #[test]
+    fn same_rank_ties_keep_the_first_root() {
+        // two trees shipping one name at the same rank (user and system
+        // copies of an app icon in equal size dirs): the earlier root
+        // wins the tie, so a user install outranks the image's copy
+        let user = ScratchTree::new("tie-user");
+        let system = ScratchTree::new("tie-system");
+        user.write_icon("kuma-app");
+        system.write_icon("kuma-app");
+
+        let (map, _) = walk_icon_trees(&[user.0.clone(), system.0.clone()]);
+        assert_eq!(
+            map["kuma-app"],
+            user.icon("kuma-app"),
+            "a same-rank tie keeps the first root's copy"
+        );
     }
 
     #[test]
