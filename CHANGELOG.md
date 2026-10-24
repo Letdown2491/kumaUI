@@ -4,6 +4,13 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+## v0.7.0 (2026-10-23)
+
+kuma-shell 0.7.0
+kuma-files 0.6.0
+kuma-term 0.5.0
+kuma-monitor 0.4.0
+
 ### Added
 
 - The nostr panel gains a Vault tab: generate or import an identity in the panel (secrets ride stdin, never a command line), export a backup (0600, never overwritten), lock and unlock with the inactivity window on show, and destroy with the dry run's cost quoted and an export offered first.
