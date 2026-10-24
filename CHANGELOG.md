@@ -4,10 +4,6 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
-### Fixed
-
-- kuma-shell: an app icon installed in both the user and the system icon trees resolves to the user's copy now: the themed walk consumed its roots in reverse order, so equal-size ties kept the system copy and an icon update landed only when the image's copy moved too.
-
 ## v0.7.1 (2026-10-23)
 
 kuma-shell 0.7.1
@@ -18,6 +14,10 @@ kuma-monitor 0.4.1
 ### Changed
 
 - New app icons for Koguma (kuma-files), Higuma (kuma-term), and Kamuy (kuma-term): a shared bear-suite style (ears behind a rounded panel, lavender with navy screens) replaces the previous green marks.
+
+### Fixed
+
+- kuma-shell: an app icon installed in both the user and the system icon trees resolves to the user's copy now: the themed walk consumed its roots in reverse order, so equal-size ties kept the system copy and an icon update landed only when the image's copy moved too.
 
 ## v0.7.0 (2026-10-23)
 
