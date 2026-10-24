@@ -78,8 +78,9 @@ kuma-shell depends on gpui via a path dependency into `vendor/zed/` (gitignored,
 - `kuma-shell/icons/`: the widget and panel icons, hand-made SVGs.
 - `widgets/`: the widget pool directory the image ships to `/usr/share/kuma-shell/widgets/` (currently empty; the Kuma Updates chip is built in); what kumaOS does with it is [widgets-deploy.md](docs/widgets-deploy.md).
 - `kuma-files/icons/`: the in-app icons, hand-made SVGs (16px stroke style).
-- `kuma-files/packaging/`: the menu entry, the app icon generator, and the app icon.
-- `kuma-monitor/packaging/`: the same trio for Kamuy (48-unit grid, drawn at 4x, downscaled to the committed 256px PNG).
+- `kuma-files/packaging/`: the menu entry, the app icon (SVG source plus the committed 256px PNG), and the rasterizer.
+- `kuma-term/packaging/`: the same trio for kuma-term.
+- `kuma-monitor/packaging/`: the same trio for Kamuy.
 
 ## Status
 

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Kuma terminal emulator">
+  <title>Kuma terminal emulator</title>
+  <g transform="translate(256 256) scale(1.4) translate(-256 -267)">
+    <!-- bear ears, sitting behind the window -->
+    <circle cx="168" cy="172" r="54" fill="#c9d1ff"/>
+    <circle cx="168" cy="172" r="27" fill="#8f9cf0"/>
+    <circle cx="344" cy="172" r="54" fill="#c9d1ff"/>
+    <circle cx="344" cy="172" r="27" fill="#8f9cf0"/>
+
+    <!-- terminal window -->
+    <rect x="88" y="204" width="336" height="212" rx="40" fill="#eef1ff"/>
+    <rect x="116" y="232" width="280" height="156" rx="24" fill="#141a45"/>
+
+    <!-- prompt -->
+    <path d="M168 288 L218 320 L168 352" fill="none" stroke="#eef1ff" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M254 352 H334" fill="none" stroke="#5eead4" stroke-width="22" stroke-linecap="round"/>
+  </g>
+</svg>
