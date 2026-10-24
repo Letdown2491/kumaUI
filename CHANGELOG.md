@@ -4,6 +4,13 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+## v0.7.1 (2026-10-23)
+
+kuma-shell 0.7.1
+kuma-files 0.6.1
+kuma-term 0.5.1
+kuma-monitor 0.4.1
+
 ### Changed
 
 - New app icons for Koguma, kuma-term, and Kamuy: a shared bear-suite style (ears behind a rounded panel, lavender with navy screens) replaces the previous green marks.
