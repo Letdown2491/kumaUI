@@ -87,6 +87,14 @@ impl Tab {
 /// zeroized on drop; a completed or cancelled form leaves no heap
 /// copy behind (the lock screen's discipline; a panel runs beside
 /// everything, where freed heap is still exposure).
+///
+/// The discipline covers the secrets the form finishes with, not the
+/// typing itself: while a secret is mid-form its String buffers grow,
+/// and the freed growth reallocations cannot be reached by zeroize,
+/// so those bytes stay in heap until the allocator reuses the memory.
+/// The same accepted limitation the lock screen's password field has,
+/// inherent to String (kumaOS#55, security audit, lane 1,
+/// hand-forward 4).
 #[derive(PartialEq)]
 enum VaultForm {
     None,
