@@ -3,6 +3,8 @@
 For a kumaOS session. kumaUI (this repo) never edits kumaOS; the owner
 lands this change there. The prompt below is the whole job.
 
+Planned for kumaOS 45.1.0, tracked in kumaOS issue #71.
+
 ## Why
 
 External monitors expose no backlight in /sys/class/backlight: the
