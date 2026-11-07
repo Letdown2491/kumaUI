@@ -1808,7 +1808,7 @@ mod tests {
         // damage test's note): the child pushes one keyboard mode, so
         // the tap must lift the shared flags off the output stream
         let (tx, _rx) = futures::channel::mpsc::unbounded::<UiEvent>();
-        let mut engine = Engine::new(
+        let engine = Engine::new(
             window_size,
             crate::theme::Theme::builtin(),
             tx,

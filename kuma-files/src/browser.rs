@@ -14939,7 +14939,7 @@ mod browser_ux_keys {
         app.run_until_parked();
         app.advance_clock(std::time::Duration::from_secs(2));
         app.run_until_parked();
-        window.update(|browser, _, _| {
+        window.update(|_browser, _, _| {
             assert_eq!(
                 fs::read_to_string(lab.live.join("notes.txt")).unwrap(),
                 "snapshot version",
@@ -14983,7 +14983,7 @@ mod browser_ux_keys {
         app.run_until_parked();
         app.advance_clock(std::time::Duration::from_secs(2));
         app.run_until_parked();
-        window.update(|browser, _, _| {
+        window.update(|_browser, _, _| {
             assert_eq!(
                 fs::read_to_string(lab.live.join("notes.txt")).unwrap(),
                 "snapshot version"
