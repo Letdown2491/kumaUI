@@ -123,19 +123,15 @@ fn file_title(path: &Path) -> String {
 }
 
 /// Whether the open surface renders this file at all. The mimetype
-/// claims (the desktop file) are the honest subset: avif has no
-/// decoder here and stays unclaimed (it is in is_image's own list),
-/// so the grid's Enter keeps handing it to whatever the system
-/// already opens it with. SVGs claim through the in-process
-/// rasterizer; videos play through the shared pane.
+/// claims (the desktop file) are the honest subset: avif decodes
+/// through the video path's libav (the image crate has no AV1
+/// decoder) and claims now that it does. SVGs claim through the
+/// in-process rasterizer; videos play through the shared pane.
 pub(crate) fn is_openable(name: &str) -> bool {
-    let ext = Path::new(name)
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase());
     icons::is_pdf(name)
         || icons::is_svg(name)
         || icons::is_video(name)
-        || (icons::is_image(name) && ext.as_deref() != Some("avif"))
+        || icons::is_image(name)
 }
 
 /// The viewer's decode budget: the peek's own cap, shared.
@@ -1075,13 +1071,13 @@ mod tests {
     #[test]
     fn openable_claims() {
         // svg joins the claimed kinds (rasterized in-process); avif
-        // stays the honest gap
+        // claims through the video path's libav decode
         assert!(is_openable("logo.svg"));
         assert!(is_openable("LOGO.SVG"));
         assert!(is_openable("photo.png"));
         assert!(is_openable("scan.pdf"));
         assert!(is_openable("clip.mp4"));
-        assert!(!is_openable("photo.avif"));
+        assert!(is_openable("photo.avif"));
         assert!(!is_openable("song.mp3"));
         // svg siblings walk svg siblings, not the images beside
         // them; videos walk videos

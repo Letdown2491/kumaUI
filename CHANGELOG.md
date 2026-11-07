@@ -7,6 +7,7 @@ Entries land with the change they describe; the next tag takes this section as i
 ### Added
 
 - The wallpaper-derived theme gains a flavor choice in Settings: Faithful (what the wallpaper shows) or Vibrant (strong chroma punches through even when it covers few pixels), the palette engine's second flavor that no control could reach before. The choice persists, re-derives the live palette on the spot, and only shows while derivation is on; configs without a flavor line read as Faithful.
+- Koguma reads AVIF images, the last image kind with no decoder here: the decode rides the video pane's libav plumbing (libavformat demuxes the HEIF container, libavcodec's AV1 decoder opens the frame), so no new dependency. Grid thumbnails, the peek's glance, and the standalone viewer all render it, the desktop file claims image/avif, and a system whose libav lacks the AV1 decoder honestly keeps the generic icon; an animated avif shows as the still it opens to.
 
 ## v0.7.1 (2026-10-23)
 

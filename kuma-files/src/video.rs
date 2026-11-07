@@ -53,6 +53,20 @@ pub(crate) fn duration_label(seconds: f64) -> Option<String> {
     }
 }
 
+/// An avif still through the video path's own first-frame decode:
+/// libavformat demuxes the HEIF container and libavcodec's AV1
+/// decoder opens the frame, so no new dependency rides. The decode
+/// is bounded at 4096 on the long edge (a huge still must not hand
+/// the pipeline an unbounded buffer); the callers' own fit, which
+/// never upscales, caps the render size like every other image.
+/// `None` wherever this system's libav cannot (the image crate has
+/// no AV1 decoder, and the stub build always answers None): avif
+/// keeps the generic icon and stays unclaimed on such a system.
+/// An animated avif is honest as a still: the first frame shows.
+pub(crate) fn decode_still_dynamic(path: &std::path::Path) -> Option<image::DynamicImage> {
+    imp::poster_dynamic(path, 4096).ok()
+}
+
 /// A stream with degenerate timestamps (static, or none at all)
 /// must not spin the img element's frame clock at unbounded rate:
 /// every displayed frame gets at least this delay.
@@ -1948,6 +1962,33 @@ mod tests {
         let bytes = render.as_bytes(0).expect("frame bytes");
         assert!(bytes.iter().any(|b| *b != 0));
         assert!(bytes.iter().any(|b| *b != bytes[0]));
+    }
+
+    #[test]
+    fn the_avif_fixture_demuxes_and_decodes() {
+        // the still's route is the video path's own first-frame
+        // decode: libavformat must demux the HEIF container and
+        // libavcodec must hold an AV1 decoder for this to work.
+        // probe() is not the gate (a still reports no duration);
+        // decode is
+        let path = Path::new("tests/fixtures/sample.avif");
+        let render = match decode_poster(path, 256) {
+            Ok(render) => render,
+            Err(fail) => panic!("avif decode failed: {fail:?}"),
+        };
+        // the poster path's fit scales up as well as down, so a 64px
+        // fixture lands at the cap; assert the square survived
+        let size = render.size(0);
+        assert_eq!(size.width, size.height);
+        // the fixture is a left-red / right-blue split: both colors
+        // survive the YUV round trip somewhere in the frame. BGRA
+        // order (the byte order gpui expects), stride tolerated by
+        // scanning rather than indexing
+        let bytes = render.as_bytes(0).expect("frame bytes");
+        let red = bytes.chunks_exact(4).any(|p| p[2] > 200 && p[0] < 60 && p[1] < 60);
+        let blue = bytes.chunks_exact(4).any(|p| p[0] > 200 && p[2] < 60 && p[1] < 60);
+        assert!(red, "no red pixel survived");
+        assert!(blue, "no blue pixel survived");
     }
 
     #[test]

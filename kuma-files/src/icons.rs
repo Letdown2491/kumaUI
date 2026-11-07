@@ -167,17 +167,44 @@ pub(crate) fn is_audio(name: &str) -> bool {
     matches!(ext.as_str(), "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a")
 }
 
+/// Whether the path is the one image kind the `image` crate cannot
+/// decode: avif needs the video path's libav decode.
+fn is_avif(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .as_deref()
+        == Some("avif")
+}
+
 /// Decode a file into a BGRA `RenderImage` no larger than the bounds, the
 /// byte order gpui expects. Same contract as kuma-shell's imaging module.
 pub(crate) fn decode_thumbnail(path: &Path, max_width: u32, max_height: u32) -> Option<gpui::RenderImage> {
-    kuma_platform::imaging::decode_fit(path, max_width, max_height)
+    if let Some(rendered) = kuma_platform::imaging::decode_fit(path, max_width, max_height) {
+        return Some(rendered);
+    }
+    // avif: the image crate has no AV1 decoder, the video path's
+    // first-frame decode stands in (None without the video feature,
+    // so the icon keeps standing in)
+    if is_avif(path) {
+        return crate::video::decode_still_dynamic(path)
+            .map(|image| kuma_platform::imaging::fit(image, max_width, max_height));
+    }
+    None
 }
 
 /// An image file decoded into a plain `DynamicImage`, uncapped and
 /// unswapped: the grid thumb job's intermediate, so the disk cache
 /// can encode PNGs of the pre-swap pixels.
 pub(crate) fn decode_thumbnail_dynamic(path: &Path) -> Option<image::DynamicImage> {
-    image::ImageReader::open(path).ok()?.decode().ok()
+    if let Some(decoded) = image::ImageReader::open(path).ok().and_then(|r| r.decode().ok()) {
+        return Some(decoded);
+    }
+    // avif: the image crate has no AV1 decoder, the video path's
+    // first-frame decode stands in (None without the video feature)
+    if is_avif(path) {
+        return crate::video::decode_still_dynamic(path);
+    }
+    None
 }
 
 /// An epub's cover bytes into the BGRA `RenderImage`, same contract

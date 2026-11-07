@@ -16811,12 +16811,11 @@ mod browser_ux_keys {
             "image/gif",
             "image/tiff",
             "image/svg+xml",
+            "image/avif",
             "application/pdf",
         ] {
             assert!(claimed.contains(&mime), "{mime} not claimed");
         }
-        // the claim follows the surface: no decoder for this yet
-        assert!(!claimed.contains(&"image/avif"));
     }
 
     #[test]
