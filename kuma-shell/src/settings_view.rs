@@ -3149,6 +3149,30 @@ impl SettingsView {
                     cx.notify();
                 }),
             ))
+            .when(
+                self.settings.read(cx).theme.wallpaper_derived,
+                |el| {
+                    // the flavor only means something while the theme
+                    // derives: with the flag off the constants apply,
+                    // and an inert control would just invite the click
+                    el.child(kit::setting_row(
+                        "Flavor",
+                        self.segmented(
+                            "theme-flavor",
+                            &[
+                                crate::palette::Flavor::Faithful,
+                                crate::palette::Flavor::Vibrant,
+                            ],
+                            self.settings.read(cx).theme.flavor,
+                            |flavor| format!("{flavor:?}"),
+                            |settings, flavor: crate::palette::Flavor, cx| {
+                                settings.set_theme_flavor(flavor, cx);
+                            },
+                            cx,
+                        ),
+                    ))
+                },
+            )
             .child(
                 div().id("gallery").grid().grid_cols(3).gap_2().children(
                     entries

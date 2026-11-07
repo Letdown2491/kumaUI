@@ -5,6 +5,7 @@
 //! off the seed's hue with WCAG contrast pulling the text values.
 
 use kuma_platform::color::{hsl_to_rgb, rgb_to_hsl};
+use serde::{Deserialize, Serialize};
 
 /// The palette's accent seed, in HSL (h in degrees, s and l 0..1).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -16,8 +17,10 @@ pub struct Seed {
 
 /// What the seed optimizes for: `Faithful` favors what the wallpaper
 /// actually shows, `Vibrant` lets strong chroma punch through even
-/// when it covers few pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// when it covers few pixels. Serialized lowercase in the config
+/// (`flavor = "faithful"`); the pre-choice default reads as Faithful.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Flavor {
     Faithful,
     Vibrant,

@@ -4,6 +4,10 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+### Added
+
+- The wallpaper-derived theme gains a flavor choice in Settings: Faithful (what the wallpaper shows) or Vibrant (strong chroma punches through even when it covers few pixels), the palette engine's second flavor that no control could reach before. The choice persists, re-derives the live palette on the spot, and only shows while derivation is on; configs without a flavor line read as Faithful.
+
 ## v0.7.1 (2026-10-23)
 
 kuma-shell 0.7.1

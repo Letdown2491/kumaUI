@@ -529,17 +529,21 @@ impl Default for BackgroundConfig {
 
 /// Wallpaper-derived theming: on by default. The shipped wallpaper
 /// themes well, and a new box should land with a cohesive palette and
-/// nothing to configure.
+/// nothing to configure. The flavor is the derivation's taste
+/// (Faithful or Vibrant) and only means something while the flag is
+/// on: off falls back to the constants.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
     pub wallpaper_derived: bool,
+    pub flavor: crate::palette::Flavor,
 }
 
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
             wallpaper_derived: true,
+            flavor: crate::palette::Flavor::Faithful,
         }
     }
 }
@@ -1425,6 +1429,18 @@ impl Settings {
         self.refresh_theme(cx);
     }
 
+    /// The derivation's flavor. Stored even while wallpaper-derived
+    /// theming is off (the choice waits for the flag to come back);
+    /// a no-op re-derivation is harmless.
+    pub fn set_theme_flavor(&mut self, flavor: crate::palette::Flavor, cx: &mut Context<Self>) {
+        if self.theme.flavor == flavor {
+            return;
+        }
+        self.theme.flavor = flavor;
+        self.commit(cx);
+        self.refresh_theme(cx);
+    }
+
     pub fn set_night_light_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
         self.night_light.enabled = on;
         self.commit(cx);
@@ -1473,12 +1489,13 @@ impl Settings {
             return;
         }
         let path = self.background.current_path();
+        let flavor = self.theme.flavor;
         cx.spawn(async move |this, cx| {
         let derived = cx
             .background_executor()
             .spawn(async move {
                 crate::imaging::decode_sampled(&path).map(|sample| {
-                    crate::palette::palette(&sample, crate::palette::Flavor::Faithful)
+                    crate::palette::palette(&sample, flavor)
                 })
             })
             .await;
@@ -1719,6 +1736,23 @@ mod tests {
         assert!(window_contains((22, 0), (22, 0), (3, 0)));
         assert!(window_contains((22, 0), (22, 0), (12, 0)));
         assert!(window_contains((22, 0), (22, 0), (22, 0)));
+    }
+
+    #[test]
+    fn theme_flavor_defaults_to_faithful_and_roundtrips() {
+        // an old config (no flavor line at all) reads as Faithful, the
+        // flavor that was hardcoded before the choice existed
+        let settings: Settings = toml::from_str("").unwrap();
+        assert_eq!(settings.theme.flavor, crate::palette::Flavor::Faithful);
+
+        // the choice survives the write-read loop, lowercase in the file
+        let settings: Settings =
+            toml::from_str("[theme]\nflavor = \"vibrant\"\n").unwrap();
+        assert_eq!(settings.theme.flavor, crate::palette::Flavor::Vibrant);
+        let text = toml::to_string_pretty(&settings).unwrap();
+        assert!(text.contains("vibrant"));
+        let reread: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(reread.theme.flavor, crate::palette::Flavor::Vibrant);
     }
 
     #[test]
