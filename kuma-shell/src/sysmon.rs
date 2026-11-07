@@ -316,6 +316,17 @@ pub struct SysMon {
     /// The device MAC an act is in flight for: the panel's
     /// "working..." tag.
     pub bt_busy: Option<String>,
+    /// The external panels that answer DDC/CI, from the last probe:
+    /// the brightness panel's rows and the OSD's DDC cards. The
+    /// probe rides the brightness panel's open (the streams scan's
+    /// shape), never the poll: a monitor that does not answer
+    /// simply does not appear.
+    pub(crate) ddc: Vec<crate::ddc::DdcPanel>,
+    /// The serialized ddc worker's queue, started by the first
+    /// request. Its own worker, not the av one: a wedged monitor's
+    /// setvcp (a 30s timeout) must never stand between a volume
+    /// press and its write.
+    ddc_sender: Option<DdcQueue>,
 }
 
 /// One poll read of the audio and brightness trio: the candidate state.
@@ -557,6 +568,108 @@ impl AvRequest {
                 }
             }
         }
+    }
+}
+
+/// One queued external-panel brightness write: the display, the
+/// target percent, the VCP max the percent denominates (captured at
+/// push time; a re-probe's new max reconciles on the next read),
+/// and the previous percent for the rollback.
+#[derive(Clone, Copy)]
+enum DdcRequest {
+    Set(u8, u8, u32, Option<u8>),
+}
+
+impl DdcRequest {
+    fn key(self) -> u8 {
+        let DdcRequest::Set(display, ..) = self;
+        display
+    }
+
+    fn percent(self) -> u8 {
+        let DdcRequest::Set(_, percent, ..) = self;
+        percent
+    }
+
+    async fn execute(self, this: &gpui::WeakEntity<SysMon>, cx: &mut gpui::AsyncApp) {
+        let DdcRequest::Set(display, percent, max, previous) = self;
+        let result = cx
+            .background_spawn(async move {
+                crate::ddc::set_brightness(display, percent, max)
+            })
+            .await;
+        let _ = this.update(cx, |sysmon, cx| {
+            if let Some(panel) = sysmon.ddc.iter_mut().find(|panel| panel.display == display) {
+                match result {
+                    Ok(()) => {
+                        panel.percent = Some(percent);
+                        panel.error = None;
+                    }
+                    Err(line) => {
+                        // the optimistic write rolls back and the
+                        // refusal surfaces: what was attempted, what
+                        // refused, nothing asserted
+                        panel.percent = previous;
+                        panel.error = Some(line);
+                    }
+                }
+                cx.notify();
+            }
+        });
+    }
+}
+
+/// The ddc worker's queue: the av queue's contract, its own worker.
+/// A wedged monitor's setvcp (a 30s timeout) must never stand
+/// between a volume press and its write, so the DDC writes drain
+/// beside the audio ones, not behind them. Same coalescing shape:
+/// one pending Set per display, the newest percent winning, the
+/// oldest previous standing for the rollback.
+#[derive(Clone)]
+struct DdcQueue {
+    pending: Arc<Mutex<Vec<DdcRequest>>>,
+    notify: smol::channel::Sender<()>,
+}
+
+impl DdcQueue {
+    fn spawn(cx: &mut Context<SysMon>) -> Self {
+        let (notify, notify_rx) = smol::channel::bounded::<()>(1);
+        let pending = Arc::new(Mutex::new(Vec::<DdcRequest>::new()));
+        let drain = pending.clone();
+        cx.spawn(async move |this, cx| {
+            while let Ok(()) = notify_rx.recv().await {
+                let requests = std::mem::take(&mut *drain.lock().expect("ddc queue poisoned"));
+                for request in requests {
+                    request.execute(&this, cx).await;
+                }
+            }
+        })
+        .detach();
+        Self { pending, notify }
+    }
+
+    fn push(&self, request: DdcRequest) {
+        {
+            let mut pending = self.pending.lock().expect("ddc queue poisoned");
+            coalesce_ddc(&mut pending, request);
+        }
+        let _ = self.notify.try_send(());
+    }
+}
+
+/// Insert one request: one pending Set per display, the newest
+/// percent winning, the oldest previous standing for the rollback
+/// (the audio queue's shape: what the first queued write replaced
+/// is what a failure restores).
+fn coalesce_ddc(pending: &mut Vec<DdcRequest>, request: DdcRequest) {
+    let display = request.key();
+    if let Some(DdcRequest::Set(_, queued, _, _)) = pending
+        .iter_mut()
+        .find(|existing| existing.key() == display)
+    {
+        *queued = request.percent();
+    } else {
+        pending.push(request);
     }
 }
 
@@ -969,6 +1082,64 @@ impl SysMon {
             cx.notify();
         }
         self.queue(AvRequest::BrightnessAbsolute(percent, previous), cx);
+    }
+
+    /// One request seam for an external panel's brightness (the
+    /// brightness panel's DDC rows): optimistic percent write, its
+    /// own queue, rollback plus the honest error line on refusal.
+    /// A panel with no live reading has no slider to drag, so the
+    /// write only queues when one stands.
+    pub fn request_set_ddc_brightness(&mut self, display: u8, percent: u8, cx: &mut Context<Self>) {
+        let Some(panel) = self.ddc.iter().find(|panel| panel.display == display) else {
+            return;
+        };
+        let (previous, max) = (panel.percent, panel.max);
+        // no live reading, no slider to drag and nothing to roll back
+        // to: the write waits for a read (the panel's error line says
+        // why there is none)
+        let Some(previous) = previous else {
+            return;
+        };
+        if let Some(panel) = self.ddc.iter_mut().find(|panel| panel.display == display) {
+            panel.percent = Some(percent);
+            panel.error = None;
+            cx.notify();
+        }
+        self.ddc_queue(DdcRequest::Set(display, percent, max, Some(previous)), cx);
+    }
+
+    /// The DDC panels' knowledge, refreshed off the UI thread: one
+    /// detect pass plus one read per panel, the brightness panel's
+    /// open-time probe (the volume panel's streams scan's shape).
+    /// The fresh list replaces the old wholesale: a monitor plugged
+    /// in since the last open appears, one that stopped answering
+    /// drops, and a drag finished before the next open never races
+    /// the read.
+    pub fn probe_ddc(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let panels = cx
+                .background_spawn(async move { crate::ddc::detect() })
+                .await;
+            let _ = this.update(cx, |sysmon, cx| {
+                sysmon.ddc = panels;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The serialized ddc executor's queue side, the av queue's
+    /// mirror: the first request starts the one worker.
+    fn ddc_queue(&mut self, request: DdcRequest, cx: &mut Context<Self>) {
+        let queue = match &self.ddc_sender {
+            Some(queue) => queue.clone(),
+            None => {
+                let queue = DdcQueue::spawn(cx);
+                self.ddc_sender = Some(queue.clone());
+                queue
+            }
+        };
+        queue.push(request);
     }
 
     /// Brightness by delta (the bar widget's scroll wheel): optimistic
@@ -2844,6 +3015,22 @@ mod tests {
         ));
         // a different absolute kind keeps its own row
         coalesce_request(&mut pending, AvRequest::BrightnessAbsolute(50, None));
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn ddc_writes_collapse_per_display() {
+        let mut pending = Vec::new();
+        coalesce_ddc(&mut pending, DdcRequest::Set(1, 20, 100, Some(10)));
+        coalesce_ddc(&mut pending, DdcRequest::Set(1, 30, 100, None));
+        // the newest percent wins; the oldest previous stands
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            &pending[0],
+            DdcRequest::Set(1, 30, 100, Some(10))
+        ));
+        // another display keeps its own row
+        coalesce_ddc(&mut pending, DdcRequest::Set(2, 50, 100, None));
         assert_eq!(pending.len(), 2);
     }
 

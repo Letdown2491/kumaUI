@@ -58,6 +58,9 @@ pub struct SliderPanelView {
     /// The volume panel's per-stream drag: the stream id plus its
     /// track's bounds stash. One pointer drags at a time.
     stream_drag: Option<(u32, TrackStash)>,
+    /// The brightness panel's per-DDC-panel drag: the display number
+    /// plus its track's bounds stash. One pointer drags at a time.
+    ddc_drag: Option<(u8, TrackStash)>,
     /// The volume panel's icon shelf: decoded desktop icons keyed by
     /// the desktop file's icon name, matched to streams at render time.
     app_icons: HashMap<String, Option<IconImage>>,
@@ -77,12 +80,21 @@ impl SliderPanelView {
         if kind == SliderKind::Volume {
             sysmon.update(cx, |sysmon, cx| sysmon.scan_streams_now(cx));
         }
+        // the brightness panel probes the DDC panels on every open
+        // (the streams scan's shape): a monitor plugged in since the
+        // last open appears, one that stopped answering drops, and
+        // the shell pays one background detect per open, never a
+        // poll's worth
+        if kind == SliderKind::Brightness {
+            sysmon.update(cx, |sysmon, cx| sysmon.probe_ddc(cx));
+        }
         let mut this = Self {
             geometry,
             sysmon,
             kind,
             dragging: None,
             stream_drag: None,
+            ddc_drag: None,
             app_icons: HashMap::new(),
             apps: Vec::new(),
         };
@@ -167,6 +179,22 @@ impl SliderPanelView {
         self.sysmon
             .update(cx, |sysmon, cx| sysmon.request_set_stream_volume(id, percent, cx));
     }
+
+    /// A DDC row's drag: same shape again, the request naming the
+    /// display. The optimistic write lives in sysmon; a monitor that
+    /// refuses mid-drag rolls back and shows its error line.
+    fn on_ddc_drag(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some((display, stash)) = self.ddc_drag.as_ref() else {
+            return;
+        };
+        let Some(percent) = stash.get().and_then(|bounds| controls::value_at(x, bounds)) else {
+            return;
+        };
+        let display = *display;
+        self.sysmon.update(cx, |sysmon, cx| {
+            sysmon.request_set_ddc_brightness(display, percent, cx)
+        });
+    }
 }
 
 impl Render for SliderPanelView {
@@ -195,6 +223,8 @@ impl Render for SliderPanelView {
                     this.on_drag(event.position.x, cx);
                 } else if this.stream_drag.is_some() {
                     this.on_stream_drag(event.position.x, cx);
+                } else if this.ddc_drag.is_some() {
+                    this.on_ddc_drag(event.position.x, cx);
                 }
             }))
             .on_mouse_up(
@@ -202,6 +232,7 @@ impl Render for SliderPanelView {
                 cx.listener(|this, _, _, _| {
                     this.dragging = None;
                     this.stream_drag = None;
+                    this.ddc_drag = None;
                 }),
             )
             .child(kit::pane_header(self.kind.title()))
@@ -258,6 +289,99 @@ impl Render for SliderPanelView {
                     }),
                 ))
             });
+
+        // the DDC rows: one per external panel that answered the
+        // open-time probe, under a divider. A row with no reading
+        // shows its honest error line instead of a dead slider; the
+        // panels ride their own queue, so a slow monitor never
+        // stands between a volume press and its write.
+        let ddc = sysmon.ddc.clone();
+        let content = content.when(
+            kind == SliderKind::Brightness && !ddc.is_empty(),
+            |el| {
+                el.child(div().mt_1().h(px(1.)).w_full().bg(rgba(crate::theme::current().divider_soft)))
+                    .children(ddc.iter().map(|panel| {
+                        let stash = controls::track_stash();
+                        let display = panel.display;
+                        div()
+                            .id(gpui::SharedString::from(format!("ddc-{display}")))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .py_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        gpui::svg()
+                                            .path("icons/brightness.svg")
+                                            .size(px(16.))
+                                            .text_color(rgb(crate::theme::current().text)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(crate::theme::current().text))
+                                            .truncate()
+                                            .child(panel.model.clone()),
+                                    )
+                                    .when_some(panel.percent, |el, percent| {
+                                        el.child(controls::slider_track(
+                                            percent,
+                                            stash.clone(),
+                                        ))
+                                        .child(
+                                            div()
+                                                .w(px(32.))
+                                                .text_size(px(11.))
+                                                .text_color(rgb(
+                                                    crate::theme::current().text_dim,
+                                                ))
+                                                .text_align(TextAlign::Right)
+                                                .child(format!("{percent}%")),
+                                        )
+                                    })
+                                    .when_none(&panel.percent, |el| {
+                                        el.child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(rgb(
+                                                    crate::theme::current().text_dim,
+                                                ))
+                                                .child("no reading"),
+                                        )
+                                    })
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                            this.ddc_drag = Some((display, stash.clone()));
+                                            if let Some(percent) = stash.get().and_then(|bounds| {
+                                                controls::value_at(event.position.x, bounds)
+                                            }) {
+                                                this.sysmon.update(cx, |sysmon, cx| {
+                                                    sysmon.request_set_ddc_brightness(
+                                                        display, percent, cx,
+                                                    )
+                                                });
+                                            }
+                                        }),
+                                    ),
+                            )
+                            .when_some(panel.error.clone(), |el, error| {
+                                el.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(crate::theme::URGENT))
+                                        .child(error),
+                                )
+                            })
+                    }))
+            },
+        );
 
         // the per-app rows: one per playback stream, under a divider.
         // The scan rides only while the panel is open, so this reads

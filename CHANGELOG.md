@@ -8,6 +8,7 @@ Entries land with the change they describe; the next tag takes this section as i
 
 - The wallpaper-derived theme gains a flavor choice in Settings: Faithful (what the wallpaper shows) or Vibrant (strong chroma punches through even when it covers few pixels), the palette engine's second flavor that no control could reach before. The choice persists, re-derives the live palette on the spot, and only shows while derivation is on; configs without a flavor line read as Faithful.
 - Koguma reads AVIF images, the last image kind with no decoder here: the decode rides the video pane's libav plumbing (libavformat demuxes the HEIF container, libavcodec's AV1 decoder opens the frame), so no new dependency. Grid thumbnails, the peek's glance, and the standalone viewer all render it, the desktop file claims image/avif, and a system whose libav lacks the AV1 decoder honestly keeps the generic icon; an animated avif shows as the still it opens to.
+- External monitors that answer DDC/CI get brightness control: the brightness panel probes on open and shows one row per answering panel (its own model name, its own slider), the writes ride ddcutil on their own queue so a slow monitor never stands between a volume press and its write, and the OSD card names the panel the drag meant. A monitor that does not answer simply does not appear; a refusal rolls the slider back and says what refused (the image needs ddcutil and the i2c rule: docs/handoffs/kumaos-ddc-brightness.md).
 
 ## v0.7.1 (2026-10-23)
 

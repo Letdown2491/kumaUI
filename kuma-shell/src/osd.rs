@@ -35,7 +35,9 @@ const PENDING_CARDS: usize = 4;
 #[derive(Clone, Debug, PartialEq)]
 pub struct OsdContent {
     icon: &'static str,
-    label: &'static str,
+    /// The channel's name; the DDC cards name the panel the change
+    /// meant ("Brightness (LG HDR 4K)").
+    label: String,
     value: String,
     /// The bar's fill, 0..=100; None means no bar (the microphone).
     percent: Option<u8>,
@@ -44,15 +46,17 @@ pub struct OsdContent {
 
 /// The slice of session state the OSD watches: a change in any of it
 /// is a change a user made blind.
-#[derive(Clone, Copy, Default, PartialEq, Debug)]
+#[derive(Clone, Default, PartialEq, Debug)]
 struct OsdSnapshot {
     volume: Option<Volume>,
     mic: Option<Mic>,
     brightness: Option<Brightness>,
-    /// The notification bell's sleep flag; None before the settings'
-    /// first read.
     dnd: Option<bool>,
     profile: Option<PowerProfile>,
+    /// The external panels' last-known percents, same diff contract
+    /// as the internal brightness: a panel that appeared or dropped
+    /// is a probe's doing, not a thing the user did.
+    ddc: Vec<crate::ddc::DdcPanel>,
 }
 
 fn snapshot_of(sysmon: &SysMon, settings: &Settings) -> OsdSnapshot {
@@ -62,6 +66,7 @@ fn snapshot_of(sysmon: &SysMon, settings: &Settings) -> OsdSnapshot {
         brightness: sysmon.brightness,
         dnd: Some(settings.notifications.dnd),
         profile: sysmon.power_profile,
+        ddc: sysmon.ddc.clone(),
     }
 }
 
@@ -85,6 +90,9 @@ fn content_for_change(before: OsdSnapshot, after: OsdSnapshot) -> Vec<OsdContent
         && before.brightness.is_some()
     {
         changes.push(brightness_content(brightness));
+    }
+    if let Some(content) = ddc_change(&before.ddc, &after.ddc) {
+        changes.push(content);
     }
     if before.mic != after.mic
         && let Some(mic) = after.mic
@@ -110,7 +118,7 @@ fn content_for_change(before: OsdSnapshot, after: OsdSnapshot) -> Vec<OsdContent
 fn volume_content(volume: Volume) -> OsdContent {
     OsdContent {
         icon: "icons/volume.svg",
-        label: "Volume",
+        label: "Volume".into(),
         value: if volume.muted {
             "Muted".into()
         } else {
@@ -124,7 +132,7 @@ fn volume_content(volume: Volume) -> OsdContent {
 fn mic_content(mic: Mic) -> OsdContent {
     OsdContent {
         icon: "icons/mic.svg",
-        label: "Microphone",
+        label: "Microphone".into(),
         value: if mic.muted {
             "Muted".into()
         } else {
@@ -136,19 +144,52 @@ fn mic_content(mic: Mic) -> OsdContent {
 }
 
 fn brightness_content(brightness: Brightness) -> OsdContent {
+    brightness_card("Brightness".into(), brightness.percent)
+}
+
+/// The card for one panel's brightness; the DDC cards name the
+/// panel the drag meant.
+fn brightness_card(label: String, percent: u8) -> OsdContent {
     OsdContent {
         icon: "icons/brightness.svg",
-        label: "Brightness",
-        value: format!("{}%", brightness.percent),
-        percent: Some(brightness.percent),
+        label,
+        value: format!("{percent}%"),
+        percent: Some(percent),
         urgent: false,
     }
+}
+
+/// The first DDC panel whose live percent moved between the two
+/// snapshots, as the card for it. One card per tick: several
+/// panels moving in one pass (never a user's doing) queue in turn
+/// like several channels would. A panel that appeared, dropped, or
+/// lost its reading is a probe's doing: no percent to diff, no
+/// card.
+fn ddc_change(
+    before: &[crate::ddc::DdcPanel],
+    after: &[crate::ddc::DdcPanel],
+) -> Option<OsdContent> {
+    for panel in after {
+        let Some(percent) = panel.percent else {
+            continue;
+        };
+        let Some(previous) = before.iter().find(|p| p.display == panel.display) else {
+            continue;
+        };
+        if previous.percent.is_some() && previous.percent != Some(percent) {
+            return Some(brightness_card(
+                format!("Brightness ({})", panel.model),
+                percent,
+            ));
+        }
+    }
+    None
 }
 
 fn profile_content(profile: PowerProfile) -> OsdContent {
     OsdContent {
         icon: "icons/power-profile.svg",
-        label: "Power Profile",
+        label: "Power Profile".into(),
         value: profile.title().into(),
         percent: None,
         urgent: profile == PowerProfile::Performance,
@@ -158,7 +199,7 @@ fn profile_content(profile: PowerProfile) -> OsdContent {
 fn dnd_content(dnd: bool) -> OsdContent {
     OsdContent {
         icon: "icons/bell.svg",
-        label: "Do Not Disturb",
+        label: "Do Not Disturb".into(),
         value: if dnd { "On".into() } else { "Off".into() },
         percent: None,
         urgent: dnd,
@@ -201,7 +242,7 @@ impl Osd {
         if self.last.is_none() && next == OsdSnapshot::default() {
             return;
         }
-        match self.last.replace(next) {
+        match self.last.replace(next.clone()) {
             // the first real snapshot says nothing: showing "Volume
             // 64%" at login is noise, not feedback
             None => {}
@@ -476,13 +517,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        let changes = content_for_change(quiet, loud);
+        let changes = content_for_change(quiet, loud.clone());
         assert_eq!(changes.len(), 1);
         let content = &changes[0];
         assert_eq!(content.label, "Volume");
         assert_eq!(content.value, "64%");
         // the poll that found nothing new shows nothing
-        assert!(content_for_change(loud, loud).is_empty());
+        assert!(content_for_change(loud.clone(), loud).is_empty());
     }
 
     #[test]
@@ -535,6 +576,48 @@ mod tests {
     }
 
     #[test]
+    fn a_ddc_percent_move_names_its_panel() {
+        let panel = crate::ddc::DdcPanel {
+            display: 1,
+            model: "LG HDR 4K".to_string(),
+            percent: Some(40),
+            max: 100,
+            error: None,
+        };
+        let before = OsdSnapshot {
+            ddc: vec![panel.clone()],
+            ..Default::default()
+        };
+        let after = OsdSnapshot {
+            ddc: vec![crate::ddc::DdcPanel {
+                percent: Some(60),
+                ..panel
+            }],
+            ..Default::default()
+        };
+        let changes = content_for_change(before, after);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].label, "Brightness (LG HDR 4K)");
+        assert_eq!(changes[0].value, "60%");
+        assert_eq!(changes[0].percent, Some(60));
+
+        // a panel arriving with no previous one is the probe finding
+        // the world (the open-time detect), not a thing the user did
+        let panel = crate::ddc::DdcPanel {
+            display: 2,
+            model: "Dell U2723QE".to_string(),
+            percent: Some(35),
+            max: 100,
+            error: None,
+        };
+        let learned = OsdSnapshot {
+            ddc: vec![panel],
+            ..Default::default()
+        };
+        assert!(content_for_change(OsdSnapshot::default(), learned).is_empty());
+    }
+
+    #[test]
     fn dnd_and_profile_name_their_change_but_not_their_first_sighting() {
         // the startup fill: a value arriving with no previous one is
         // the poll finding the world, not the user pressing anything
@@ -543,7 +626,7 @@ mod tests {
             dnd: Some(false),
             ..Default::default()
         };
-        assert!(content_for_change(OsdSnapshot::default(), fill).is_empty());
+        assert!(content_for_change(OsdSnapshot::default(), fill.clone()).is_empty());
 
         // the same startup fill for every polled field: a value arriving
         // with no previous one is the poll finding the world (a slow
@@ -563,9 +646,9 @@ mod tests {
         // a real toggle names itself
         let on = OsdSnapshot {
             dnd: Some(true),
-            ..fill
+            ..fill.clone()
         };
-        let content = &content_for_change(fill, on);
+        let content = &content_for_change(fill.clone(), on);
         assert_eq!(content.len(), 1);
         let content = &content[0];
         assert_eq!(content.label, "Do Not Disturb");
@@ -574,7 +657,7 @@ mod tests {
 
         let fast = OsdSnapshot {
             profile: Some(PowerProfile::Performance),
-            ..fill
+            ..fill.clone()
         };
         let content = &content_for_change(fill, fast);
         assert_eq!(content.len(), 1);
