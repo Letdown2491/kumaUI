@@ -4,6 +4,13 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+## v0.9.0 (2026-11-13)
+
+kuma-shell 0.9.0
+kuma-files 0.7.0
+kuma-term 0.5.1
+kuma-monitor 0.4.1
+
 ### Added
 
 - kuma-shell grows threshold battery notifications and retires the image's battery-watch script: the shell watches udev power_supply events instead of polling, warns at 15% and at 5% only while discharging, warns once per band with replugging re-arming the warning, and warns from the first read when a session opens on a low battery, while machines without a battery stay silent.
