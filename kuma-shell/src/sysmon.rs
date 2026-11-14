@@ -2498,7 +2498,8 @@ pub fn set_brightness(percent: u8) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_battery() -> Option<Battery> {
+/// The sysfs read the bar's widget and the threshold notifier share.
+pub(crate) fn read_battery() -> Option<Battery> {
     let supplies = std::fs::read_dir("/sys/class/power_supply").ok()?;
     let battery = supplies
         .filter_map(|entry| entry.ok())

@@ -52,6 +52,11 @@ fn main() {
             kuma_shell::osd::run(&osd, &sysmon, &settings, cx);
 
             let notifications = kuma_shell::notifications::start(settings.clone(), cx);
+            // the battery threshold notifier: rides udev power_supply
+            // events (the image's battery-watch script's road, now
+            // absorbed here) and pushes through the notification state,
+            // so it warns while the shell idles displayless too
+            kuma_shell::battery::run(&notifications, cx);
             let tray = kuma_shell::tray::start(cx);
             let nostr = cx.new(|_| kuma_shell::nostr::NostrState::new(notifications.clone()));
             kuma_shell::nostr::run(&nostr, cx);
