@@ -66,10 +66,9 @@ pub enum OscEvent {
     Cwd { host: Option<String>, path: String },
     /// `OSC 9 ; message` or `OSC 777 ; notify ; title ; body`.
     Notification { title: Option<String>, body: String },
-    /// `OSC 7501 ; status[;message]`: a program reported its status.
-    /// Every status value is forwarded as spelled; unknown values are
-    /// the wiring's to ignore (the kitty keyboard tap's etiquette).
-    ProgramStatus { status: String, message: Option<String> },
+    /// `OSC 7501 ; state=...`: a program-status report, the protocol's
+    /// body parsed and typed.
+    ProgramStatus(crate::ProgramStatus),
     /// `OSC 7501 ; ?`: the program asked what the current status is.
     /// The caller owes a reply on the PTY.
     ProgramStatusQuery,
@@ -177,6 +176,54 @@ impl Tap {
     }
 }
 
+/// One program-status report (OSC 7501, the Program Status Protocol
+/// rev 0.4): the protocol's key=value body with the known fields
+/// typed. `state=clear` rides the same struct, meaning "remove
+/// records" (all of them when `id` is `None`, the named one and every
+/// record beneath it otherwise).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramStatus {
+    pub state: ProgramState,
+    /// The record's id, absent for the root record. An id that breaks
+    /// the protocol's shape (its charset, depth, or length) reads as
+    /// the root record: a record on the wrong key is worse than one
+    /// on the root.
+    pub id: Option<String>,
+    /// With `blocked` only, what the program waits for.
+    pub kind: Option<ProgramBlockedKind>,
+    /// With `working`, a percentage (the protocol caps at 100).
+    pub progress: Option<u8>,
+    /// The reporting program's own name.
+    pub app: Option<String>,
+    /// The message, base64 in the protocol and decoded here. A body
+    /// that will not decode stays as spelled: a program that sent
+    /// plain text still shows something.
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Error,
+    /// Not a state: remove records (the id names which).
+    Clear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramBlockedKind {
+    Permission,
+    Question,
+    Auth,
+}
+
+/// The reply a supporting terminal owes the query variant, with this
+/// terminal's supported states and blocked kinds spelled out.
+pub const PROGRAM_STATUS_REPLY: &str =
+    "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
+
 /// Parse a completed OSC body: `number[;params...]`. Returns `None`
 /// for everything the tap does not speak.
 fn parse(body: &[u8]) -> Option<OscEvent> {
@@ -247,21 +294,100 @@ fn parse(body: &[u8]) -> Option<OscEvent> {
             Some(OscEvent::Notification { title: Some(title?), body })
         },
         b"7501" => {
-            let status = params.next()?;
-            if status == b"?" {
+            let body = params.next()?;
+            if body == b"?" {
                 return Some(OscEvent::ProgramStatusQuery);
             }
-            let status = String::from_utf8_lossy(status).into_owned();
-            let message: Vec<u8> = params.collect::<Vec<&[u8]>>().join(&b';');
-            let message = if message.is_empty() {
-                None
-            } else {
-                Some(String::from_utf8_lossy(&message).into_owned())
-            };
-            Some(OscEvent::ProgramStatus { status, message })
+            let status = program_status(body)?;
+            Some(OscEvent::ProgramStatus(status))
         },
         _ => None,
     }
+}
+
+/// The OSC 7501 body: `key=value` pairs joined by `:`, `state=` required.
+fn program_status(body: &[u8]) -> Option<ProgramStatus> {
+    let mut status = ProgramStatus {
+        state: ProgramState::Clear,
+        id: None,
+        kind: None,
+        progress: None,
+        app: None,
+        message: None,
+    };
+    let mut has_state = false;
+    for pair in body.split(|&b| b == b':') {
+        let (key, value) = match pair.iter().position(|&b| b == b'=') {
+            Some(eq) => (&pair[..eq], &pair[eq + 1..]),
+            None => continue,
+        };
+        match key {
+            b"state" => {
+                // any other value makes the terminal discard the whole
+                // report (the protocol's own discard rule)
+                status.state = match value {
+                    b"idle" => ProgramState::Idle,
+                    b"working" => ProgramState::Working,
+                    b"done" => ProgramState::Done,
+                    b"blocked" => ProgramState::Blocked,
+                    b"error" => ProgramState::Error,
+                    b"clear" => ProgramState::Clear,
+                    _ => return None,
+                };
+                has_state = true;
+            },
+            b"kind" => {
+                status.kind = match value {
+                    b"permission" => Some(ProgramBlockedKind::Permission),
+                    b"question" => Some(ProgramBlockedKind::Question),
+                    b"auth" => Some(ProgramBlockedKind::Auth),
+                    _ => None,
+                };
+            },
+            b"progress" => {
+                status.progress = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|s| s.parse::<u8>().ok())
+                    .filter(|p| *p <= 100);
+            },
+            b"app" => status.app = Some(String::from_utf8_lossy(value).into_owned()),
+            b"msg" => {
+                status.message = Some(base64_decode(value).unwrap_or_else(|| {
+                    String::from_utf8_lossy(value).into_owned()
+                }));
+            },
+            // unknown keys are ignored: the report stands
+            _ => {},
+        }
+    }
+    has_state.then_some(status)
+}
+
+/// Standard-alphabet base64, tolerant of the `-w0` unpadded spelling
+/// the protocol's examples ride and of padding either way.
+fn base64_decode(value: &[u8]) -> Option<String> {
+    let value = value.strip_suffix(b"-w0").unwrap_or(value);
+    let mut out = Vec::with_capacity(value.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for &b in value {
+        let digit: u32 = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | digit;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// `file://host/path` with the path percent-decoded. A non-file scheme
@@ -389,16 +515,30 @@ mod tests {
     fn program_status_forwards_and_queries() {
         let mut tap = Tap::default();
         assert_eq!(
-            feed(&mut tap, b"\x1b]7501;working\x07"),
-            vec![OscEvent::ProgramStatus { status: "working".into(), message: None }]
+            feed(&mut tap, b"\x1b]7501;state=working\x07"),
+            vec![OscEvent::ProgramStatus(ProgramStatus {
+                state: ProgramState::Working,
+                id: None,
+                kind: None,
+                progress: None,
+                app: None,
+                message: None,
+            })]
         );
+        // msg is base64 in the protocol; -w0's unpadded spelling rides
         assert_eq!(
-            feed(&mut tap, b"\x1b]7501;failed;exit 2\x07"),
-            vec![OscEvent::ProgramStatus {
-                status: "failed".into(),
-                message: Some("exit 2".into())
-            }]
+            feed(&mut tap, b"\x1b]7501;state=done:msg=ZG9uZQ-w0\x07"),
+            vec![OscEvent::ProgramStatus(ProgramStatus {
+                state: ProgramState::Done,
+                id: None,
+                kind: None,
+                progress: None,
+                app: None,
+                message: Some("done".into()),
+            })]
         );
+        // an unknown state discards the whole report
+        assert!(feed(&mut tap, b"\x1b]7501;state=running\x07").is_empty());
         assert_eq!(feed(&mut tap, b"\x1b]7501;?\x07"), vec![OscEvent::ProgramStatusQuery]);
     }
 

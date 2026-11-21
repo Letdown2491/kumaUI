@@ -127,7 +127,26 @@ struct Tab {
     /// reflows the grid and the marks drift with it, like every mark
     /// implementation's.
     marks: Vec<i64>,
+    /// The program-status records (OSC 7501), one per report id (the
+    /// root record's id is empty), with the protocol's own lifetimes:
+    /// a new prompt ends the working and blocked ones, done and error
+    /// survive until replaced or cleared. Capped, oldest dropped.
+    status_records: Vec<StatusRecord>,
 }
+
+/// One program-status record on a tab. The report's message is parsed
+/// by the tap and dropped here: the dot is this decoration's whole
+/// vocabulary until a tooltip lands.
+#[derive(Clone, Debug)]
+struct StatusRecord {
+    /// The report id; empty for the root record.
+    id: String,
+    state: term_tap::ProgramState,
+}
+
+/// The status-record cap: a program may report hierarchies of ids, and
+/// a hostile one could report forever.
+const STATUS_RECORDS_CAP: usize = 32;
 
 /// The prompt-mark cap: a long session marks a prompt per command, and
 /// the oldest marks are the least interesting to jump to.
@@ -426,6 +445,7 @@ impl TerminalView {
             _pump: pump,
             cwd: None,
             marks: Vec::new(),
+            status_records: Vec::new(),
         })
     }
 
@@ -656,6 +676,11 @@ impl TerminalView {
                     tab.marks.remove(0);
                 }
                 tab.marks.push(depth);
+                // the protocol's lifetime rule: a new prompt ends every
+                // working and blocked record (the command ran, the
+                // wait is over); done and error survive, the result
+                // stays visible until the next run
+                prompt_ends_records(&mut tab.status_records);
             }
             UiEvent::CommandFinished(code) => {
                 // the honest command-finish event; the program-status
@@ -667,6 +692,12 @@ impl TerminalView {
                     self.tabs[index].cwd = Some(path);
                 } else {
                     log::info!("ignoring a cwd report from another host: {host:?}");
+                }
+            }
+            UiEvent::ProgramStatus(status) => {
+                apply_status(&mut self.tabs[index].status_records, &status);
+                if index == self.active {
+                    cx.notify();
                 }
             }
             UiEvent::PtyWrite(bytes) => self.tabs[index].engine.input(bytes),
@@ -1416,9 +1447,71 @@ fn cwd_host_is_local(host: Option<&str>) -> bool {
     }
 }
 
+/// A tab's status dot (OSC 7501): the one record the user should look
+/// at, attention-first: failed beats waiting-for-you, which beats an
+/// unseen result, which beats busy; idle and clear show nothing. The
+/// colors are the theme's own ANSI: red for error, yellow for blocked,
+/// green for done, and the plain foreground for working.
+fn status_dot(records: &[StatusRecord], theme: &Theme) -> Option<crate::palette::Rgb8> {
+    let best = records
+        .iter()
+        .max_by_key(|record| match record.state {
+            term_tap::ProgramState::Error => 5,
+            term_tap::ProgramState::Blocked => 4,
+            term_tap::ProgramState::Done => 2,
+            term_tap::ProgramState::Working => 1,
+            _ => 0,
+        })?;
+    match best.state {
+        term_tap::ProgramState::Blocked => Some(theme.named[3]),
+        term_tap::ProgramState::Error => Some(theme.named[1]),
+        term_tap::ProgramState::Done => Some(theme.named[2]),
+        term_tap::ProgramState::Working => Some(theme.foreground),
+        _ => None,
+    }
+}
+
+/// Apply one program-status report to a tab's records: upsert the id's
+/// record, or remove (with `clear`) the named record and everything
+/// beneath it in the protocol's hierarchy.
+fn apply_status(records: &mut Vec<StatusRecord>, status: &term_tap::ProgramStatus) {
+    if status.state == term_tap::ProgramState::Clear {
+        match &status.id {
+            Some(id) => {
+                let prefix = format!("{id}/");
+                records.retain(|record| record.id != *id && !record.id.starts_with(&prefix));
+            }
+            None => records.clear(),
+        }
+        return;
+    }
+    let record = StatusRecord {
+        id: status.id.clone().unwrap_or_default(),
+        state: status.state,
+    };
+    match records.iter().position(|r| r.id == record.id) {
+        Some(at) => records[at] = record,
+        None => {
+            if records.len() == STATUS_RECORDS_CAP {
+                records.remove(0);
+            }
+            records.push(record);
+        }
+    }
+}
+
+/// The prompt's lifetime rule (OSC 133;A ends the transient states).
+fn prompt_ends_records(records: &mut Vec<StatusRecord>) {
+    records.retain(|record| {
+        !matches!(
+            record.state,
+            term_tap::ProgramState::Working | term_tap::ProgramState::Blocked
+        )
+    });
+}
+
 /// This machine's hostname, via gethostname.
-fn local_host() -> Option<String> {
-    let mut buf = [0u8; 256];
+fn local_host() -> Option<String> {    let mut buf = [0u8; 256];
     let written = unsafe {
         libc::gethostname(buf.as_mut_ptr().cast(), buf.len())
     };
@@ -1725,6 +1818,7 @@ impl Render for TerminalView {
                         .mr(px(2.0))
                         .flex()
                         .items_center()
+                        .gap_1()
                         .rounded_sm()
                         .bg(bg)
                         .text_size(px(11.0))
@@ -1741,6 +1835,9 @@ impl Render for TerminalView {
                             })
                         })
                         .child(label)
+                        .children(status_dot(&tab.status_records, &theme).map(|rgb8| {
+                            div().size(px(6.0)).rounded_full().bg(hsla_of(rgb8))
+                        }))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
@@ -2608,6 +2705,91 @@ mod tests {
 
     fn theme() -> Theme {
         Theme::builtin()
+    }
+
+    fn status(state: term_tap::ProgramState, id: Option<&str>) -> term_tap::ProgramStatus {
+        term_tap::ProgramStatus {
+            state,
+            id: id.map(str::to_owned),
+            kind: None,
+            progress: None,
+            app: None,
+            message: None,
+        }
+    }
+
+    #[test]
+    fn program_status_records_upsert_and_clear() {
+        let mut records = Vec::new();
+        apply_status(&mut records, &status(term_tap::ProgramState::Working, None));
+        apply_status(
+            &mut records,
+            &status(term_tap::ProgramState::Working, Some("deploy")),
+        );
+        assert_eq!(records.len(), 2);
+        // a re-report on the same id replaces, never duplicates
+        apply_status(&mut records, &status(term_tap::ProgramState::Done, None));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].state, term_tap::ProgramState::Done);
+        // clear removes the named record and everything beneath it
+        apply_status(
+            &mut records,
+            &status(term_tap::ProgramState::Working, Some("deploy/eu")),
+        );
+        apply_status(
+            &mut records,
+            &status(term_tap::ProgramState::Clear, Some("deploy")),
+        );
+        assert!(records.iter().all(|record| record.id != "deploy"
+            && record.id != "deploy/eu"));
+        apply_status(&mut records, &status(term_tap::ProgramState::Clear, None));
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn a_new_prompt_ends_the_transient_states_only() {
+        let mut records = vec![
+            StatusRecord { id: String::new(), state: term_tap::ProgramState::Working },
+            StatusRecord { id: "side".into(), state: term_tap::ProgramState::Blocked },
+            StatusRecord { id: "done".into(), state: term_tap::ProgramState::Done },
+            StatusRecord { id: "bad".into(), state: term_tap::ProgramState::Error },
+        ];
+        prompt_ends_records(&mut records);
+        let states: Vec<_> = records.iter().map(|r| r.state).collect();
+        assert_eq!(
+            states,
+            vec![term_tap::ProgramState::Done, term_tap::ProgramState::Error]
+        );
+    }
+
+    #[test]
+    fn the_status_dot_is_attention_first() {
+        let t = theme();
+        let mut records = vec![StatusRecord {
+            id: String::new(),
+            state: term_tap::ProgramState::Done,
+        }];
+        assert_eq!(status_dot(&records, &t), Some(t.named[2]));
+        // blocked outranks done
+        records.push(StatusRecord {
+            id: "ask".into(),
+            state: term_tap::ProgramState::Blocked,
+        });
+        assert_eq!(status_dot(&records, &t), Some(t.named[3]));
+        // error outranks blocked
+        records.push(StatusRecord {
+            id: "boom".into(),
+            state: term_tap::ProgramState::Error,
+        });
+        assert_eq!(status_dot(&records, &t), Some(t.named[1]));
+        // idle alone shows nothing
+        records.clear();
+        records.push(StatusRecord {
+            id: String::new(),
+            state: term_tap::ProgramState::Idle,
+        });
+        assert_eq!(status_dot(&records, &t), None);
+        assert_eq!(status_dot(&[], &t), None);
     }
 
     #[test]

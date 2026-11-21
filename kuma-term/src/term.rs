@@ -69,6 +69,9 @@ pub enum UiEvent {
     /// machine before the path is trusted (an ssh session's remote
     /// report must not steer a local spawn).
     Cwd { host: Option<String>, path: String },
+    /// OSC 7501: a program reported its status (the Program Status
+    /// Protocol, parsed and typed by the tap).
+    ProgramStatus(term_tap::ProgramStatus),
 }
 
 /// The event proxy: lives on the PTY reader thread, forwards into the UI
@@ -444,12 +447,18 @@ fn handle_osc(term: &mut Term<UiProxy>, proxy: &UiProxy, event: OscEvent) {
         }
         OscEvent::CommandFinished(code) => proxy.forward(UiEvent::CommandFinished(code)),
         OscEvent::Cwd { host, path } => proxy.forward(UiEvent::Cwd { host, path }),
-        // notifications (OSC 9/777) and program status (OSC 7501) ride
-        // their own landings; the tap already sees the sequences, so
-        // those landings are view-side wiring only
-        OscEvent::Notification { .. }
-        | OscEvent::ProgramStatus { .. }
-        | OscEvent::ProgramStatusQuery => {},
+        OscEvent::ProgramStatus(status) => proxy.forward(UiEvent::ProgramStatus(status)),
+        OscEvent::ProgramStatusQuery => {
+            // the protocol's feature-detection reply: the states and
+            // blocked kinds this terminal speaks
+            proxy.forward(UiEvent::PtyWrite(
+                term_tap::PROGRAM_STATUS_REPLY.as_bytes().to_vec(),
+            ));
+        }
+        // notifications (OSC 9/777) ride their own landing; the tap
+        // already sees the sequence, so that landing is view-side
+        // wiring only
+        OscEvent::Notification { .. } => {},
         OscEvent::CommandStart | OscEvent::OutputStart => {},
     }
 }
