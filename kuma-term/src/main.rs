@@ -6,6 +6,7 @@ mod font;
 mod glyphs;
 mod icons;
 mod kitty;
+mod notify;
 mod palette;
 mod term;
 mod theme;

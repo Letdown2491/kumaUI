@@ -90,6 +90,7 @@ fn main() {
             let msg_settings = settings.clone();
             let msg_nostr = nostr.clone();
             let msg_sysmon = sysmon.clone();
+            let msg_notifications = notifications.clone();
 
             // The persistent surfaces (wallpaper, bar) and the watch that
             // keeps them alive: opened by the same `ensure` pass that
@@ -193,6 +194,31 @@ fn main() {
                         kuma_shell::msg::Request::MicMute => {
                             msg_sysmon.update(cx, |sysmon, cx| sysmon.request_mic_toggle(cx));
                         }
+                        kuma_shell::msg::Request::Notify { title, body } => {
+                            // A terminal-side notification lands exactly
+                            // where a dbus client's does: same push,
+                            // same queue, same DND gate. Normal urgency:
+                            // neither OSC spelling carries one.
+                            msg_notifications.update(cx, |state, cx| {
+                                state.push(
+                                    kuma_shell::notifications::Notification {
+                                        id: 0,
+                                        app_name: "kuma-term".into(),
+                                        icon: None,
+                                        summary: title.unwrap_or_else(|| {
+                                            "Terminal".into()
+                                        }),
+                                        body,
+                                        actions: Vec::new(),
+                                        urgency: kuma_shell::notifications::Urgency::Normal,
+                                        received_at: chrono::Local::now(),
+                                        expire_timeout: -1,
+                                        closed: false,
+                                    },
+                                    cx,
+                                );
+                            });
+                        }
                         kuma_shell::msg::Request::Nostr(uri) => {
                             // The scheme handler's landing: the offer
                             // arrives even with the panel open; the view
@@ -268,6 +294,21 @@ fn run_cli(args: &[String]) -> i32 {
         "updates" => kuma_shell::msg::send(&kuma_shell::msg::Request::Updates),
         "notifications" => kuma_shell::msg::send(&kuma_shell::msg::Request::NotificationsPanel),
         "notifications-dnd" => kuma_shell::msg::send(&kuma_shell::msg::Request::Notifications),
+        // the terminal's road, exposed for testing the same pipe
+        // kuma-term's OSC 9/777 notifications ride: `kuma-shell notify
+        // <title> <body>` (or `msg notify`), body from the rest
+        "notify" => {
+            let rest = iter.collect::<Vec<_>>().join(" ");
+            let (title, body) = match rest.split_once(' ') {
+                Some((title, body)) => (Some(title.to_string()), body.to_string()),
+                None => (None, rest),
+            };
+            if body.is_empty() {
+                eprintln!("usage: kuma-shell msg notify <title> <body>");
+                return 1;
+            }
+            kuma_shell::msg::send(&kuma_shell::msg::Request::Notify { title, body })
+        }
         // the scheme handler's road: `kuma-shell msg nostr <nostrconnect://…>`,
         // the URI is argv end to end, never a shell string. Bare
         // `nostr` (no URI) is the keybind's road: open the panel.

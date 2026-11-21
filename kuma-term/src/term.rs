@@ -455,10 +455,13 @@ fn handle_osc(term: &mut Term<UiProxy>, proxy: &UiProxy, event: OscEvent) {
                 term_tap::PROGRAM_STATUS_REPLY.as_bytes().to_vec(),
             ));
         }
-        // notifications (OSC 9/777) ride their own landing; the tap
-        // already sees the sequence, so that landing is view-side
-        // wiring only
-        OscEvent::Notification { .. } => {},
+        // notifications ride the MSG socket into the shell's
+        // notification center: same push, same queue, same DND gate as
+        // a dbus client's (see notify.rs)
+        OscEvent::Notification { title, body } => crate::notify::send(
+            title.as_deref(),
+            &body,
+        ),
         OscEvent::CommandStart | OscEvent::OutputStart => {},
     }
 }

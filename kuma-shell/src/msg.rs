@@ -36,6 +36,12 @@ pub enum Request {
     /// Toggle the Kuma Updates panel: the memory probe's and scripted
     /// sessions' road into the row-and-badge render.
     Updates,
+    /// A terminal-side notification (OSC 9 or OSC 777 from kuma-term):
+    /// the same push into the notification center the dbus daemon's
+    /// clients get, minus the dbus hop. The title is optional (OSC 9
+    /// has none), the body required; no urgency rides either OSC
+    /// spelling, so normal it is.
+    Notify { title: Option<String>, body: String },
     /// The audio and brightness keybinds' road: applied in-process, the
     /// widgets and the OSD react at once instead of at the next poll.
     Volume(VolumeCmd),
@@ -68,6 +74,7 @@ impl Request {
             Request::NostrPanel => "NostrPanel",
             Request::Settings => "Settings",
             Request::Updates => "Updates",
+            Request::Notify { .. } => "Notify",
             Request::Volume(_) => "Volume",
             Request::Brightness(_) => "Brightness",
             Request::MicMute => "Mic",
@@ -83,6 +90,9 @@ impl Request {
             Request::NostrPanel => "Open".into(),
             Request::Settings => "Toggle".into(),
             Request::Updates => "Toggle".into(),
+            // the object payload path in to_line handles Notify;
+            // value() never sees it
+            Request::Notify { .. } => String::new(),
             Request::Volume(cmd) => match cmd {
                 VolumeCmd::Up => "Up".into(),
                 VolumeCmd::Down => "Down".into(),
@@ -114,10 +124,21 @@ fn reply(handled: bool) -> &'static str {
 /// control bytes, and a hand-rolled escape lets them tear the line.
 fn to_line(request: &Request) -> String {
     let mut map = serde_json::Map::new();
-    map.insert(
-        request.key().to_string(),
-        serde_json::Value::String(request.value()),
-    );
+    // Notify's payload is an object (title and body, and more may come:
+    // an urgency variant would ride here), every other verb's is a
+    // string, the shape the first verbs shipped with.
+    let payload = match request {
+        Request::Notify { title, body } => {
+            let mut object = serde_json::Map::new();
+            if let Some(title) = title {
+                object.insert("title".into(), serde_json::Value::String(title.clone()));
+            }
+            object.insert("body".into(), serde_json::Value::String(body.clone()));
+            serde_json::Value::Object(object)
+        }
+        _ => serde_json::Value::String(request.value()),
+    };
+    map.insert(request.key().to_string(), payload);
     serde_json::Value::Object(map).to_string()
 }
 
@@ -128,31 +149,49 @@ pub fn parse(line: &str) -> Option<Request> {
     let doc: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     let map = doc.as_object()?;
     let (key, value) = map.iter().next()?;
-    let value = value.as_str()?;
+    // Notify's payload is the object to_line sends; every other verb's
+    // is a string.
     match key.to_lowercase().as_str() {
-        "launcher" => Some(Request::Launcher),
-        "notifications" => Some(Request::Notifications),
-        "notificationspanel" => Some(Request::NotificationsPanel),
-        "nostr" => Some(Request::Nostr(value.to_string())),
-        "nostrpanel" => Some(Request::NostrPanel),
-        "settings" => Some(Request::Settings),
-        "updates" => Some(Request::Updates),
-        "volume" => match value.to_lowercase().as_str() {
-            "up" => Some(Request::Volume(VolumeCmd::Up)),
-            "down" => Some(Request::Volume(VolumeCmd::Down)),
-            "mute" => Some(Request::Volume(VolumeCmd::Mute)),
-            _ => None,
-        },
-        "brightness" => match value.to_lowercase().as_str() {
-            "up" => Some(Request::Brightness(BrightnessCmd::Up)),
-            "down" => Some(Request::Brightness(BrightnessCmd::Down)),
-            _ => None,
-        },
-        "mic" => match value.to_lowercase().as_str() {
-            "mute" => Some(Request::MicMute),
-            _ => None,
-        },
-        _ => None,
+        "notify" => {
+            let object = value.as_object()?;
+            // the body is the notification's content; the title is
+            // optional (OSC 9 has none). Anything else reads as absent.
+            let string_field = |name: &str| {
+                object.get(name).and_then(|v| v.as_str()).map(str::to_owned)
+            };
+            Some(Request::Notify {
+                title: string_field("title"),
+                body: string_field("body")?,
+            })
+        }
+        _ => {
+            let value = value.as_str()?;
+            match key.to_lowercase().as_str() {
+                "launcher" => Some(Request::Launcher),
+                "notifications" => Some(Request::Notifications),
+                "notificationspanel" => Some(Request::NotificationsPanel),
+                "nostr" => Some(Request::Nostr(value.to_string())),
+                "nostrpanel" => Some(Request::NostrPanel),
+                "settings" => Some(Request::Settings),
+                "updates" => Some(Request::Updates),
+                "volume" => match value.to_lowercase().as_str() {
+                    "up" => Some(Request::Volume(VolumeCmd::Up)),
+                    "down" => Some(Request::Volume(VolumeCmd::Down)),
+                    "mute" => Some(Request::Volume(VolumeCmd::Mute)),
+                    _ => None,
+                },
+                "brightness" => match value.to_lowercase().as_str() {
+                    "up" => Some(Request::Brightness(BrightnessCmd::Up)),
+                    "down" => Some(Request::Brightness(BrightnessCmd::Down)),
+                    _ => None,
+                },
+                "mic" => match value.to_lowercase().as_str() {
+                    "mute" => Some(Request::MicMute),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
     }
 }
 
@@ -315,6 +354,23 @@ mod tests {
             Some(Request::NostrPanel)
         );
         assert_eq!(to_line(&Request::NostrPanel), "{\"NostrPanel\":\"Open\"}");
+    }
+
+    #[test]
+    fn a_terminal_notification_round_trips_whole() {
+        // OSC 777's shape: title and body. The wire is the object
+        // payload, and serde's escaping keeps a body of quotes and
+        // backslashes (a build log's, say) intact
+        let request = Request::Notify {
+            title: Some("build".into()),
+            body: "say \"hi\" \\ done".into(),
+        };
+        assert_eq!(parse(&to_line(&request)), Some(request));
+        // OSC 9's shape: body only, the shell names the app
+        let body_only = Request::Notify { title: None, body: "done".into() };
+        assert_eq!(parse(&to_line(&body_only)), Some(body_only));
+        // a body-less object is nothing: the reply says unknown request
+        assert_eq!(parse("{\"Notify\":{\"title\":\"x\"}}"), None);
     }
 
     #[test]

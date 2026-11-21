@@ -8,6 +8,7 @@ Entries land with the change they describe; the next tag takes this section as i
 
 - kuma-term speaks shell integration (#114): the terminal taps OSC 133 prompt markers, OSC 7 and OSC 9;9 cwd reports, OSC 9 and OSC 777 notifications, and OSC 7501 program status off the output stream (a new zero-dependency `term-tap` crate, fuzzed by the pty-bytes target alongside the grid parser), new tabs open in the active pane's reported directory, ctrl+shift+z/x jump to the previous/next prompt, and commands report an honest finish. The image-side shell snippets ride a kumaOS handoff.
 - kuma-term shows program status in the tab bar (#115, the Program Status Protocol OSC 7501 rev 0.4): a dot on the tab title, attention-first (red failed, yellow waiting-for-you, green finished, foreground busy), with the protocol's lifetimes (a new prompt ends the working and blocked records, done and error survive), hierarchical report ids, and an honest feature-detection reply.
+- kuma-term delivers OSC 9 and OSC 777 notifications into the shell's notification center (#113): the same push, queue, and do-not-disturb gate a dbus client's get, over the MSG socket (a `Notify` verb, also exposed as `kuma-shell msg notify <title> <body>` for testing), with the body escaped whole and delivery best-effort (no running shell is a logged miss, never a blocked pump).
 
 ### Changed
 
