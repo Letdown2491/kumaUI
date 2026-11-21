@@ -97,6 +97,122 @@ struct SearchState {
     stale: bool,
 }
 
+/// The smooth-scroll animation, view-side: a fractional position in
+/// lines back into history, gliding toward where the wheel wants it,
+/// plus momentum for the touchpad (a fling's velocity carries past the
+/// finger, decaying, and the position snaps to a row when the motion
+/// dies, so the pointer mapping lands on real cells at rest).
+///
+/// The engine's grid stays integer: a tick decides which display
+/// offset the engine sits at (the position's floor) and how far into
+/// the next row the paint slides (its remainder). The partial row the
+/// slide reveals at the screen's top edge comes from the engine's
+/// `row_above`.
+#[derive(Default)]
+struct ScrollAnim {
+    /// lines back into history, fractional
+    pos: f32,
+    /// where the wheel wants the position
+    target: f32,
+    /// lines per second: the touchpad fling's momentum
+    vel: f32,
+    /// when the last wheel event landed: momentum starts when the
+    /// finger goes quiet
+    last_input: Option<Instant>,
+    /// when tick last ran
+    last_tick: Option<Instant>,
+    /// the position's remainder: how far into the next row the paint
+    /// slides, read by the render between ticks
+    frac: f32,
+}
+
+/// The glide's time constant: how fast pos approaches the target.
+/// Short enough to track a finger, long enough to hide wheel stepping.
+const GLIDE_T: f32 = 0.045;
+/// Seconds of input quiet before momentum takes over from the finger.
+const MOMENTUM_DELAY: f32 = 0.08;
+/// The fling's decay time constant.
+const MOMENTUM_TAU: f32 = 0.25;
+/// Lines per second under which the motion counts as dead and the
+/// position snaps to a row.
+const MOMENTUM_MIN: f32 = 2.0;
+
+impl ScrollAnim {
+    /// A wheel notch: the target glides by `lines`, no momentum.
+    fn wheel_lines(&mut self, lines: f32, history: usize, now: Instant) {
+        self.target = (self.target + lines).clamp(0.0, history as f32);
+        self.vel = 0.0;
+        self.last_input = Some(now);
+    }
+
+    /// A touchpad pixel delta, in lines: direct manipulation (the
+    /// target tracks the finger one to one, through the glide), and
+    /// the velocity estimate the momentum rides.
+    fn wheel_pixels(&mut self, lines: f32, history: usize, now: Instant) {
+        if let Some(last) = self.last_input {
+            let dt = now.duration_since(last).as_secs_f32();
+            if dt > 0.001 {
+                // smoothed over the recent events; clamped, so a
+                // scheduler hiccup cannot fake a fling
+                let inst = (lines / dt).clamp(-100.0, 100.0);
+                self.vel = 0.6 * self.vel + 0.4 * inst;
+            }
+        }
+        self.target = (self.target + lines).clamp(0.0, history as f32);
+        self.last_input = Some(now);
+    }
+
+    /// One animation step: advance pos, apply momentum when the finger
+    /// is quiet, snap to a row when the motion dies. Returns the
+    /// engine offset and the paint fraction, plus whether the
+    /// animation is still running.
+    fn tick(&mut self, history: usize, now: Instant) -> (usize, f32, bool) {
+        // the old instant, before this one took its place
+        let last = self.last_tick.replace(now).unwrap_or(now);
+        let dt = now.duration_since(last).as_secs_f32().min(0.1);
+        let quiet = self
+            .last_input
+            .map(|t| now.duration_since(t).as_secs_f32())
+            .unwrap_or(f32::INFINITY);
+        if quiet > MOMENTUM_DELAY {
+            if self.vel.abs() < MOMENTUM_MIN {
+                // the motion dies: a real row to rest on
+                self.vel = 0.0;
+                self.target = self.target.round().clamp(0.0, history as f32);
+            } else {
+                self.target = (self.target + self.vel * dt).clamp(0.0, history as f32);
+                self.vel *= (-dt / MOMENTUM_TAU).exp();
+            }
+        }
+        // the glide toward the target
+        self.pos += (self.target - self.pos) * (1.0 - (-dt / GLIDE_T).exp());
+        self.pos = self.pos.clamp(0.0, history as f32);
+
+        let base = self.pos.floor() as usize;
+        self.frac = self.pos - base as f32;
+        if (self.pos - self.target).abs() < 0.001 && self.vel.abs() < MOMENTUM_MIN {
+            // settled: land exactly, and let the task stop
+            self.pos = self.target;
+            let base = self.pos.floor() as usize;
+            self.frac = self.pos - base as f32;
+            self.last_tick = None;
+            return (base, self.frac, false);
+        }
+        (base, self.frac, true)
+    }
+
+    /// A programmatic jump (a prompt mark, a search hit) lands
+    /// directly: the animation forgets its glide.
+    fn reset(&mut self, offset: usize) {
+        self.pos = offset as f32;
+        self.target = offset as f32;
+        self.vel = 0.0;
+        self.frac = 0.0;
+        self.last_input = None;
+        self.last_tick = None;
+    }
+}
+
 /// One terminal session: its own engine, PTY pump, and per-session UI
 /// state. Everything the grid owns lives here; window-level state
 /// (font, cell metrics, pointer gestures, blink) stays on the view.
@@ -132,6 +248,12 @@ struct Tab {
     /// a new prompt ends the working and blocked ones, done and error
     /// survive until replaced or cleared. Capped, oldest dropped.
     status_records: Vec<StatusRecord>,
+    /// The smooth-scroll animation: the fractional scroll position and
+    /// its momentum, view-side only (the grid stays integer).
+    scroll: ScrollAnim,
+    /// Bumped when the animation task should start; a stale task's
+    /// ticks stop at the bump, so two loops never run at once.
+    scroll_generation: u64,
 }
 
 /// One program-status record on a tab. The report's message is parsed
@@ -446,6 +568,8 @@ impl TerminalView {
             cwd: None,
             marks: Vec::new(),
             status_records: Vec::new(),
+            scroll: ScrollAnim::default(),
+            scroll_generation: 0,
         })
     }
 
@@ -574,6 +698,7 @@ impl TerminalView {
         // history - q; a mark on the live screen (q above the history
         // line) clamps to 0, the live viewport
         let offset = (history - depth).max(0) as usize;
+        self.active_mut().scroll.reset(offset);
         self.active().engine.scroll_to_offset(offset);
         cx.notify();
     }
@@ -961,6 +1086,7 @@ impl TerminalView {
         } else {
             return;
         };
+        self.tabs[tab].scroll.reset(target.max(0) as usize);
         self.tabs[tab].engine.scroll_to_offset(target.max(0) as usize);
     }
 
@@ -1392,32 +1518,88 @@ impl TerminalView {
             self.active().engine.report_mouse(button, col, row, false);
             return;
         }
-        // a notch below one line still moves one line
-        let lines = if lines.abs() < 1.0 {
-            if lines < 0.0 {
-                -1
-            } else {
-                1
-            }
-        } else {
-            lines.round() as i32
-        }
-        .clamp(-8, 8);
-        if lines == 0 {
-            return;
-        }
-
+        // a notch below one line still moves one line; the smooth
+        // scroll's animation decides the rest (see ScrollAnim)
         if self.active().engine.alt_screen() {
+            let lines = if lines.abs() < 1.0 {
+                if lines < 0.0 {
+                    -1
+                } else {
+                    1
+                }
+            } else {
+                lines.round() as i32
+            }
+            .clamp(-8, 8);
+            if lines == 0 {
+                return;
+            }
             // full-screen programs own the viewport: wheel becomes arrows,
             // which is what they expect
             let key = if lines < 0 { "\x1b[A" } else { "\x1b[B" };
             let bytes = key.repeat(lines.unsigned_abs() as usize).into_bytes();
             self.active().engine.input(bytes);
         } else {
-            // wheel up shows older output
-            self.active().engine.scroll(-lines);
+            // the smooth scroll: notches glide, touchpad deltas track
+            // the finger and can fling. The tick task applies the
+            // position; here only the target moves
+            let history = self.active().engine.history_size();
+            let cell_h = self.cell_h;
+            let now = Instant::now();
+            let anim = &mut self.active_mut().scroll;
+            match event.delta {
+                ScrollDelta::Lines(point) => {
+                    let lines = if point.y.abs() < 1.0 {
+                        -point.y.signum()
+                    } else {
+                        -point.y.round()
+                    };
+                    anim.wheel_lines(lines.clamp(-8.0, 8.0), history, now);
+                }
+                ScrollDelta::Pixels(point) => {
+                    anim.wheel_pixels(-point.y.as_f32() / cell_h, history, now);
+                }
+            }
+            self.kick_scroll(cx);
         }
         cx.notify();
+    }
+
+    /// Start (or re-start) the scroll animation task for one tab: a
+    /// loop ticking at ~120 fps while the animation runs, applying the
+    /// engine offset and the paint fraction, and stopping when the
+    /// anim settles (or the tab closes, or a newer task took over).
+    fn kick_scroll(&mut self, cx: &mut Context<Self>) {
+        let (tab_id, generation) = {
+            let tab = self.active_mut();
+            tab.scroll_generation += 1;
+            (tab.id, tab.scroll_generation)
+        };
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(8)).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+                            return false;
+                        };
+                        if tab.scroll_generation != generation {
+                            return false;
+                        }
+                        let history = tab.engine.history_size();
+                        let (offset, frac, keep) = tab.scroll.tick(history, Instant::now());
+                        tab.engine.scroll_to_offset(offset);
+                        tab.scroll.frac = frac;
+                        cx.notify();
+                        keep
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 }
 
@@ -1735,6 +1917,17 @@ impl Render for TerminalView {
         let rows: Vec<Arc<RowRender>> =
             snapshot.rows.iter().map(|row| self.row_render(row)).collect();
 
+        // the smooth scroll's slide: the tick set the engine offset to
+        // the position's floor; the remainder slides the paint, and the
+        // partially revealed row above comes straight from the grid
+        let frac = self.active().scroll.frac;
+        let (above, shift) = if frac > 0.0 {
+            let above = self.active().engine.row_above().map(|row| self.row_render(&row));
+            (above, frac * self.cell_h)
+        } else {
+            (None, 0.0)
+        };
+
         // the link under the pointer, if any: an OSC 8 span first (the
         // program's own link), else a text-detected URL. The paint
         // underlines it and claims the pointing-hand cursor
@@ -1766,6 +1959,8 @@ impl Render for TerminalView {
         let grid_w = self.cols as f32 * self.cell_w;
         let grid = GridPaint {
             rows,
+            above,
+            shift,
             font_size,
             cell_w: self.cell_w,
             cell_h: self.cell_h,
@@ -2638,6 +2833,12 @@ fn spans_by_row(spans: &[SelectSpan], rows: usize) -> Vec<Vec<(usize, usize)>> {
 
 struct GridPaint {
     rows: Vec<Arc<RowRender>>,
+    /// The row above the viewport's top (the partial row a mid-slide
+    /// frame reveals), painted first at [shift - cell_h, shift).
+    above: Option<Arc<RowRender>>,
+    /// The slide, in pixels: every row paints this far down. Zero
+    /// outside an animation.
+    shift: f32,
     font_size: Pixels,
     cell_w: f32,
     cell_h: f32,
@@ -2664,179 +2865,76 @@ struct GridPaint {
 impl GridPaint {
     fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) {
         let origin = bounds.origin;
-        // the washes bucket per row once, at paint start: filtering
-        // every span against every row made the paint O(rows x spans)
-        // when a selection or a search lit up the screen
-        let selection = spans_by_row(&self.selection, self.rows.len());
-        let search = spans_by_row(&self.search, self.rows.len());
-        let search_current = spans_by_row(&self.search_current, self.rows.len());
-        for (iy, row) in self.rows.iter().enumerate() {
-            let row_y = origin.y + px(iy as f32 * self.cell_h);
+        // a slide paints rows outside the grid's own bounds (the
+        // partially revealed row pokes above the top edge): the layer
+        // clips the whole paint to the grid rect, so nothing bleeds
+        // into the padding or the tab bar
+        window.paint_layer(bounds, |window| {
+            // the washes bucket per row once, at paint start: filtering
+            // every span against every row made the paint O(rows x spans)
+            // when a selection or a search lit up the screen
+            let selection = spans_by_row(&self.selection, self.rows.len());
+            let search = spans_by_row(&self.search, self.rows.len());
+            let search_current = spans_by_row(&self.search_current, self.rows.len());
+            let base_y = origin.y + px(self.shift);
 
-            // run backgrounds, cell aligned
-            for &(col, len, color) in &row.bg_quads {
-                let quad_bounds = Bounds::new(
-                    point(origin.x + px(col as f32 * self.cell_w), row_y),
-                    size(px(len as f32 * self.cell_w), px(self.cell_h)),
+            // the revealed row above: its bottom `shift` pixels sit in
+            // the strip the first row vacated. No washes, no cursor,
+            // no hover: those are viewport-row things.
+            if let Some(above) = &self.above {
+                paint_row(
+                    above,
+                    origin.x,
+                    base_y - px(self.cell_h),
+                    self.cell_w,
+                    self.cell_h,
+                    self.font_size,
+                    &[],
+                    self.selection_color,
+                    &[],
+                    self.search_color,
+                    &[],
+                    self.search_current_color,
+                    None,
+                    self.cursor_color,
+                    None,
+                    self.fg,
+                    window,
                 );
-                window.paint_quad(fill(quad_bounds, hsla_of(color)));
             }
-
-            // the selection wash sits over cell backgrounds, under text;
-            // this row's bucket only, so nothing overdraws per iteration
-            for &(start, len) in &selection[iy] {
-                let quad_bounds = Bounds::new(
-                    point(origin.x + px(start as f32 * self.cell_w), row_y),
-                    size(px(len as f32 * self.cell_w), px(self.cell_h)),
-                );
-                window.paint_quad(fill(quad_bounds, self.selection_color));
-            }
-
-            // search washes at the same depth: dim over every visible
-            // match, strong over the one enter is parked on
-            for &(start, len) in &search[iy] {
-                let quad_bounds = Bounds::new(
-                    point(origin.x + px(start as f32 * self.cell_w), row_y),
-                    size(px(len as f32 * self.cell_w), px(self.cell_h)),
-                );
-                window.paint_quad(fill(quad_bounds, self.search_color));
-            }
-            for &(start, len) in &search_current[iy] {
-                let quad_bounds = Bounds::new(
-                    point(origin.x + px(start as f32 * self.cell_w), row_y),
-                    size(px(len as f32 * self.cell_w), px(self.cell_h)),
-                );
-                window.paint_quad(fill(quad_bounds, self.search_current_color));
-            }
-
-            // vector glyphs: box drawing, block elements, braille
-            for g in &row.glyphs {
-                for (x, y, w, h) in glyphs::cell_rects(g.ch, self.cell_w, self.cell_h) {
-                    let quad_bounds = Bounds::new(
-                        point(origin.x + px(g.col as f32 * self.cell_w + x), row_y + px(y)),
-                        size(px(w), px(h)),
-                    );
-                    window.paint_quad(fill(quad_bounds, hsla_of(g.fg)));
-                }
-            }
-
-            // the text itself: every glyph snapped to its cell's left
-            // edge, so a fallback font's own advances can never drift
-            // the grid (see paint_row_text)
-            if !row.text.is_empty() {
-                if let Err(err) = paint_row_text(
+            for (iy, row) in self.rows.iter().enumerate() {
+                let row_y = base_y + px(iy as f32 * self.cell_h);
+                paint_row(
                     row,
                     origin.x,
                     row_y,
                     self.cell_w,
                     self.cell_h,
                     self.font_size,
+                    &selection[iy],
+                    self.selection_color,
+                    &search[iy],
+                    self.search_color,
+                    &search_current[iy],
+                    self.search_current_color,
+                    self.cursor.filter(|(crow, _, _)| *crow == iy),
+                    self.cursor_color,
+                    self.url_hover.filter(|(hover_row, _, _)| *hover_row == iy),
+                    self.fg,
                     window,
-                ) {
-                    warn!("row paint failed: {err}");
-                }
+                );
             }
-
-            // the cursor overlay: beam, underline, and the unfocused
-            // hollow stroke; the block paints through the row's own
-            // baked cell colors and needs nothing here
-            if let Some((crow, ccol, shape)) = &self.cursor {
-                if *crow == iy {
-                    let cell_x = origin.x + px(*ccol as f32 * self.cell_w);
-                    match shape {
-                        CursorShape::Beam => {
-                            let quad_bounds = Bounds::new(
-                                point(cell_x, row_y),
-                                size(px(2.0), px(self.cell_h)),
-                            );
-                            window.paint_quad(fill(quad_bounds, self.cursor_color));
-                        }
-                        CursorShape::Underline => {
-                            let h = (self.cell_h / 10.0).max(2.0);
-                            let quad_bounds = Bounds::new(
-                                point(cell_x, row_y + px(self.cell_h - h)),
-                                size(px(self.cell_w), px(h)),
-                            );
-                            window.paint_quad(fill(quad_bounds, self.cursor_color));
-                        }
-                        CursorShape::HollowBlock => {
-                            // a 1px stroke around the cell, four quads
-                            let stroke = 1.0;
-                            for (x, y, w, h) in [
-                                (0.0, 0.0, self.cell_w, stroke),
-                                (0.0, self.cell_h - stroke, self.cell_w, stroke),
-                                (0.0, 0.0, stroke, self.cell_h),
-                                (self.cell_w - stroke, 0.0, stroke, self.cell_h),
-                            ] {
-                                let quad_bounds = Bounds::new(
-                                    point(cell_x + px(x), row_y + px(y)),
-                                    size(px(w), px(h)),
-                                );
-                                window.paint_quad(fill(quad_bounds, self.cursor_color));
-                            }
-                        }
-                        CursorShape::Block | CursorShape::Hidden => {}
-                    }
-                }
-            }
-
-            // the hovered URL: underline under its columns
-            if let Some((row, start, len)) = self.url_hover {
-                if row == iy {
-                    let quad_bounds = Bounds::new(
-                        point(
-                            origin.x + px(start as f32 * self.cell_w),
-                            row_y + px(self.cell_h - 2.0),
-                        ),
-                        size(px(len as f32 * self.cell_w), px(1.5)),
-                    );
-                    window.paint_quad(fill(quad_bounds, hsla_of(self.fg)));
-                }
-            }
-
-            // the underlines gpui's runs cannot paint: double is two
-            // lines, dotted and dashed are segments along the baseline
-            for &(start, len, kind, color) in &row.underline_decorations {
-                let width = len as f32 * self.cell_w;
-                let x = origin.x + px(start as f32 * self.cell_w);
-                match kind {
-                    Underline::Double => {
-                        for dy in [self.cell_h - 3.5, self.cell_h - 1.5] {
-                            let quad_bounds = Bounds::new(
-                                point(x, row_y + px(dy)),
-                                size(px(width), px(1.2)),
-                            );
-                            window.paint_quad(fill(quad_bounds, hsla_of(color)));
-                        }
-                    }
-                    Underline::Dotted | Underline::Dashed => {
-                        // 2-on/2-off and 4-on/2-off, aligned to the row
-                        let on: f32 = if kind == Underline::Dotted { 2.0 } else { 4.0 };
-                        let step = on + 2.0;
-                        let mut at = 0.0;
-                        while at < width {
-                            let seg = on.min(width - at);
-                            let quad_bounds = Bounds::new(
-                                point(x + px(at), row_y + px(self.cell_h - 2.0)),
-                                size(px(seg), px(1.5)),
-                            );
-                            window.paint_quad(fill(quad_bounds, hsla_of(color)));
-                            at += step;
-                        }
-                    }
-                    Underline::None | Underline::Straight | Underline::Curly => {},
-                }
-            }
-        }
+        });
 
         // the pointing hand over the hovered link: a hitbox exactly the
         // span's cell rect, so the cursor reverts the moment the pointer
-        // leaves it (or the link scrolls away)
+        // leaves it (or the link scrolls away). The slide shifts the
+        // rows under the pointer, the hitbox with them.
         if let Some((row, start, len)) = self.url_hover {
             let rect = Bounds::new(
                 point(
                     origin.x + px(start as f32 * self.cell_w),
-                    origin.y + px(row as f32 * self.cell_h),
+                    origin.y + px(self.shift + row as f32 * self.cell_h),
                 ),
                 size(px(len as f32 * self.cell_w), px(self.cell_h)),
             );
@@ -2852,6 +2950,176 @@ impl GridPaint {
                 size(px(3.0), bounds.size.height),
             );
             window.paint_quad(fill(quad_bounds, hsla_of(self.fg.scale(0.4))));
+        }
+    }
+}
+
+/// One row's paint: backgrounds, washes, vector glyphs, the text, the
+/// cursor overlay when it sits here, the hover underline and the
+/// quad-painted underline styles. `row_y` is the row's pixel top, the
+/// slide's shift folded in by the caller; the washes and the cursor
+/// ride the row's viewport index through the caller's filtering (empty
+/// slices and a `None` cursor for the revealed row above, which is
+/// none of the viewport's business).
+#[allow(clippy::too_many_arguments)]
+fn paint_row(
+    row: &RowRender,
+    x_origin: Pixels,
+    row_y: Pixels,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: Pixels,
+    selection: &[(usize, usize)],
+    selection_color: gpui::Hsla,
+    search: &[(usize, usize)],
+    search_color: gpui::Hsla,
+    search_current: &[(usize, usize)],
+    search_current_color: gpui::Hsla,
+    cursor: Option<(usize, usize, CursorShape)>,
+    cursor_color: gpui::Hsla,
+    url_hover: Option<(usize, usize, usize)>,
+    fg: Rgb8,
+    window: &mut Window,
+) {
+    // run backgrounds, cell aligned
+    for &(col, len, color) in &row.bg_quads {
+        let quad_bounds = Bounds::new(
+            point(x_origin + px(col as f32 * cell_w), row_y),
+            size(px(len as f32 * cell_w), px(cell_h)),
+        );
+        window.paint_quad(fill(quad_bounds, hsla_of(color)));
+    }
+
+    // the selection wash sits over cell backgrounds, under text
+    for &(start, len) in selection {
+        let quad_bounds = Bounds::new(
+            point(x_origin + px(start as f32 * cell_w), row_y),
+            size(px(len as f32 * cell_w), px(cell_h)),
+        );
+        window.paint_quad(fill(quad_bounds, selection_color));
+    }
+
+    // search washes at the same depth: dim over every visible match,
+    // strong over the one enter is parked on
+    for &(start, len) in search {
+        let quad_bounds = Bounds::new(
+            point(x_origin + px(start as f32 * cell_w), row_y),
+            size(px(len as f32 * cell_w), px(cell_h)),
+        );
+        window.paint_quad(fill(quad_bounds, search_color));
+    }
+    for &(start, len) in search_current {
+        let quad_bounds = Bounds::new(
+            point(x_origin + px(start as f32 * cell_w), row_y),
+            size(px(len as f32 * cell_w), px(cell_h)),
+        );
+        window.paint_quad(fill(quad_bounds, search_current_color));
+    }
+
+    // vector glyphs: box drawing, block elements, braille
+    for g in &row.glyphs {
+        for (x, y, w, h) in glyphs::cell_rects(g.ch, cell_w, cell_h) {
+            let quad_bounds = Bounds::new(
+                point(x_origin + px(g.col as f32 * cell_w + x), row_y + px(y)),
+                size(px(w), px(h)),
+            );
+            window.paint_quad(fill(quad_bounds, hsla_of(g.fg)));
+        }
+    }
+
+    // the text itself: every glyph snapped to its cell's left edge, so
+    // a fallback font's own advances can never drift the grid (see
+    // paint_row_text)
+    if !row.text.is_empty()
+        && let Err(err) = paint_row_text(row, x_origin, row_y, cell_w, cell_h, font_size, window)
+    {
+        warn!("row paint failed: {err}");
+    }
+
+    // the cursor overlay: beam, underline, and the unfocused hollow
+    // stroke; the block paints through the row's own baked cell colors
+    // and needs nothing here
+    if let Some((_crow, ccol, shape)) = cursor {
+        let cell_x = x_origin + px(ccol as f32 * cell_w);
+        match shape {
+            CursorShape::Beam => {
+                let quad_bounds = Bounds::new(
+                    point(cell_x, row_y),
+                    size(px(2.0), px(cell_h)),
+                );
+                window.paint_quad(fill(quad_bounds, cursor_color));
+            }
+            CursorShape::Underline => {
+                let h = (cell_h / 10.0).max(2.0);
+                let quad_bounds = Bounds::new(
+                    point(cell_x, row_y + px(cell_h - h)),
+                    size(px(cell_w), px(h)),
+                );
+                window.paint_quad(fill(quad_bounds, cursor_color));
+            }
+            CursorShape::HollowBlock => {
+                // a 1px stroke around the cell, four quads
+                let stroke = 1.0;
+                for (x, y, w, h) in [
+                    (0.0, 0.0, cell_w, stroke),
+                    (0.0, cell_h - stroke, cell_w, stroke),
+                    (0.0, 0.0, stroke, cell_h),
+                    (cell_w - stroke, 0.0, stroke, cell_h),
+                ] {
+                    let quad_bounds = Bounds::new(
+                        point(cell_x + px(x), row_y + px(y)),
+                        size(px(w), px(h)),
+                    );
+                    window.paint_quad(fill(quad_bounds, cursor_color));
+                }
+            }
+            CursorShape::Block | CursorShape::Hidden => {}
+        }
+    }
+
+    // the hovered URL: underline under its columns
+    if let Some((_, start, len)) = url_hover {
+        let quad_bounds = Bounds::new(
+            point(
+                x_origin + px(start as f32 * cell_w),
+                row_y + px(cell_h - 2.0),
+            ),
+            size(px(len as f32 * cell_w), px(1.5)),
+        );
+        window.paint_quad(fill(quad_bounds, hsla_of(fg)));
+    }
+
+    // the underlines gpui's runs cannot paint: double is two lines,
+    // dotted and dashed are segments along the baseline
+    for &(start, len, kind, color) in &row.underline_decorations {
+        let width = len as f32 * cell_w;
+        let x = x_origin + px(start as f32 * cell_w);
+        match kind {
+            Underline::Double => {
+                for dy in [cell_h - 3.5, cell_h - 1.5] {
+                    let quad_bounds = Bounds::new(
+                        point(x, row_y + px(dy)),
+                        size(px(width), px(1.2)),
+                    );
+                    window.paint_quad(fill(quad_bounds, hsla_of(color)));
+                }
+            }
+            Underline::Dotted | Underline::Dashed => {
+                // 2-on/2-off and 4-on/2-off, aligned to the row
+                let on: f32 = if kind == Underline::Dotted { 2.0 } else { 4.0 };
+                let step = on + 2.0;
+                let mut at = 0.0;
+                while at < width {
+                    let seg = on.min(width - at);
+                    let quad_bounds = Bounds::new(
+                        point(x + px(at), row_y + px(cell_h - 2.0)),
+                        size(px(seg), px(1.5)),
+                    );
+                    window.paint_quad(fill(quad_bounds, hsla_of(color)));
+                    at += step;
+                }
+            }
+            Underline::None | Underline::Straight | Underline::Curly => {},
         }
     }
 }
@@ -2918,6 +3186,92 @@ mod tests {
             states,
             vec![term_tap::ProgramState::Done, term_tap::ProgramState::Error]
         );
+    }
+
+    #[test]
+    fn a_notch_glides_to_its_target_and_lands_on_a_row() {
+        let mut anim = ScrollAnim::default();
+        let t0 = Instant::now();
+        anim.wheel_lines(3.0, 100, t0);
+        // the glide: progress without reaching, until it settles
+        let (offset, frac, keep) = anim.tick(100, t0 + Duration::from_millis(8));
+        assert!(keep);
+        assert!(offset <= 3);
+        let _ = frac;
+        let mut ticks = 0;
+        loop {
+            let (offset, frac, keep) = anim.tick(100, t0 + Duration::from_millis(8 * (ticks + 2)));
+            ticks += 1;
+            if !keep {
+                assert_eq!((offset, frac), (3, 0.0));
+                break;
+            }
+            assert!(ticks < 1000, "the glide never settled");
+        }
+    }
+
+    #[test]
+    fn a_fling_keeps_going_then_snaps_to_a_row() {
+        let mut anim = ScrollAnim::default();
+        // a fast upward fling: five touchpad events, 4 lines each,
+        // 10ms apart (negative pixel y is wheel up, back into history)
+        let t0 = Instant::now();
+        for i in 0..5 {
+            anim.wheel_pixels(4.0, 500, t0 + Duration::from_millis(i * 10));
+        }
+        assert!(anim.vel > 10.0, "the fling must estimate a velocity");
+        // quiet now: momentum carries the target past the last event
+        let mut ticks = 0;
+        let mut farthest = 0.0f32;
+        loop {
+            let (offset, frac, keep) = anim.tick(
+                500,
+                t0 + Duration::from_millis(50) + Duration::from_millis(8 * (ticks + 1)),
+            );
+            ticks += 1;
+            farthest = farthest.max(anim.target);
+            if !keep {
+                // the rest is a real row, not the fling's fractional tail
+                assert_eq!(frac, 0.0);
+                break;
+            }
+            assert!(ticks < 2000, "the momentum never died");
+        }
+        // the momentum carried the position past the finger's 20 lines
+        assert!(farthest > 20.0, "no momentum: stopped at {farthest}");
+        assert!(farthest <= 500.0);
+    }
+
+    #[test]
+    fn the_scroll_clamps_at_the_buffers_top() {
+        let mut anim = ScrollAnim::default();
+        let t0 = Instant::now();
+        anim.wheel_lines(50.0, 5, t0);
+        let mut ticks = 0;
+        loop {
+            let (offset, _, keep) = anim.tick(5, t0 + Duration::from_millis(8 * (ticks + 1)));
+            ticks += 1;
+            if !keep {
+                assert_eq!(offset, 5);
+                break;
+            }
+            assert!(ticks < 1000);
+        }
+    }
+
+    #[test]
+    fn a_programmatic_jump_forgets_the_glide() {
+        let mut anim = ScrollAnim::default();
+        let t0 = Instant::now();
+        anim.wheel_lines(10.0, 100, t0);
+        anim.reset(2);
+        assert_eq!(anim.pos, 2.0);
+        assert_eq!(anim.target, 2.0);
+        assert_eq!(anim.frac, 0.0);
+        // and the next tick has nothing to do
+        let (offset, frac, keep) = anim.tick(100, t0 + Duration::from_millis(8));
+        assert!(!keep);
+        assert_eq!((offset, frac), (2, 0.0));
     }
 
     #[test]

@@ -869,17 +869,6 @@ impl Engine {
         self.term.lock().resize(GridDims::from_window_size(ws));
     }
 
-    /// Scroll the viewport by lines (positive = back into history). No-op on
-    /// the alternate screen, where the program owns scrolling.
-    pub fn scroll(&self, lines: i32) {
-        let mut term = self.term.lock();
-        if term.mode().contains(TermMode::ALT_SCREEN) {
-            return;
-        }
-        let scroll = Scroll::Delta(lines);
-        term.scroll_display(scroll);
-    }
-
     pub fn window_size(&self) -> WindowSize {
         self.window_size
     }
@@ -894,6 +883,33 @@ impl Engine {
     /// jump converts depth to a display offset with this.
     pub fn history_size(&self) -> usize {
         self.term.lock().grid().history_size()
+    }
+
+    /// The grid row just above the viewport's top: the partial row a
+    /// fractional (mid-animation) scroll reveals at the screen's top
+    /// edge. Decodes straight from the grid, the same cell conversion
+    /// the viewport rows get. `None` at the buffer's top (nothing
+    /// above it) or on the alternate screen, where scrolling is the
+    /// program's.
+    pub fn row_above(&self) -> Option<Row> {
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let offset = term.grid().display_offset();
+        if offset >= term.grid().history_size() {
+            return None;
+        }
+        let content = term.renderable_content();
+        let line = Line(-(offset as i32) - 1);
+        let columns = term.columns();
+        let mut row = Row::default();
+        let mut links = Vec::new();
+        for column in 0..columns {
+            decode_and_push(&mut row, &mut links, &self.theme, content.colors, &term.grid()[line][Column(column)]);
+        }
+        row.links = group_links(&row.cells, &links);
+        Some(row)
     }
 
     /// A handle for background search scans: shares the term behind its
@@ -1265,69 +1281,13 @@ fn fill_rows(
             continue;
         }
         let row = viewport_row as usize;
-        let cell = indexed.cell;
-        let flags = cell.flags;
-        let link = cell.hyperlink();
-
-        if flags.contains(Flags::WIDE_CHAR_SPACER) {
-            rows[row].cells.push(RenderCell {
-                c: ' ',
-                fg: theme.foreground,
-                bg: theme.background,
-                bold: false,
-                italic: false,
-                underline: Underline::None,
-                underline_color: None,
-                strikeout: false,
-                spacer: true,
-            });
-            link_cells[row].push(link);
-            continue;
-        }
-
-        let mut fg = palette::resolve(cell.fg, content.colors, theme);
-        let mut bg = palette::resolve(cell.bg, content.colors, theme);
-        if flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        if flags.contains(Flags::HIDDEN) {
-            fg = bg;
-        }
-        if flags.contains(Flags::DIM) {
-            fg = fg.scale(2.0 / 3.0);
-        }
-
-        let underline = if flags.contains(Flags::UNDERLINE) {
-            Underline::Straight
-        } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
-            Underline::Double
-        } else if flags.contains(Flags::UNDERCURL) {
-            Underline::Curly
-        } else if flags.contains(Flags::DOTTED_UNDERLINE) {
-            Underline::Dotted
-        } else if flags.contains(Flags::DASHED_UNDERLINE) {
-            Underline::Dashed
-        } else {
-            Underline::None
-        };
-        // SGR 58's color, through the same resolution the fg gets (a
-        // Named or Indexed underline color rides the dynamic overrides)
-        let underline_color = cell
-            .underline_color()
-            .map(|color| palette::resolve(color, content.colors, theme));
-
-        rows[row].cells.push(RenderCell {
-            c: if flags.contains(Flags::HIDDEN) { ' ' } else { cell.c },
-            fg,
-            bg,
-            bold: flags.contains(Flags::BOLD),
-            italic: flags.contains(Flags::ITALIC),
-            underline,
-            underline_color,
-            strikeout: flags.contains(Flags::STRIKEOUT),
-            spacer: false,
-        });
-        link_cells[row].push(link);
+        decode_and_push(
+            &mut rows[row],
+            &mut link_cells[row],
+            theme,
+            content.colors,
+            &indexed.cell,
+        );
     }
 
     // the links group: consecutive cells sharing one hyperlink become
@@ -1339,6 +1299,80 @@ fn fill_rows(
         }
         rows[row].links = group_links(&rows[row].cells, links);
     }
+}
+
+/// One grid cell into the row's render list: the decode everything
+/// visible rides (fill_rows' loop body, shared with `row_above`, which
+/// reads history rows the viewport iterator cannot reach). Returns the
+/// cell's hyperlink for the caller's span grouping.
+fn decode_and_push(
+    row: &mut Row,
+    links: &mut Vec<Option<cell::Hyperlink>>,
+    theme: &Theme,
+    colors: &color::Colors,
+    cell: &cell::Cell,
+) {
+    let flags = cell.flags;
+    let link = cell.hyperlink();
+
+    if flags.contains(Flags::WIDE_CHAR_SPACER) {
+        row.cells.push(RenderCell {
+            c: ' ',
+            fg: theme.foreground,
+            bg: theme.background,
+            bold: false,
+            italic: false,
+            underline: Underline::None,
+            underline_color: None,
+            strikeout: false,
+            spacer: true,
+        });
+        links.push(link);
+        return;
+    }
+
+    let mut fg = palette::resolve(cell.fg, colors, theme);
+    let mut bg = palette::resolve(cell.bg, colors, theme);
+    if flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if flags.contains(Flags::HIDDEN) {
+        fg = bg;
+    }
+    if flags.contains(Flags::DIM) {
+        fg = fg.scale(2.0 / 3.0);
+    }
+
+    let underline = if flags.contains(Flags::UNDERLINE) {
+        Underline::Straight
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        Underline::Double
+    } else if flags.contains(Flags::UNDERCURL) {
+        Underline::Curly
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        Underline::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        Underline::Dashed
+    } else {
+        Underline::None
+    };
+    // SGR 58's color, through the same resolution the fg gets (a
+    // Named or Indexed underline color rides the dynamic overrides)
+    let underline_color =
+        cell.underline_color().map(|color| palette::resolve(color, colors, theme));
+
+    row.cells.push(RenderCell {
+        c: if flags.contains(Flags::HIDDEN) { ' ' } else { cell.c },
+        fg,
+        bg,
+        bold: flags.contains(Flags::BOLD),
+        italic: flags.contains(Flags::ITALIC),
+        underline,
+        underline_color,
+        strikeout: flags.contains(Flags::STRIKEOUT),
+        spacer: false,
+    });
+    links.push(link);
 }
 
 /// Consecutive same-hyperlink cells as column-measured spans. Grouped
