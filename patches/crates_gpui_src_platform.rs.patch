@@ -1,0 +1,16 @@
+--- a/vendor/zed/crates/gpui/src/platform.rs
++++ b/vendor/zed/crates/gpui/src/platform.rs
+@@ -412,6 +412,13 @@ pub trait PlatformDisplay: Debug {
+     /// Returns a stable identifier for this display that can be persisted and used
+     /// across system restarts.
+     fn uuid(&self) -> Result<Uuid>;
+
++    /// The display's own name, where the platform carries one: the
++    /// Wayland backend carries the compositor's wl_output name, the
++    /// join key session mirrors key their outputs by.
++    fn name(&self) -> Option<&str> {
++        None
++    }
++
+     /// Get the bounds for this display
+     fn bounds(&self) -> Bounds<Pixels>;

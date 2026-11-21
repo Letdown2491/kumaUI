@@ -32,6 +32,13 @@ local patches, which should be recorded here.
 
 ## Local patches
 
+- `crates/gpui/src/platform.rs`: a `name()` accessor on the
+  `PlatformDisplay` trait (default `None`), implemented in
+  `crates/gpui_linux/src/linux/wayland/display.rs` to return the
+  compositor's own wl_output name. The name was `pub(crate)` upstream,
+  so the shell had no way to join a gpui display to the output names
+  the session mirror (niri, sway) keys everything by; the per-output
+  surfaces (#72) key their maps by that name.
 - `crates/gpui/src/app.rs`: a `kuma-debug: slab REMOVE window` info line
   in the window drop path (debugging aid; grep-able in the shell's log).
 - `crates/gpui_linux/src/linux/wayland/window.rs`: a `closed` flag on

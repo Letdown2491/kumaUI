@@ -19,11 +19,13 @@
 //! quiet `Err` (the same `window not found` the journal shows), so
 //! detection costs nothing and logs nothing when all is well.
 
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AnyWindowHandle, App, AppContext, Bounds, Entity, Global, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions,
+    AnyWindowHandle, App, AppContext, Bounds, DisplayId, Entity, Global, PlatformDisplay,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
     layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
     point, px, size,
 };
@@ -62,11 +64,15 @@ pub struct SurfaceDeps {
 
 struct SurfaceHost {
     deps: SurfaceDeps,
-    wallpaper: Option<AnyWindowHandle>,
-    bar: Option<AnyWindowHandle>,
-    /// The position the live bar surface was created for: layer-shell
+    /// One surface per output, keyed by the compositor's own output
+    /// name (`display_key`): the maps are the reconcile's memory of
+    /// what it opened, diffed against `cx.displays()` every pass.
+    wallpaper: HashMap<String, AnyWindowHandle>,
+    bar: HashMap<String, AnyWindowHandle>,
+    /// The position the live bar surfaces were created for: layer-shell
     /// anchors are fixed at creation, so a position change is not a
-    /// live change; the observer closes the bar and ensure reopens it.
+    /// live change; the observer closes every bar and ensure reopens
+    /// them.
     bar_position: Option<BarPosition>,
     /// The last surface-creation failure, kept as its message: a
     /// permanent failure (a compositor without layer-shell support,
@@ -83,11 +89,16 @@ impl SurfaceHost {
     fn deps(cx: &App) -> SurfaceDeps {
         cx.global::<SurfaceHost>().deps.clone()
     }
+}
 
-    /// Whether a persistent surface is still open (a probe update).
-    fn alive(handle: Option<AnyWindowHandle>, cx: &mut App) -> bool {
-        handle.is_some_and(|window| window.update(cx, |_, _, _| {}).is_ok())
-    }
+/// The map key for a display: the compositor's own output name when
+/// gpui carries one (the spelling the session mirror reports for niri
+/// and sway), else a stable fallback spelled from the display id.
+pub(crate) fn display_key(display: &Rc<dyn PlatformDisplay>) -> String {
+    display
+        .name()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("display-{}", u64::from(display.id())))
 }
 
 /// Take ownership of the persistent surfaces. Nothing opens here: the
@@ -98,27 +109,28 @@ pub fn init(deps: SurfaceDeps, cx: &mut App) {
     let niri = deps.niri.clone();
     cx.set_global(SurfaceHost {
         deps,
-        wallpaper: None,
-        bar: None,
+        wallpaper: HashMap::new(),
+        bar: HashMap::new(),
         bar_position: None,
         last_error: None,
     });
-    // A bar position change cannot apply by re-render: the surface's
-    // anchors are fixed at creation. Drop the bar so the ensure pass
-    // reopens it at the new edge; every other bar setting applies live.
+    // A bar position change cannot apply by re-render: the surfaces'
+    // anchors are fixed at creation. Drop every bar so the ensure pass
+    // reopens them at the new edge; every other bar setting applies
+    // live.
     cx.observe(&settings, |settings, cx| {
         let position = settings.read(cx).bar.position;
-        let bar = {
+        let bars = {
             let host = cx.global_mut::<SurfaceHost>();
             if host.bar_position == Some(position) {
                 return;
             }
             host.bar_position = None;
-            host.bar.take()
+            std::mem::take(&mut host.bar).into_values().collect::<Vec<_>>()
         };
-        if let Some(bar) = bar {
+        for bar in bars {
             if let Err(err) = bar.update(cx, |_, window, _| window.remove_window()) {
-                log::error!("closing the bar for its position change failed: {err:#}");
+                log::error!("closing a bar for its position change failed: {err:#}");
             }
         }
         ensure(cx);
@@ -134,34 +146,88 @@ pub fn init(deps: SurfaceDeps, cx: &mut App) {
     .detach();
 }
 
-/// Recreate whatever persistent surface is missing. A no-op while there
-/// is nothing to attach to; probes only when everything is alive.
+/// Recreate whatever persistent surface is missing, per output. A
+/// no-op while there is nothing to attach to; probes only when
+/// everything is alive. This is the reconcile the hotplug event and
+/// the heartbeat share (ADR-0018): a diff, never a rebuild, so a
+/// spurious call costs nothing.
 pub fn ensure(cx: &mut App) {
     if cx.displays().is_empty() {
         return;
     }
-    let (wallpaper, bar) = {
-        let host = cx.global_mut::<SurfaceHost>();
-        (host.wallpaper, host.bar)
-    };
-    let wallpaper_gone = !SurfaceHost::alive(wallpaper, cx);
-    let bar_gone = !SurfaceHost::alive(bar, cx);
+    // The truth (cx.displays()) spelled as map keys, with the display
+    // id each name targets (the layer surface's binding level).
+    let displays: Vec<(String, DisplayId)> = cx
+        .displays()
+        .iter()
+        .map(|display| (display_key(display), display.id()))
+        .collect();
 
-    if wallpaper_gone {
+    // Prune: a surface whose window died (its output went away and the
+    // compositor closed it) or whose output is no longer in the truth
+    // drops out of the map and its handle, if still probed alive, is
+    // closed for good measure. The maps are cloned out first so the
+    // liveness probes run without the global borrow held.
+    let (walls, bars): (HashMap<String, AnyWindowHandle>, HashMap<String, AnyWindowHandle>) = {
+        let host = cx.global_mut::<SurfaceHost>();
+        (host.wallpaper.clone(), host.bar.clone())
+    };
+    let mut dead = Vec::new();
+    let mut live_walls = HashMap::new();
+    for (name, handle) in walls {
+        let gone = !displays.iter().any(|(key, _)| *key == name);
+        if gone || !handle.update(cx, |_, _, _| {}).is_ok() {
+            dead.push(handle);
+        } else {
+            live_walls.insert(name, handle);
+        }
+    }
+    let mut live_bars = HashMap::new();
+    for (name, handle) in bars {
+        let gone = !displays.iter().any(|(key, _)| *key == name);
+        if gone || !handle.update(cx, |_, _, _| {}).is_ok() {
+            dead.push(handle);
+        } else {
+            live_bars.insert(name, handle);
+        }
+    }
+    for handle in dead {
+        if let Err(err) = handle.update(cx, |_, window, _| window.remove_window()) {
+            log::debug!("pruning an already-closed surface: {err:#}");
+        }
+    }
+    let (missing_walls, missing_bars) = {
+        let host = cx.global_mut::<SurfaceHost>();
+        host.wallpaper = live_walls;
+        host.bar = live_bars;
+        let missing_walls: Vec<(String, DisplayId)> = displays
+            .iter()
+            .filter(|(name, _)| !host.wallpaper.contains_key(name))
+            .cloned()
+            .collect();
+        let missing_bars: Vec<(String, DisplayId)> = displays
+            .iter()
+            .filter(|(name, _)| !host.bar.contains_key(name))
+            .cloned()
+            .collect();
+        (missing_walls, missing_bars)
+    };
+
+    for (name, display_id) in missing_walls {
         let settings = SurfaceHost::deps(cx).settings;
-        match cx.open_window(wallpaper_options(), |_, cx| {
+        match cx.open_window(wallpaper_options(display_id), |_, cx| {
             cx.new(|cx| crate::wallpaper::WallpaperView::new(settings, cx))
         }) {
             Ok(handle) => {
                 let host = cx.global_mut::<SurfaceHost>();
-                host.wallpaper = Some(*handle);
+                host.wallpaper.insert(name.clone(), *handle);
                 host.last_error = None;
-                log::info!("surfaces: wallpaper opened");
+                log::info!("surfaces: wallpaper opened on {name}");
             }
             Err(err) => surface_error(&err.to_string(), cx),
         }
     }
-    if bar_gone {
+    for (name, display_id) in missing_bars {
         let SurfaceDeps {
             niri,
             sysmon,
@@ -175,7 +241,7 @@ pub fn ensure(cx: &mut App) {
             lock: _,
         } = SurfaceHost::deps(cx);
         let config: BarConfig = settings.read(cx).bar.clone();
-        match cx.open_window(bar_window_options(&config), |_, cx| {
+        match cx.open_window(bar_window_options(&config, display_id), |_, cx| {
             cx.new(|cx| {
                 ShellBar::new(
                     niri, sysmon, settings, notifications, tray, nostr, weather, widgets, updates,
@@ -185,10 +251,10 @@ pub fn ensure(cx: &mut App) {
         }) {
             Ok(handle) => {
                 let host = cx.global_mut::<SurfaceHost>();
-                host.bar = Some(*handle);
+                host.bar.insert(name.clone(), *handle);
                 host.bar_position = Some(config.position);
                 host.last_error = None;
-                log::info!("surfaces: bar opened");
+                log::info!("surfaces: bar opened on {name}");
             }
             Err(err) => surface_error(&err.to_string(), cx),
         }
@@ -238,7 +304,7 @@ fn surface_error(message: &str, cx: &mut App) {
     }
 }
 
-fn wallpaper_options() -> WindowOptions {
+fn wallpaper_options(display_id: DisplayId) -> WindowOptions {
     WindowOptions {
         titlebar: None,
         // client decorations: layer surfaces have no server side
@@ -247,6 +313,7 @@ fn wallpaper_options() -> WindowOptions {
             origin: point(px(0.), px(0.)),
             size: size(px(0.), px(0.)),
         })),
+        display_id: Some(display_id),
         app_id: Some("kuma-shell-wallpaper".into()),
         window_background: WindowBackgroundAppearance::Opaque,
         kind: WindowKind::LayerShell(LayerShellOptions {
@@ -261,7 +328,7 @@ fn wallpaper_options() -> WindowOptions {
     }
 }
 
-fn bar_window_options(config: &BarConfig) -> WindowOptions {
+fn bar_window_options(config: &BarConfig, display_id: DisplayId) -> WindowOptions {
     // the anchors pick the edge the bar hangs from; the offset, the
     // tooltip room, and the strip's placement inside the surface are
     // the view's business, so every other geometry setting changes live
@@ -277,6 +344,7 @@ fn bar_window_options(config: &BarConfig) -> WindowOptions {
             origin: point(px(0.), px(0.)),
             size: size(px(0.), px(config.height + config.offset_top)),
         })),
+        display_id: Some(display_id),
         app_id: Some("kuma-shell".into()),
         window_background: WindowBackgroundAppearance::Transparent,
         kind: WindowKind::LayerShell(LayerShellOptions {

@@ -1,0 +1,15 @@
+--- a/vendor/zed/crates/gpui_linux/src/linux/wayland/display.rs
++++ b/vendor/zed/crates/gpui_linux/src/linux/wayland/display.rs
+@@ -33,8 +33,12 @@ impl PlatformDisplay for WaylandDisplay {
+             .as_ref()
+             .context("Wayland display does not have a name")?;
+         Ok(Uuid::new_v5(&Uuid::NAMESPACE_DNS, name.as_bytes()))
+     }
+
++    fn name(&self) -> Option<&str> {
++        self.name.as_deref()
++    }
++
+     fn bounds(&self) -> Bounds<Pixels> {
+         self.bounds
+     }

@@ -8,8 +8,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext, Bounds, Context, Div, Entity, ImageSource, Render, SharedString, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, img,
+    App, AppContext, Bounds, Context, Div, DisplayId, Entity, ImageSource, Render, SharedString,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    div, img,
     layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
     point,
     prelude::*,
@@ -18,6 +19,7 @@ use gpui::{
 
 use crate::imaging::IconImage;
 use crate::launcher::{AppEntry, launch, load_apps};
+use crate::surfaces::display_key;
 use crate::session::{SessionState, SessionWindow};
 use crate::settings::{DockPosition, Settings};
 
@@ -234,7 +236,7 @@ fn unmatched_app_ids<'a>(
 /// coordinates, which the context menu's placement depends on). The visible
 /// card is centered by the view; the input region covers only the card.
 /// A 0 dimension on the doubly-anchored axis lets the compositor stretch.
-pub fn dock_window_options(position: DockPosition) -> WindowOptions {
+pub fn dock_window_options(position: DockPosition, display_id: DisplayId) -> WindowOptions {
     let (anchor, width, height) = match position {
         DockPosition::Bottom => (Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT, 0., STRIP),
         DockPosition::Top => (Anchor::TOP | Anchor::LEFT | Anchor::RIGHT, 0., STRIP),
@@ -249,6 +251,7 @@ pub fn dock_window_options(position: DockPosition) -> WindowOptions {
             origin: point(px(0.), px(0.)),
             size: size(px(width), px(height)),
         })),
+        display_id: Some(display_id),
         app_id: Some("kuma-shell-dock".into()),
         window_background: WindowBackgroundAppearance::Transparent,
         kind: WindowKind::LayerShell(LayerShellOptions {
@@ -263,10 +266,12 @@ pub fn dock_window_options(position: DockPosition) -> WindowOptions {
     }
 }
 
-/// Owns the dock window's lifecycle: opened iff enabled, recreated when the
-/// position changes (a layer surface's anchor is fixed at creation).
+/// Owns the dock's windows' lifecycle: one per output (keyed by the
+/// compositor's output name, the surfaces map's own key), opened iff
+/// enabled, recreated when the position changes (a layer surface's
+/// anchor is fixed at creation).
 pub struct DockHost {
-    window: Option<WindowHandle<DockView>>,
+    windows: HashMap<String, WindowHandle<DockView>>,
     position: DockPosition,
 }
 
@@ -282,46 +287,64 @@ impl DockHost {
             (settings.dock.enabled, settings.dock.position)
         };
         // with no displays there is nothing to attach to: the compositor
-        // closes the surface immediately, so wait for the surfaces watch
+        // closes the surfaces immediately, so wait for the surfaces watch
         // to call again when one appears
         if cx.displays().is_empty() {
             return;
-        }
-        // a compositor-side close (the output the dock was on went away)
-        // leaves a dead handle: the probe reads it as gone so this sync
-        // recreates instead of guarding a ghost
-        if !self
-            .window
-            .as_ref()
-            .is_some_and(|window| window.update(cx, |_, _, _| {}).is_ok())
-        {
-            self.window = None;
         }
         if !enabled {
             self.close(cx);
             return;
         }
-        if self.window.is_some() && self.position == position {
-            return;
+        // the truth as map keys with each name's display id
+        let displays: Vec<(String, DisplayId)> = cx
+            .displays()
+            .iter()
+            .map(|display| (display_key(display), display.id()))
+            .collect();
+        // a position change invalidates every surface (anchors are fixed
+        // at creation): close them all and reopen on the new edge
+        if self.position != position {
+            self.close(cx);
         }
-        self.close(cx);
-        log::info!("dock: recreating window at {position:?}");
-        let niri = niri.clone();
-        let settings = settings.clone();
-        match cx.open_window(dock_window_options(position), |_, cx| {
-            cx.new(|cx| DockView::new(niri, settings, cx))
-        }) {
-            Ok(handle) => {
-                self.window = Some(handle);
-                self.position = position;
+        // prune: dead handles (the output went away and the compositor
+        // closed the surface) and outputs no longer in the truth
+        let mut live = HashMap::new();
+        for (name, window) in std::mem::take(&mut self.windows) {
+            let alive = window.update(cx, |_, _, _| {}).is_ok();
+            let gone = !displays.iter().any(|(key, _)| *key == name);
+            if alive && gone {
+                if let Err(err) = window.update(cx, |_, window, _| window.remove_window()) {
+                    log::error!("closing dock window on the lost output {name} failed: {err:#}");
+                }
             }
-            Err(err) => log::error!("failed to open dock window: {err:#}"),
+            if alive && !gone {
+                live.insert(name, window);
+            }
+        }
+        self.windows = live;
+        self.position = position;
+        for (name, display_id) in displays {
+            if self.windows.contains_key(&name) {
+                continue;
+            }
+            log::info!("dock: opening window on {name} at {position:?}");
+            let niri = niri.clone();
+            let settings = settings.clone();
+            match cx.open_window(dock_window_options(position, display_id), |_, cx| {
+                cx.new(|cx| DockView::new(niri, settings, cx))
+            }) {
+                Ok(handle) => {
+                    self.windows.insert(name, handle);
+                }
+                Err(err) => log::error!("failed to open dock window on {name}: {err:#}"),
+            }
         }
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
-        if let Some(handle) = self.window.take() {
-            if let Err(err) = handle.update(cx, |_, window, _| window.remove_window()) {
+        for (_, window) in std::mem::take(&mut self.windows) {
+            if let Err(err) = window.update(cx, |_, window, _| window.remove_window()) {
                 log::error!("closing dock window failed: {err:#}");
             }
         }
@@ -347,7 +370,7 @@ pub fn run(niri: Entity<SessionState>, settings: Entity<Settings>, cx: &mut App)
         )
         .detach();
         DockHost {
-            window: None,
+            windows: HashMap::new(),
             position: DockPosition::default(),
         }
     });
