@@ -1,15 +1,16 @@
 //! The shell's persistent surfaces and the watch that keeps them alive.
 //!
 //! The surfaces the shell cannot work without (the wallpaper, the bar,
-//! the lock screens, the dock) are owned here: a watch probes their
-//! handles and recreates the missing ones while displays exist. This is
-//! the contract noctalia idled by: a compositor closes every layer
-//! surface the moment its last output goes away (a dock unplug on an
-//! external-monitor laptop, the CI smoke's output-less qemu), and the
-//! shell answers by idling with zero windows, still holding its DBus
-//! names (org.freedesktop.Notifications) and deliberately taking no
-//! part in the suspend path, then bringing the surfaces back when
-//! outputs return. The process exits only when the
+//! the lock screens, the dock) are owned here: the adapters' output
+//! change event (ADR-0018) reconciles them on hotplug, and a watch
+//! heartbeats the same ensure pass so a missed event heals within a
+//! tick. This is the contract noctalia idled by: a compositor closes
+//! every layer surface the moment its last output goes away (a dock
+//! unplug on an external-monitor laptop, the CI smoke's output-less
+//! qemu), and the shell answers by idling with zero windows, still
+//! holding its DBus names (org.freedesktop.Notifications) and
+//! deliberately taking no part in the suspend path, then bringing the
+//! surfaces back when outputs return. The process exits only when the
 //! compositor's connection itself breaks, which is session end.
 //!
 //! Output visibility needs no window: gpui binds `wl_output` globals as
@@ -29,16 +30,18 @@ use gpui::{
 
 use crate::bar::ShellBar;
 use crate::lock;
-use crate::session::SessionState;
+use crate::session::{OutputsChanged, SessionState};
 use crate::nostr::NostrState;
 use crate::notifications::NotificationState;
 use crate::settings::{BarConfig, BarPosition, Settings};
 use crate::sysmon::SysMon;
 use crate::tray::TrayState;
 
-/// How often the watch surveys the surfaces: hotplug lands within about
-/// one tick, and the survey is a display count plus a few probes,
-/// nothing at all when everything is alive.
+/// How often the watch heartbeats the surfaces: event-driven hotplug
+/// (ADR-0018) does the real reacting, and the tick exists to catch
+/// what the event stream missed (a downed stream, a lost event). The
+/// survey is a display count plus a few probes, nothing at all when
+/// everything is alive.
 const WATCH_TICK: Duration = Duration::from_secs(2);
 
 /// The entities the persistent surfaces render from, held so the watch
@@ -92,6 +95,7 @@ impl SurfaceHost {
 /// same code.
 pub fn init(deps: SurfaceDeps, cx: &mut App) {
     let settings = deps.settings.clone();
+    let niri = deps.niri.clone();
     cx.set_global(SurfaceHost {
         deps,
         wallpaper: None,
@@ -117,6 +121,14 @@ pub fn init(deps: SurfaceDeps, cx: &mut App) {
                 log::error!("closing the bar for its position change failed: {err:#}");
             }
         }
+        ensure(cx);
+    })
+    .detach();
+    // The hotplug trigger (ADR-0018): the adapters report an output
+    // change as an event, and the reconcile is the same ensure pass
+    // the watch heartbeats. The event is a trigger, never a command:
+    // ensure diffs before it acts, and a spurious hint costs a no-op.
+    cx.subscribe(&niri, |_, _: &OutputsChanged, cx| {
         ensure(cx);
     })
     .detach();
@@ -193,8 +205,10 @@ pub fn ensure(cx: &mut App) {
     crate::dock::ensure(&niri, &settings, cx);
 }
 
-/// Run the watch: survey and recreate every tick. The loop runs until
-/// the process does; the compositor's death is what ends the process.
+/// Run the watch: heartbeat the survey every tick, recreating whatever
+/// event-driven hotplug (ADR-0018) did not already reconcile. The loop
+/// runs until the process does; the compositor's death is what ends
+/// the process.
 pub fn watch(cx: &mut App) {
     cx.spawn(async move |cx| {
         let mut last_displays: Option<usize> = None;

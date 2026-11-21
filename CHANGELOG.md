@@ -4,6 +4,10 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+### Changed
+
+- kuma-shell reacts to monitor hotplug by event instead of by poll: the compositor adapters report output changes as a session event (niri derives it from workspace changes behind a set-compare gate, sway maps its native output event), the bar and wallpaper reconcile immediately on plug, unplug, or a config change that enables or disables an output, and the 2-second surface watch demotes to a heartbeat that only catches what the event stream misses.
+
 ## v0.9.0 (2026-11-13)
 
 kuma-shell 0.9.0

@@ -3,6 +3,7 @@
 //! module may mention niri.
 
 use std::{
+    collections::HashSet,
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
@@ -10,12 +11,12 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{App, Entity};
-use log::error;
+use log::{error, info};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use smol::channel::Sender;
 
-use crate::session::{SessionEvent, SessionState};
+use crate::session::{SessionEvent, SessionState, Workspace};
 
 #[derive(Deserialize)]
 struct WorkspaceActivatedEvent {
@@ -113,6 +114,11 @@ fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
         bail!("unexpected niri IPC reply: {reply}");
     }
 
+    // The hotplug gate's state (ADR-0018). None means "never seen": a
+    // reconnect re-seeds from the replicated initial workspaces, which
+    // may fire one OutputsChanged the reconcile absorbs as a no-op diff.
+    let mut last_outputs: Option<HashSet<String>> = None;
+
     loop {
         let Some(line) = read_capped_line(&mut reader)? else {
             bail!("niri closed the event stream");
@@ -123,11 +129,49 @@ fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
         // and socket errors above still end the attempt; the mirror
         // reconnects (session.rs).
         match parse_event(&line) {
-            Ok(Some(event)) => event_tx.send_blocking(event)?,
+            Ok(Some(event)) => {
+                // Niri has no output event in any shipped version; a
+                // WorkspacesChanged whose output-name set changed is
+                // the hint (ADR-0018). Sent after the workspace event
+                // so the mirror's workspaces are fresh when the
+                // surfaces reconcile.
+                if let SessionEvent::Workspaces(workspaces) = &event {
+                    if outputs_changed(&mut last_outputs, workspaces) {
+                        event_tx.send_blocking(SessionEvent::OutputsChanged)?;
+                        info!("session: outputs changed");
+                    }
+                }
+                event_tx.send_blocking(event)?
+            }
             Ok(None) => {}
             Err(err) => error!("niri event skipped, parse failed: {err:#}"),
         }
     }
+}
+
+/// The usable-output set: the union of the workspace mirror's output
+/// names. Niri gives every mapped monitor at least one workspace and a
+/// disabled output carries none, so this set is exactly the outputs a
+/// surface may target.
+fn usable_outputs(workspaces: &[Workspace]) -> HashSet<String> {
+    workspaces
+        .iter()
+        .filter_map(|workspace| workspace.output.clone())
+        .collect()
+}
+
+/// The set-compare gate: true when the new workspaces' output set
+/// differs from the last seen set (which it then replaces).
+/// `WorkspacesChanged` also fires for ordinary reshuffles (a rename, a
+/// workspace moved between monitors), so the gate is what keeps the
+/// hint cheap (ADR-0018).
+fn outputs_changed(last: &mut Option<HashSet<String>>, workspaces: &[Workspace]) -> bool {
+    let outputs = usable_outputs(workspaces);
+    if last.as_ref() == Some(&outputs) {
+        return false;
+    }
+    *last = Some(outputs);
+    true
 }
 
 fn parse_event(line: &str) -> Result<Option<SessionEvent>> {
@@ -322,6 +366,42 @@ mod tests {
             None
         ));
         assert!(parse_event("not json").is_err());
+    }
+
+    fn workspace_on(output: &str) -> Workspace {
+        Workspace {
+            output: Some(output.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn outputs_gate_fires_on_plug_and_unplug_only() {
+        let mut last = None;
+        // first sight is a change (the replicated initial state): the
+        // reconcile absorbs it as a no-op diff (ADR-0018)
+        assert!(outputs_changed(&mut last, &[workspace_on("eDP-1")]));
+        // a rename and a workspace move between monitors do not
+        let renamed = &[Workspace {
+            name: Some("big".into()),
+            ..workspace_on("eDP-1")
+        }];
+        assert!(!outputs_changed(&mut last, renamed));
+        assert!(!outputs_changed(
+            &mut last,
+            &[workspace_on("eDP-1"), workspace_on("eDP-1")]
+        ));
+        // plug
+        assert!(outputs_changed(&mut last, &[workspace_on("eDP-1"), workspace_on("DP-1")]));
+        // unplug: the orphaned workspaces move to the survivor
+        assert!(outputs_changed(&mut last, &[workspace_on("eDP-1")]));
+        // a workspace on no output (niri's scratch, a disabled slot)
+        // contributes nothing to the set
+        let scratch = &[Workspace {
+            output: None,
+            ..Default::default()
+        }, workspace_on("eDP-1")];
+        assert!(!outputs_changed(&mut last, scratch));
     }
 
     #[test]

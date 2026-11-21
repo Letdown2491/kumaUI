@@ -37,6 +37,7 @@ const GET_TREE: u32 = 4;
 /// i3's input list: the keyboards and their xkb layouts.
 const GET_INPUTS: u32 = 101;
 const EVENT_WORKSPACE: u32 = 0x8000_0000;
+const EVENT_OUTPUT: u32 = 0x8000_0001;
 const EVENT_WINDOW: u32 = 0x8000_0003;
 const EVENT_INPUT: u32 = 0x8000_0005;
 
@@ -200,7 +201,7 @@ fn inputs_to_layouts(reply: &Value) -> Option<KeyboardLayouts> {
 
 fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
     let mut ipc = Ipc::connect()?;
-    let subscribed = ipc.request(SUBSCRIBE, br#"["workspace","window","input"]"#)?;
+    let subscribed = ipc.request(SUBSCRIBE, br#"["workspace","window","input","output"]"#)?;
     if !subscribed["success"].as_bool().unwrap_or(false) {
         bail!("sway rejected the event subscription");
     }
@@ -223,6 +224,16 @@ fn run_event_stream(event_tx: Sender<SessionEvent>) -> Result<()> {
                 // rather than patch, so visible and focused stay exact
                 let workspaces = fetch_workspaces(&mut ipc)?;
                 event_tx.send_blocking(SessionEvent::Workspaces(workspaces))?;
+            }
+            EVENT_OUTPUT => {
+                // sway's native output event (add, remove, enable,
+                // disable): the hint niri's adapter must derive from
+                // workspace churn (ADR-0018). The workspaces refetch
+                // rides the workspace event's own discipline, because
+                // an output change reassigns them.
+                let workspaces = fetch_workspaces(&mut ipc)?;
+                event_tx.send_blocking(SessionEvent::Workspaces(workspaces))?;
+                event_tx.send_blocking(SessionEvent::OutputsChanged)?;
             }
             EVENT_WINDOW => {
                 if let Some(event) = window_event(&value) {

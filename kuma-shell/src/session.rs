@@ -7,7 +7,7 @@
 use std::{collections::HashMap, time::Duration, time::Instant};
 
 use anyhow::Result;
-use gpui::{App, AppContext, Entity};
+use gpui::{App, AppContext, Entity, EventEmitter};
 use log::{debug, error, warn};
 use serde::Deserialize;
 use smol::channel::{Sender, bounded, unbounded};
@@ -107,6 +107,14 @@ pub enum CastTarget {
     Window { id: u64 },
 }
 
+/// The set of usable outputs changed: a monitor arrived, left, or a
+/// config change enabled or disabled one. The mirror holds no output
+/// state of its own (the truth is gpui's `cx.displays()`, which the
+/// surfaces read live), so this event carries nothing: it is only the
+/// trigger the surfaces reconcile against (ADR-0018).
+#[derive(Clone, Copy, Debug)]
+pub struct OutputsChanged;
+
 /// The compositor's session events, whatever compositor sent them.
 /// Adapters translate their wire format into this enum; the state
 /// applies it blind.
@@ -122,6 +130,11 @@ pub enum SessionEvent {
     CastStartedOrChanged(Cast),
     CastStopped(u64),
     KeyboardLayouts(KeyboardLayouts),
+    /// The usable-output set changed (ADR-0018): niri derives it from
+    /// `WorkspacesChanged` behind a set-compare gate, sway maps its
+    /// native output event. No mirror state; the mirror loop emits
+    /// `OutputsChanged` through the entity for the surfaces.
+    OutputsChanged,
 }
 
 /// The compositor's configured keyboard layouts: the names in their
@@ -244,6 +257,9 @@ impl SessionState {
                 self.casts.remove(&stream_id);
             }
             SessionEvent::KeyboardLayouts(layouts) => self.keyboard_layouts = Some(layouts),
+            // no mirror state: the outputs' truth is gpui's displays,
+            // and the surfaces reconcile on the emitted event (ADR-0018)
+            SessionEvent::OutputsChanged => {}
         }
         // transition-only: the mirror's own telemetry, and the smoke's
         // assertion surface. A summary that kept logging would spam
@@ -275,6 +291,11 @@ impl SessionState {
         )
     }
 }
+
+/// The mirror is also the hotplug trigger's broadcast point (ADR-0018):
+/// an adapter that reports an output change emits `OutputsChanged`
+/// through the entity, and the surfaces subscribe to reconcile.
+impl EventEmitter<OutputsChanged> for SessionState {}
 
 /// Wire the session state to whatever compositor this session runs:
 /// detect the adapter by its IPC socket, then feed the mirror. A
@@ -360,7 +381,14 @@ where
         while let Ok(event) = event_rx.recv().await {
             if state
                 .update(cx, |state, cx| {
+                    // The hotplug event carries no mirror state (the
+                    // truth is the displays); it is broadcast instead,
+                    // and the surfaces' subscription reconciles.
+                    let outputs_changed = matches!(event, SessionEvent::OutputsChanged);
                     state.apply(event);
+                    if outputs_changed {
+                        cx.emit(OutputsChanged);
+                    }
                     cx.notify();
                 })
                 .is_err()
