@@ -244,6 +244,7 @@ pub fn ensure(cx: &mut App) {
         match cx.open_window(bar_window_options(&config, display_id), |_, cx| {
             cx.new(|cx| {
                 ShellBar::new(
+                    name.clone(),
                     niri, sysmon, settings, notifications, tray, nostr, weather, widgets, updates,
                     cx,
                 )

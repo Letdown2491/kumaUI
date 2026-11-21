@@ -332,7 +332,7 @@ impl DockHost {
             let niri = niri.clone();
             let settings = settings.clone();
             match cx.open_window(dock_window_options(position, display_id), |_, cx| {
-                cx.new(|cx| DockView::new(niri, settings, cx))
+                cx.new(|cx| DockView::new(name.clone(), niri, settings, cx))
             }) {
                 Ok(handle) => {
                     self.windows.insert(name, handle);
@@ -393,6 +393,10 @@ pub fn ensure(niri: &Entity<SessionState>, settings: &Entity<Settings>, cx: &mut
 /// The dock surface: a rounded card of entries centered on a stretched,
 /// otherwise transparent strip at the screen edge.
 pub struct DockView {
+    /// This surface's own output (the compositor's name): what its
+    /// clicks name when they open a panel, so the panel opens on the
+    /// dock that was clicked.
+    output: String,
     niri: Entity<SessionState>,
     settings: Entity<Settings>,
     apps: Vec<AppEntry>,
@@ -430,6 +434,7 @@ fn decode_icons(keys: Vec<(String, String)>) -> Vec<(String, Option<IconImage>)>
 
 impl DockView {
     pub fn new(
+        output: String,
         niri: Entity<SessionState>,
         settings: Entity<Settings>,
         cx: &mut Context<Self>,
@@ -466,6 +471,7 @@ impl DockView {
         .detach();
 
         Self {
+            output,
             niri,
             settings,
             apps: Vec::new(),
@@ -723,11 +729,20 @@ fn menu_row(label: &'static str, on_click: impl Fn(&mut App) + 'static) -> gpui:
 }
 
 /// Open the dock context menu beside the dock at the pointer. `x`/`y` are
-/// the pointer in dock-window coordinates.
-pub fn open_dock_menu(context: DockMenuContext, x: f32, y: f32, dock: DockPosition, cx: &mut App) {
+/// the pointer in dock-window coordinates; `output` is the dock surface's
+/// own output, which the menu's panel targets.
+pub fn open_dock_menu(
+    context: DockMenuContext,
+    output: &str,
+    x: f32,
+    y: f32,
+    dock: DockPosition,
+    cx: &mut App,
+) {
     cx.global_mut::<crate::panel::PanelHost>()
         .set_dock_menu(Some(context));
     crate::panel::toggle_panel_at(
+        output,
         crate::panel::PanelKind::DockMenu,
         x,
         y,
@@ -802,9 +817,9 @@ fn dock_icon(
         .hover(|el| el.bg(rgb(crate::theme::current().surface_hover)))
         .when(focused, |el| el.bg(rgb(crate::theme::current().surface)))
         .tooltip(crate::panel_kit::text_tooltip(tooltip.into()))
-        .on_click(cx.listener(move |_, _, _, cx| {
+        .on_click(cx.listener(move |this, _, _, cx| {
             if is_fixture {
-                crate::panel::toggle_panel(crate::panel::PanelKind::Launcher, cx);
+                crate::panel::toggle_panel_on(&this.output, crate::panel::PanelKind::Launcher, cx);
             } else if let Some(target) = cycle_target(&click_windows, click_focused) {
                 cx.background_spawn(async move {
                     if let Err(err) = crate::session::focus_window(target) {
@@ -818,7 +833,7 @@ fn dock_icon(
                 log::error!("launch {exec} failed: {err:#}");
             }
         }))
-        .on_aux_click(cx.listener(move |_, event: &gpui::ClickEvent, _, cx| {
+        .on_aux_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
             // aux covers middle and right; only right opens the menu, and
             // raw unmatched entries have no desktop file to pin
             if !matches!(
@@ -835,8 +850,9 @@ fn dock_icon(
             };
             let (x, y) = (f32::from(event.position().x), f32::from(event.position().y));
             // the menu hangs beside the dock at the cell; which axis it
-            // centers on depends on the dock's edge
-            open_dock_menu(context, x, y, pin_dock, cx);
+            // centers on depends on the dock's edge. The menu opens on
+            // the dock's own output.
+            open_dock_menu(context, &this.output, x, y, pin_dock, cx);
         }))
         .child(match icon {
             _ if is_fixture => svg()

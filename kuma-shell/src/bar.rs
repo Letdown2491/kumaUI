@@ -38,6 +38,11 @@ pub struct ShellBar {
     weather: Entity<WeatherState>,
     widgets: Entity<crate::widgets::CustomWidgets>,
     updates: Entity<crate::updates::UpdatesState>,
+    /// This surface's own output (the compositor's name, the key the
+    /// surfaces map and the panel host speak): what a widget click
+    /// names when it opens a panel, so the panel opens on the output
+    /// whose bar was clicked.
+    output: String,
     applied_geometry: Option<(f32, f32, f32, f32, f32, BarPosition)>,
     clock: String,
     /// Set by the panel host on every panel transition; consumed at the next
@@ -53,6 +58,7 @@ pub struct ShellBar {
 
 impl ShellBar {
     pub fn new(
+        output: String,
         niri: Entity<SessionState>,
         sysmon: Entity<SysMon>,
         settings: Entity<Settings>,
@@ -96,7 +102,7 @@ impl ShellBar {
         // the panel host needs to know about transitions it triggers
         let this = cx.weak_entity();
         cx.update_global(|host: &mut crate::panel::PanelHost, _| {
-            host.set_bar(this);
+            host.set_bar(output.clone(), this);
         });
 
         Self {
@@ -109,6 +115,7 @@ impl ShellBar {
             weather,
             widgets,
             updates,
+            output,
             applied_geometry: None,
             clock: String::new(),
             suppress_tooltips_requested: false,
@@ -121,6 +128,19 @@ impl ShellBar {
     pub fn suppress_tooltips(&mut self, cx: &mut Context<Self>) {
         self.suppress_tooltips_requested = true;
         cx.notify();
+    }
+
+    /// Toggle a panel on this bar's own output: the click's output owns
+    /// the panel, so a second monitor's bar opens its panels on the
+    /// second monitor (#72).
+    fn toggle_panel(&self, kind: crate::panel::PanelKind, cx: &mut App) {
+        crate::panel::toggle_panel_on(&self.output, kind, cx);
+    }
+
+    /// The anchored flavor: the drawer hangs under the pointer x in
+    /// this bar's own coordinates.
+    fn toggle_panel_anchored(&self, kind: crate::panel::PanelKind, anchor_x: f32, cx: &mut App) {
+        crate::panel::toggle_panel_anchored_on(&self.output, kind, anchor_x, cx);
     }
 }
 
@@ -197,12 +217,15 @@ impl Render for ShellBar {
                 // flush against the bar's inner face, measured from the
                 // edge the bar hangs from
                 cx.global_mut::<crate::panel::PanelHost>()
-                    .report_bar_geometry(crate::panel::BarGeometry {
-                        content_x: content_x.into(),
-                        content_width: content_width.into(),
-                        bar_edge: (f32::from(bar.offset_top) + f32::from(bar.height)).into(),
-                        position: bar.position,
-                    });
+                    .report_bar_geometry(
+                        &self.output,
+                        crate::panel::BarGeometry {
+                            content_x: content_x.into(),
+                            content_width: content_width.into(),
+                            bar_edge: (f32::from(bar.offset_top) + f32::from(bar.height)).into(),
+                            position: bar.position,
+                        },
+                    );
                 // re-anchor any open panel to the fresh geometry: its
                 // drawer positions at render from this value
                 crate::panel::refresh_open_panels(cx);
@@ -512,8 +535,8 @@ impl ShellBar {
                     .items_center()
                     .cursor_pointer()
                     .when(tooltips_on, |el| el.tooltip(text_tooltip("Apps".into())))
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        crate::panel::toggle_panel(crate::panel::PanelKind::Launcher, cx)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_panel(crate::panel::PanelKind::Launcher, cx)
                     }))
                     .child(
                         svg()
@@ -586,9 +609,9 @@ impl ShellBar {
                     None,
                 )
                 .cursor_pointer()
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Cpu, anchor, cx)
+                    this.toggle_panel_anchored(crate::panel::PanelKind::Cpu, anchor, cx)
                 }))
                 .into_any_element()
             }),
@@ -624,10 +647,10 @@ impl ShellBar {
                     this.sysmon
                         .update(cx, |sysmon, cx| sysmon.request_volume(delta, cx));
                 }))
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     // hang the mini panel under the pointer, i.e. under this widget
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Volume, anchor, cx)
+                    this.toggle_panel_anchored(crate::panel::PanelKind::Volume, anchor, cx)
                 }))
                 .into_any_element()
             }),
@@ -660,9 +683,9 @@ impl ShellBar {
                     this.sysmon
                         .update(cx, |sysmon, cx| sysmon.request_brightness(delta, cx));
                 }))
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(
+                    this.toggle_panel_anchored(
                         crate::panel::PanelKind::Brightness,
                         anchor,
                         cx,
@@ -699,9 +722,9 @@ impl ShellBar {
                     None,
                 )
                 .cursor_pointer()
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Ram, anchor, cx)
+                    this.toggle_panel_anchored(crate::panel::PanelKind::Ram, anchor, cx)
                 }))
                 .into_any_element()
             }),
@@ -731,9 +754,9 @@ impl ShellBar {
                     None,
                 )
                 .cursor_pointer()
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Temp, anchor, cx)
+                    this.toggle_panel_anchored(crate::panel::PanelKind::Temp, anchor, cx)
                 }))
                 .into_any_element()
             }),
@@ -767,9 +790,9 @@ impl ShellBar {
                     None,
                 )
                 .cursor_pointer()
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Disk, anchor, cx)
+                    this.toggle_panel_anchored(crate::panel::PanelKind::Disk, anchor, cx)
                 }))
                 .into_any_element()
             }),
@@ -796,9 +819,9 @@ impl ShellBar {
                     None,
                 )
                 .cursor_pointer()
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(crate::panel::PanelKind::Mic, anchor, cx)
+                    this.toggle_panel_anchored(crate::panel::PanelKind::Mic, anchor, cx)
                 }))
                 .into_any_element()
             }),
@@ -825,10 +848,10 @@ impl ShellBar {
                     None,
                 )
                 .cursor_pointer()
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     // hang the popup under the pointer, i.e. under this widget
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(
+                    this.toggle_panel_anchored(
                         crate::panel::PanelKind::PowerProfile,
                         anchor,
                         cx,
@@ -940,9 +963,9 @@ impl ShellBar {
                     None,
                 )
                 .cursor_pointer()
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(
+                    this.toggle_panel_anchored(
                         crate::panel::PanelKind::Battery,
                         anchor,
                         cx,
@@ -1007,9 +1030,9 @@ impl ShellBar {
                         None,
                     )
                     .cursor_pointer()
-                    .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                         let anchor = f32::from(event.position().x);
-                        crate::panel::toggle_panel_anchored(
+                        this.toggle_panel_anchored(
                             crate::panel::PanelKind::Weather,
                             anchor,
                             cx,
@@ -1051,8 +1074,8 @@ impl ShellBar {
                     None,
                     )
                     .cursor_pointer()
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        crate::panel::toggle_panel(crate::panel::PanelKind::Calendar, cx)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_panel(crate::panel::PanelKind::Calendar, cx)
                     }))
                     .into_any_element(),
                 )
@@ -1098,9 +1121,9 @@ impl ShellBar {
                     None,
                 )
                 .cursor_pointer()
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(
+                    this.toggle_panel_anchored(
                         crate::panel::PanelKind::Bluetooth,
                         anchor,
                         cx,
@@ -1144,9 +1167,9 @@ impl ShellBar {
                     None,
                 )
                 .cursor_pointer()
-                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                     let anchor = f32::from(event.position().x);
-                    crate::panel::toggle_panel_anchored(
+                    this.toggle_panel_anchored(
                         crate::panel::PanelKind::Wifi,
                         anchor,
                         cx,
@@ -1185,9 +1208,9 @@ impl ShellBar {
                         None,
                     )
                     .cursor_pointer()
-                    .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
                         let anchor = f32::from(event.position().x);
-                        crate::panel::toggle_panel_anchored(
+                        this.toggle_panel_anchored(
                             crate::panel::PanelKind::Wifi,
                             anchor,
                             cx,
@@ -1253,8 +1276,8 @@ impl ShellBar {
                     None,
                     )
                     .cursor_pointer()
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        crate::panel::toggle_panel(crate::panel::PanelKind::Notifications, cx)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_panel(crate::panel::PanelKind::Notifications, cx)
                     }))
                     .into_any_element(),
                 )
@@ -1316,11 +1339,11 @@ impl ShellBar {
                         None,
                     )
                     .cursor_pointer()
-                    .on_click(cx.listener(|_, _, _, cx| {
+                    .on_click(cx.listener(|this, _, _, cx| {
                         // centered like the launcher and settings: the
                         // anchored hang looked off, and the panel is a
                         // destination, not a glance
-                        crate::panel::toggle_panel(crate::panel::PanelKind::Updates, cx)
+                        this.toggle_panel(crate::panel::PanelKind::Updates, cx)
                     }))
                     .into_any_element(),
                 )
@@ -1350,8 +1373,8 @@ impl ShellBar {
                     None,
                     )
                     .cursor_pointer()
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        crate::panel::toggle_panel(crate::panel::PanelKind::Nostr, cx)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_panel(crate::panel::PanelKind::Nostr, cx)
                     }))
                     .into_any_element(),
                 )
@@ -1853,9 +1876,9 @@ fn gear_button(cx: &Context<ShellBar>, tooltips_on: bool) -> gpui::Stateful<Div>
         .when(tooltips_on, |el| {
             el.tooltip(text_tooltip("Settings".into()))
         })
-        .on_click(cx.listener(|_, _, _, cx| {
+        .on_click(cx.listener(|this, _, _, cx| {
             // the settings panel opens onto its quick page
-            crate::panel::toggle_panel(crate::panel::PanelKind::Settings, cx)
+            this.toggle_panel(crate::panel::PanelKind::Settings, cx)
         }))
         .child(
             svg()

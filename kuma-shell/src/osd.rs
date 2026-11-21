@@ -310,7 +310,7 @@ impl Osd {
                 let (position, edge) = cx
                     .try_global::<PanelHost>()
                     .map(|host| {
-                        let bar = host.bar();
+                        let bar = host.toast_bar(cx);
                         (bar.position, bar.bar_edge)
                     })
                     .unwrap_or((crate::settings::BarPosition::default(), 0.));

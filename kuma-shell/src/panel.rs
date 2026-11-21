@@ -4,7 +4,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, Context, Div, Element, ElementId, Global, GlobalElementId,
+    AnyElement, App, Bounds, Context, Div, DisplayId, Element, ElementId, Global, GlobalElementId,
     InspectorElementId, KeyDownEvent, LayoutId, Pixels, Render, Size, Stateful, Style, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div,
     layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
@@ -12,6 +12,8 @@ use gpui::{
     prelude::*,
     px, rgba, size, svg,
 };
+
+use crate::surfaces::display_key;
 
 pub const COVE: f32 = 16.;
 pub const CORNER_RADIUS: f32 = 12.;
@@ -560,10 +562,20 @@ pub struct PanelHost {
     /// chip's.
     updates: gpui::Entity<crate::updates::UpdatesState>,
     /// The bar view, told about panel transitions so it can suppress the
-    /// tooltips the compositor's re-entry would otherwise resurrect.
-    bar_view: Option<gpui::WeakEntity<crate::bar::ShellBar>>,
+    /// tooltips the compositor's re-entry would otherwise resurrect: the
+    /// views keyed by their output, since the transition's synthesized
+    /// pointer move only lands on the target output's bar.
+    bar_views: HashMap<String, gpui::WeakEntity<crate::bar::ShellBar>>,
+    /// The session mirror: what "the focused output" means when a toggle
+    /// names no output (the msg verbs), and the toasts' anchor choice.
+    niri: gpui::Entity<crate::session::SessionState>,
+    /// Live bar geometry per output, reported by each bar view.
+    bars: HashMap<String, BarGeometry>,
+    /// The output the open panel targets: chosen by the click (the
+    /// toggling bar's own output) or the focused output (msg verbs),
+    /// and the panel surface is created display-targeted to it.
+    target: Option<String>,
     open: Option<OpenPanel>,
-    bar: BarGeometry,
     /// Where the next open panel hangs, set by the toggle flavors.
     placement: PanelPlacement,
     /// The context menu target a dock cell right-clicked: consumed by the
@@ -594,6 +606,7 @@ impl Global for PanelHost {}
 
 impl PanelHost {
     pub fn new(
+        niri: gpui::Entity<crate::session::SessionState>,
         settings: gpui::Entity<crate::settings::Settings>,
         sysmon: gpui::Entity<crate::sysmon::SysMon>,
         notifications: gpui::Entity<crate::notifications::NotificationState>,
@@ -610,29 +623,55 @@ impl PanelHost {
             weather,
             widgets,
             updates,
-            bar_view: None,
+            niri,
+            bar_views: HashMap::new(),
+            bars: HashMap::new(),
+            target: None,
             open: None,
-            bar: BarGeometry::default(),
             placement: PanelPlacement::Bar,
             dock_menu: None,
         }
     }
 
     /// The bar reports its identity at construction (it reports geometry
-    /// later, at render).
-    pub fn set_bar(&mut self, bar: gpui::WeakEntity<crate::bar::ShellBar>) {
-        self.bar_view = Some(bar);
+    /// later, at render): `output` is the compositor's output name the
+    /// bar's surface was created for, the map key every per-output
+    /// lookup here speaks.
+    pub fn set_bar(&mut self, output: String, bar: gpui::WeakEntity<crate::bar::ShellBar>) {
+        self.bar_views.insert(output, bar);
     }
 
     /// The bar reports its content rect whenever it changes; panels center
     /// against it.
-    pub fn report_bar_geometry(&mut self, bar: BarGeometry) {
-        self.bar = bar;
+    pub fn report_bar_geometry(&mut self, output: &str, bar: BarGeometry) {
+        self.bars.insert(output.to_owned(), bar);
     }
 
-    /// Live bar geometry: toasts hang under the bar, panels center on it.
+    /// The bar geometry the open panel's chrome places against:
+    /// `target`'s when it reported one, else any bar's (a msg verb
+    /// before the focused output's bar ever rendered), else the
+    /// default (a session with no bar yet).
     pub fn bar(&self) -> BarGeometry {
-        self.bar
+        self.target
+            .as_ref()
+            .and_then(|output| self.bars.get(output))
+            .or_else(|| self.bars.values().next())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The bar geometry a toast anchors to: the focused output's bar,
+    /// else any reported bar (the mirror has no focus yet), else the
+    /// default. Toasts follow focus, not the last toggle.
+    pub fn toast_bar(&self, cx: &App) -> BarGeometry {
+        let focused = self
+            .niri
+            .read(cx)
+            .focused_output()
+            .and_then(|output| self.bars.get(output))
+            .or_else(|| self.bars.values().next())
+            .copied();
+        focused.unwrap_or_default()
     }
 
     /// The dock right-click target: read by the dock menu's construction.
@@ -669,24 +708,43 @@ pub fn is_open(kind: &PanelKind, cx: &mut App) -> bool {
         .any(|window| window.update(cx, |_, _, _| {}).is_ok())
 }
 
-/// Toggle a panel open/closed. Free function because the host lives in `cx`.
+/// Toggle a panel open/closed on the focused output's bar: the msg
+/// verbs' flavor (and anything that cannot name an output). Falls back
+/// to any bar when the focused output has none yet.
 pub fn toggle_panel(kind: PanelKind, cx: &mut App) {
-    // centered placement: clear any stale placement
+    let target = {
+        let host = cx.global::<PanelHost>();
+        host.niri
+            .read(cx)
+            .focused_output()
+            .map(str::to_owned)
+            .filter(|output| host.bars.contains_key(output))
+            .or_else(|| host.bars.keys().next().cloned())
+    };
     cx.global_mut::<PanelHost>().placement = PanelPlacement::Bar;
-    open_panel(kind, cx);
+    open_panel(kind, target, cx);
+}
+
+/// Toggle a panel open/closed on one output's bar, centered on its
+/// content: the bar fixture clicks' flavor.
+pub fn toggle_panel_on(output: &str, kind: PanelKind, cx: &mut App) {
+    cx.global_mut::<PanelHost>().placement = PanelPlacement::Bar;
+    open_panel(kind, Some(output.to_owned()), cx);
 }
 
 /// Toggle a panel open/closed, hanging it centered under `anchor_x` (the
-/// pointer x at widget-click time) instead of centered on the bar content.
-pub fn toggle_panel_anchored(kind: PanelKind, anchor_x: f32, cx: &mut App) {
+/// pointer x at widget-click time, in that bar's own coordinates)
+/// instead of centered on the bar content.
+pub fn toggle_panel_anchored_on(output: &str, kind: PanelKind, anchor_x: f32, cx: &mut App) {
     cx.global_mut::<PanelHost>().placement = PanelPlacement::Widget { x: anchor_x };
-    open_panel(kind, cx);
+    open_panel(kind, Some(output.to_owned()), cx);
 }
 
 /// Toggle a panel open/closed beside the dock at the pointer: the dock's
 /// context menu placement. `offset` is the distance from the dock's edge
-/// (its strip plus a gap).
+/// (its strip plus a gap). The menu opens on the dock's own output.
 pub fn toggle_panel_at(
+    output: &str,
     kind: PanelKind,
     x: f32,
     y: f32,
@@ -695,10 +753,10 @@ pub fn toggle_panel_at(
     cx: &mut App,
 ) {
     cx.global_mut::<PanelHost>().placement = PanelPlacement::At { x, y, dock, offset };
-    open_panel(kind, cx);
+    open_panel(kind, Some(output.to_owned()), cx);
 }
 
-fn open_panel(kind: PanelKind, cx: &mut App) {
+fn open_panel(kind: PanelKind, target: Option<String>, cx: &mut App) {
     // a session whose surfaces the compositor closed (its output went
     // away) reads as closed: running the stale close would only log
     // "window not found", and the toggle would eat its own press
@@ -732,6 +790,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
 
     let (settings, sysmon, notifications, nostr, weather, widgets, updates) = {
         let host = cx.global_mut::<PanelHost>();
+        host.target = target.clone();
         (
             host.settings.clone(),
             host.sysmon.clone(),
@@ -747,10 +806,26 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
     let (_, _, keyboard) = kind.geometry();
     let namespace = kind.namespace();
 
+    // the surface is display-targeted: the panel renders in the
+    // target output's own coordinates, so its drawer lands under the
+    // bar that toggled it. No matching display (the output vanished
+    // between the click and here) falls back to the first display,
+    // the no-bar behavior.
+    let displays = cx.displays();
+    let display_id = target
+        .as_ref()
+        .and_then(|output| {
+            displays
+                .iter()
+                .find(|display| display_key(display) == *output)
+        })
+        .or_else(|| displays.first())
+        .map(|display| display.id());
+
     let mut close_steps: Vec<Box<dyn Fn(&mut App)>> = Vec::new();
     let mut windows: Vec<gpui::AnyWindowHandle> = Vec::new();
 
-    match cx.open_window(scrim_options(), |_, cx| cx.new(|_| ScrimView)) {
+    match cx.open_window(scrim_options(display_id), |_, cx| cx.new(|_| ScrimView)) {
         Ok(handle) => {
             windows.push(*handle);
             close_steps.push(Box::new(move |cx| {
@@ -763,7 +838,7 @@ fn open_panel(kind: PanelKind, cx: &mut App) {
     }
 
     let panel_close: Box<dyn Fn(&mut App)> = match cx.open_window(
-        panel_window_options(namespace, keyboard),
+        panel_window_options(namespace, keyboard, display_id),
         |window, cx| {
             let view = kind.open_view(
                 settings.clone(),
@@ -875,10 +950,16 @@ pub fn close_panels(cx: &mut App) {
 /// bar re-entrantly there would panic. The spawned task runs after the
 /// current dispatch completes.
 fn notify_bar(cx: &mut App) {
-    let bar = cx.global::<PanelHost>().bar_view.clone();
-    if let Some(bar) = bar {
+    let (target, views) = {
+        let host = cx.global::<PanelHost>();
+        (host.target.clone(), host.bar_views.clone())
+    };
+    // the synthesized move lands on the target output's bar only
+    let view = target.as_ref().and_then(|output| views.get(output));
+    if let Some(view) = view {
+        let view = view.clone();
         cx.spawn(async move |cx| {
-            if let Err(err) = bar.update(cx, crate::bar::ShellBar::suppress_tooltips) {
+            if let Err(err) = view.update(cx, crate::bar::ShellBar::suppress_tooltips) {
                 log::error!("notifying bar of a panel transition failed: {err:#}");
             }
         })
@@ -1038,7 +1119,11 @@ pub fn chrome(
         )
 }
 
-pub fn panel_window_options(namespace: &str, keyboard: KeyboardInteractivity) -> WindowOptions {
+pub fn panel_window_options(
+    namespace: &str,
+    keyboard: KeyboardInteractivity,
+    display_id: Option<DisplayId>,
+) -> WindowOptions {
     // The surface spans the whole output, the scrim's shape, and
     // carries no placement at all: drawer_origin computes the drawer's
     // rect at render from live geometry, so any bar change re-anchors
@@ -1059,6 +1144,7 @@ pub fn panel_window_options(namespace: &str, keyboard: KeyboardInteractivity) ->
             origin: point(px(0.), px(0.)),
             size: size(px(0.), px(0.)),
         })),
+        display_id,
         app_id: Some(format!("kuma-shell-{namespace}")),
         window_background: WindowBackgroundAppearance::Transparent,
         kind: WindowKind::LayerShell(LayerShellOptions {
@@ -1073,7 +1159,7 @@ pub fn panel_window_options(namespace: &str, keyboard: KeyboardInteractivity) ->
     }
 }
 
-pub fn scrim_options() -> WindowOptions {
+pub fn scrim_options(display_id: Option<DisplayId>) -> WindowOptions {
     WindowOptions {
         titlebar: None,
         // client decorations: same reason as panel_window_options
@@ -1082,6 +1168,7 @@ pub fn scrim_options() -> WindowOptions {
             origin: point(px(0.), px(0.)),
             size: size(px(0.), px(0.)),
         })),
+        display_id,
         app_id: Some("kuma-shell-scrim".into()),
         window_background: WindowBackgroundAppearance::Transparent,
         kind: WindowKind::LayerShell(LayerShellOptions {
@@ -1153,7 +1240,8 @@ mod tests {
             },
         ] {
             let _ = &placement;
-            let options = panel_window_options("test", KeyboardInteractivity::OnDemand);
+            let options =
+                panel_window_options("test", KeyboardInteractivity::OnDemand, None);
             let layer = layer_of(&options);
             assert_eq!(
                 layer.anchor,

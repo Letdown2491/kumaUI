@@ -70,6 +70,7 @@ fn main() {
             kuma_shell::idle::run(&settings, &lock, cx);
             kuma_shell::polkit::run(&lock, cx);
             cx.set_global(kuma_shell::panel::PanelHost::new(
+                niri.clone(),
                 settings.clone(),
                 sysmon.clone(),
                 notifications.clone(),

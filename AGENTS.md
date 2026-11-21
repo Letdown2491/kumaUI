@@ -104,6 +104,13 @@ refreshes the lock and installs through the build, and commits
 the changelog's newest version line disagree, so a version bump
 without changelog bullets will not go green.
 
+App versions are independent: a release bumps only the apps that
+moved (kuma-shell 0.10.0 can ship alongside kuma-term 0.5.1, which
+bumps to 0.6.0 only when its own changes earn it). The one
+synchronization point is kumaUI 1.0.0, which aligns every app at
+1.0.0 together; until then apps version on their own cadence
+(#153).
+
 ## kumaOS
 
 kumaOS (`~/Documents/kuma`, remote `Letdown2491/kumaOS`) is handled
