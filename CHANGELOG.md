@@ -4,6 +4,13 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+## v0.10.0 (2026-11-20)
+
+kuma-shell 0.10.0
+kuma-files 0.7.0
+kuma-term 0.6.0
+kuma-monitor 0.4.1
+
 ### Added
 
 - kuma-term speaks shell integration (#114): the terminal taps OSC 133 prompt markers, OSC 7 and OSC 9;9 cwd reports, OSC 9 and OSC 777 notifications, and OSC 7501 program status off the output stream (a new zero-dependency `term-tap` crate, fuzzed by the pty-bytes target alongside the grid parser), new tabs open in the active pane's reported directory, ctrl+shift+z/x jump to the previous/next prompt, and commands report an honest finish. The image-side shell snippets ride a kumaOS handoff.
