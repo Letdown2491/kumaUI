@@ -748,6 +748,21 @@ impl TerminalView {
     fn paste(&mut self, cx: &mut Context<Self>) {
         let Some(item) = cx.read_from_clipboard() else { return };
         let Some(text) = item.text() else { return };
+        self.paste_text(&text);
+    }
+
+    /// The middle-click road: the primary selection pastes (the X11
+    /// habit), stripped of its bracketed markers like any paste. An
+    /// empty primary is a no-op, not an error.
+    fn paste_primary(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_primary() else { return };
+        let Some(text) = item.text() else { return };
+        self.paste_text(&text);
+    }
+
+    /// One paste, however it arrived: bracketed when the shell asked,
+    /// newlines normalized to carriage returns, markers stripped.
+    fn paste_text(&mut self, text: &str) {
         let mut bytes = Vec::with_capacity(text.len() + 16);
         if self.active().engine.bracketed_paste() {
             bytes.extend_from_slice(b"\x1b[200~");
@@ -1229,6 +1244,13 @@ impl TerminalView {
             cx.notify();
             return;
         }
+        // middle click: the primary selection pastes at the cursor, the
+        // X11 habit (the program took the click above when it owns the
+        // pointer)
+        if event.button == MouseButton::Middle {
+            self.paste_primary(cx);
+            return;
+        }
         if event.button != MouseButton::Left {
             return;
         }
@@ -1333,6 +1355,14 @@ impl TerminalView {
         }
         self.down_cell = None;
         self.active_mut().engine.finish_selection();
+        // the finished selection lands on the primary selection (the
+        // Linux convention: middle-click pastes it elsewhere), every
+        // time, not behind the copy_on_select opt-in
+        if let Some(text) = self.active().engine.selection_text()
+            && !text.is_empty()
+        {
+            cx.write_to_primary(ClipboardItem::new_string(text));
+        }
         // the config's opt-in: a finished selection lands on the
         // clipboard by itself, like the terminal.app habit
         if self.theme.copy_on_select
