@@ -116,7 +116,22 @@ struct Tab {
     search_generation: u64,
     /// this session's PTY reader; aborts if dropped
     _pump: Task<()>,
+    /// The shell's reported working directory (OSC 7 / OSC 9;9,
+    /// host-checked before it is kept): the next tab spawn inherits it
+    /// if the directory still exists. `None` until the shell reported.
+    cwd: Option<String>,
+    /// The prompt marks (OSC 133;A), each the prompt line's depth below
+    /// the history buffer's top: the coordinate that survives scrolling
+    /// (the grid's own absolute lines shift on every scroll), converted
+    /// to a display offset at jump time. Oldest first, capped; a resize
+    /// reflows the grid and the marks drift with it, like every mark
+    /// implementation's.
+    marks: Vec<i64>,
 }
+
+/// The prompt-mark cap: a long session marks a prompt per command, and
+/// the oldest marks are the least interesting to jump to.
+const MARKS_CAP: usize = 1000;
 
 /// Height of the tab bar, shown only while more than one tab is open.
 const TAB_BAR_H: f32 = 22.0;
@@ -226,7 +241,7 @@ impl TerminalView {
             cell_width: cell_w as u16,
             cell_height: cell_h as u16,
         };
-        let tab = Self::start_session(&theme, 1, window_size, cx, command)
+        let tab = Self::start_session(&theme, 1, window_size, cx, command, None)
             .unwrap_or_else(|err| {
                 // without a shell there is no terminal
                 panic!("kuma-term: cannot spawn the shell: {err}")
@@ -345,16 +360,18 @@ impl TerminalView {
 
     /// Spawn a session (engine + its PTY pump task) sized for the
     /// window; the caller places it in `tabs`. `id` is the session's
-    /// stable identity: the pump tags every event with it.
+    /// stable identity: the pump tags every event with it. `cwd` seeds
+    /// the child's working directory.
     fn start_session(
         theme: &Theme,
         id: u64,
         window_size: alacritty_terminal::event::WindowSize,
         cx: &mut Context<Self>,
         command: Option<Vec<String>>,
+        cwd: Option<std::path::PathBuf>,
     ) -> std::io::Result<Tab> {
         let (tx, rx) = futures::channel::mpsc::unbounded::<UiEvent>();
-        let engine = Engine::new(window_size, theme.clone(), tx, command)?;
+        let engine = Engine::new(window_size, theme.clone(), tx, command, cwd)?;
         let pump = cx.spawn(async move |this, cx| {
             let mut rx = rx;
             'pump: while let Some(first) = rx.next().await {
@@ -407,6 +424,8 @@ impl TerminalView {
             _search_task: Task::ready(()),
             search_generation: 0,
             _pump: pump,
+            cwd: None,
+            marks: Vec::new(),
         })
     }
 
@@ -420,8 +439,8 @@ impl TerminalView {
     }
 
     /// Open a new session after the focused one, and focus it. Spawns
-    /// in the process's cwd; a spawn-in-this-tab's-cwd needs the OSC 7
-    /// tap, which is not wired yet.
+    /// in the active pane's reported directory (the shell integration's
+    /// OSC 7) when it still exists, the process's cwd otherwise.
     fn spawn_tab(&mut self, cx: &mut Context<Self>) {
         let window_size = alacritty_terminal::event::WindowSize {
             num_cols: self.cols,
@@ -429,9 +448,18 @@ impl TerminalView {
             cell_width: self.cell_w as u16,
             cell_height: self.cell_h as u16,
         };
+        // the inherited directory must still exist: the report could be
+        // stale (a deleted dir) or from a machine that has one at the
+        // same path (the host check guards, but belt and braces)
+        let cwd = self.active().cwd.as_ref().and_then(|path| {
+            let path = std::path::PathBuf::from(path);
+            std::fs::metadata(&path)
+                .is_ok_and(|meta| meta.is_dir())
+                .then_some(path)
+        });
         // a new tab is a fresh shell: `-e` seeds the initial tab only
         let id = self.next_tab_id;
-        let tab = match Self::start_session(&self.theme, id, window_size, cx, None) {
+        let tab = match Self::start_session(&self.theme, id, window_size, cx, None, cwd) {
             Ok(tab) => tab,
             Err(err) => {
                 log::warn!("kuma-term: cannot spawn a tab: {err}");
@@ -502,6 +530,32 @@ impl TerminalView {
     fn jump_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.switch_tab(index, cx);
+    }
+
+    /// Jump to the previous (delta -1) or next (delta 1) prompt mark
+    /// (OSC 133;A), scrolling it to the viewport's top: kitty's
+    /// scroll_to_prompt. A mark's depth converts to a display offset
+    /// against the history size at jump time, since both the history
+    /// and the mark's coordinate move together as output scrolls.
+    fn jump_prompt(&mut self, delta: i32, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        let tab = self.active();
+        let history = tab.engine.history_size() as i64;
+        // the viewport's top row's depth: history minus how far the
+        // viewport is scrolled into it
+        let top_depth = history - tab.engine.display_offset() as i64;
+        let target = if delta < 0 {
+            tab.marks.iter().rev().find(|&&depth| depth < top_depth).copied()
+        } else {
+            tab.marks.iter().find(|&&depth| depth > top_depth).copied()
+        };
+        let Some(depth) = target else { return };
+        // depth q sits at the viewport's top when the display offset is
+        // history - q; a mark on the live screen (q above the history
+        // line) clamps to 0, the live viewport
+        let offset = (history - depth).max(0) as usize;
+        self.active().engine.scroll_to_offset(offset);
+        cx.notify();
     }
 
     fn handle_event(
@@ -595,6 +649,25 @@ impl TerminalView {
                     });
                 })
                 .detach();
+            }
+            UiEvent::PromptMark(depth) => {
+                let tab = &mut self.tabs[index];
+                if tab.marks.len() == MARKS_CAP {
+                    tab.marks.remove(0);
+                }
+                tab.marks.push(depth);
+            }
+            UiEvent::CommandFinished(code) => {
+                // the honest command-finish event; the program-status
+                // and notification landings compose with it
+                log::debug!("command finished: {code:?}");
+            }
+            UiEvent::Cwd { host, path } => {
+                if cwd_host_is_local(host.as_deref()) {
+                    self.tabs[index].cwd = Some(path);
+                } else {
+                    log::info!("ignoring a cwd report from another host: {host:?}");
+                }
             }
             UiEvent::PtyWrite(bytes) => self.tabs[index].engine.input(bytes),
         }
@@ -967,6 +1040,17 @@ impl TerminalView {
                     cx.stop_propagation();
                     return;
                 }
+                // prompt-mark jumps, kitty's scroll_to_prompt chords:
+                // previous/next prompt (the shell integration's OSC
+                // 133;A marks)
+                "z" => {
+                    self.jump_prompt(-1, cx);
+                    return;
+                }
+                "x" => {
+                    self.jump_prompt(1, cx);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1318,6 +1402,34 @@ fn open_url(url: &str) {
         },
         Err(err) => warn!("opening {url}: {err}"),
     }
+}
+
+/// Whether an OSC 7 report's host is this machine: `None` (the file
+/// URI's authority was empty), the loopback names, or a hostname that
+/// matches this one. A remote host's report (an ssh session's remote
+/// shell) must not steer a local spawn: the path would name a
+/// directory on the wrong machine.
+fn cwd_host_is_local(host: Option<&str>) -> bool {
+    match host {
+        None | Some("localhost") | Some("127.0.0.1") | Some("::1") => true,
+        Some(host) => local_host().as_deref() == Some(host),
+    }
+}
+
+/// This machine's hostname, via gethostname.
+fn local_host() -> Option<String> {
+    let mut buf = [0u8; 256];
+    let written = unsafe {
+        libc::gethostname(buf.as_mut_ptr().cast(), buf.len())
+    };
+    if written != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end])
+        .ok()
+        .map(str::to_owned)
+        .filter(|name| !name.is_empty())
 }
 
 /// The OSC 52 confirm card, kitty's prompt in this terminal's own

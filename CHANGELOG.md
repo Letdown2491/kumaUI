@@ -4,6 +4,10 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+### Added
+
+- kuma-term speaks shell integration (#114): the terminal taps OSC 133 prompt markers, OSC 7 and OSC 9;9 cwd reports, OSC 9 and OSC 777 notifications, and OSC 7501 program status off the output stream (a new zero-dependency `term-tap` crate, fuzzed by the pty-bytes target alongside the grid parser), new tabs open in the active pane's reported directory, ctrl+shift+z/x jump to the previous/next prompt, and commands report an honest finish. The image-side shell snippets ride a kumaOS handoff.
+
 ### Changed
 
 - kuma-shell reacts to monitor hotplug by event instead of by poll: the compositor adapters report output changes as a session event (niri derives it from workspace changes behind a set-compare gate, sway maps its native output event), the bar and wallpaper reconcile immediately on plug, unplug, or a config change that enables or disables an output, and the 2-second surface watch demotes to a heartbeat that only catches what the event stream misses.

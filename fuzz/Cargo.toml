@@ -22,6 +22,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 alacritty_terminal = "0.26"
+term-tap = { path = "../term-tap" }
 
 [[bin]]
 name = "pty_bytes"

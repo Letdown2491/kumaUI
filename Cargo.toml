@@ -1,10 +1,11 @@
 [workspace]
-members = ["kuma-files", "kuma-monitor", "kuma-platform", "kuma-shell", "kuma-term"]
+members = ["kuma-files", "kuma-monitor", "kuma-platform", "kuma-shell", "kuma-term", "term-tap"]
 exclude = ["vendor"]
 resolver = "2"
 
 [workspace.dependencies]
 kuma-platform = { path = "kuma-platform" }
+term-tap = { path = "term-tap" }
 gpui = { path = "vendor/zed/crates/gpui" }
 gpui_platform = { path = "vendor/zed/crates/gpui_platform", features = ["wayland"] }
 gpui_wgpu = { path = "vendor/zed/crates/gpui_wgpu" }

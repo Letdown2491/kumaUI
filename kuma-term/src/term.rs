@@ -23,6 +23,7 @@ use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::{Color, Processor, Rgb};
 use rustc_hash::FxHasher;
 use std::hash::Hasher;
+use term_tap::{OscEvent, Tap as OscTap};
 
 /// The cursor shape rides through the term seam so the view never
 /// touches alacritty directly.
@@ -55,6 +56,19 @@ pub enum UiEvent {
     /// The shell asked to write bytes to the PTY (DA replies, DSR, and the
     /// replies to the queries above).
     PtyWrite(Vec<u8>),
+    /// OSC 133;A: a prompt started. The value is the prompt line's depth
+    /// below the history buffer's top (the grid's own absolute lines
+    /// shift on every scroll; the depth does not until the line scrolls
+    /// off), which a jump converts to a display offset at its own time.
+    PromptMark(i64),
+    /// OSC 133;D: the shell reported a command's exit. The honest
+    /// command-finish event: shell-integration truth, not a heuristic.
+    CommandFinished(Option<i32>),
+    /// OSC 7 / OSC 9;9: the shell reported its working directory. The
+    /// host is the file URI's authority, validated against this
+    /// machine before the path is trusted (an ssh session's remote
+    /// report must not steer a local spawn).
+    Cwd { host: Option<String>, path: String },
 }
 
 /// The event proxy: lives on the PTY reader thread, forwards into the UI
@@ -418,13 +432,34 @@ fn pty_take_master(pty: &mut tty::Pty) -> std::fs::File {
     pty.file().try_clone().expect("clone the PTY master")
 }
 
+/// One tap event, processed with the grid parser advanced exactly to
+/// the sequence's boundary: the prompt mark reads the cursor here, so
+/// the prompt text following in the same read has not moved it yet.
+fn handle_osc(term: &mut Term<UiProxy>, proxy: &UiProxy, event: OscEvent) {
+    match event {
+        OscEvent::PromptStart => {
+            let grid = term.grid();
+            let depth = grid.history_size() as i64 + grid.cursor.point.line.0 as i64;
+            proxy.forward(UiEvent::PromptMark(depth));
+        }
+        OscEvent::CommandFinished(code) => proxy.forward(UiEvent::CommandFinished(code)),
+        OscEvent::Cwd { host, path } => proxy.forward(UiEvent::Cwd { host, path }),
+        // notifications (OSC 9/777) and program status (OSC 7501) ride
+        // their own landings; the tap already sees the sequences, so
+        // those landings are view-side wiring only
+        OscEvent::Notification { .. }
+        | OscEvent::ProgramStatus { .. }
+        | OscEvent::ProgramStatusQuery => {},
+        OscEvent::CommandStart | OscEvent::OutputStart => {},
+    }
+}
+
 /// The byte pump: the terminal's own read loop, replacing alacritty's
 /// EventLoop. Reads the PTY master in blocking mode, hands the bytes to
 /// the vte parser (which updates the grid and fires UiProxy events for
-/// queries/titles). No shell-integration tap today: when the OSC 133/7
-/// tap arrives it will be a second hand-rolled parser over this same
-/// attacker-controllable stream and needs vte-grade care (UTF-8 state,
-/// OSC bounds, terminators).
+/// queries/titles) and to the shell-integration tap, whose events come
+/// with their byte offsets so the parser advances in slices and the
+/// cursor reads exactly at each sequence's boundary.
 /// On Linux a PTY master read after child exit returns EIO once the
 /// kernel buffer drains, which is the drain-on-exit behavior alacritty's
 /// loop implemented: final output lands, then the Exit event closes the
@@ -451,6 +486,10 @@ fn pump_thread(
     // the shared flags, and answers the mode query straight onto the
     // master before the next read
     let mut tap = crate::kitty::Tap::default();
+    // the shell-integration tap: OSC 133/7/9/777/7501, the same
+    // observe-only arrangement, its events converted to UiEvents at
+    // the sequence's exact grid boundary (see handle_osc)
+    let mut osc = OscTap::default();
     let mut buf = [0u8; 8192];
     loop {
         match master.read(&mut buf) {
@@ -460,12 +499,25 @@ fn pump_thread(
                 return;
             },
             Ok(n) => {
+                let bytes = &buf[..n];
+                let osc_events = osc.feed(bytes);
                 let mut locked = term.lock();
-                parser.advance(&mut *locked, &buf[..n]);
+                // advance the grid parser in slices so each OSC event
+                // is handled with the cursor exactly at its sequence's
+                // terminator: the prompt mark's line is the cursor at
+                // `133;A`, before the prompt text lands. No events in
+                // the chunk means the single advance of old.
+                let mut ate = 0;
+                for (at, event) in osc_events {
+                    parser.advance(&mut *locked, &bytes[ate..at]);
+                    ate = at;
+                    handle_osc(&mut locked, &proxy, event);
+                }
+                parser.advance(&mut *locked, &bytes[ate..]);
                 // like alacritty's loop: wake the UI once per chunk, after
                 // the grid took the bytes
                 drop(locked);
-                if tap.feed(&buf[..n], &kitty) {
+                if tap.feed(bytes, &kitty) {
                     let reply = format!("\x1b[?{}u", kitty.active());
                     if let Err(err) = master.write_all(reply.as_bytes()) {
                         log::warn!("keyboard mode reply failed: {err}");
@@ -605,12 +657,15 @@ impl Engine {
     /// Spawn the shell, wire the PTY reader thread. `window_size` carries
     /// the initial cell geometry (measured from the real font by the view).
     /// `command` is `-e`'s argv, run directly (no shell between), which
-    /// wins over the env hook when both are present.
+    /// wins over the env hook when both are present. `cwd` seeds the
+    /// child's working directory (a spawned tab inherits the active
+    /// pane's, per the shell integration's OSC 7 report).
     pub fn new(
         window_size: WindowSize,
         theme: Theme,
         tx: UnboundedSender<UiEvent>,
         command: Option<Vec<String>>,
+        cwd: Option<std::path::PathBuf>,
     ) -> io::Result<Self> {
         // TERM and COLORTERM for the child; alacritty's own helper picks
         // alacritty terminfo when installed, xterm-256color otherwise
@@ -625,7 +680,7 @@ impl Engine {
                 .ok()
                 .map(|hook| vec!["/bin/sh".to_string(), "-c".to_string(), hook])
         });
-        let options = match argv {
+        let mut options = match argv {
             Some(argv) => tty::Options {
                 shell: Some(tty::Shell::new(
                     argv[0].clone(),
@@ -635,6 +690,7 @@ impl Engine {
             },
             None => tty::Options::default(),
         };
+        options.working_directory = cwd;
         let mut pty = tty::new(&options, window_size, 0)?;
 
         let proxy = UiProxy { tx };
@@ -783,6 +839,13 @@ impl Engine {
     /// How far the viewport is scrolled back into history (0 = live).
     pub fn display_offset(&self) -> usize {
         self.term.lock().grid().display_offset()
+    }
+
+    /// The scrollback history's line count (the buffer above the live
+    /// screen): prompt marks are depths below the buffer's top, and a
+    /// jump converts depth to a display offset with this.
+    pub fn history_size(&self) -> usize {
+        self.term.lock().grid().history_size()
     }
 
     /// A handle for background search scans: shares the term behind its
@@ -1704,7 +1767,8 @@ mod tests {
         unsafe { std::env::set_var("KUMA_TERM_COMMAND", "echo kuma") };
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<UiEvent>();
         let mut engine =
-            Engine::new(window_size, crate::theme::Theme::builtin(), tx, None).expect("engine with a live pty");
+            Engine::new(window_size, crate::theme::Theme::builtin(), tx, None, None)
+                .expect("engine with a live pty");
 
         // pump the event channel until the child exits, with a wall clock
         // bound so a broken pump fails instead of hanging the suite
@@ -1759,6 +1823,7 @@ mod tests {
             crate::theme::Theme::builtin(),
             tx,
             Some(vec!["echo".to_string(), "direct-wins".to_string()]),
+            None,
         )
         .expect("engine with a live pty");
 
@@ -1817,6 +1882,7 @@ mod tests {
                 "-c".to_string(),
                 "printf '\\033[>1u'; sleep 30".to_string(),
             ]),
+            None,
         )
         .expect("engine");
         let mut applied = false;
@@ -1853,6 +1919,7 @@ mod tests {
             crate::theme::Theme::builtin(),
             tx,
             Some(vec!["sh".to_string(), "-c".to_string(), "echo one; sleep 30".to_string()]),
+            None,
         )
         .expect("engine");
 
@@ -1935,5 +2002,108 @@ mod tests {
         engine.resize(19, 4);
         let fifth = engine.snapshot(true);
         assert_eq!(fifth.rows.len(), 4);
+    }
+
+    /// The prompt mark's depth is the cursor at the sequence's
+    /// terminator, not the cursor after the chunk: the shell prints
+    /// the prompt (and maybe scrolls the screen) after announcing it,
+    /// and a mark read after the fact would point a line or more low.
+    #[test]
+    fn prompt_marks_read_the_cursor_at_the_boundary() {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+        let proxy = UiProxy { tx: tx.clone() };
+        let mut term = Term::new(
+            alacritty_terminal::term::Config::default(),
+            &GridDims { columns: 10, screen_lines: 3 },
+            proxy.clone(),
+        );
+        // push history so the mark's chunk scrolls the screen behind it
+        feed(&mut term, b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+
+        // the marker mid-chunk, prompt text and a scroll after it
+        let bytes: &[u8] = b"\x1b]133;A\x07prompt> more\r\n";
+        let mut parser = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        let mut osc = OscTap::default();
+        let events = osc.feed(bytes);
+        assert_eq!(events.len(), 1);
+        let mut ate = 0;
+        for (at, event) in events {
+            parser.advance(&mut term, &bytes[ate..at]);
+            ate = at;
+            handle_osc(&mut term, &proxy, event);
+        }
+        parser.advance(&mut term, &bytes[ate..]);
+
+        // the reference: another term with the same content advanced
+        // exactly to the boundary
+        let (ref_tx, _ref_rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+        let mut boundary = Term::new(
+            alacritty_terminal::term::Config::default(),
+            &GridDims { columns: 10, screen_lines: 3 },
+            UiProxy { tx: ref_tx },
+        );
+        feed(&mut boundary, b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        feed(&mut boundary, &bytes[..ate]);
+        let expected =
+            boundary.grid().history_size() as i64 + boundary.grid().cursor.point.line.0 as i64;
+        assert!(expected >= 0);
+
+        match futures::executor::block_on(rx.next()) {
+            Some(UiEvent::PromptMark(depth)) => assert_eq!(depth, expected),
+            Some(_) => panic!("expected the prompt mark, got another event first"),
+            None => panic!("the channel died before the prompt mark"),
+        }
+        // the boundary really mattered: the chunk's tail moved the cursor
+        let naive = term.grid().history_size() as i64 + term.grid().cursor.point.line.0 as i64;
+        assert!(
+            naive > expected,
+            "the test must scroll behind the marker, or it proves nothing"
+        );
+    }
+
+    /// The engine seeds its child's working directory (the tab spawn's
+    /// inherited cwd rides the tty options), and a directory that does
+    /// not exist refuses the spawn rather than starting somewhere else.
+    #[test]
+    fn engine_seeds_the_child_cwd() {
+        if std::env::var("KUMA_TERM_SKIP_PTY_TEST").is_ok() {
+            return;
+        }
+        let _env = crate::PTY_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let window_size = WindowSize {
+            num_cols: 20,
+            num_lines: 5,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        // alacritty's tty::new does not check the directory: a missing
+        // one would start the child in the process's cwd. The view
+        // validates before handing a path over (spawn_tab), which is
+        // the contract this test exercises on the happy path only.
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+        let mut engine = Engine::new(
+            window_size,
+            crate::theme::Theme::builtin(),
+            tx,
+            Some(vec!["sh".to_string(), "-c".to_string(), "pwd; sleep 30".to_string()]),
+            Some("/tmp".into()),
+        )
+        .expect("engine with a live pty");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match futures::executor::block_on(rx.next()) {
+                Some(UiEvent::Wakeup) => {
+                    let saw_tmp = engine.snapshot(true).rows.iter().any(|row| {
+                        row.cells.iter().map(|c| c.c).collect::<String>().contains("/tmp")
+                    });
+                    if saw_tmp {
+                        return;
+                    }
+                }
+                Some(_) => {},
+                None => panic!("the pump died mid-test"),
+            }
+        }
+        panic!("pwd never reported /tmp on the grid");
     }
 }

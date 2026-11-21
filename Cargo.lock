@@ -3179,6 +3179,7 @@ dependencies = [
  "libc",
  "log",
  "rustc-hash 1.1.0",
+ "term-tap",
 ]
 
 [[package]]
@@ -5847,6 +5848,10 @@ dependencies = [
  "rustix",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "term-tap"
+version = "0.1.0"
 
 [[package]]
 name = "termcolor"
