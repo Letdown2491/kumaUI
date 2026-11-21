@@ -26,8 +26,8 @@ use crate::glyphs;
 use crate::palette::Rgb8;
 use crate::term::{
     CellEdge, CursorShape, Engine, GridPoint, MouseTracking, RenderCell, Row, SearchMatch,
-    SelectMode, SelectSpan, UiEvent, MOUSE_LEFT, MOUSE_MIDDLE, MOUSE_MOTION_FLAG, MOUSE_NONE,
-    MOUSE_RIGHT, MOUSE_WHEEL_DOWN, MOUSE_WHEEL_UP,
+    SelectMode, SelectSpan, Underline, UiEvent, MOUSE_LEFT, MOUSE_MIDDLE, MOUSE_MOTION_FLAG,
+    MOUSE_NONE, MOUSE_RIGHT, MOUSE_WHEEL_DOWN, MOUSE_WHEEL_UP,
 };
 use crate::theme::Theme;
 
@@ -1155,17 +1155,26 @@ impl TerminalView {
         (row, col, edge)
     }
 
-    /// The URL under a viewport cell, if any: the span that covers it,
-    /// rebuilt from the row's cells. Bare www. hosts get the scheme.
+    /// The URL under a viewport cell, if any: an OSC 8 span first (the
+    /// program's own link), else the text-detected span. Bare www.
+    /// hosts get the scheme.
     fn url_at(&self, row: usize, col: usize) -> Option<String> {
         // one row of cells, not a whole-grid snapshot: this runs per
         // mouse move while a link is hovered
-        let cells = self.active().engine.row_cells(row)?;
-        let spans = url_spans(&cells, cells.len());
+        let row_cells = self.active().engine.row_cells(row)?;
+        if let Some(link) = row_cells
+            .links
+            .iter()
+            .find(|span| col >= span.start && col < span.start + span.len)
+        {
+            return Some(link.uri.clone());
+        }
+        let cells = &row_cells.cells;
+        let spans = url_spans(cells, cells.len());
         let &(start, len) = spans
             .iter()
             .find(|(s, len)| col >= *s && col < s + len)?;
-        let mut url = span_cells_text(&cells, start, len);
+        let mut url = span_cells_text(cells, start, len);
         if url.starts_with("www.") {
             url.insert_str(0, "http://");
         }
@@ -1696,12 +1705,16 @@ impl Render for TerminalView {
         let rows: Vec<Arc<RowRender>> =
             snapshot.rows.iter().map(|row| self.row_render(row)).collect();
 
-        // the URL under the pointer, if the pointer is over one: the paint
-        // pass underlines it and claims the pointing-hand cursor
+        // the link under the pointer, if any: an OSC 8 span first (the
+        // program's own link), else a text-detected URL. The paint
+        // underlines it and claims the pointing-hand cursor
         let url_hover = self.hover.and_then(|(row, col)| {
-            let spans = &rows.get(row)?.url_spans;
-            spans
+            let rendered = rows.get(row)?;
+            let mut spans = rendered
+                .links
                 .iter()
+                .chain(&rendered.url_spans);
+            spans
                 .find(|(start, len)| col >= *start && col < start + len)
                 .map(|&(start, len)| (row, start, len))
         });
@@ -1971,10 +1984,31 @@ fn hash_row(row: &Row) -> u64 {
         hasher.write_u8(cell.bg.2);
         let flags = cell.bold as u8
             | (cell.italic as u8) << 1
-            | (cell.underline as u8) << 2
-            | (cell.strikeout as u8) << 3
-            | (cell.spacer as u8) << 4;
+            | (match cell.underline {
+                Underline::None => 0,
+                Underline::Straight => 1,
+                Underline::Double => 2,
+                Underline::Curly => 3,
+                Underline::Dotted => 4,
+                Underline::Dashed => 5,
+            }) << 2
+            | (cell.strikeout as u8) << 5
+            | (cell.spacer as u8) << 6;
         hasher.write_u8(flags);
+        // the underline's own color moves the hash when it is set
+        if let Some(color) = cell.underline_color {
+            hasher.write_u8(color.0);
+            hasher.write_u8(color.1);
+            hasher.write_u8(color.2);
+        } else {
+            hasher.write_u8(255);
+        }
+    }
+    // the OSC 8 spans ride the key too: they paint hover affordances
+    for link in &row.links {
+        hasher.write_usize(link.start);
+        hasher.write_usize(link.len);
+        hasher.write(link.uri.as_bytes());
     }
     hasher.finish()
 }
@@ -2024,6 +2058,13 @@ struct RowRender {
     glyphs: Vec<CellGlyph>,
     /// URLs in the row, cell aligned: (start column, length)
     url_spans: Vec<(usize, usize)>,
+    /// OSC 8 hyperlinks in the row, cell aligned: (start column,
+    /// length). The program's own links, a separate channel from the
+    /// text-detected spans above.
+    links: Vec<(usize, usize)>,
+    /// Underlines gpui's text runs cannot paint (double, dotted,
+    /// dashed): (start column, length, kind, color), painted as quads.
+    underline_decorations: Vec<(usize, usize, Underline, Rgb8)>,
     /// where every cell lives in the display string: its byte offset,
     /// grid column, and columns covered. Paint snaps glyphs to these
     /// origins instead of trusting shaped advances, so a fallback font's
@@ -2068,7 +2109,8 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
             end -= 1;
             continue;
         }
-        let plain = cell.c == ' ' && cell.bg == default_bg && !cell.underline && !cell.strikeout;
+        let plain =
+            cell.c == ' ' && cell.bg == default_bg && !cell.underline.is_some() && !cell.strikeout;
         if plain {
             end -= 1;
         } else {
@@ -2097,8 +2139,10 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
     let mut glyphs: Vec<CellGlyph> = Vec::new();
     let mut cells: Vec<CellSpan> = Vec::new();
     let mut bg_quads: Vec<(usize, usize, Rgb8)> = Vec::new();
-    // (bold, italic, underline, strikeout, fg) of the run being built
-    let mut current: Option<(bool, bool, bool, bool, Rgb8)> = None;
+    let mut underline_decorations: Vec<(usize, usize, Underline, Rgb8)> = Vec::new();
+    // (bold, italic, underline, underline color, strikeout, fg) of the
+    // run being built
+    let mut current: Option<(bool, bool, Underline, Option<Rgb8>, bool, Rgb8)> = None;
     // (start column, length, color) of the open background run
     let mut bg_open: Option<(usize, usize, Rgb8)> = None;
 
@@ -2152,17 +2196,53 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
             span: cell_width(&row.cells, i),
         });
 
-        let key = (cell.bold, cell.italic, cell.underline, cell.strikeout, cell.fg);
+        let key =
+            (cell.bold, cell.italic, cell.underline, cell.underline_color, cell.strikeout, cell.fg);
         let len_in_text = drawn.len_utf8();
         match &mut current {
             Some(prev) if *prev == key => {
                 runs.last_mut().unwrap().len += len_in_text;
+                // a decoration run extends while its style holds
+                if let Some(last) = underline_decorations.last_mut()
+                    && matches!(cell.underline, Underline::Double | Underline::Dotted | Underline::Dashed)
+                    && last.0 + last.1 == col_of[i]
+                    && last.2 == cell.underline
+                    && last.3 == cell.underline_color.unwrap_or(cell.fg)
+                {
+                    last.1 += cell_width(&row.cells, i);
+                }
             }
             _ => {
                 current = Some(key);
                 let fg = hsla_of(cell.fg);
-                let underline =
-                    cell.underline.then(|| UnderlineStyle { thickness: px(1.0), color: Some(fg), wavy: false });
+                // the underline's own color wins; the foreground is the
+                // classic default
+                let underline_color = cell.underline_color.unwrap_or(cell.fg);
+                // straight and curly paint inside the text run; the
+                // other styles paint as quads (the run underline only
+                // speaks straight and wavy)
+                let underline = match cell.underline {
+                    Underline::None => None,
+                    Underline::Straight => Some(UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(hsla_of(underline_color)),
+                        wavy: false,
+                    }),
+                    Underline::Curly => Some(UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(hsla_of(underline_color)),
+                        wavy: true,
+                    }),
+                    style @ (Underline::Double | Underline::Dotted | Underline::Dashed) => {
+                        underline_decorations.push((
+                            col_of[i],
+                            cell_width(&row.cells, i),
+                            style,
+                            underline_color,
+                        ));
+                        None
+                    }
+                };
                 let strikethrough = cell
                     .strikeout
                     .then(|| gpui::StrikethroughStyle { thickness: px(1.0), color: Some(fg) });
@@ -2184,7 +2264,21 @@ fn build_row(row: &Row, font: &gpui::Font, theme: &Theme) -> RowRender {
     }
     flush_bg_at_end(&mut bg_quads, bg_open.take());
 
-    RowRender { key: 0, text, runs, bg_quads, glyphs, url_spans: url_spans(&row.cells, end), cells }
+    RowRender {
+        key: 0,
+        text,
+        runs,
+        bg_quads,
+        glyphs,
+        url_spans: url_spans(&row.cells, end),
+        links: row
+            .links
+            .iter()
+            .map(|span| (span.start, span.len))
+            .collect(),
+        underline_decorations,
+        cells,
+    }
 }
 
 /// True when `c` may appear inside a URL run. Everything RFC 3986 allows
@@ -2669,6 +2763,40 @@ impl GridPaint {
                     window.paint_quad(fill(quad_bounds, hsla_of(self.fg)));
                 }
             }
+
+            // the underlines gpui's runs cannot paint: double is two
+            // lines, dotted and dashed are segments along the baseline
+            for &(start, len, kind, color) in &row.underline_decorations {
+                let width = len as f32 * self.cell_w;
+                let x = origin.x + px(start as f32 * self.cell_w);
+                match kind {
+                    Underline::Double => {
+                        for dy in [self.cell_h - 3.5, self.cell_h - 1.5] {
+                            let quad_bounds = Bounds::new(
+                                point(x, row_y + px(dy)),
+                                size(px(width), px(1.2)),
+                            );
+                            window.paint_quad(fill(quad_bounds, hsla_of(color)));
+                        }
+                    }
+                    Underline::Dotted | Underline::Dashed => {
+                        // 2-on/2-off and 4-on/2-off, aligned to the row
+                        let on: f32 = if kind == Underline::Dotted { 2.0 } else { 4.0 };
+                        let step = on + 2.0;
+                        let mut at = 0.0;
+                        while at < width {
+                            let seg = on.min(width - at);
+                            let quad_bounds = Bounds::new(
+                                point(x + px(at), row_y + px(self.cell_h - 2.0)),
+                                size(px(seg), px(1.5)),
+                            );
+                            window.paint_quad(fill(quad_bounds, hsla_of(color)));
+                            at += step;
+                        }
+                    }
+                    Underline::None | Underline::Straight | Underline::Curly => {},
+                }
+            }
         }
 
         // the pointing hand over the hovered link: a hitbox exactly the
@@ -2847,7 +2975,8 @@ mod tests {
             bg: t.background,
             bold: false,
             italic: false,
-            underline: false,
+            underline: Underline::None,
+            underline_color: None,
             strikeout: false,
             spacer: false,
         }
@@ -2857,8 +2986,61 @@ mod tests {
         gpui::Font { family: "monospace".into(), ..Default::default() }
     }
 
+    #[test]
+    fn styled_underlines_leave_the_run_and_join_the_decorations() {
+        let t = theme();
+        // a dotted run over three cells: the runs carry no underline
+        // (gpui cannot paint these), the quad list does
+        let mut cells = "abc".chars().map(cell).collect::<Vec<_>>();
+        for cell in &mut cells {
+            cell.underline = Underline::Dotted;
+        }
+        let row = Row { cells, links: Vec::new() };
+        let rendered = build_row(&row, &font(), &t);
+        assert!(rendered.runs.iter().all(|run| run.underline.is_none()));
+        assert_eq!(rendered.underline_decorations.len(), 1);
+        let (start, len, kind, color) = rendered.underline_decorations[0];
+        assert_eq!((start, len, kind), (0, 3, Underline::Dotted));
+        assert_eq!(color, t.foreground);
+        // a colored underline keeps its own color, not the fg
+        let mut cells = "d".chars().map(cell).collect::<Vec<_>>();
+        cells[0].underline = Underline::Dashed;
+        cells[0].underline_color = Some(Rgb8(255, 0, 0));
+        let row = Row { cells, links: Vec::new() };
+        let rendered = build_row(&row, &font(), &t);
+        assert_eq!(rendered.underline_decorations[0].3, Rgb8(255, 0, 0));
+    }
+
+    #[test]
+    fn curly_underlines_ride_the_text_run_wavy() {
+        let t = theme();
+        let mut cells = "w".chars().map(cell).collect::<Vec<_>>();
+        cells[0].underline = Underline::Curly;
+        let row = Row { cells, links: Vec::new() };
+        let rendered = build_row(&row, &font(), &t);
+        assert_eq!(rendered.underline_decorations.len(), 0);
+        assert!(rendered.runs.iter().all(|run| run
+            .underline
+            .is_some_and(|style| style.wavy)));
+    }
+
+    #[test]
+    fn osc8_links_pass_through_to_the_row_render() {
+        let t = theme();
+        let row = Row {
+            cells: vec![cell('l'), cell('i'), cell('n'), cell('k')],
+            links: vec![crate::term::LinkSpan {
+                start: 0,
+                len: 4,
+                uri: "https://example.com".into(),
+            }],
+        };
+        let rendered = build_row(&row, &font(), &t);
+        assert_eq!(rendered.links, vec![(0, 4)]);
+    }
+
     fn row_of(s: &str) -> Row {
-        Row { cells: s.chars().map(cell).collect() }
+        Row { cells: s.chars().map(cell).collect(), links: Vec::new() }
     }
 
     fn spans_of(s: &str) -> Vec<(usize, usize)> {
@@ -3016,7 +3198,7 @@ mod tests {
         // a match ending on a wide char grows over its spacer column
         let mut cells = vec![cell('a'), cell('漢'), cell(' '), cell('b')];
         cells[2].spacer = true;
-        let rows = vec![Arc::new(Row { cells })];
+        let rows = vec![Arc::new(Row { cells, links: Vec::new() })];
         let (all, focused) = search_view_spans(&[search_hit((0, 1), (0, 1))], 0, 0, &rows);
         assert!(all.is_empty());
         assert_eq!(focused, vec![SelectSpan { row: 0, start: 1, len: 2 }]);
@@ -3024,7 +3206,7 @@ mod tests {
 
     #[test]
     fn plain_rows_trim_trailing_space() {
-        let mut row = Row { cells: vec![cell('h'), cell('i')] };
+        let mut row = Row { cells: vec![cell('h'), cell('i')], links: Vec::new() };
         row.cells.push(cell(' '));
         row.cells.push(cell(' '));
         let font = font();
@@ -3040,7 +3222,7 @@ mod tests {
     fn cell_map_records_bytes_columns_and_spans() {
         let mut spacer = cell(' ');
         spacer.spacer = true;
-        let row = Row { cells: vec![cell('a'), cell('漢'), spacer, cell('b')] };
+        let row = Row { cells: vec![cell('a'), cell('漢'), spacer, cell('b')], links: Vec::new() };
         let font = font();
         let t = theme();
         let rendered = build_row(&row, &font, &t);
@@ -3074,7 +3256,7 @@ mod tests {
         let mut red = cell('r');
         red.fg = Rgb8(255, 0, 0);
         let green = cell('g');
-        let row = Row { cells: vec![red, green] };
+        let row = Row { cells: vec![red, green], links: Vec::new() };
         let font = font();
         let t = theme();
         let rendered = build_row(&row, &font, &t);
@@ -3088,7 +3270,7 @@ mod tests {
     fn colored_background_becomes_a_cell_aligned_quad() {
         let mut marked = cell(' ');
         marked.bg = Rgb8(40, 40, 40);
-        let row = Row { cells: vec![cell('a'), cell(' '), marked] };
+        let row = Row { cells: vec![cell('a'), cell(' '), marked], links: Vec::new() };
         let font = font();
         let t = theme();
         let rendered = build_row(&row, &font, &t);
@@ -3107,7 +3289,7 @@ mod tests {
         wide.bg = Rgb8(40, 40, 40);
         let mut spacer = cell(' ');
         spacer.spacer = true;
-        let row = Row { cells: vec![wide, spacer] };
+        let row = Row { cells: vec![wide, spacer], links: Vec::new() };
         let font = font();
         let t = theme();
         let rendered = build_row(&row, &font, &t);
@@ -3116,7 +3298,7 @@ mod tests {
 
     #[test]
     fn empty_rows_paint_nothing() {
-        let row = Row { cells: vec![] };
+        let row = Row { cells: vec![], links: Vec::new() };
         let font = font();
         let t = theme();
         let rendered = build_row(&row, &font, &t);
@@ -3127,7 +3309,7 @@ mod tests {
 
     #[test]
     fn box_drawing_becomes_a_blank_plus_an_overlay() {
-        let row = Row { cells: vec![cell('\u{2500}'), cell('x')] };
+        let row = Row { cells: vec![cell('\u{2500}'), cell('x')], links: Vec::new() };
         let font = font();
         let t = theme();
         let rendered = build_row(&row, &font, &t);
@@ -3144,7 +3326,7 @@ mod tests {
     fn overlay_columns_survive_wide_chars() {
         let mut spacer = cell(' ');
         spacer.spacer = true;
-        let row = Row { cells: vec![cell('a'), cell('漢'), spacer, cell('\u{2588}')] };
+        let row = Row { cells: vec![cell('a'), cell('漢'), spacer, cell('\u{2588}')], links: Vec::new() };
         let font = font();
         let t = theme();
         let rendered = build_row(&row, &font, &t);
@@ -3159,7 +3341,7 @@ mod tests {
         // char to the shaper
         let mut hidden = cell('\u{2500}');
         hidden.fg = hidden.bg;
-        let row = Row { cells: vec![hidden] };
+        let row = Row { cells: vec![hidden], links: Vec::new() };
         let font = font();
         let t = theme();
         let rendered = build_row(&row, &font, &t);
@@ -3169,14 +3351,22 @@ mod tests {
 
     #[test]
     fn row_hash_is_stable_per_content_and_sensitive_to_changes() {
-        let mut a = Row { cells: vec![RenderCell {
-            c: 'x', fg: Rgb8(1, 2, 3), bg: Rgb8(0, 0, 0),
-            bold: false, italic: false, underline: false, strikeout: false, spacer: false,
-        }] };
-        let b = Row { cells: vec![RenderCell {
-            c: 'x', fg: Rgb8(1, 2, 3), bg: Rgb8(0, 0, 0),
-            bold: false, italic: false, underline: false, strikeout: false, spacer: false,
-        }] };
+        let mut a = Row {
+            cells: vec![RenderCell {
+                c: 'x', fg: Rgb8(1, 2, 3), bg: Rgb8(0, 0, 0),
+                bold: false, italic: false, underline: Underline::None, underline_color: None,
+                strikeout: false, spacer: false,
+            }],
+            links: Vec::new(),
+        };
+        let b = Row {
+            cells: vec![RenderCell {
+                c: 'x', fg: Rgb8(1, 2, 3), bg: Rgb8(0, 0, 0),
+                bold: false, italic: false, underline: Underline::None, underline_color: None,
+                strikeout: false, spacer: false,
+            }],
+            links: Vec::new(),
+        };
         assert_eq!(hash_row(&a), hash_row(&b));
 
         // every field build_row reads must move the hash
@@ -3200,10 +3390,14 @@ mod tests {
     fn row_hash_collapses_equivalent_flag_truthiness() {
         // identical cells built twice hash identically regardless of
         // struct instance
-        let mk = |bold| Row { cells: vec![RenderCell {
-            c: 'q', fg: Rgb8(5, 5, 5), bg: Rgb8(0, 0, 0),
-            bold, italic: false, underline: false, strikeout: false, spacer: false,
-        }] };
+        let mk = |bold| Row {
+            cells: vec![RenderCell {
+                c: 'q', fg: Rgb8(5, 5, 5), bg: Rgb8(0, 0, 0),
+                bold, italic: false, underline: Underline::None, underline_color: None,
+                strikeout: false, spacer: false,
+            }],
+            links: Vec::new(),
+        };
         assert_eq!(hash_row(&mk(true)), hash_row(&mk(true)));
         assert_ne!(hash_row(&mk(true)), hash_row(&mk(false)));
     }

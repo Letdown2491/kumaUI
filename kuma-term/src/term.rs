@@ -15,7 +15,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{self, Flags};
 use alacritty_terminal::term::color;
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{RenderableContent, Term, TermMode};
@@ -155,15 +155,51 @@ pub struct RenderCell {
     pub bg: Rgb8,
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: Underline,
+    /// The underline's own color (SGR 58), resolved to rgb. `None`
+    /// paints the foreground, the classic behavior.
+    pub underline_color: Option<Rgb8>,
     pub strikeout: bool,
     /// true for the second half of a wide char: no glyph, no width
     pub spacer: bool,
 }
 
+/// The underline styles the grid can carry: the classic straight one
+/// and the SGR 4:2..4:5 styled set. Straight and curly paint inside the
+/// text runs; double, dotted, and dashed paint as quads (the run
+/// underline only speaks straight and wavy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Underline {
+    None,
+    Straight,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+impl Underline {
+    /// Whether any underline at all paints here.
+    pub fn is_some(self) -> bool {
+        self != Underline::None
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Row {
     pub cells: Vec<RenderCell>,
+    /// The row's OSC 8 hyperlinks, cell aligned: the explicit links the
+    /// program drew (a separate channel from the text-detected url
+    /// spans, which guess at printed text).
+    pub links: Vec<LinkSpan>,
+}
+
+/// One hyperlink run: the cells [start, start+len) share one URI.
+#[derive(Clone, Debug)]
+pub struct LinkSpan {
+    pub start: usize,
+    pub len: usize,
+    pub uri: String,
 }
 
 /// What the cursor looks like, in viewport coordinates.
@@ -961,16 +997,16 @@ impl Engine {
 
     /// One visible row's cells, the same decode a snapshot row gets,
     /// without materializing the rest of the frame.
-    pub fn row_cells(&self, row: usize) -> Option<Vec<RenderCell>> {
+    pub fn row_cells(&self, row: usize) -> Option<Row> {
         let term = self.term.lock();
         let content = term.renderable_content();
         let lines = term.screen_lines();
         let mut rows: Vec<Row> =
-            (0..lines).map(|_| Row { cells: Vec::new() }).collect();
+            (0..lines).map(|_| Row::default()).collect();
         let mut mask = vec![false; lines];
         mask[row] = true;
         fill_rows(&self.theme, content, &mut rows, Some(&mask));
-        rows.into_iter().nth(row).map(|row| row.cells)
+        rows.into_iter().nth(row)
     }
 
     /// Take a snapshot of the visible grid for the renderer.
@@ -1015,7 +1051,7 @@ impl Engine {
                 // a sentinel no frame's hash matches: the first
                 // snapshot after a resize decodes every line
                 hash: u64::MAX,
-                row: Arc::new(Row { cells: Vec::new() }),
+                row: Arc::new(Row::default()),
             });
         }
 
@@ -1058,6 +1094,22 @@ impl Engine {
                 hasher.write_u16(cell.flags.bits());
                 hash_color(hasher, cell.fg);
                 hash_color(hasher, cell.bg);
+                // the fill's other reads: the underline's own color and
+                // the cell's hyperlink (identity by uri and id, the
+                // Arc's contents, not its address)
+                if let Some(color) = cell.underline_color() {
+                    hash_color(hasher, color);
+                } else {
+                    hasher.write_u8(3);
+                }
+                match cell.hyperlink() {
+                    Some(link) => {
+                        hasher.write(b"link");
+                        hasher.write(link.uri().as_bytes());
+                        hasher.write(link.id().as_bytes());
+                    }
+                    None => hasher.write_u8(4),
+                }
             }
             for (row, hasher) in hashers.into_iter().enumerate() {
                 let mut hasher = hasher;
@@ -1092,7 +1144,7 @@ impl Engine {
             // decode pass, over the same locked grid
             let content = term.renderable_content();
             let mut rows: Vec<Row> =
-                (0..screen_lines).map(|_| Row { cells: Vec::new() }).collect();
+                (0..screen_lines).map(|_| Row::default()).collect();
             fill_rows(&self.theme, content, &mut rows, Some(&changed));
             for (row, changed_line) in changed.iter().enumerate() {
                 if !changed_line {
@@ -1184,7 +1236,9 @@ impl Drop for Engine {
 
 /// The visible-grid cell walk behind `snapshot` and `row_cells`: decodes
 /// each grid cell into a viewport `RenderCell` (INVERSE swaps, HIDDEN
-/// blanks, DIM dims, wide-char spacers as blank two-wide slots).
+/// blanks, DIM dims, wide-char spacers as blank two-wide slots). The
+/// styled underlines and OSC 8 hyperlinks decode with the styles: the
+/// links group into per-row spans, one per URI run.
 /// `only_rows` decodes just the masked viewport rows' cells and leaves
 /// the other
 /// rows empty: the URL hover reads one row per mouse move and has no
@@ -1196,6 +1250,10 @@ fn fill_rows(
     only_rows: Option<&[bool]>,
 ) {
     let offset = content.display_offset;
+    // per-row hyperlinks parallel to the cells pushed below: the span
+    // grouping pass reads them once the row is complete
+    let mut link_cells: Vec<Vec<Option<cell::Hyperlink>>> =
+        (0..rows.len()).map(|_| Vec::new()).collect();
     for indexed in content.display_iter {
         let viewport_row = indexed.point.line.0 + offset as i32;
         if viewport_row < 0 || viewport_row as usize >= rows.len() {
@@ -1206,21 +1264,24 @@ fn fill_rows(
         {
             continue;
         }
-        let row = &mut rows[viewport_row as usize];
+        let row = viewport_row as usize;
         let cell = indexed.cell;
         let flags = cell.flags;
+        let link = cell.hyperlink();
 
         if flags.contains(Flags::WIDE_CHAR_SPACER) {
-            row.cells.push(RenderCell {
+            rows[row].cells.push(RenderCell {
                 c: ' ',
                 fg: theme.foreground,
                 bg: theme.background,
                 bold: false,
                 italic: false,
-                underline: false,
+                underline: Underline::None,
+                underline_color: None,
                 strikeout: false,
                 spacer: true,
             });
+            link_cells[row].push(link);
             continue;
         }
 
@@ -1236,17 +1297,73 @@ fn fill_rows(
             fg = fg.scale(2.0 / 3.0);
         }
 
-        row.cells.push(RenderCell {
+        let underline = if flags.contains(Flags::UNDERLINE) {
+            Underline::Straight
+        } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+            Underline::Double
+        } else if flags.contains(Flags::UNDERCURL) {
+            Underline::Curly
+        } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+            Underline::Dotted
+        } else if flags.contains(Flags::DASHED_UNDERLINE) {
+            Underline::Dashed
+        } else {
+            Underline::None
+        };
+        // SGR 58's color, through the same resolution the fg gets (a
+        // Named or Indexed underline color rides the dynamic overrides)
+        let underline_color = cell
+            .underline_color()
+            .map(|color| palette::resolve(color, content.colors, theme));
+
+        rows[row].cells.push(RenderCell {
             c: if flags.contains(Flags::HIDDEN) { ' ' } else { cell.c },
             fg,
             bg,
             bold: flags.contains(Flags::BOLD),
             italic: flags.contains(Flags::ITALIC),
-            underline: flags.contains(Flags::UNDERLINE),
+            underline,
+            underline_color,
             strikeout: flags.contains(Flags::STRIKEOUT),
             spacer: false,
         });
+        link_cells[row].push(link);
     }
+
+    // the links group: consecutive cells sharing one hyperlink become
+    // one span, measured in grid columns (a wide leader's spacer rides
+    // inside its leader's two columns)
+    for (row, links) in link_cells.iter_mut().enumerate() {
+        if links.iter().all(Option::is_none) {
+            continue;
+        }
+        rows[row].links = group_links(&rows[row].cells, links);
+    }
+}
+
+/// Consecutive same-hyperlink cells as column-measured spans. Grouped
+/// by URI alone: two adjacent runs of one URI click and paint the same,
+/// whatever their ids were.
+fn group_links(cells: &[RenderCell], links: &[Option<cell::Hyperlink>]) -> Vec<LinkSpan> {
+    let mut out: Vec<LinkSpan> = Vec::new();
+    let mut col = 0usize;
+    for (i, _) in cells.iter().enumerate() {
+        if cells[i].spacer {
+            continue;
+        }
+        let width = if cells.get(i + 1).is_some_and(|next| next.spacer) { 2 } else { 1 };
+        match (&links[i], out.last_mut()) {
+            (Some(link), Some(open)) if open.uri == link.uri() => open.len += width,
+            (Some(link), _) => out.push(LinkSpan {
+                start: col,
+                len: width,
+                uri: link.uri().to_owned(),
+            }),
+            (None, _) => {},
+        }
+        col += width;
+    }
+    out
 }
 
 /// The frame's cursor spot: position, the DECSCUSR shape in effect,
@@ -1319,6 +1436,73 @@ mod tests {
         assert_eq!(text_of_row(&term, 0).trim_end(), "hello");
     }
 
+    /// fill_rows over a fed term, no engine: the direct decode read.
+    fn filled(theme: &Theme, term: &Term<UiProxy>) -> Vec<Row> {
+        let content = term.renderable_content();
+        let lines = term.screen_lines();
+        let mut rows: Vec<Row> = (0..lines).map(|_| Row::default()).collect();
+        fill_rows(theme, content, &mut rows, None);
+        rows
+    }
+
+    #[test]
+    fn osc8_links_group_into_row_spans() {
+        let mut term = test_term(20, 3);
+        feed(
+            &mut term,
+            b"\x1b]8;;https://example.com\x07click\x1b]8;;\x07 rest",
+        );
+        let rows = filled(&Theme::builtin(), &term);
+        assert_eq!(rows[0].links.len(), 1);
+        let span = &rows[0].links[0];
+        assert_eq!(span.start, 0);
+        assert_eq!(span.len, 5);
+        assert_eq!(span.uri, "https://example.com");
+        // the terminator restores plain cells: nothing else is linked
+        assert!(rows[0].links.iter().all(|s| s.start + s.len <= 5));
+    }
+
+    #[test]
+    fn two_adjacent_links_do_not_merge() {
+        let mut term = test_term(20, 3);
+        feed(
+            &mut term,
+            b"\x1b]8;;https://a\x07ab\x1b]8;;\x07\x1b]8;;https://b\x07cd\x1b]8;;\x07",
+        );
+        let rows = filled(&Theme::builtin(), &term);
+        let uris: Vec<&str> = rows[0].links.iter().map(|s| s.uri.as_str()).collect();
+        assert_eq!(uris, ["https://a", "https://b"]);
+        assert_eq!(rows[0].links[0].len, 2);
+        assert_eq!(rows[0].links[1].start, 2);
+    }
+
+    #[test]
+    fn styled_underlines_decode_to_their_kinds() {
+        let theme = Theme::builtin();
+        // 4:2 double, 4:3 curly, 4:4 dotted, 4:5 dashed, then reset
+        let mut term = test_term(10, 3);
+        feed(&mut term, b"\x1b[4:2md\x1b[4:3mc\x1b[4:4mo\x1b[4:5ma\x1b[0mx");
+        let rows = filled(&theme, &term);
+        assert_eq!(rows[0].cells[0].underline, Underline::Double);
+        assert_eq!(rows[0].cells[1].underline, Underline::Curly);
+        assert_eq!(rows[0].cells[2].underline, Underline::Dotted);
+        assert_eq!(rows[0].cells[3].underline, Underline::Dashed);
+        assert_eq!(rows[0].cells[4].underline, Underline::None);
+    }
+
+    #[test]
+    fn an_underline_color_rides_the_cell() {
+        let theme = Theme::builtin();
+        let mut term = test_term(10, 3);
+        // SGR 58:2 truecolor red underlined, then 59 resets the color
+        feed(&mut term, b"\x1b[58:2::255:0:0;4mu\x1b[59mv");
+        let rows = filled(&theme, &term);
+        assert_eq!(rows[0].cells[0].underline_color, Some(Rgb8(255, 0, 0)));
+        assert_eq!(rows[0].cells[0].underline, Underline::Straight);
+        // after 59, the underline color is back to the fg (None)
+        assert_eq!(rows[0].cells[1].underline_color, None);
+    }
+
     #[test]
     fn history_scrolls_and_display_offset_moves() {
         let mut term = test_term(10, 3);
@@ -1386,7 +1570,7 @@ mod tests {
 
         // only the targeted viewport row decodes; the others stay empty
         let content = term.renderable_content();
-        let mut rows: Vec<Row> = (0..3).map(|_| Row { cells: Vec::new() }).collect();
+        let mut rows: Vec<Row> = (0..3).map(|_| Row::default()).collect();
         let mut mask = vec![false; 3];
         mask[1] = true;
         fill_rows(&theme, content, &mut rows, Some(&mask));
@@ -1396,7 +1580,7 @@ mod tests {
 
         // the unfiltered walk (snapshot's path) fills every row
         let content = term.renderable_content();
-        let mut rows: Vec<Row> = (0..3).map(|_| Row { cells: Vec::new() }).collect();
+        let mut rows: Vec<Row> = (0..3).map(|_| Row::default()).collect();
         fill_rows(&theme, content, &mut rows, None);
         assert!(!rows[0].cells.iter().any(|c| c.c == 'r'));
         assert!(rows[1].cells.iter().any(|c| c.c == 'r'));
@@ -1404,7 +1588,7 @@ mod tests {
         // a row past the screen is None territory for row_cells' caller:
         // the walk never indexes it
         let content = term.renderable_content();
-        let mut rows: Vec<Row> = (0..3).map(|_| Row { cells: Vec::new() }).collect();
+        let mut rows: Vec<Row> = (0..3).map(|_| Row::default()).collect();
         fill_rows(&theme, content, &mut rows, Some(&[false; 3]));
         assert!(rows.iter().all(|row| row.cells.is_empty()));
     }
