@@ -27,10 +27,13 @@
 //!   monitoring surfaces share
 //! - `desktop`: the desktop-entry parser, the Exec tokenizer, the
 //!   applications walk, and the wayland-sessions variant
+//! - `config`: the key=value state-file grammar and where an app's
+//!   state file lives
 
 pub mod activation;
 pub mod app;
 pub mod color;
+pub mod config;
 pub mod desktop;
 pub mod files;
 pub mod format;

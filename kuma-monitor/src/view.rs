@@ -487,22 +487,23 @@ impl MonitorView {
     // ---------- the state file ----------
 
     /// Where the view's knobs persist: one tiny key=value file under
-    /// ~/.config, Koguma's shape (browser.rs `state_path`), spoken in
-    /// the same dialect so a reader meets one convention. Not a
-    /// settings system, just the knobs you set once and expect to
-    /// keep.
+    /// the config dir, Koguma's shape (browser.rs `state_path`), spoken
+    /// in the same dialect so a reader meets one convention. The
+    /// location is the platform's (config::state_file). Not a settings
+    /// system, just the knobs you set once and expect to keep.
     fn state_path() -> Option<PathBuf> {
-        let mut path = dirs::config_dir()?;
-        path.push("kuma-monitor/state");
-        Some(path)
+        kuma_platform::config::state_file("kuma-monitor")
     }
 
     /// The knobs' text, one line each: the sort key's own name and
     /// the filter buffer whole (it can hold an equals sign; the
-    /// parse's split_once keeps the value's tail). A trailing newline
-    /// because a config file ends with one.
+    /// grammar's split at the first `=` keeps the value's tail). The
+    /// render is the platform's, the keys are this app's.
     fn state_text(&self) -> String {
-        format!("sort={}\nfilter={}\n", self.sort.name(), self.filter)
+        kuma_platform::config::render([
+            ("sort", self.sort.name()),
+            ("filter", self.filter.as_str()),
+        ])
     }
 
     /// The knobs land through the platform's atomic write: one
@@ -1610,20 +1611,17 @@ fn send_signal(pid: u32, sig: i32, name: String) -> String {
     }
 }
 
-/// The state file's parse: sort and filter, nothing else. Unknown
-/// keys and malformed values die quietly, so a future key or a
-/// hand-edited file cannot break an older reader; a duplicated line
-/// lets the last one win.
+/// The state file's parse: sort and filter, nothing else. The grammar
+/// is the platform's (unknown keys and malformed values come through
+/// and die quietly here, so a future key or a hand-edited file cannot
+/// break an older reader; a duplicated line lets the last one win).
 fn parse_state(text: &str) -> (Option<SortKey>, Option<String>) {
     let mut sort = None;
     let mut filter = None;
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key {
-            "sort" => sort = SortKey::from_name(value),
-            "filter" => filter = Some(value.to_string()),
+    for (key, value) in kuma_platform::config::parse(text) {
+        match key.as_str() {
+            "sort" => sort = SortKey::from_name(&value),
+            "filter" => filter = Some(value),
             _ => {}
         }
     }

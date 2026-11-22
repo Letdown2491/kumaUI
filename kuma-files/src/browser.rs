@@ -5286,9 +5286,7 @@ impl Browser {
     /// ~/.config. Not a settings system, just the knobs you set once
     /// and expect to keep.
     fn state_path() -> Option<PathBuf> {
-        let mut path = dirs::config_dir()?;
-        path.push("kuma-files/state");
-        Some(path)
+        kuma_platform::config::state_file("kuma-files")
     }
 
     fn load_state(&mut self, cli_dir: Option<&Path>) {
@@ -5307,19 +5305,17 @@ impl Browser {
             return;
         };
 
-        // parse everything first: the view knobs must apply AFTER the
-        // tabs are resolved, not to a placeholder that gets thrown away
+        // parse everything first (the grammar is the platform's): the
+        // view knobs must apply AFTER the tabs are resolved, not to a
+        // placeholder that gets thrown away
         let mut view: Option<ViewMode> = None;
         let mut sort: Option<SortKey> = None;
         let mut sort_asc = true;
         let mut saved_tabs: Vec<(usize, PathBuf)> = Vec::new();
         let mut saved_places: Vec<(usize, PathBuf)> = Vec::new();
         let mut saved_active: Option<usize> = None;
-        for line in text.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            match (key, value) {
+        for (key, value) in kuma_platform::config::parse(&text) {
+            match (key.as_str(), value.as_str()) {
                 ("view", "icons") => view = Some(ViewMode::Icons),
                 ("view", "list") => view = Some(ViewMode::List),
                 ("sort", "name") => sort = Some(SortKey::Name),
@@ -5337,7 +5333,9 @@ impl Browser {
                 ("inspector-lock", "bottom") => self.inspector_lock = Some(true),
                 ("inspector-lock", "right") => self.inspector_lock = Some(false),
                 ("accent", "auto") => self.accent = None,
-                ("accent", _) => self.accent = kuma_platform::palette::parse_hex_color(value),
+                ("accent", _) => {
+                    self.accent = kuma_platform::palette::parse_hex_color(&value)
+                }
                 // "keys" (once an open flag for a sidebar cheatsheet)
                 // is a modal now: the line parses as unknown and dies
                 // in the _ arm
@@ -5351,13 +5349,13 @@ impl Browser {
                     if let Some(index) = key.strip_prefix("tab").and_then(|n| n.parse().ok())
                         && !value.is_empty()
                     {
-                        saved_tabs.push((index, PathBuf::from(value)));
+                        saved_tabs.push((index, PathBuf::from(&value)));
                     }
                     if let Some(index) =
                         key.strip_prefix("place").and_then(|n| n.parse().ok())
                         && !value.is_empty()
                     {
-                        saved_places.push((index, PathBuf::from(value)));
+                        saved_places.push((index, PathBuf::from(&value)));
                     }
                 }
             }
@@ -5434,50 +5432,47 @@ impl Browser {
             SortKey::Modified => "modified",
             SortKey::Type => "type",
         };
-        let text = format!(
-            "view={}\nsort={}\nasc={}\nhidden={}\ninspector={}\ninspector-bottom={}\ninspector-lock={}\naccent={}\nscale={}\n",
-            if tab.view_mode == ViewMode::Icons {
-                "icons"
-            } else {
-                "list"
-            },
-            sort,
-            tab.sort_asc,
-            self.show_hidden,
-            self.inspector,
-            self.inspector_bottom,
-            match self.inspector_lock {
-                Some(true) => "bottom",
-                Some(false) => "right",
-                None => "auto",
-            },
-            match self.accent {
-                Some(hex) => format!("#{hex:06x}"),
-                None => "auto".into(),
-            },
-            self.scale,
-        );
-        let mut text = text;
+        // the grammar is the platform's: one record per line, a value
+        // carrying a raw newline (legal in a Linux path) dropped rather
+        // than saved wrong, the file written atomically
+        let mut records: Vec<(String, String)> = vec![
+            (
+                "view".into(),
+                if tab.view_mode == ViewMode::Icons { "icons" } else { "list" }.into(),
+            ),
+            ("sort".into(), sort.into()),
+            ("asc".into(), tab.sort_asc.to_string()),
+            ("hidden".into(), self.show_hidden.to_string()),
+            ("inspector".into(), self.inspector.to_string()),
+            ("inspector-bottom".into(), self.inspector_bottom.to_string()),
+            (
+                "inspector-lock".into(),
+                match self.inspector_lock {
+                    Some(true) => "bottom",
+                    Some(false) => "right",
+                    None => "auto",
+                }
+                .into(),
+            ),
+            (
+                "accent".into(),
+                match self.accent {
+                    Some(hex) => format!("#{hex:06x}"),
+                    None => "auto".into(),
+                },
+            ),
+            ("scale".into(), self.scale.to_string()),
+        ];
         for (i, tab) in self.tabs.iter().enumerate() {
             if let Some(dir) = tab.current_dir() {
-                // the file is line-based key=value: a path with a raw
-                // newline (legal on Linux) would tear the record and
-                // silently lose the tail on the next load, so the tab
-                // is not remembered rather than remembered wrong
-                if dir.display().to_string().contains('\n') {
-                    continue;
-                }
-                text.push_str(&format!("tab{}={}\n", i, dir.display()));
+                records.push((format!("tab{i}"), dir.display().to_string()));
             }
         }
         for (i, path) in self.place_order.iter().enumerate() {
-            if path.display().to_string().contains('\n') {
-                continue;
-            }
-            text.push_str(&format!("place{}={}\n", i, path.display()));
+            records.push((format!("place{i}"), path.display().to_string()));
         }
-        text.push_str(&format!("active={}\n", self.active));
-        write_state_atomically(path, text);
+        records.push(("active".into(), self.active.to_string()));
+        write_state_atomically(path, kuma_platform::config::render(records.iter().map(|(k, v)| (k.as_str(), v.as_str()))));
     }
 
     /// Shift+Delete in a directory view: skip the trash entirely. Same
