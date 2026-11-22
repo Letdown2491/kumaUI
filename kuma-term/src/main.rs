@@ -21,14 +21,6 @@ pub(crate) static PTY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(())
 use gpui::App;
 use gpui_platform::application;
 
-/// The version line `--version` prints: the crate version plus the
-/// commit build.sh stamped in, so a running instance pins to an exact
-/// build. The format lives in the platform crate; the version stays a
-/// call-site argument because it is this crate's.
-fn version_line() -> String {
-    kuma_platform::version::line("kuma-term", env!("CARGO_PKG_VERSION"))
-}
-
 fn main() {
     // the PTY child inherits this process's environment, so anything set
     // here is how the shell recognizes kuma-term (prompt snippets key on

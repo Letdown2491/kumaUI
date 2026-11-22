@@ -14,14 +14,6 @@ mod stats;
 mod theme;
 mod view;
 
-/// The version line `--version` prints: the crate version plus the
-/// commit build.sh stamped in, so a running instance pins to an exact
-/// build. The format lives in the platform crate; the version stays a
-/// call-site argument because it is this crate's.
-pub(crate) fn version_line() -> String {
-    kuma_platform::version::line("kuma-monitor", env!("CARGO_PKG_VERSION"))
-}
-
 fn main() {
     if !kuma_platform::app::start("kuma-monitor", env!("CARGO_PKG_VERSION")) {
         return;
