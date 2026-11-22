@@ -10,6 +10,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, env, fs, io};
 
+// the desktop Exec tokenizer, the platform's one home
+use kuma_platform::desktop::exec_argv;
+
 use std::io::{BufRead as _, Read as _, Write as _};
 
 use gpui::{
@@ -12050,140 +12053,32 @@ struct DesktopApp {
 
 /// Scan the standard applications directories. Runs once per session
 /// and is cached; a few hundred small INI files read in milliseconds.
+/// The walk, the parse (visibility flags included, which the old local
+/// copy never consulted), and the Exec tokenizer are the platform's;
+/// what stays here is the first-per-label dedupe and the open-with
+/// shape.
 fn scan_desktop_apps() -> Vec<DesktopApp> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(data_home) = env::var("XDG_DATA_HOME") {
-        dirs.push(PathBuf::from(data_home).join("applications"));
-    } else if let Ok(home) = env::var("HOME") {
-        dirs.push(PathBuf::from(home).join(".local/share/applications"));
-    }
-    dirs.push(PathBuf::from("/usr/share/applications"));
-    if let Ok(data_dirs) = env::var("XDG_DATA_DIRS") {
-        for dir in env::split_paths(&data_dirs) {
-            dirs.push(dir.join("applications"));
-        }
-    }
-
     let mut apps: Vec<DesktopApp> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for dir in dirs {
-        let Ok(listing) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for file in listing.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
-                continue;
-            }
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let (mut name, mut exec, mut mimes) = (String::new(), String::new(), Vec::new());
-            let (mut comment, mut id) = (None, String::new());
-            let (mut hidden, mut nodisplay, mut is_app) = (false, false, false);
-            let mut in_entry = false;
-            if let Some(fname) = path.file_name().and_then(|f| f.to_str()) {
-                id = fname.to_string();
-            }
-            for line in text.lines() {
-                let line = line.trim();
-                if line.starts_with('[') {
-                    in_entry = line == "[Desktop Entry]";
-                    continue;
-                }
-                if !in_entry {
-                    continue;
-                }
-                let Some((key, value)) = line.split_once('=') else {
-                    continue;
-                };
-                match key {
-                    "Name" => name = value.to_string(),
-                    "Comment" => comment = Some(value.to_string()),
-                    "Exec" => exec = value.to_string(),
-                    "MimeType" => {
-                        mimes = value
-                            .split(';')
-                            .filter(|m| !m.is_empty())
-                            .map(str::to_string)
-                            .collect()
-                    }
-                    "NoDisplay" => nodisplay = value == "true",
-                    "Hidden" => hidden = value == "true",
-                    "Type" => is_app = value == "Application",
-                    _ => {}
-                }
-            }
-            // Known gap: OnlyShowIn/NotShowIn are not consulted here, so an
-            // entry gated to another desktop can appear in open-with. The
-            // shell's launcher honors them (kuma-shell/src/launcher.rs
-            // shows_in); the shared fix rides the platform crate (#33).
-            if !is_app || hidden || nodisplay || exec.is_empty() {
-                continue;
-            }
-            let label = if name.is_empty() { exec.clone() } else { name };
-            if seen.insert(label.clone()) {
-                apps.push(DesktopApp {
-                    name: label,
-                    id,
-                    exec,
-                    mimes,
-                    comment,
-                });
-            }
+    for scanned in kuma_platform::desktop::scan_applications(None) {
+        let entry = scanned.entry;
+        let label = if entry.name.is_empty() { entry.exec.clone() } else { entry.name };
+        if seen.insert(label.clone()) {
+            apps.push(DesktopApp {
+                name: label,
+                id: scanned
+                    .path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                exec: entry.exec,
+                mimes: entry.mimes,
+                comment: entry.comment,
+            });
         }
     }
     apps
-}
-
-/// Turn a .desktop Exec line into an argv for one path: tokenize with
-/// quote awareness, substitute the field codes, and append the path
-/// when the line names none.
-fn exec_argv(exec: &str, path: &Path, app_name: &str) -> Vec<String> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut quote: Option<char> = None;
-    let mut chars = exec.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => {
-                if let Some(&next) = chars.peek() {
-                    cur.push(next);
-                    chars.next();
-                }
-            }
-            '\'' | '"' if quote.is_none() => quote = Some(ch),
-            ending if Some(ending) == quote => quote = None,
-            split if quote.is_none() && split.is_whitespace() => {
-                if !cur.is_empty() {
-                    tokens.push(std::mem::take(&mut cur));
-                }
-            }
-            other => cur.push(other),
-        }
-    }
-    if !cur.is_empty() {
-        tokens.push(cur);
-    }
-
-    let mut argv: Vec<String> = Vec::new();
-    let mut has_file = false;
-    for token in tokens {
-        match token.as_str() {
-            "%f" | "%u" | "%F" | "%U" | "%d" | "%D" | "%n" | "%N" => {
-                argv.push(path.display().to_string());
-                has_file = true;
-            }
-            "%c" => argv.push(app_name.to_string()),
-            "%i" | "%k" | "%v" | "%m" => {}
-            field if field.starts_with('%') => {}
-            plain => argv.push(plain.to_string()),
-        }
-    }
-    if !has_file {
-        argv.push(path.display().to_string());
-    }
-    argv
 }
 
 /// Free bytes on the volume holding dir, via libc statvfs (already in

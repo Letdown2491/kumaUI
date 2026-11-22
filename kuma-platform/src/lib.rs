@@ -23,9 +23,12 @@
 //!   same way (byte sizes)
 //! - `sysfs`: the kernel-state samplers (/proc, /sys, statvfs) the
 //!   monitoring surfaces share
+//! - `desktop`: the desktop-entry parser, the Exec tokenizer, the
+//!   applications walk, and the wayland-sessions variant
 
 pub mod activation;
 pub mod color;
+pub mod desktop;
 pub mod files;
 pub mod format;
 pub mod imaging;

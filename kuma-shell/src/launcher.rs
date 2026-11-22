@@ -32,41 +32,17 @@ pub fn load_apps() -> Vec<AppEntry> {
     // threading it in as a plain value keeps the filter testable without
     // env mutation. Feeds the launcher, the dock's app menu, and the
     // volume panel's per-app rows, so all three honor the show-in pair.
+    // The walk and parse are the platform's; what stays here is the
+    // usage bookkeeping and the dedupe (most-used entry per name wins).
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok()
         .filter(|name| !name.is_empty());
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let data_dirs = std::env::var("XDG_DATA_DIRS")
-        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
-    for data_dir in data_dirs.split(':').filter(|dir| !dir.is_empty()) {
-        dirs.push(PathBuf::from(data_dir).join("applications"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = PathBuf::from(home);
-        dirs.push(home.join(".local/share/applications"));
-        dirs.push(home.join(".local/share/flatpak/exports/share/applications"));
-    }
-    dirs.push(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
-
     let usage = load_usage();
     let mut apps = Vec::new();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(|entry| entry.ok()) {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let desktop_path = path.to_string_lossy().to_string();
-                if let Some(mut app) = parse_desktop_entry(&text, desktop.as_deref()) {
-                    app.desktop_path = desktop_path.clone();
-                    app.usage = usage.get(&desktop_path).copied().unwrap_or(0);
-                    apps.push(app);
-                }
-            }
-        }
+    for scanned in kuma_platform::desktop::scan_applications(desktop.as_deref()) {
+        let mut app = AppEntry::from(scanned.entry);
+        app.desktop_path = scanned.path.display().to_string();
+        app.usage = usage.get(&app.desktop_path).copied().unwrap_or(0);
+        apps.push(app);
     }
     // same app can ship from several sources (system + flatpak): keep the
     // most-used entry per name
@@ -161,92 +137,37 @@ fn record_usage(desktop_path: &str) {
     save_usage(&usage);
 }
 
-/// Semicolon-separated list value per the Desktop Entry spec: the trailing
-/// semicolon is part of the syntax, so empty segments drop out.
-fn show_in_list(value: &str) -> Vec<String> {
-    value
-        .trim()
-        .split(';')
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// glib's g_desktop_app_info_get_show_in, hand-rolled: walk the stacked
-/// desktop values in order, OnlyShowIn consulted before NotShowIn per value,
-/// and the tail hides whatever carries OnlyShowIn when nothing matched (an
-/// unset or empty desktop hides every gated entry). Plain case-sensitive
-/// equality, like the reference reader and the menu spec's registry
-/// ("these are case-sensitive").
-fn shows_in(only: Option<&[String]>, not: Option<&[String]>, desktop: Option<&str>) -> bool {
-    let Some(desktop) = desktop else {
-        return only.is_none();
-    };
-    for env in desktop.split(':').filter(|env| !env.is_empty()) {
-        if let Some(only) = only
-            && only.iter().any(|name| name.as_str() == env)
-        {
-            return true;
-        }
-        if let Some(not) = not
-            && not.iter().any(|name| name.as_str() == env)
-        {
-            return false;
-        }
-    }
-    only.is_none()
-}
-
+/// The platform's parse, shaped as the grid entry: the exec's field
+/// codes drop (the launch is `sh -c`, no path ever substitutes) and
+/// the icon name lowercases (icon themes register lower case). Test
+/// helper; the real path is `load_apps`'s `From` conversion.
+#[cfg(test)]
 fn parse_desktop_entry(text: &str, desktop: Option<&str>) -> Option<AppEntry> {
-    let mut name = None;
-    let mut generic = None;
-    let mut keywords = None;
-    let mut exec = None;
-    let mut icon = None;
-    let mut terminal = false;
-    let mut hidden = false;
-    let mut only_show_in: Option<Vec<String>> = None;
-    let mut not_show_in: Option<Vec<String>> = None;
-    for line in text.lines() {
-        if line.starts_with('[') && !line.starts_with("[Desktop Entry]") {
-            break;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            match key.trim() {
-                "Name" => name = Some(value.trim().to_string()),
-                "GenericName" => generic = Some(value.trim().to_string()),
-                "Keywords" => keywords = Some(value.trim().to_string()),
-                "Exec" => exec = Some(value.trim().to_string()),
-                "Icon" => icon = Some(value.trim().to_string()),
-                "Terminal" => terminal = value.trim() == "true",
-                "NoDisplay" | "Hidden" => hidden = value.trim() == "true",
-                "OnlyShowIn" => only_show_in = Some(show_in_list(value)),
-                "NotShowIn" => not_show_in = Some(show_in_list(value)),
-                _ => {}
-            }
+    Some(AppEntry::from(kuma_platform::desktop::parse_entry(text, desktop)?))
+}
+
+impl From<kuma_platform::desktop::Entry> for AppEntry {
+    fn from(entry: kuma_platform::desktop::Entry) -> Self {
+        AppEntry {
+            name: if entry.name.is_empty() {
+                "Unnamed".to_string()
+            } else {
+                entry.name
+            },
+            generic: entry.generic,
+            keywords: entry.keywords,
+            exec: entry
+                .exec
+                .split_whitespace()
+                .filter(|token| !token.starts_with('%'))
+                .collect::<Vec<_>>()
+                .join(" "),
+            terminal: entry.terminal,
+            icon: entry.icon.to_lowercase(),
+            desktop_path: String::new(),
+            usage: 0,
         }
     }
-    if hidden {
-        return None;
-    }
-    if !shows_in(only_show_in.as_deref(), not_show_in.as_deref(), desktop) {
-        return None;
-    }
-    let exec = exec?;
-    Some(AppEntry {
-        icon: icon.unwrap_or_default().to_lowercase(),
-        name: name.unwrap_or_else(|| "Unnamed".to_string()),
-        generic: generic.unwrap_or_default(),
-        keywords: keywords.unwrap_or_default(),
-        desktop_path: String::new(),
-        usage: 0,
-        exec: exec
-            .split_whitespace()
-            .filter(|token| !token.starts_with('%'))
-            .collect::<Vec<_>>()
-            .join(" "),
-        terminal,
-    })
 }
 
 /// Subsequence match with bonuses for consecutive runs and word boundaries,

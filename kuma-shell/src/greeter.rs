@@ -8,8 +8,6 @@
 
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
-
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
@@ -205,74 +203,9 @@ pub fn cancel(client: &mut GreetdClient) {
 
 // ---------- the session list ----------
 
-/// One wayland session the greeter can start: its display name and
-/// the command greetd runs for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Session {
-    pub name: String,
-    pub exec: String,
-}
-
-/// Read the wayland sessions from `dir` (normally
-/// /usr/share/wayland-sessions): every desktop entry's Name and Exec,
-/// hidden entries skipped. Sorted by name so the list is stable.
-pub fn wayland_sessions(dir: &Path) -> Vec<Session> {
-    let mut sessions = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return sessions;
-    };
-    for entry in entries.flatten() {
-        let Some(session) = parse_session(&entry.path()) else {
-            continue;
-        };
-        sessions.push(session);
-    }
-    sessions.sort_by(|a, b| a.name.cmp(&b.name));
-    sessions
-}
-
-/// Parse one desktop file: the `[Desktop Entry]` section's Name and
-/// Exec, with NoDisplay or Hidden files rejected.
-fn parse_session(path: &Path) -> Option<Session> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let mut name = None;
-    let mut exec = None;
-    let mut hidden = false;
-    let mut in_entry = false;
-    for line in raw.lines() {
-        match line.trim() {
-            "[Desktop Entry]" => in_entry = true,
-            "[]" | "" => in_entry = false,
-            // any other section header ([Desktop Action a], vendor
-            // extensions) ends the entry section. It used to fall
-            // through to the key/value arm, whose missing '=' aborted
-            // the whole file: a session shipping actions vanished
-            // from the picker
-            header if header.starts_with('[') && header.ends_with(']') => in_entry = false,
-            _ if in_entry => {
-                // a stray line without '=' is skipped, not fatal: the
-                // session should not vanish over one bad line
-                let Some((key, value)) = line.split_once('=') else {
-                    continue;
-                };
-                match key.trim() {
-                    "Name" => name = Some(value.trim().to_string()),
-                    "Exec" => exec = Some(value.trim().to_string()),
-                    "NoDisplay" | "Hidden" if value.trim() == "true" => hidden = true,
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-    if hidden {
-        return None;
-    }
-    Some(Session {
-        name: name?,
-        exec: exec?,
-    })
-}
+// the session list is the platform's desktop-entry work (the greeter
+// variant): the names ride to greetd verbatim, no field codes
+pub use kuma_platform::desktop::{Session, wayland_sessions};
 
 #[cfg(test)]
 mod tests {
@@ -504,8 +437,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn missing_session_dir_reads_as_empty() {
-        assert!(wayland_sessions(Path::new("/nonexistent-kuma-sessions")).is_empty());
-    }
 }
