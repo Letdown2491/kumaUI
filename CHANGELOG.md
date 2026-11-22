@@ -4,6 +4,17 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+### Changed
+
+- kuma-term opens http and https links through the desktop portal instead of a raw xdg-open spawn: xdg-desktop-portal first, the activation token handed over so the browser does not steal focus badly, xdg-open behind it.
+- The byte formatter is one across the apps: Koguma sizes at a tebibyte and beyond display TiB instead of capping at GiB, zero bytes read "0 B" instead of "0.0 KiB", and kuma-shell's bar disk tooltip gains its decimal.
+
+### Fixed
+
+- kuma-shell's CPU temperature read finds an ARM cpu_thermal chip and the machines whose only cpu sensor sits in /sys/class/thermal, and a hot nvme drive can no longer pose as the CPU sensor on machines without a cpu-named chip.
+- Kamuy's per-core bars no longer shift when a core reports no elapsed jiffies between beats.
+- Koguma's open-with list no longer offers desktop entries gated to another desktop (OnlyShowIn/NotShowIn, glib's rule).
+
 ## v0.10.0 (2026-11-20)
 
 kuma-shell 0.10.0
