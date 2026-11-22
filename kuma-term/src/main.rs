@@ -18,7 +18,7 @@ mod view;
 #[cfg(test)]
 pub(crate) static PTY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-use gpui::{App, AppContext, TitlebarOptions, WindowBounds, WindowOptions, px, size, SharedString};
+use gpui::App;
 use gpui_platform::application;
 
 /// The version line `--version` prints: the crate version plus the
@@ -35,21 +35,10 @@ fn main() {
     // it). Sound: no other thread exists yet.
     unsafe { std::env::set_var("KUMA_TERM", "1") };
 
-    kuma_platform::logging::init();
-
-    // --version prints and exits: no session, no window, any tty
-    if std::env::args()
-        .nth(1)
-        .is_some_and(|arg| kuma_platform::version::is_version_flag(&arg))
-    {
-        println!("{}", version_line());
+    if !kuma_platform::app::start("kuma-term", env!("CARGO_PKG_VERSION")) {
         return;
     }
-
-    if std::env::var("WAYLAND_DISPLAY").is_err() && std::env::var("DISPLAY").is_err() {
-        eprintln!("kuma-term: no Wayland/X11 session detected");
-        std::process::exit(1);
-    }
+    kuma_platform::app::require_session("kuma-term");
 
     // `-e` consumes the rest of argv as the command to run instead of
     // the shell: the kitty/alacritty convention kuma-launch relies on
@@ -65,20 +54,15 @@ fn main() {
     application()
         .with_assets(icons::Assets)
         .run(move |cx: &mut App| {
-        let bounds = gpui::Bounds::centered(None, size(px(920.), px(620.)), cx);
-        let _ = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                app_id: Some("kuma-term".into()),
-                titlebar: Some(TitlebarOptions {
-                    // the display name is Higuma, the black bear of the
-                    // family (the binary and app id keep kuma-term)
-                    title: Some(SharedString::from("Higuma")),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| view::TerminalView::new(command, window, cx)),
+        // the display name is Higuma, the black bear of the family
+        // (the binary and app id keep kuma-term)
+        let _ = kuma_platform::app::main_window(
+            cx,
+            "kuma-term",
+            "Higuma",
+            920.,
+            620.,
+            move |window, cx| view::TerminalView::new(command, window, cx),
         );
         cx.activate(true);
     });

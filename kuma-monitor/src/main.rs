@@ -4,7 +4,7 @@
 //! join hold, and does the owner want it in the dock a week later.
 
 
-use gpui::{App, AppContext, TitlebarOptions, WindowBounds, WindowOptions, px, size, SharedString};
+use gpui::App;
 use gpui_platform::application;
 
 mod icons;
@@ -23,21 +23,10 @@ pub(crate) fn version_line() -> String {
 }
 
 fn main() {
-    kuma_platform::logging::init();
-
-    // --version prints and exits: no session, no window, any tty
-    if std::env::args()
-        .nth(1)
-        .is_some_and(|arg| kuma_platform::version::is_version_flag(&arg))
-    {
-        println!("{}", version_line());
+    if !kuma_platform::app::start("kuma-monitor", env!("CARGO_PKG_VERSION")) {
         return;
     }
-
-    if std::env::var("WAYLAND_DISPLAY").is_err() && std::env::var("DISPLAY").is_err() {
-        eprintln!("kuma-monitor: no Wayland/X11 session detected");
-        std::process::exit(1);
-    }
+    kuma_platform::app::require_session("kuma-monitor");
 
     // second launch while one is already up: a bare poke over the
     // activation socket and exit; the first window comes forward.
@@ -46,28 +35,19 @@ fn main() {
     application()
         .with_assets(icons::Assets)
         .run(move |cx: &mut App| {
-        let bounds = gpui::Bounds::centered(None, size(px(860.), px(640.)), cx);
-        let handle = match cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                app_id: Some("kuma-monitor".into()),
-                titlebar: Some(TitlebarOptions {
-                    // the display name is Kamuy, the Ainu spirit that
-                    // dwells in the bear: the family's watcher (the
-                    // binary and app id keep kuma-monitor)
-                    title: Some(SharedString::from("Kamuy")),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| view::MonitorView::new(window, cx)),
-        ) {
-            Ok(handle) => handle,
-            Err(err) => {
-                log::error!("open_window failed: {err:#}");
+            // the display name is Kamuy, the Ainu spirit that dwells
+            // in the bear: the family's watcher (the binary and app id
+            // keep kuma-monitor)
+            let Some(handle) = kuma_platform::app::main_window(
+                cx,
+                "kuma-monitor",
+                "Kamuy",
+                860.,
+                640.,
+                |window, cx| view::MonitorView::new(window, cx),
+            ) else {
                 return;
-            }
-        };
+            };
         cx.activate(true);
 
         if let Some(listener) = listener {

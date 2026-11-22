@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 
-use gpui::{App, AppContext, WindowBounds, WindowOptions, TitlebarOptions, px, size, SharedString};
+use gpui::App;
 use gpui_platform::application;
 
 mod browser;
@@ -34,24 +34,11 @@ pub(crate) fn version_tag() -> String {
 }
 
 fn main() {
-    kuma_platform::logging::init();
-
-    // --version prints and exits: no session, no socket handoff, no
-    // window, works from any tty
-    if std::env::args()
-        .nth(1)
-        .is_some_and(|arg| kuma_platform::version::is_version_flag(&arg))
-    {
-        println!("{}", version_line());
+    if !kuma_platform::app::start("kuma-files", env!("CARGO_PKG_VERSION")) {
         return;
     }
-
     log::info!("koguma {}", version_line());
-
-    if std::env::var("WAYLAND_DISPLAY").is_err() && std::env::var("DISPLAY").is_err() {
-        eprintln!("kuma-files: no Wayland/X11 session detected");
-        std::process::exit(1);
-    }
+    kuma_platform::app::require_session("kuma-files");
 
     // an explicit CLI arg: a dir lists it, a file opens it in the
     // viewer. Nothing passed means "reopen where I was last time"
@@ -83,20 +70,13 @@ fn main() {
                     viewer::open_or_focus(path, cx);
                 }
                 None => {
-                    let bounds = gpui::Bounds::centered(None, size(px(960.), px(640.)), cx);
-                    let handle = match cx.open_window(
-                        WindowOptions {
-                            window_bounds: Some(WindowBounds::Windowed(bounds)),
-                            // the Wayland app_id: the dock matches it against
-                            // the desktop-file stem for icon and grouping
-                            app_id: Some("kuma-files".into()),
-                            titlebar: Some(TitlebarOptions {
-                                title: Some(SharedString::from("Koguma")),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        },
-                        |window, cx| {
+                    let Some(handle) = kuma_platform::app::main_window(
+                        cx,
+                        "kuma-files",
+                        "Koguma",
+                        960.,
+                        640.,
+                        move |window, cx| {
                             log::info!(
                                 "koguma window open, {}",
                                 dir.as_ref().map_or_else(
@@ -104,14 +84,10 @@ fn main() {
                                     |d| format!("listing {}", d.display()),
                                 )
                             );
-                            cx.new(|cx| Browser::new(dir.clone(), window, cx))
+                            Browser::new(dir.clone(), window, cx)
                         },
-                    ) {
-                        Ok(handle) => handle,
-                        Err(err) => {
-                            log::error!("open_window failed: {err:#}");
-                            return;
-                        }
+                    ) else {
+                        return;
                     };
                     cx.global_mut::<Hosts>().browser = Some(handle);
                 }

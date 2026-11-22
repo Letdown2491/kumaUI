@@ -12,6 +12,8 @@
 //!   order gpui expects in one place
 //! - `activation`: the single-instance activation socket, keyed by
 //!   app id; a second launch hands its request over and exits
+//! - `app`: the main preamble (logging, the version flag, the session
+//!   gate, the main window's open)
 //! - `niri`: the IPC envelope, ADR-0003's hand-rolled client (events,
 //!   actions, and response types stay per app)
 //! - `titlebar`: the family's client-side title bar, behavior and
@@ -27,6 +29,7 @@
 //!   applications walk, and the wayland-sessions variant
 
 pub mod activation;
+pub mod app;
 pub mod color;
 pub mod desktop;
 pub mod files;
