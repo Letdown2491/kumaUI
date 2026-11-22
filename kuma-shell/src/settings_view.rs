@@ -2035,7 +2035,7 @@ impl SettingsView {
                     .text_color(rgb(crate::theme::current().accent))
                     .underline()
                     .cursor_pointer()
-                    .on_click(|_, _, cx| cx.open_url(REPO_URL))
+                    .on_click(|_, _, cx| kuma_platform::open::url(REPO_URL, cx))
                     .child(REPO_URL),
             )
             .child(
@@ -2045,7 +2045,7 @@ impl SettingsView {
                     .text_color(rgb(crate::theme::current().accent))
                     .underline()
                     .cursor_pointer()
-                    .on_click(|_, _, cx| cx.open_url(ISSUES_URL))
+                    .on_click(|_, _, cx| kuma_platform::open::url(ISSUES_URL, cx))
                     .child(ISSUES_URL),
             )
     }

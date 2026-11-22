@@ -18,6 +18,7 @@
 //!   geometry shared, colors and glyphs per app
 //! - `xdg`: the base-directory fallback chain (config, state), the
 //!   spec's ignore-relative rule in one place
+//! - `open`: the one URL opener, the scheme allowlist at the gate
 //! - `format`: presentation formatting every surface renders the
 //!   same way (byte sizes)
 //! - `sysfs`: the kernel-state samplers (/proc, /sys, statvfs) the
@@ -30,6 +31,7 @@ pub mod format;
 pub mod imaging;
 pub mod logging;
 pub mod niri;
+pub mod open;
 pub mod palette;
 pub mod process;
 pub mod sysfs;

@@ -1476,7 +1476,7 @@ impl TerminalView {
             && self.down_cell == Some((row, col, edge))
         {
             if let Some(url) = self.url_at(row, col) {
-                open_url(&url);
+                kuma_platform::open::url(&url, cx);
             }
         }
         self.down_cell = None;
@@ -1632,27 +1632,6 @@ fn paste_payload(text: &str) -> Vec<u8> {
 impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus.clone()
-    }
-}
-
-/// Open a URL through the desktop handler: fire and forget, reaped on a
-/// side thread so the child cannot zombie and the UI never blocks. The
-/// scheme is checked here at the opener, not just in the span matcher:
-/// whatever the pty printed, only a web address may leave the terminal.
-/// A `file://` span is link-shaped text, not a click's license to hand
-/// xdg-open a local path (a .desktop file would execute).
-fn open_url(url: &str) {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        log::info!("not opening {url}: only http and https leave the terminal");
-        return;
-    }
-    match std::process::Command::new("xdg-open").arg(url).spawn() {
-        Ok(mut child) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        },
-        Err(err) => warn!("opening {url}: {err}"),
     }
 }
 
@@ -3224,7 +3203,7 @@ mod tests {
         let mut ticks = 0;
         let mut farthest = 0.0f32;
         loop {
-            let (offset, frac, keep) = anim.tick(
+            let (_, frac, keep) = anim.tick(
                 500,
                 t0 + Duration::from_millis(50) + Duration::from_millis(8 * (ticks + 1)),
             );
