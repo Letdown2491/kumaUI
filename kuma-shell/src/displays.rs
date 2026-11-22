@@ -393,17 +393,7 @@ struct OutputBlock {
 /// The store file: niri's local.kdl, an include the baked /etc config
 /// carries last, so these blocks win over everything the image ships.
 fn store_path() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| PathBuf::from(home).join(".config"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".config"));
-    base.join("niri").join("local.kdl")
+    kuma_platform::xdg::config_dir().join("niri").join("local.kdl")
 }
 
 /// Read the store. A missing file is an empty store (the include is

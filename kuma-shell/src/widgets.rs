@@ -96,18 +96,9 @@ const ICON_EXTENSIONS: [&str; 4] = ["svg", "png", "jpg", "jpeg"];
 /// The user's widgets directory: installed widgets live here, and the
 /// watcher on it is what makes installs live.
 pub fn user_dir() -> PathBuf {
-    // same base resolution as settings::config_path
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| PathBuf::from(home).join(".config"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".config"));
-    base.join("kuma-shell").join("widgets")
+    kuma_platform::xdg::config_dir()
+        .join("kuma-shell")
+        .join("widgets")
 }
 
 /// The system pool: stock widgets shipped complete but not installed.

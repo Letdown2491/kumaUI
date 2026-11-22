@@ -365,17 +365,9 @@ fn detect_kuma() -> bool {
 
 /// The state file's path: beside config.toml, same resolution.
 fn state_path() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| PathBuf::from(home).join(".config"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".config"));
-    base.join("kuma-shell").join("updates-state.toml")
+    kuma_platform::xdg::config_dir()
+        .join("kuma-shell")
+        .join("updates-state.toml")
 }
 
 /// This boot's identity, or empty when the kernel does not provide

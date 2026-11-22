@@ -156,15 +156,12 @@ fn config_path() -> Option<PathBuf> {
     )
 }
 
-/// The pure rule behind `config_path`, so the XDG handling is testable
-/// without mutating process environment.
+/// The pure rule behind `config_path`, now the platform's (the XDG
+/// handling lives in one place, kuma_platform::xdg::base_dir, and
+/// stays testable without mutating process environment).
 fn config_path_for(xdg: Option<&std::ffi::OsStr>, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    let explicit = xdg.map(PathBuf::from).filter(|dir| dir.is_absolute());
-    let dir = match explicit {
-        Some(dir) => dir,
-        None => PathBuf::from(home?).join(".config"),
-    };
-    Some(dir.join("kuma-term/kuma-term.conf"))
+    kuma_platform::xdg::base_dir(xdg, home, ".config")
+        .map(|dir| dir.join("kuma-term/kuma-term.conf"))
 }
 
 /// Parse the key value grammar (and its includes, one branch at a time,

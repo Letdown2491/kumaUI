@@ -16,6 +16,8 @@
 //!   actions, and response types stay per app)
 //! - `titlebar`: the family's client-side title bar, behavior and
 //!   geometry shared, colors and glyphs per app
+//! - `xdg`: the base-directory fallback chain (config, state), the
+//!   spec's ignore-relative rule in one place
 
 pub mod activation;
 pub mod color;
@@ -27,3 +29,4 @@ pub mod palette;
 pub mod process;
 pub mod titlebar;
 pub mod version;
+pub mod xdg;
