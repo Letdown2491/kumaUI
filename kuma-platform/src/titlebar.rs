@@ -4,9 +4,11 @@
 //! wm_capabilities). This module is the shared bar on top of them
 //! (ADR-0017): a drag region carrying the app's name, and the button
 //! cluster the compositor backs. The platform owns the behavior and
-//! the geometry; the app owns the colors, the name, and the glyphs,
-//! so the bar wears each app's look without the platform growing a
-//! palette or an asset set.
+//! the geometry; the app owns the colors and the name. The glyph set
+//! is the platform's too (one copy, the family's 16px stroke style,
+//! identical bytes in every app at the fold): an app that wants its
+//! own look points `TitlebarIcons` elsewhere or ships its own asset
+//! source.
 
 use std::{
     cell::Cell,
@@ -57,6 +59,43 @@ pub struct TitlebarIcons {
     pub minimize: SharedString,
     pub maximize: SharedString,
     pub close: SharedString,
+}
+
+impl Default for TitlebarIcons {
+    /// The family's glyph set, carried by this crate's `Assets`.
+    fn default() -> Self {
+        TitlebarIcons {
+            minimize: "icons/titlebar_minimize.svg".into(),
+            maximize: "icons/titlebar_maximize.svg".into(),
+            close: "icons/titlebar_close.svg".into(),
+        }
+    }
+}
+
+/// The family's titlebar glyph set: the three window controls, gpui
+/// renders them as alpha masks tinted by the element's text color (the
+/// SVGs' own colors are placeholders). One copy; kuma-term,
+/// kuma-monitor, and kuma-files' titlebar arms all serve these bytes.
+pub struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        let bytes: Option<&'static [u8]> = match path {
+            "icons/titlebar_minimize.svg" => {
+                Some(include_bytes!("../icons/titlebar_minimize.svg"))
+            }
+            "icons/titlebar_maximize.svg" => {
+                Some(include_bytes!("../icons/titlebar_maximize.svg"))
+            }
+            "icons/titlebar_close.svg" => Some(include_bytes!("../icons/titlebar_close.svg")),
+            _ => None,
+        };
+        Ok(bytes.map(std::borrow::Cow::Borrowed))
+    }
+
+    fn list(&self, _path: &str) -> anyhow::Result<Vec<SharedString>> {
+        Ok(Vec::new())
+    }
 }
 
 /// One of the bar's buttons.
@@ -253,5 +292,39 @@ mod tests {
 
         let bare = WindowControls { minimize: false, maximize: false, ..all };
         assert_eq!(buttons_for(bare), vec![Control::Close], "close is always offered");
+    }
+
+    /// The glyphs must rasterize to actual ink: a path the SVG parser
+    /// drops paints nothing and the button goes blind (the missing
+    /// minus, caught in the monitor's copy first).
+    #[test]
+    fn the_glyphs_rasterize() {
+        use gpui::{AssetSource, SvgRenderer};
+        use std::sync::Arc;
+
+        let assets = Arc::new(Assets);
+        let renderer = SvgRenderer::new(assets.clone());
+        for (name, path) in [
+            ("minimize", "icons/titlebar_minimize.svg"),
+            ("maximize", "icons/titlebar_maximize.svg"),
+            ("close", "icons/titlebar_close.svg"),
+        ] {
+            let bytes = assets
+                .load(path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name}: nothing at {path}"));
+            let image = renderer
+                .render_single_frame(bytes.as_ref(), 1.0)
+                .unwrap_or_else(|err| panic!("{name}: did not parse: {err}"));
+            let ink = image
+                .as_bytes(0)
+                .unwrap()
+                .iter()
+                .skip(3)
+                .step_by(4)
+                .filter(|&alpha| *alpha > 0)
+                .count();
+            assert!(ink > 20, "{name}: only {ink} inked pixels rasterized");
+        }
     }
 }

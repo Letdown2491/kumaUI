@@ -138,40 +138,9 @@ fn arg_to_path(arg: &str) -> PathBuf {
         return PathBuf::from(arg);
     }
     // split_once consumed the path's own leading slash: put it back
-    let mut decoded = percent_decode(path);
+    let mut decoded = kuma_platform::files::percent_decode_bytes(path, false);
     decoded.insert(0, b'/');
     PathBuf::from(OsStr::from_bytes(&decoded))
-}
-
-/// Percent-decode a URI path: `%XX` byte runs become raw bytes, so
-/// escaped UTF-8 and spaces survive. A lone `%` is not an escape and
-/// rides; `+` stays literal, that escape belongs to form encoding.
-fn percent_decode(path: &str) -> Vec<u8> {
-    let bytes = path.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(high), Some(low)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
-        {
-            out.push(high * 16 + low);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn hex_val(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

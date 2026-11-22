@@ -18,15 +18,6 @@ impl AssetSource for Assets {
             "icons/arrow_left.svg" => Some(include_bytes!("../icons/arrow_left.svg")),
             "icons/arrow_right.svg" => Some(include_bytes!("../icons/arrow_right.svg")),
             "icons/arrow_up.svg" => Some(include_bytes!("../icons/arrow_up.svg")),
-            // the titlebar's window controls (family-made, same bytes
-            // as the monitor's set)
-            "icons/titlebar_minimize.svg" => {
-                Some(include_bytes!("../icons/titlebar_minimize.svg"))
-            }
-            "icons/titlebar_maximize.svg" => {
-                Some(include_bytes!("../icons/titlebar_maximize.svg"))
-            }
-            "icons/titlebar_close.svg" => Some(include_bytes!("../icons/titlebar_close.svg")),
             "icons/chevron_down.svg" => Some(include_bytes!("../icons/chevron_down.svg")),
             "icons/chevron_right.svg" => Some(include_bytes!("../icons/chevron_right.svg")),
             "icons/chevron_up.svg" => Some(include_bytes!("../icons/chevron_up.svg")),
@@ -47,7 +38,9 @@ impl AssetSource for Assets {
             "icons/square_plus.svg" => Some(include_bytes!("../icons/square_plus.svg")),
             "icons/image.svg" => Some(include_bytes!("../icons/image.svg")),
             "icons/trash.svg" => Some(include_bytes!("../icons/trash.svg")),
-            _ => None,
+            // the titlebar's window controls: the family's set, the
+            // platform's copy
+            _ => return kuma_platform::titlebar::Assets.load(path),
         };
         Ok(bytes.map(Cow::Borrowed))
     }

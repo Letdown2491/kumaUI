@@ -10882,11 +10882,7 @@ impl Render for Browser {
                     kuma_platform::titlebar::bar(
                         "Koguma".into(),
                         window.window_controls(),
-                        kuma_platform::titlebar::TitlebarIcons {
-                            minimize: "icons/titlebar_minimize.svg".into(),
-                            maximize: "icons/titlebar_maximize.svg".into(),
-                            close: "icons/titlebar_close.svg".into(),
-                        },
+                        kuma_platform::titlebar::TitlebarIcons::default(),
                         kuma_platform::titlebar::TitlebarColors {
                             background: theme::sidebar(),
                             border: theme::border(),

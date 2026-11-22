@@ -797,11 +797,7 @@ impl Render for MonitorView {
                         kuma_platform::titlebar::bar(
                             "Kamuy".into(),
                             window.window_controls(),
-                            kuma_platform::titlebar::TitlebarIcons {
-                                minimize: "icons/titlebar_minimize.svg".into(),
-                                maximize: "icons/titlebar_maximize.svg".into(),
-                                close: "icons/titlebar_close.svg".into(),
-                            },
+                            kuma_platform::titlebar::TitlebarIcons::default(),
                             kuma_platform::titlebar::TitlebarColors {
                                 background: theme::surface(),
                                 border: theme::border(),
@@ -2760,7 +2756,7 @@ mod tests {
 
         let mut app = gpui::TestApp::with_text_system_and_assets(
             Arc::new(gpui_wgpu::CosmicTextSystem::new("system-ui")),
-            Arc::new(crate::icons::Assets),
+            Arc::new(kuma_platform::titlebar::Assets),
         );
         let mut window = app.open_window(|window, cx| MonitorView::new(window, cx));
         app.run_until_parked();
@@ -2788,7 +2784,7 @@ mod tests {
         use gpui::AssetSource;
         use std::sync::Arc;
 
-        let assets = Arc::new(crate::icons::Assets);
+        let assets = Arc::new(kuma_platform::titlebar::Assets);
         let renderer = gpui::SvgRenderer::new(assets.clone());
         for (name, path) in [
             ("minimize", "icons/titlebar_minimize.svg"),

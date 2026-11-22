@@ -39,26 +39,30 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     outcome
 }
 
-/// Percent-decode a URI's path or component: `%XX` hex escapes grow
-/// to bytes, an unterminated or non-hex escape stays literal, and the
-/// result is lossy UTF-8 (undecodable bytes become replacement
-/// characters). `plus_as_space` is the form-encoding quirk: query
+/// Percent-decode a URI's path or component to raw bytes: `%XX` hex
+/// escapes grow to bytes, an unterminated or non-hex escape stays
+/// literal. `plus_as_space` is the form-encoding quirk: query
 /// components spell a space `+`; filesystem paths do not, and a
 /// literal `+` in a directory name must survive.
-pub fn percent_decode(text: &str, plus_as_space: bool) -> String {
+pub fn percent_decode_bytes(text: &str, plus_as_space: bool) -> Vec<u8> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
             b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
-                match u8::from_str_radix(hex, 16) {
-                    Ok(byte) => {
-                        out.push(byte);
+                // hex digits only: from_str_radix would also take a
+                // leading sign, and "%+1" is literal text, not byte 1
+                let hex = &bytes[index + 1..index + 3];
+                match (
+                    (hex[0] as char).to_digit(16),
+                    (hex[1] as char).to_digit(16),
+                ) {
+                    (Some(high), Some(low)) => {
+                        out.push(high as u8 * 16 + low as u8);
                         index += 3;
                     }
-                    Err(_) => {
+                    _ => {
                         out.push(bytes[index]);
                         index += 1;
                     }
@@ -74,7 +78,13 @@ pub fn percent_decode(text: &str, plus_as_space: bool) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
+}
+
+/// Percent-decode a URI's path or component: the bytes core above,
+/// lossy UTF-8 (undecodable bytes become replacement characters).
+pub fn percent_decode(text: &str, plus_as_space: bool) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(text, plus_as_space)).into_owned()
 }
 
 #[cfg(test)]
@@ -91,6 +101,8 @@ mod tests {
         // the form quirk is opt-in: a literal + in a path survives
         assert_eq!(percent_decode("a+b", false), "a+b");
         assert_eq!(percent_decode("a+b", true), "a b");
+        // a sign is not a hex digit: "%+1" is literal, not byte 1
+        assert_eq!(percent_decode("%2B%20x%+1", false), "+ x%+1");
     }
 
     #[test]

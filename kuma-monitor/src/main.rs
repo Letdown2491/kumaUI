@@ -7,7 +7,6 @@
 use gpui::App;
 use gpui_platform::application;
 
-mod icons;
 mod niri;
 mod sample;
 mod stats;
@@ -25,7 +24,7 @@ fn main() {
     let listener = kuma_platform::activation::become_single_instance("kuma-monitor", "");
 
     application()
-        .with_assets(icons::Assets)
+        .with_assets(kuma_platform::titlebar::Assets)
         .run(move |cx: &mut App| {
             // the display name is Kamuy, the Ainu spirit that dwells
             // in the bear: the family's watcher (the binary and app id

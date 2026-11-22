@@ -2082,11 +2082,7 @@ impl Render for TerminalView {
             kuma_platform::titlebar::bar(
                 "Higuma".into(),
                 window.window_controls(),
-                kuma_platform::titlebar::TitlebarIcons {
-                    minimize: "icons/titlebar_minimize.svg".into(),
-                    maximize: "icons/titlebar_maximize.svg".into(),
-                    close: "icons/titlebar_close.svg".into(),
-                },
+                kuma_platform::titlebar::TitlebarIcons::default(),
                 kuma_platform::titlebar::TitlebarColors {
                     background: bar_bg.into(),
                     border: bar_border.into(),

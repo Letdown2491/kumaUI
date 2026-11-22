@@ -4,7 +4,6 @@
 mod encoder;
 mod font;
 mod glyphs;
-mod icons;
 mod kitty;
 mod notify;
 mod palette;
@@ -44,7 +43,7 @@ fn main() {
     });
 
     application()
-        .with_assets(icons::Assets)
+        .with_assets(kuma_platform::titlebar::Assets)
         .run(move |cx: &mut App| {
         // the display name is Higuma, the black bear of the family
         // (the binary and app id keep kuma-term)
@@ -127,35 +126,5 @@ mod tests {
     #[test]
     fn parse_args_errors_on_a_bare_e() {
         assert!(parse_args(&argv(&["kuma-term", "-e"])).is_err());
-    }
-
-    #[test]
-    fn titlebar_glyphs_rasterize() {
-        use gpui::{AssetSource, SvgRenderer};
-
-        let assets = std::sync::Arc::new(icons::Assets);
-        let renderer = SvgRenderer::new(assets.clone());
-        for (name, path) in [
-            ("minimize", "icons/titlebar_minimize.svg"),
-            ("maximize", "icons/titlebar_maximize.svg"),
-            ("close", "icons/titlebar_close.svg"),
-        ] {
-            let bytes = assets
-                .load(path)
-                .unwrap()
-                .unwrap_or_else(|| panic!("{name}: nothing at {path}"));
-            let image = renderer
-                .render_single_frame(bytes.as_ref(), 1.0)
-                .unwrap_or_else(|err| panic!("{name}: did not parse: {err}"));
-            let ink = image
-                .as_bytes(0)
-                .unwrap()
-                .iter()
-                .skip(3)
-                .step_by(4)
-                .filter(|&alpha| *alpha > 0)
-                .count();
-            assert!(ink > 20, "{name}: only {ink} inked pixels rasterized");
-        }
     }
 }
