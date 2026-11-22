@@ -4,6 +4,13 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+## v0.10.1 (2026-11-21)
+
+kuma-shell 0.10.1
+kuma-files 0.7.1
+kuma-term 0.6.1
+kuma-monitor 0.4.2
+
 ### Changed
 
 - kuma-term opens http and https links through the desktop portal instead of a raw xdg-open spawn: xdg-desktop-portal first, the activation token handed over so the browser does not steal focus badly, xdg-open behind it.
