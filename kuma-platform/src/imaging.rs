@@ -32,6 +32,31 @@ pub fn render_image(rgba: image::RgbaImage) -> gpui::RenderImage {
     gpui::RenderImage::new(SmallVec::from_buf([image::Frame::new(bgra)]))
 }
 
+/// SNI `IconPixmap`: ARGB32 in network byte order (A,R,G,B per
+/// pixel), width, height, straight to the BGRA `RenderImage` gpui
+/// wants. A data length that disagrees with the dimensions is no
+/// image at all.
+pub fn argb32_to_render_image(
+    width: i32,
+    height: i32,
+    mut data: Vec<u8>,
+) -> Option<gpui::RenderImage> {
+    let width = usize::try_from(width).ok()?;
+    let height = usize::try_from(height).ok()?;
+    if data.len() != width * height * 4 {
+        return None;
+    }
+    // wire order is A,R,G,B per pixel; gpui wants B,G,R,A
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 3);
+        pixel.swap(1, 2);
+    }
+    let bgra = image::RgbaImage::from_raw(width as u32, height as u32, data)?;
+    Some(gpui::RenderImage::new(SmallVec::from_buf([
+        image::Frame::new(bgra),
+    ])))
+}
+
 /// Open and decode a file, full size.
 pub fn open(path: &Path) -> Option<image::DynamicImage> {
     let mut reader = image::ImageReader::open(path).ok()?;

@@ -419,7 +419,7 @@ fn resolve_icon(
     let hash = pixmap_hash(&pixmap);
     (
         pixmap.and_then(|(width, height, data)| {
-            imaging::argb_to_render_image(width, height, data)
+            kuma_platform::imaging::argb32_to_render_image(width, height, data)
                 .map(Arc::new)
                 .map(IconImage::Raster)
         }),

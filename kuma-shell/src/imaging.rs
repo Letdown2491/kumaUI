@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use smallvec::SmallVec;
-
 /// A decoded icon, either raster or vector; the launcher's app icons and
 /// the tray's status icons share this. Named icons decode to Raster even
 /// when the file is an SVG (gpui's `svg()` element is a single-color tint,
@@ -68,8 +66,7 @@ fn svg_renderer() -> &'static gpui::SvgRenderer {
 /// paint size. SVGs rasterize in full color at the same size rasters
 /// decode at, so callers paint one shape of icon either way.
 fn decode_icon_sized(path: &Path, size: u32) -> Option<IconImage> {
-    if path.extension().and_then(|ext| ext.to_str()) == Some("svg") {
-        let bytes = std::fs::read(path).ok()?;
+    if path.extension().and_then(|ext| ext.to_str()) == Some("svg") {        let bytes = std::fs::read(path).ok()?;
         let parsed = svg_renderer().parse_svg(&bytes).ok()?;
         let image = svg_renderer()
             .render_parsed(
@@ -83,29 +80,6 @@ fn decode_icon_sized(path: &Path, size: u32) -> Option<IconImage> {
         return Some(IconImage::Raster(image));
     }
     decode_thumbnail(path, size, size).map(Arc::new).map(IconImage::Raster)
-}
-
-/// SNI `IconPixmap`: ARGB32 in network byte order, width, height, straight
-/// to the BGRA `RenderImage` gpui wants.
-pub fn argb_to_render_image(
-    width: i32,
-    height: i32,
-    mut data: Vec<u8>,
-) -> Option<gpui::RenderImage> {
-    let width = usize::try_from(width).ok()?;
-    let height = usize::try_from(height).ok()?;
-    if data.len() != width * height * 4 {
-        return None;
-    }
-    // wire order is A,R,G,B per pixel; gpui wants B,G,R,A
-    for pixel in data.chunks_exact_mut(4) {
-        pixel.swap(0, 3);
-        pixel.swap(1, 2);
-    }
-    let bgra = image::RgbaImage::from_raw(width as u32, height as u32, data)?;
-    Some(gpui::RenderImage::new(SmallVec::from_buf([
-        image::Frame::new(bgra),
-    ])))
 }
 
 pub fn decode_rgba(bytes: &[u8]) -> Option<gpui::RenderImage> {
