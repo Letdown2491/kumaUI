@@ -1,6 +1,6 @@
 [package]
 name = "kuma-platform"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Shared wiring for the kuma apps: the setup every app would otherwise copy-paste (version reporting, the shell's palette handshake, the HSL color space, the decode-to-RenderImage family, the niri IPC envelope)"
 license = "MIT"
