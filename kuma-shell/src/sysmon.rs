@@ -234,13 +234,9 @@ fn read_recording() -> Option<RecordingState> {
     })
 }
 
-#[derive(Clone, Default)]
-struct CpuSample {
-    idle: u64,
-    total: u64,
-    /// One (idle, total) pair per core, from the cpuN lines.
-    cores: Vec<(u64, u64)>,
-}
+// the /proc/stat sample: the platform's, whole (the sampler and the
+// percent math live in kuma_platform::sysfs)
+use kuma_platform::sysfs::CpuSample;
 
 /// One poll's CPU reading: the total usage fraction and per-core
 /// fractions (same length every poll, the poll loop guarantees that).
@@ -2646,16 +2642,10 @@ fn read_ram() -> Option<Ram> {
 }
 
 fn parse_meminfo(text: &str) -> Option<Ram> {
-    let field = |name: &str| -> Option<u64> {
-        text.lines().find_map(|line| {
-            let value = line.strip_prefix(name)?;
-            let value = value.trim().trim_end_matches(" kB").trim();
-            value.parse::<u64>().ok()
-        })
-    };
+    use kuma_platform::sysfs::meminfo_kb;
     // meminfo reports kB; MiB keeps the numbers in widget range
-    let total_mib = field("MemTotal:")? / 1024;
-    let available_mib = field("MemAvailable:")? / 1024;
+    let total_mib = meminfo_kb(text, "MemTotal")? / 1024;
+    let available_mib = meminfo_kb(text, "MemAvailable")? / 1024;
     if total_mib == 0 {
         return None;
     }
@@ -2689,7 +2679,7 @@ fn read_cpu_temp() -> Option<u32> {
     let mut resolved = CPU_SENSOR.lock().ok()?;
     match &*resolved {
         Some(CpuSensor::Found(path)) => {
-            if let Some(temp) = read_milli_degrees(path) {
+            if let Some(temp) = kuma_platform::sysfs::read_temp_input(path) {
                 return Some(temp);
             }
             // the sensor stopped answering (a hwmon module reloaded):
@@ -2703,75 +2693,15 @@ fn read_cpu_temp() -> Option<u32> {
         }
         None => {}
     }
-    let Some(path) = probe_cpu_sensor() else {
+    let Some(path) = kuma_platform::sysfs::probe_cpu_sensor() else {
         *resolved = Some(CpuSensor::Absent(Instant::now()));
         return None;
     };
-    let temp = read_milli_degrees(&path);
+    let temp = kuma_platform::sysfs::read_temp_input(&path);
     *resolved = Some(CpuSensor::Found(path));
     temp
 }
 
-/// The walk: hwmon chips named for CPUs (priority 1) and the
-/// thermal_zone fallback (x86_pkg_temp, soc thermal). The hottest
-/// sensor among the top priority wins.
-fn probe_cpu_sensor() -> Option<PathBuf> {
-    const CPU_CHIPS: [&str; 3] = ["coretemp", "k10temp", "zenpower"];
-    let mut candidates: Vec<(u8, u32, PathBuf)> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("/sys/class/hwmon") {
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            let Ok(name) = std::fs::read_to_string(dir.join("name")) else {
-                continue;
-            };
-            let priority = u8::from(CPU_CHIPS.contains(&name.trim()));
-            let Ok(zones) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for zone in zones.flatten() {
-                let file = zone.file_name().to_string_lossy().to_string();
-                if file.starts_with("temp") && file.ends_with("_input") {
-                    if let Some(temp) = read_milli_degrees(&zone.path()) {
-                        candidates.push((priority, temp, zone.path()));
-                    }
-                }
-            }
-        }
-    }
-    // the thermal_zone fallback: machines whose CPU sensor only shows
-    // there (x86_pkg_temp, soc thermal)
-    if let Ok(entries) = std::fs::read_dir("/sys/class/thermal") {
-        for entry in entries.flatten() {
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            let Some(rest) = file_name.strip_prefix("thermal_zone") else {
-                continue;
-            };
-            if !rest.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
-            let Ok(ty) = std::fs::read_to_string(entry.path().join("type")) else {
-                continue;
-            };
-            if !ty.trim().contains("cpu") {
-                continue;
-            }
-            if let Some(temp) = read_milli_degrees(&entry.path()) {
-                candidates.push((1, temp, entry.path()));
-            }
-        }
-    }
-    // a named CPU chip outranks a thermal zone; the hottest zone wins
-    // within a chip
-    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-    candidates.into_iter().next().map(|(_, _, path)| path)
-}
-
-/// One hwmon/thermal reading: milli-degrees in, degrees out. A
-/// missing or unparsable file is no reading at all.
-fn read_milli_degrees(path: &std::path::Path) -> Option<u32> {
-    let text = std::fs::read_to_string(path).ok()?;
-    text.trim().parse::<u32>().ok().map(|milli| milli / 1000)
-}
 
 /// A mount's disk usage from statvfs: the percent is the df number,
 /// used over (used plus the user's available), so the reserved-root
@@ -2785,10 +2715,14 @@ fn read_milli_degrees(path: &std::path::Path) -> Option<u32> {
 fn read_disk(mount: &std::path::Path) -> Option<Disk> {
     let real = |path: &std::path::Path| -> Option<Disk> {
         match mount_fstype(path) {
-            Some(fstype) if !is_virtual_fs(&fstype) => statvfs_disk(path).map(|disk| Disk {
-                mount: path.display().to_string(),
-                ..disk
-            }),
+            Some(fstype) if !is_virtual_fs(&fstype) => {
+                kuma_platform::sysfs::statvfs_disk(path).map(|usage| Disk {
+                    mount: path.display().to_string(),
+                    percent: usage.percent,
+                    used_mib: usage.used_mib,
+                    total_mib: usage.total_mib,
+                })
+            }
             _ => None,
         }
     };
@@ -2854,39 +2788,6 @@ fn unescape_mount_path(point: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn statvfs_disk(mount: &std::path::Path) -> Option<Disk> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(mount.as_os_str().as_bytes()).ok()?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
-    if rc != 0 {
-        return None;
-    }
-    parse_statvfs(
-        u64::try_from(stat.f_frsize).ok()?,
-        stat.f_blocks,
-        stat.f_bfree,
-        stat.f_bavail,
-    )
-}
-
-fn parse_statvfs(frsize: u64, blocks: u64, bfree: u64, bavail: u64) -> Option<Disk> {
-    let total_mib = blocks * frsize / (1024 * 1024);
-    let used_mib = (blocks - bfree) * frsize / (1024 * 1024);
-    let user_avail_mib = bavail * frsize / (1024 * 1024);
-    let denominator = used_mib + user_avail_mib;
-    if denominator == 0 {
-        return None;
-    }
-    Some(Disk {
-        percent: ((used_mib * 100) / denominator) as u8,
-        used_mib,
-        total_mib,
-        // the caller names the mount it actually read
-        mount: String::new(),
-    })
-}
-
 // `stat` is the contents of /proc/<pid>/stat: starttime is field 22
 // (1-indexed); fields after the comm parenthesis start at field 3, so it's
 // index 19 of the post-paren fields. Clock ticks are 100/sec.
@@ -2898,106 +2799,39 @@ fn parse_recording_stat(stat: &str, uptime_secs: f64) -> Option<u64> {
 }
 
 fn sample_cpu_usage(previous: &mut Option<CpuSample>) -> Option<CpuUsage> {
+    use kuma_platform::sysfs::cpu_sample;
     let text = std::fs::read_to_string("/proc/stat").ok()?;
-    let sample = parse_cpu_stat(&text)?;
+    let sample = cpu_sample(&text)?;
     let usage = previous
         .take()
-        .and_then(|previous| cpu_usage(previous, sample.clone()));
+        .and_then(|previous| cpu_usage(&previous, &sample));
     *previous = Some(sample);
     usage
 }
 
-fn parse_cpu_stat(text: &str) -> Option<CpuSample> {
-    let mut lines = text.lines();
-    let aggregate = lines.next()?;
-    let fields: Vec<u64> = aggregate
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|field| field.parse().ok())
-        .collect();
-    if fields.len() < 5 {
-        return None;
-    }
-    // the cpuN lines after the aggregate: one (idle, total) per core
-    let cores = lines
-        .filter(|line| line.starts_with("cpu") && line.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
-        .filter_map(|line| {
-            let fields: Vec<u64> = line
-                .split_whitespace()
-                .skip(1)
-                .filter_map(|field| field.parse().ok())
-                .collect();
-            if fields.len() < 5 {
-                return None;
-            }
-            Some((fields[3] + fields[4], fields.iter().sum()))
-        })
-        .collect();
-    Some(CpuSample {
-        idle: fields[3] + fields[4],
-        total: fields.iter().sum(),
-        cores,
-    })
-}
-
-fn cpu_usage(previous: CpuSample, sample: CpuSample) -> Option<CpuUsage> {
-    let total = cpu_delta(previous.clone(), sample.clone())?;
-    let cores = previous
-        .cores
+/// The platform sampler speaks percent (htop's math); the shell's
+/// readings are fractions of one, the widget's convention.
+fn cpu_usage(previous: &CpuSample, sample: &CpuSample) -> Option<CpuUsage> {
+    use kuma_platform::sysfs::{core_percents, usage_percent};
+    let total = usage_percent((previous.idle, previous.total), (sample.idle, sample.total))? / 100.0;
+    let cores = core_percents(&previous.cores, &sample.cores)
         .iter()
-        .zip(sample.cores.iter())
-        .filter_map(|(previous, sample)| {
-            let (p_idle, p_total) = *previous;
-            let (s_idle, s_total) = *sample;
-            let delta = s_total.saturating_sub(p_total);
-            if delta == 0 {
-                None
-            } else {
-                Some((1.0 - s_idle.saturating_sub(p_idle) as f32 / delta as f32).max(0.0))
-            }
-        })
+        .map(|percent| percent / 100.0)
         .collect();
     Some(CpuUsage { total, cores })
 }
 
-fn cpu_delta(previous: CpuSample, sample: CpuSample) -> Option<f32> {
-    let total = sample.total.saturating_sub(previous.total);
-    let idle = sample.idle.saturating_sub(previous.idle);
-    if total == 0 {
-        None
-    } else {
-        Some((1.0 - idle as f32 / total as f32).max(0.0))
-    }
-}
-
 /// /proc/loadavg: the three averages and the running/total process
-/// counts bundled in the fourth field.
+/// counts bundled in the fourth field. The parsing is the platform's.
 fn read_loadavg() -> Option<([f32; 3], u32)> {
     let text = std::fs::read_to_string("/proc/loadavg").ok()?;
-    parse_loadavg(&text)
-}
-
-fn parse_loadavg(text: &str) -> Option<([f32; 3], u32)> {
-    let fields: Vec<&str> = text.split_whitespace().collect();
-    let loads = [
-        fields.first()?.parse().ok()?,
-        fields.get(1)?.parse().ok()?,
-        fields.get(2)?.parse().ok()?,
-    ];
-    // "x/y entities": y is the total process count
-    let counts = fields.get(3)?;
-    let procs = counts.split('/').nth(1)?.parse().ok()?;
-    Some((loads, procs))
+    kuma_platform::sysfs::loadavg(&text)
 }
 
 /// Seconds since boot, from /proc/uptime.
 fn read_uptime() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/uptime").ok()?;
-    text.split_whitespace()
-        .next()?
-        .parse::<f64>()
-        .ok()
-        .map(|secs| secs as u64)
+    kuma_platform::sysfs::uptime_secs(&text).map(|secs| secs as u64)
 }
 
 #[cfg(test)]
@@ -3193,36 +3027,14 @@ mod tests {
     }
 
     #[test]
-    fn cpu_delta_computes_usage_fraction() {
-        let previous = CpuSample {
-            idle: 1000,
-            total: 2000,
-            cores: vec![],
-        };
-        let busy = CpuSample {
-            idle: 1000,
-            total: 3000,
-            cores: vec![],
-        };
-        let idle = CpuSample {
-            idle: 1500,
-            total: 3000,
-            cores: vec![],
-        };
-        assert_eq!(cpu_delta(previous.clone(), busy), Some(1.0));
-        assert_eq!(cpu_delta(previous.clone(), idle), Some(0.5));
-        assert_eq!(cpu_delta(previous.clone(), previous), None);
-    }
-
-    #[test]
     fn cpu_stat_line_parses() {
-        let sample = parse_cpu_stat("cpu  99106 646 27178 5737528 25604 0 9318 0 0 0\n").unwrap();
+        let sample = kuma_platform::sysfs::cpu_sample("cpu  99106 646 27178 5737528 25604 0 9318 0 0 0\n").unwrap();
         assert_eq!(sample.idle, 5737528 + 25604);
         assert_eq!(
             sample.total,
             99106 + 646 + 27178 + 5737528 + 25604 + 0 + 9318 + 0 + 0 + 0
         );
-        assert!(parse_cpu_stat("garbage").is_none());
+        assert!(kuma_platform::sysfs::cpu_sample("garbage").is_none());
     }
 
     #[test]
@@ -3274,7 +3086,7 @@ mod tests {
                     cpu0 500 0 500 9000 0 0 0 0 0 0\n\
                     cpu1 250 0 250 9500 0 0 0 0 0 0\n\
                     intr 123\n";
-        let sample = parse_cpu_stat(text).unwrap();
+        let sample = kuma_platform::sysfs::cpu_sample(text).unwrap();
         assert_eq!(sample.cores.len(), 2);
         assert_eq!(sample.cores[0], (9000, 10000));
         assert_eq!(sample.cores[1], (9500, 10000));
@@ -3282,26 +3094,18 @@ mod tests {
 
     #[test]
     fn cpu_usage_reads_per_core() {
-        let previous = parse_cpu_stat(
+        let previous = kuma_platform::sysfs::cpu_sample(
             "cpu  1000 0 1000 8000 0 0 0 0 0 0\ncpu0 500 0 500 9000 0 0 0 0 0 0\n",
         )
         .unwrap();
-        let sample = parse_cpu_stat(
+        let sample = kuma_platform::sysfs::cpu_sample(
             "cpu  1500 0 1000 8500 0 0 0 0 0 0\ncpu0 750 0 500 9250 0 0 0 0 0 0\n",
         )
         .unwrap();
-        let usage = cpu_usage(previous, sample).unwrap();
+        let usage = cpu_usage(&previous, &sample).unwrap();
         assert_eq!(usage.total, 0.5);
         // core0: half its delta is idle
         assert_eq!(usage.cores, vec![0.5]);
-    }
-
-    #[test]
-    fn loadavg_parses_loads_and_processes() {
-        let (loads, procs) = parse_loadavg("0.42 0.39 0.31 2/2471 12345\n").unwrap();
-        assert_eq!(loads, [0.42, 0.39, 0.31]);
-        assert_eq!(procs, 2471);
-        assert!(parse_loadavg("0.42 0.39\n").is_none());
     }
 
     #[test]
@@ -3317,19 +3121,6 @@ mod tests {
         assert!(parse_meminfo("MemTotal:          0 kB\nMemAvailable:      0 kB\n").is_none());
         // missing fields are None, not a panic
         assert!(parse_meminfo("MemTotal:       16384000 kB\n").is_none());
-    }
-
-    #[test]
-    fn statvfs_numbers_read_as_disk() {
-        // 10 GiB of blocks, 5 GiB free, but the user may only take 4
-        // (bavail): the percent is the df number, used over what the
-        // user could still fill
-        let disk = parse_statvfs(4096, 2_621_440, 1_310_720, 1_048_576).unwrap();
-        assert_eq!(disk.total_mib, 10240);
-        assert_eq!(disk.used_mib, 5120);
-        assert_eq!(disk.percent, 55);
-        // a zero-block filesystem is no disk at all
-        assert!(parse_statvfs(4096, 0, 0, 0).is_none());
     }
 
     #[test]

@@ -93,7 +93,7 @@ impl Stats {
             net_devs: Vec::new(),
             io_devs: Vec::new(),
             cores: Vec::new(),
-            temp_chip: discover_temp_chip(),
+            temp_chip: kuma_platform::sysfs::cpu_sensor_chip(),
             last: Instant::now(),
         }
     }
@@ -104,12 +104,13 @@ impl Stats {
         self.last = now;
 
         let load = std::fs::read_to_string("/proc/loadavg")
-            .as_deref()
-            .map(parse_loadavg)
+            .ok()
+            .and_then(|text| kuma_platform::sysfs::loadavg(&text))
+            .map(|(loads, _)| loads)
             .unwrap_or([0.; 3]);
         let uptime_secs = std::fs::read_to_string("/proc/uptime")
-            .as_deref()
-            .map(parse_uptime)
+            .ok()
+            .and_then(|text| kuma_platform::sysfs::uptime_secs(&text))
             .unwrap_or(0.);
         let psi = [
             read_pressure("/proc/pressure/cpu"),
@@ -189,53 +190,15 @@ impl Stats {
     /// Per-core usage against the previous beat: (busy time, total
     /// time) deltas per core, htop's math from /proc/stat.
     fn core_beat(&mut self, text: &str) -> Vec<f32> {
-        let cores: Vec<(u64, u64)> = text
-            .lines()
-            .filter(|line| line.starts_with("cpu") && !line.starts_with("cpu "))
-            .map(|line| {
-                let fields: Vec<u64> = line
-                    .split_whitespace()
-                    .skip(1)
-                    .filter_map(|f| f.parse().ok())
-                    .collect();
-                let total: u64 = fields.iter().sum();
-                let idle = fields.get(3).unwrap_or(&0) + fields.get(4).unwrap_or(&0);
-                (idle, total)
-            })
-            .collect();
-        let usage = cores
-            .iter()
-            .zip(self.cores.iter())
-            .map(|(&(idle, total), &(prev_idle, prev_total))| {
-                let d_total = total.saturating_sub(prev_total) as f32;
-                let d_idle = idle.saturating_sub(prev_idle) as f32;
-                if d_total > 0. {
-                    ((d_total - d_idle) / d_total * 100.).clamp(0., 100.)
-                } else {
-                    0.
-                }
-            })
-            .collect();
+        // the parse and the percent math are the platform's; the
+        // sampler state is the previous beat's core pairs
+        let cores = kuma_platform::sysfs::cpu_sample(text)
+            .map(|sample| sample.cores)
+            .unwrap_or_default();
+        let usage = kuma_platform::sysfs::core_percents(&self.cores, &cores);
         self.cores = cores;
         usage
     }
-}
-
-/// "0.52 0.58 0.59 2/1234 5678"
-fn parse_loadavg(text: &str) -> [f32; 3] {
-    let mut load = [0.; 3];
-    for (slot, field) in load.iter_mut().zip(text.split_whitespace()) {
-        *slot = field.parse().unwrap_or(0.);
-    }
-    load
-}
-
-/// "12345.67 23456.78"
-fn parse_uptime(text: &str) -> f64 {
-    text.split_whitespace()
-        .next()
-        .and_then(|f| f.parse().ok())
-        .unwrap_or(0.)
 }
 
 /// "some avg10=0.34 avg60=1.20 avg300=2.00 total=6000": the "some"
@@ -266,49 +229,10 @@ fn read_pressure(path: &str) -> Option<f32> {
     parse_pressure(&std::fs::read_to_string(path).ok()?)
 }
 
-/// The cpu's sensor chip under /sys/class/hwmon: k10temp or zenpower
-/// (AMD), coretemp (Intel), cpu_thermal (ARM boards). The names are
-/// the kernel's stable drivers; anything else is not the package
-/// sensor and would read a nvme drive or a motherboard chipset.
-fn discover_temp_chip() -> Option<PathBuf> {
-    for entry in std::fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
-        // one flaky entry (a driver unbinding mid-enumeration, a
-        // device returning EIO) skips itself: this runs once at
-        // startup and the answer is kept for the process lifetime, so
-        // letting one bad read abort would mean no sensor all session
-        let Ok(name) = std::fs::read_to_string(entry.path().join("name")) else {
-            continue;
-        };
-        if matches!(
-            name.trim(),
-            "k10temp" | "zenpower" | "coretemp" | "cpu_thermal"
-        ) {
-            return Some(entry.path());
-        }
-    }
-    None
-}
-
-/// The hottest input of the chip, in degrees celsius. coretemp
-/// exposes one input per core plus a package: the max is the one
-/// that throttles.
+/// The chip's hottest input, in degrees celsius: the platform's
+/// read (the union of the family's walks), f32 the Vitals' shape.
 fn read_temp(chip: &std::path::Path) -> Option<f32> {
-    let mut hottest = None;
-    for entry in std::fs::read_dir(chip).ok()?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("temp") || !name.ends_with("_input") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(milli) = text.trim().parse::<f32>() else {
-            continue;
-        };
-        hottest = Some(hottest.map_or(milli, |best: f32| best.max(milli)));
-    }
-    hottest.map(|milli| milli / 1000.)
+    kuma_platform::sysfs::hottest_input(chip)
 }
 
 /// Per-interface rx/tx byte counters, lo excluded, name-sorted.
@@ -374,20 +298,9 @@ fn sum_devs(devs: &[(String, u64, u64)]) -> (u64, u64) {
 /// their overlaps, so the six close to the total (other takes the
 /// residue). Counters new this kernel read as zero.
 fn parse_meminfo(text: &str) -> MemInfo {
-    let kb = |wanted: &str| {
-        // the first line that starts with the counter: the kernel's
-        // fixed order keeps "Slab:" ahead of "SlabUnreclaimable"
-        text.lines()
-            .find_map(|line| line.strip_prefix(wanted))
-            .and_then(|rest| {
-                rest.trim_start_matches(':')
-                    .split_whitespace()
-                    .next()
-                    .and_then(|v| v.parse::<u64>().ok())
-            })
-            .unwrap_or(0)
-            * 1024
-    };
+    // the platform's counter lookup (None is a counter this kernel
+    // does not carry); kB grown to bytes
+    let kb = |wanted: &str| kuma_platform::sysfs::meminfo_kb(text, wanted).unwrap_or(0) * 1024;
     let total = kb("MemTotal");
     let free = kb("MemFree");
     let available = kb("MemAvailable");
@@ -475,10 +388,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_load_uptime_and_pressure() {
-        assert_eq!(parse_loadavg("0.52 0.58 0.59 2/1234 5678"), [0.52, 0.58, 0.59]);
-        assert_eq!(parse_loadavg("junk"), [0., 0., 0.]);
-        assert_eq!(parse_uptime("12345.67 23456.78"), 12345.67);
+    fn parses_pressure_and_scheduler_counts() {
+        // loadavg and uptime parse in the platform now; what stays
+        // local is the pressure line and /proc/stat's scheduler counts
         let psi = "some avg10=0.34 avg60=1.20 avg300=2.00 total=6000\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0";
         assert_eq!(parse_pressure(psi), Some(0.34));
         assert_eq!(parse_pressure("full avg10=1.00"), None);

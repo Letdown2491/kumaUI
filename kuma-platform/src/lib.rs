@@ -20,6 +20,8 @@
 //!   spec's ignore-relative rule in one place
 //! - `format`: presentation formatting every surface renders the
 //!   same way (byte sizes)
+//! - `sysfs`: the kernel-state samplers (/proc, /sys, statvfs) the
+//!   monitoring surfaces share
 
 pub mod activation;
 pub mod color;
@@ -30,6 +32,7 @@ pub mod logging;
 pub mod niri;
 pub mod palette;
 pub mod process;
+pub mod sysfs;
 pub mod titlebar;
 pub mod version;
 pub mod xdg;
