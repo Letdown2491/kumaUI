@@ -1,3 +1,4 @@
+pub(crate) use kuma_platform::format::human_bytes as human_size;
 use std::collections::{HashSet, VecDeque};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -13507,20 +13508,6 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-pub(crate) fn human_size(size: u64) -> String {
-    const KIB: f64 = 1024.0;
-    let bytes = size as f64;
-    if bytes < KIB {
-        format!("{size} B")
-    } else if bytes < KIB * KIB {
-        format!("{:.1} KiB", bytes / KIB)
-    } else if bytes < KIB * KIB * KIB {
-        format!("{:.1} MiB", bytes / (KIB * KIB))
-    } else {
-        format!("{:.1} GiB", bytes / (KIB * KIB * KIB))
-    }
 }
 
 struct Ghost {

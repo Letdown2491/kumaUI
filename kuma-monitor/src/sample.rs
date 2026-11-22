@@ -3,6 +3,7 @@
 //! into one row, and the sorts. The join and the grouping are pure so
 //! the tests can pin them without a live system.
 
+pub(crate) use kuma_platform::format::human_bytes as human_mem;
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 
@@ -431,20 +432,6 @@ pub(crate) fn match_group(group: &AppGroup, q: &str) -> Option<GroupHit> {
     (!hits.is_empty()).then_some(GroupHit::Members(hits))
 }
 
-/// Bytes at the table's width: one decimal, the unit carrying the
-/// magnitude (KiB, MiB, GiB), TiB the honest cap.
-pub(crate) fn human_mem(bytes: u64) -> String {
-    const KIB: f64 = 1024.;
-    let mut value = bytes as f64 / KIB;
-    for unit in ["KiB", "MiB", "GiB"] {
-        if value < KIB {
-            return format!("{value:.1} {unit}");
-        }
-        value /= KIB;
-    }
-    format!("{value:.1} TiB")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,7 +672,7 @@ mod tests {
 
     #[test]
     fn human_mem_names_the_unit() {
-        assert_eq!(human_mem(0), "0.0 KiB");
+        assert_eq!(human_mem(0), "0 B");
         assert_eq!(human_mem(1024 * 1024 * 5), "5.0 MiB");
         assert_eq!(human_mem(1024 * 1024 * 1024 * 31), "31.0 GiB");
     }

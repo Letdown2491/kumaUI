@@ -132,7 +132,7 @@ impl SysPanelView {
                 cell
             }
         };
-        let gib = |mib: u64| format!("{:.1} GiB", mib as f32 / 1024.);
+        let gib = |mib: u64| kuma_platform::format::human_bytes(mib * 1024 * 1024);
         let row = |left, right| {
             div().flex().justify_between().child(left).child(right)
         };

@@ -18,10 +18,13 @@
 //!   geometry shared, colors and glyphs per app
 //! - `xdg`: the base-directory fallback chain (config, state), the
 //!   spec's ignore-relative rule in one place
+//! - `format`: presentation formatting every surface renders the
+//!   same way (byte sizes)
 
 pub mod activation;
 pub mod color;
 pub mod files;
+pub mod format;
 pub mod imaging;
 pub mod logging;
 pub mod niri;

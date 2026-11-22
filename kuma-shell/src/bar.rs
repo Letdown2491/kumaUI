@@ -709,9 +709,9 @@ impl ShellBar {
                     crate::theme::current().text,
                     move |sysmon: &SysMon, _| match sysmon.ram {
                         Some(ram) => format!(
-                            "Memory: {:.1} GiB of {:.1} GiB",
-                            ram.used_mib as f32 / 1024.,
-                            ram.total_mib as f32 / 1024.
+                            "Memory: {} of {}",
+                            kuma_platform::format::human_bytes(ram.used_mib * 1024 * 1024),
+                            kuma_platform::format::human_bytes(ram.total_mib * 1024 * 1024),
                         )
                         .into(),
                         None => "Memory unknown".into(),
@@ -776,10 +776,10 @@ impl ShellBar {
                     if percent >= 90 { crate::theme::URGENT } else { crate::theme::current().text },
                     move |sysmon: &SysMon, _| match sysmon.disk.clone() {
                         Some(disk) => format!(
-                            "{}: {:.0} GiB of {:.0} GiB used",
+                            "{}: {} of {} used",
                             disk.mount,
-                            disk.used_mib as f32 / 1024.,
-                            disk.total_mib as f32 / 1024.
+                            kuma_platform::format::human_bytes(disk.used_mib * 1024 * 1024),
+                            kuma_platform::format::human_bytes(disk.total_mib * 1024 * 1024),
                         )
                         .into(),
                         None => "Disk unknown".into(),
