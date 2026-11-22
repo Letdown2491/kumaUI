@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use gpui::{Rgba, rgb, rgba};
-use kuma_platform::{color, palette::Palette};
+use kuma_platform::palette::Palette;
 
 // Every color is a static so the palette can swap live: the shell's
 // palette file applies through `apply_palette` and the next render
@@ -104,14 +104,12 @@ pub(crate) fn apply_palette(palette: &Palette) {
 
 /// Put the selection color in the accent's hue. The coefficients are
 /// the relationship today's blues have to today's accent, so the
-/// default look survives the refactor untouched.
+/// default look survives the refactor untouched; the HSL derivation
+/// itself is the platform's (one home, no drift).
 pub(crate) fn set_accent(hex: u32) {
     ACCENT.store(hex, Ordering::Relaxed);
-    ROW_SELECTED.store(derive(&hex, 0.68, 0.276), Ordering::Relaxed);
-}
-
-/// A low-saturation tone in the accent's hue at lightness `l`.
-fn derive(accent: &u32, sat_scale: f32, l: f32) -> u32 {
-    let (h, s, _) = color::rgb_to_hsl(*accent);
-    color::hsl_to_rgb(h, (s * sat_scale).clamp(0.0, 0.95), l)
+    ROW_SELECTED.store(
+        kuma_platform::palette::derive_accent(hex, 0.68, 0.276),
+        Ordering::Relaxed,
+    );
 }

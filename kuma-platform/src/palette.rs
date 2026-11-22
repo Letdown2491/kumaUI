@@ -113,6 +113,15 @@ pub fn parse_hex_color(value: &str) -> Option<u32> {
     u32::from_str_radix(text, 16).ok()
 }
 
+/// A low-saturation tone in the accent's hue at lightness `l`: the
+/// derivation every app's selection tints ride. The HSL round trip
+/// lives here so the math cannot drift between apps; the coefficients
+/// stay at each app's slots (its design choices).
+pub fn derive_accent(accent: u32, sat_scale: f32, l: f32) -> u32 {
+    let (h, s, _) = crate::color::rgb_to_hsl(accent);
+    crate::color::hsl_to_rgb(h, (s * sat_scale).clamp(0.0, 0.95), l)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

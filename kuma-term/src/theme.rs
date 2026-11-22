@@ -282,48 +282,30 @@ fn apply_config(theme: &mut Theme, path: &Path, depth: u8) {
     }
 }
 
+/// One color out of the config file: the platform's parser (which
+/// speaks "#rrggbb", bare hex, and the 8-digit alpha form) converted
+/// to the grid's Rgb8, alpha folded away.
 fn hex_color(value: &str) -> Option<Rgb8> {
-    let v = value.trim();
-    let v = v.strip_prefix('#')?;
-    if v.len() != 6 || !v.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let r = u8::from_str_radix(&v[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&v[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&v[4..6], 16).ok()?;
-    Some(Rgb8(r, g, b))
+    let n = kuma_platform::palette::parse_hex_color(value)?;
+    Some(rgb8(if n > 0xFFFFFF { n >> 8 } else { n }))
+}
+
+fn rgb8(n: u32) -> Rgb8 {
+    Rgb8((n >> 16) as u8, (n >> 8) as u8, n as u8)
 }
 
 /// Swap the chrome for the wallpaper palette kuma-shell publishes
-/// (key=value, RRGGBB or RRGGBBAA). Same mapping kuma-files uses: the
-/// window backing is the shell's darkest inset, text follows the shell's
-/// text, and the cursor takes the accent. The ANSI 16 are untouched.
+/// (key=value). The parse is the platform's, whole (including the
+/// RRGGBBAA alpha fold); only the slot mapping is the terminal's:
+/// the window backing is the shell's darkest inset, text follows the
+/// shell's text, and the cursor takes the accent. The ANSI 16 are
+/// untouched.
 pub fn apply_shell_palette(theme: &mut Theme, text: &str) {
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let Some(hex) = palette_hex(value) else {
-            continue;
-        };
-        match key.trim() {
-            "inset" => theme.background = hex,
-            "text" => theme.foreground = hex,
-            "accent" => theme.cursor = hex,
-            "accent_text" => theme.cursor_text = hex,
-            _ => {}
-        }
-    }
-}
-
-/// The shell's panel colors arrive as RRGGBBAA (alpha in the low byte);
-/// the terminal's chrome is opaque, so keep the top 24 bits. Pure RGB
-/// values pass through untouched.
-fn palette_hex(value: &str) -> Option<Rgb8> {
-    let v = value.trim();
-    let n = u32::from_str_radix(v, 16).ok()?;
-    let n = if n > 0xFFFFFF { n >> 8 } else { n };
-    Some(Rgb8((n >> 16) as u8, (n >> 8) as u8, n as u8))
+    let palette = kuma_platform::palette::parse(text);
+    theme.background = rgb8(palette.inset);
+    theme.foreground = rgb8(palette.text);
+    theme.cursor = rgb8(palette.accent);
+    theme.cursor_text = rgb8(palette.accent_text);
 }
 
 #[cfg(test)]
