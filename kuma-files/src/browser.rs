@@ -1919,7 +1919,7 @@ pub(crate) struct Browser {
     accent: Option<u32>,
     /// Last seen mtime of the shell's palette file, so wallpaper
     /// changes are noticed on the regular refresh tick.
-    palette_mtime: Option<std::time::SystemTime>,
+    palette_beat: kuma_platform::palette::Beat,
     /// Last seen mtime of the active directory when it sits on a
     /// gvfs-FUSE mount: the remote side sends no inotify events
     /// through the bridge, so the idle tick polls this stat instead
@@ -2179,7 +2179,7 @@ impl Browser {
             inspector_bottom: true,
             inspector_lock: None,
             accent: None,
-            palette_mtime: None,
+            palette_beat: kuma_platform::palette::Beat::new(),
             gvfs_mtime: None,
             gvfs_probe_inflight: false,
             theme_refresh: Instant::now(),
@@ -2289,7 +2289,7 @@ impl Browser {
         browser.load_state(cli_dir.as_deref());
         let show_hidden = browser.show_hidden;
         browser.tab_mut().reload(show_hidden);
-        browser.palette_mtime = Browser::palette_mtime();
+        browser.palette_beat.changed();
         browser.apply_theme();
         browser.places = browser.ordered_places();
         browser.start_dir_watch(cx);
@@ -3012,10 +3012,6 @@ impl Browser {
     /// colors, published for any app that wants them. Absent means we
     /// are not running under kuma-shell (or adaptive is off) and the
     /// built-ins stand.
-    fn palette_mtime() -> Option<std::time::SystemTime> {
-        kuma_platform::palette::mtime()
-    }
-
     fn read_palette() -> Option<kuma_platform::palette::Palette> {
         kuma_platform::palette::read()
     }
@@ -3043,26 +3039,24 @@ impl Browser {
             return false;
         }
         self.theme_refresh = Instant::now();
-        let mtime = Self::palette_mtime();
-        if mtime != self.palette_mtime {
-            self.palette_mtime = mtime;
-            self.apply_theme();
-            log::info!(
-                "palette: {} (user accent {})",
-                if Self::read_palette().is_some() {
-                    "applied shell palette"
-                } else {
-                    "applied built-ins"
-                },
-                match self.accent {
-                    Some(hex) => format!("#{hex:06x}"),
-                    None => "unset".into(),
-                },
-            );
-            cx.notify();
-            return true;
+        if !self.palette_beat.changed() {
+            return false;
         }
-        false
+        self.apply_theme();
+        log::info!(
+            "palette: {} (user accent {})",
+            if Self::read_palette().is_some() {
+                "applied shell palette"
+            } else {
+                "applied built-ins"
+            },
+            match self.accent {
+                Some(hex) => format!("#{hex:06x}"),
+                None => "unset".into(),
+            },
+        );
+        cx.notify();
+        true
     }
 
     /// The accent picker's choice, written to the state file.

@@ -68,6 +68,31 @@ pub fn read() -> Option<Palette> {
     read_text().map(|text| parse(&text))
 }
 
+/// The handshake's client half: the mtime bookkeeping every follower
+/// writes (note it, spot the move). A poll is one stat; a poll that
+/// reports changed costs one file read, at the caller's cadence.
+#[derive(Default)]
+pub struct Beat {
+    last: Option<SystemTime>,
+}
+
+impl Beat {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the published file moved since the last look (the
+    /// first look counts as moved, so a follower applies at least
+    /// once). Records the new state either way: a vanished file
+    /// reports changed once, then quiets.
+    pub fn changed(&mut self) -> bool {
+        let mtime = mtime();
+        let changed = mtime != self.last;
+        self.last = mtime;
+        changed
+    }
+}
+
 /// Parse the palette file: key=value hex lines, unknown or broken
 /// lines ignored, missing keys keep the built-ins.
 pub fn parse(text: &str) -> Palette {

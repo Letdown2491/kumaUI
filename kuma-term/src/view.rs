@@ -391,14 +391,13 @@ impl TerminalView {
         // the wallpaper republishes the shell palette; swap the chrome
         // live so the terminal follows the session like kuma-files does
         let palette_tick = cx.spawn(async move |this, cx| {
-            let mut mtime = crate::theme::Theme::palette_mtime();
+            let mut beat = kuma_platform::palette::Beat::new();
+            beat.changed();
             loop {
                 cx.background_executor().timer(Duration::from_secs(2)).await;
-                let now = crate::theme::Theme::palette_mtime();
-                if now == mtime {
+                if !beat.changed() {
                     continue;
                 }
-                mtime = now;
                 if this
                     .update_in(cx, |this, _window, cx| this.apply_shell_palette(cx))
                     .is_err()

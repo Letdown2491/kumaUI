@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use gpui::{
     prelude::*, App, ClickEvent, ClipboardItem, Context, Div, FocusHandle, Focusable, IntoElement,
@@ -196,7 +196,7 @@ pub(crate) struct MonitorView {
     sort: SortKey,
     mem_used: u64,
     mem_total: u64,
-    palette_mtime: Option<SystemTime>,
+    palette_beat: kuma_platform::palette::Beat,
     scroll: UniformListScrollHandle,
     /// The table's filter: plain typing lands here, escape clears,
     /// an empty string is no filter at all.
@@ -308,7 +308,7 @@ impl MonitorView {
             sort: saved_sort.unwrap_or(SortKey::Cpu),
             mem_used: 0,
             mem_total: 0,
-            palette_mtime: None,
+            palette_beat: kuma_platform::palette::Beat::new(),
             scroll: UniformListScrollHandle::new(),
             filter: saved_filter.unwrap_or_default(),
             copied_flash: None,
@@ -374,11 +374,9 @@ impl MonitorView {
     /// moved (wallpaper changed, accent picked); a vanished file
     /// reverts to the built-ins once.
     fn sync_palette(&mut self) {
-        let mtime = kuma_platform::palette::mtime();
-        if mtime == self.palette_mtime {
+        if !self.palette_beat.changed() {
             return;
         }
-        self.palette_mtime = mtime;
         theme::apply_palette(&read_palette());
     }
 

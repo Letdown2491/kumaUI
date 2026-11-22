@@ -131,10 +131,6 @@ impl Theme {
         kuma_platform::palette::read_text()
     }
 
-    pub fn palette_mtime() -> Option<std::time::SystemTime> {
-        kuma_platform::palette::mtime()
-    }
-
     /// The fallback chain the grid's font carries: the config's list (or
     /// the builtin default), verbatim.
     pub fn font_fallbacks(&self) -> gpui::FontFallbacks {
