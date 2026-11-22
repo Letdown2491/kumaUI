@@ -23,18 +23,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
-    let mut file = std::fs::File::create(&tmp)?;
-    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(err)
-        }
+    // any failure cleans the temp: an ENOSPC mid-write must not
+    // leave the `.tmp` litter beside the record forever
+    let outcome = (|| -> io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    outcome
 }
 
 /// Percent-decode a URI's path or component: `%XX` hex escapes grow

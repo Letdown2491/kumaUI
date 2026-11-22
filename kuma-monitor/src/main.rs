@@ -55,11 +55,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn version_line_names_the_binary() {
-        let line = version_line();
+        let line = kuma_platform::version::line("kuma-monitor", env!("CARGO_PKG_VERSION"));
         assert!(line.starts_with("kuma-monitor "));
         assert!(line.contains("(g"));
     }

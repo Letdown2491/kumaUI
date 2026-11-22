@@ -66,7 +66,8 @@ fn svg_renderer() -> &'static gpui::SvgRenderer {
 /// paint size. SVGs rasterize in full color at the same size rasters
 /// decode at, so callers paint one shape of icon either way.
 fn decode_icon_sized(path: &Path, size: u32) -> Option<IconImage> {
-    if path.extension().and_then(|ext| ext.to_str()) == Some("svg") {        let bytes = std::fs::read(path).ok()?;
+    if path.extension().and_then(|ext| ext.to_str()) == Some("svg") {
+        let bytes = std::fs::read(path).ok()?;
         let parsed = svg_renderer().parse_svg(&bytes).ok()?;
         let image = svg_renderer()
             .render_parsed(

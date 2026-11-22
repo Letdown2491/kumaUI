@@ -157,8 +157,12 @@ pub fn probe_cpu_sensor() -> Option<PathBuf> {
             if !ty.trim().contains("cpu") {
                 continue;
             }
-            if let Some(temp) = read_temp_input(&entry.path()) {
-                candidates.push((temp, entry.path()));
+            // the zone's reading lives in its `temp` file (hwmon's
+            // tempN_input equivalent): the zone directory itself is a
+            // directory, and reading it never answers
+            let file = entry.path().join("temp");
+            if let Some(temp) = read_temp_input(&file) {
+                candidates.push((temp, file));
             }
         }
     }
@@ -261,10 +265,12 @@ pub fn statvfs_disk(mount: &Path) -> Option<DiskUsage> {
 }
 
 /// The statvfs math, separated for tests: block size and the three
-/// block counts into a DiskUsage.
+/// block counts into a DiskUsage. A filesystem that reports more free
+/// than total blocks (btrfs profiles do under some raids) is clamped
+/// to zero used, it does not wrap into an astronomic number.
 pub fn parse_statvfs(frsize: u64, blocks: u64, bfree: u64, bavail: u64) -> Option<DiskUsage> {
     let total_mib = blocks * frsize / (1024 * 1024);
-    let used_mib = (blocks - bfree) * frsize / (1024 * 1024);
+    let used_mib = blocks.saturating_sub(bfree) * frsize / (1024 * 1024);
     let user_avail_mib = bavail * frsize / (1024 * 1024);
     let denominator = used_mib + user_avail_mib;
     if denominator == 0 {
@@ -365,5 +371,10 @@ mod tests {
         assert_eq!(disk.percent, 55);
         // a zero-block filesystem is no disk at all
         assert!(parse_statvfs(4096, 0, 0, 0).is_none());
+        // a filesystem reporting more free than total (btrfs under
+        // some raids) clamps to zero used, it does not wrap
+        let disk = parse_statvfs(4096, 1_000, 2_000, 1_500).unwrap();
+        assert_eq!(disk.used_mib, 0);
+        assert_eq!(disk.percent, 0);
     }
 }
