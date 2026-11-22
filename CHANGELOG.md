@@ -20,7 +20,8 @@ kuma-monitor 0.4.2
 
 - kuma-shell's CPU temperature read finds an ARM cpu_thermal chip and the machines whose only cpu sensor sits in /sys/class/thermal, and a hot nvme drive can no longer pose as the CPU sensor on machines without a cpu-named chip.
 - Kamuy's per-core bars no longer shift when a core reports no elapsed jiffies between beats.
-- Koguma's open-with list no longer offers desktop entries gated to another desktop (OnlyShowIn/NotShowIn, glib's rule).
+- Koguma's open-with list no longer offers desktop entries gated to another desktop (OnlyShowIn/NotShowIn, glib's rule), and now sees the flatpak exports and XDG_DATA_HOME applications directories the old scanners missed, so apps installed there appear.
+- kuma-term's config color lines accept the bare and 0x-prefixed hex forms (kitty theme files carry them), not only the # form.
 
 ## v0.10.0 (2026-11-20)
 
