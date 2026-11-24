@@ -9,7 +9,9 @@
 //! window (CLI parsing, activation handoff, env the pty inherits), and
 //! the run closure's body.
 
-use gpui::{App, Render, WindowHandle, AppContext as _};
+use gpui::{App, Context, Render, WindowHandle, AppContext as _};
+
+use std::time::Duration;
 
 /// The shared preamble: logging on, then the `--version` first-arg
 /// check (prints the version line and reports false: the caller
@@ -76,4 +78,30 @@ pub fn main_window<T: Render + 'static>(
         }
     };
     Some(handle)
+}
+
+/// The debounce, flag-only: arm the flag now, and one `quiet` later
+/// run `run` iff the flag survived. Every fire clears the flag and
+/// every re-arm re-sets it, so a burst of calls coalesces into one
+/// run when the clock outruns the typing. The flag is the caller's
+/// field, the cadence the caller's too (a state save at 300ms, a
+/// status refresh at 500); this is only the arm-timer-take shape they
+/// shared. The generation-guarded scans (the two search loops) stay
+/// hand-rolled: their guard is a generation, not a flag, and their
+/// mid-flight steps differ.
+pub fn debounce<E: 'static>(
+    cx: &mut Context<E>,
+    quiet: Duration,
+    flag: impl FnOnce(&mut E) -> &mut bool + 'static,
+    run: impl FnOnce(&mut E) + 'static,
+) {
+    cx.spawn(async move |this, cx| {
+        cx.background_executor().timer(quiet).await;
+        let _ = this.update(cx, |this, _| {
+            if std::mem::take(flag(this)) {
+                run(this);
+            }
+        });
+    })
+    .detach();
 }

@@ -1,6 +1,5 @@
 pub(crate) use kuma_platform::format::human_bytes as human_size;
 use std::collections::{HashSet, VecDeque};
-use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -5403,16 +5402,12 @@ impl Browser {
     /// else. The immediate shape is [`Self::save_state_now`].
     fn save_state(&mut self, cx: &mut Context<Self>) {
         self.save_pending = true;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(300)).await;
-            let _ = this.update(cx, |this, _| {
-                if this.save_pending {
-                    this.save_pending = false;
-                    this.save_state_now();
-                }
-            });
-        })
-        .detach();
+        kuma_platform::app::debounce(
+            cx,
+            Duration::from_millis(300),
+            |this| &mut this.save_pending,
+            |this| this.save_state_now(),
+        );
     }
 
     fn save_state_now(&self) {
@@ -12072,16 +12067,9 @@ fn scan_desktop_apps() -> Vec<DesktopApp> {
     apps
 }
 
-/// Free bytes on the volume holding dir, via libc statvfs (already in
-/// the binary through gpui; no new build artifact).
+/// Free bytes on the volume holding dir, the platform's statvfs read.
 fn free_bytes(dir: &Path) -> Option<u64> {
-    let cpath = CString::new(dir.as_os_str().as_bytes()).ok()?;
-    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut vfs) };
-    if rc != 0 {
-        return None;
-    }
-    Some(vfs.f_bavail as u64 * vfs.f_frsize as u64)
+    kuma_platform::sysfs::statvfs_free_bytes(dir)
 }
 
 /// A file:// URI with minimal percent-encoding for odd characters.

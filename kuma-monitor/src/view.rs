@@ -526,18 +526,12 @@ impl MonitorView {
     /// flag, not a handle: extra wakeups see the queue empty.
     fn save_soon(&mut self, cx: &mut Context<Self>) {
         self.save_pending = true;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(500))
-                .await;
-            let _ = this.update(cx, |this, _| {
-                if this.save_pending {
-                    this.save_pending = false;
-                    this.save_state();
-                }
-            });
-        })
-        .detach();
+        kuma_platform::app::debounce(
+            cx,
+            std::time::Duration::from_millis(500),
+            |this| &mut this.save_pending,
+            |this| this.save_state(),
+        );
     }
 
     // ---------- the kill path ----------

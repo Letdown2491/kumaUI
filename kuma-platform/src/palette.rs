@@ -12,6 +12,10 @@ use std::{
     time::SystemTime,
 };
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use gpui::{Rgba, rgb, rgba};
+
 /// The published file's path, or None when XDG_RUNTIME_DIR is unset
 /// (no session, no shell: the built-ins stand).
 pub fn path() -> Option<PathBuf> {
@@ -64,6 +68,41 @@ impl Default for Palette {
             accent: 0x89b4fa,
             accent_text: 0x11111b,
         }
+    }
+}
+
+/// One color slot: a static-backed atomic, so a palette swap lands on
+/// the next render with no restart and no gpui global plumbing. Each
+/// app owns its own slot set (what a monitor needs is not what a file
+/// browser does); this newtype is only the machinery they shared:
+/// load as a color, store a hex, fade under an alpha byte.
+pub struct Slot(AtomicU32);
+
+impl Slot {
+    pub const fn new(hex: u32) -> Self {
+        Self(AtomicU32::new(hex))
+    }
+
+    /// The raw hex: what the derived colors (the accent's hue family)
+    /// start from.
+    pub fn hex(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, hex: u32) {
+        self.0.store(hex, Ordering::Relaxed)
+    }
+
+    /// The slot's color, opaque.
+    pub fn get(&self) -> Rgba {
+        rgb(self.hex())
+    }
+
+    /// The slot's color under an alpha byte (0x00-0xFF): the
+    /// accent-at-a-whisper fills, the mass colors riding a window
+    /// opacity.
+    pub fn faded(&self, alpha: u32) -> Rgba {
+        rgba((self.hex() << 8) | alpha)
     }
 }
 

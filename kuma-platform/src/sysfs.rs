@@ -245,10 +245,17 @@ pub struct DiskUsage {
     pub user_avail_mib: u64,
 }
 
-/// statvfs on a mount. The caller owns the mount-point policy (an
-/// atomic root's virtual filesystem lies about the disk under it);
-/// this is the raw read.
-pub fn statvfs_disk(mount: &Path) -> Option<DiskUsage> {
+/// The raw statvfs read, both consumers' core: block size and the
+/// three block counts. The caller owns the mount-point policy (an
+/// atomic root's virtual filesystem lies about the disk under it).
+struct RawStatvfs {
+    frsize: u64,
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+}
+
+fn statvfs_raw(mount: &Path) -> Option<RawStatvfs> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(mount.as_os_str().as_bytes()).ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -256,12 +263,33 @@ pub fn statvfs_disk(mount: &Path) -> Option<DiskUsage> {
     if rc != 0 {
         return None;
     }
+    Some(RawStatvfs {
+        frsize: u64::try_from(stat.f_frsize).ok()?,
+        blocks: stat.f_blocks,
+        bfree: stat.f_bfree,
+        bavail: stat.f_bavail,
+    })
+}
+
+/// statvfs on a mount. The caller owns the mount-point policy (an
+/// atomic root's virtual filesystem lies about the disk under it);
+/// this is the raw read.
+pub fn statvfs_disk(mount: &Path) -> Option<DiskUsage> {
+    let stat = statvfs_raw(mount)?;
     parse_statvfs(
-        u64::try_from(stat.f_frsize).ok()?,
-        stat.f_blocks,
-        stat.f_bfree,
-        stat.f_bavail,
+        stat.frsize,
+        stat.blocks,
+        stat.bfree,
+        stat.bavail,
     )
+}
+
+/// The user's free bytes (bavail * frsize) on the volume holding
+/// mount: the bytes-shaped answer beside DiskUsage's MiB (Koguma's
+/// status line wants a size, not a percent).
+pub fn statvfs_free_bytes(mount: &Path) -> Option<u64> {
+    let stat = statvfs_raw(mount)?;
+    stat.bavail.checked_mul(stat.frsize)
 }
 
 /// The statvfs math, separated for tests: block size and the three
