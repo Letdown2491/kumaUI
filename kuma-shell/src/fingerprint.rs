@@ -50,36 +50,67 @@ pub fn current_user() -> String {
 /// read as unavailable, which keeps the lock screen's behavior
 /// unchanged for everyone else.
 pub fn available(user: &str) -> bool {
-    let Ok(conn) = zbus::blocking::Connection::system() else {
-        return false;
+    // the name, paths, and interfaces are all spelled with a capital F
+    // on this fprintd (1.94.5, Fedora 45): the Manager object sits at
+    // /net/reactivated/Fprint/Manager, not the service root. A wrong
+    // spelling reads as "unavailable" by design, so each reason logs
+    // at info: a silent false here is a fingerprint reader that never
+    // listens, which took a pkexec test to notice.
+    let conn = match zbus::blocking::Connection::system() {
+        Ok(conn) => conn,
+        Err(err) => {
+            log::info!("fingerprint: no system bus: {err}");
+            return false;
+        }
     };
-    let Ok(manager) = zbus::blocking::Proxy::new(
+    let manager = match zbus::blocking::Proxy::new(
         &conn,
-        "net.reactivated.fprint",
-        "/net/reactivated/fprint",
-        "net.reactivated.fprint.Manager",
-    ) else {
-        return false;
+        "net.reactivated.Fprint",
+        "/net/reactivated/Fprint/Manager",
+        "net.reactivated.Fprint.Manager",
+    ) {
+        Ok(manager) => manager,
+        Err(err) => {
+            log::info!("fingerprint: no manager proxy: {err}");
+            return false;
+        }
     };
     // no reader: the call errors, and so does the whole feature
-    let Ok(device) = manager.call::<_, _, zbus::zvariant::OwnedObjectPath>("GetDefaultDevice", &())
-    else {
-        return false;
+    let device = match manager.call::<_, _, zbus::zvariant::OwnedObjectPath>(
+        "GetDefaultDevice",
+        &(),
+    ) {
+        Ok(device) => device,
+        Err(err) => {
+            log::info!("fingerprint: no default reader: {err}");
+            return false;
+        }
     };
-    let Ok(device) = zbus::blocking::Proxy::new(
+    let device = match zbus::blocking::Proxy::new(
         &conn,
-        "net.reactivated.fprint",
+        "net.reactivated.Fprint",
         device,
-        "net.reactivated.fprint.Device",
-    ) else {
-        return false;
+        "net.reactivated.Fprint.Device",
+    ) {
+        Ok(device) => device,
+        Err(err) => {
+            log::info!("fingerprint: no device proxy: {err}");
+            return false;
+        }
     };
     // no prints enrolled: an empty list answers cleanly on 1.94, but
     // some builds error instead; both read as unavailable
-    device
-        .call::<_, _, Vec<String>>("ListEnrolledFingers", &(user,))
-        .map(|fingers| !fingers.is_empty())
-        .unwrap_or(false)
+    match device.call::<_, _, Vec<String>>("ListEnrolledFingers", &(user,)) {
+        Ok(fingers) if !fingers.is_empty() => true,
+        Ok(_) => {
+            log::info!("fingerprint: the reader has no prints for {user}");
+            false
+        }
+        Err(err) => {
+            log::info!("fingerprint: cannot list {user}'s prints: {err}");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
