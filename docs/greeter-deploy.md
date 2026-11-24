@@ -38,8 +38,12 @@ command, and the socket flows down to it. The greeter renders one
 layer-shell surface (the lock screen's shape: overlay layer, all
 four anchors, exclusive keyboard), shows the default wallpaper and
 theme from the settings fallbacks, and speaks greetd's IPC:
-create_session, answers for every auth message, start_session. On
-success the greeter exits and greetd starts the session.
+create_session, answers for every auth message, start_session. A
+password attempt answers PAM's question and start_session rides the
+reply; Enter on an empty password field is a fingerprint attempt
+instead (the finger's exchange targets the typed username, and the
+reader's prompts show under the field as status). On success the
+greeter exits and greetd starts the session.
 
 `kuma-greeter --version` prints the version line the other apps
 print (build version and git hash) and exits, so the image's upgrade
