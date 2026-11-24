@@ -4,6 +4,13 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+## v0.11.0 (2026-11-23)
+
+kuma-shell 0.11.0
+kuma-files 0.8.0
+kuma-term 0.6.1
+kuma-monitor 0.5.0
+
 ### Added
 
 - The settings power row offers Suspend: first in the list, no arming question (the verb is reversible, wake is two seconds), a moon icon, and `systemctl suspend` under it. Locking before suspend is unchanged and automatic: logind announces the sleep, and the shell locks first when lock_before_suspend is on, which is the default. The confirm-row kit gains the immediate-action shape for such reversible verbs.

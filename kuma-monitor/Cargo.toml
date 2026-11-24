@@ -1,6 +1,6 @@
 [package]
 name = "kuma-monitor"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 description = "Window-aware process monitor spike: observation only (issue #71)"
 license = "MIT"
