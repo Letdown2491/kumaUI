@@ -17,6 +17,7 @@ use gpui::{
     KeyDownEvent, Render, Window, WindowOptions,
 };
 use kuma_shell::greeter::{self, GreetdClient, LoginOutcome};
+use kuma_shell::lock::AuthNote;
 use kuma_shell::icons::KumaAssets;
 use kuma_shell::theme;
 use zeroize::Zeroize;
@@ -158,8 +159,9 @@ struct GreeterState {
     password: String,
     focus: usize,
     busy: bool,
-    /// The last attempt's failure message (shown under the fields).
-    message: Option<gpui::SharedString>,
+    /// The last attempt's failure, or the fingerprint listener's
+    /// status: status never wears the red (ADR-0019's split).
+    message: Option<kuma_shell::lock::AuthNote>,
     sessions: Vec<greeter::Session>,
     session_index: usize,
     session_open: bool,
@@ -336,7 +338,7 @@ impl GreeterState {
         }
         let username = self.username.trim().to_string();
         if username.is_empty() {
-            self.message = Some("who is logging in?".into());
+            self.message = Some(AuthNote::Failure("who is logging in?".into()));
             cx.notify();
             return;
         }
@@ -361,7 +363,7 @@ impl GreeterState {
                 async move |cx| {
                     while let Ok(text) = note_rx.recv().await {
                         let _ = this.update(cx, |this, cx| {
-                            this.message = Some(text.into());
+                            this.message = Some(AuthNote::Status(text.into()));
                             cx.notify();
                         });
                     }
@@ -398,13 +400,13 @@ impl GreeterState {
                     // out of the journal, where a failed-login diagnosis
                     // needs it
                     log::info!("greeter: auth failed: {}", description.trim());
-                    this.message = Some(short_auth_failure(&description).into());
+                    this.message = Some(AuthNote::Failure(short_auth_failure(&description).into()));
                     cx.notify();
                 }
                 Err(err) => {
                     log::error!("greeter: login attempt failed: {err:#}");
                     this.busy = false;
-                    this.message = Some("something went wrong talking to greetd".into());
+                    this.message = Some(AuthNote::Failure("something went wrong talking to greetd".into()));
                     cx.notify();
                 }
             });
@@ -650,14 +652,23 @@ impl Render for GreeterView {
                         ))
                     })
                     .when_some(message, |el, message| {
+                        let (text, is_failure) = match &message {
+                            AuthNote::Status(text) => (text.clone(), false),
+                            AuthNote::Failure(text) => (text.clone(), true),
+                        };
                         el.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(theme::URGENT))
-                                .child(message),
+                                .text_color(rgb(if is_failure {
+                                    theme::URGENT
+                                } else {
+                                    theme.text_dim
+                                }))
+                                .child(text),
                         )
                     })
-                    .when(!busy && !has_message && fingerprint_ready, |el| {                        el.child(
+                    .when(!busy && !has_message && fingerprint_ready, |el| {
+                        el.child(
                             div()
                                 .text_size(px(11.))
                                 .text_color(rgb(theme.text_dim))

@@ -901,7 +901,63 @@ async fn run_lock_listener(tx: Sender<LockEvent>, hint_rx: Receiver<bool>) -> an
 
 #[cfg(test)]
 mod tests {
-    use super::{has_auth_stack, needs_lock_surfaces, AuthError};
+    use super::{has_auth_stack, needs_lock_surfaces, AuthError, FingerConversation,
+        PasswordConversation};
+    use std::ffi::CString;
+
+    #[test]
+    fn the_password_conversation_answers_finger_prompts_with_nothing() {
+        // ADR-0019: the typed password never rides into a pam_fprintd
+        // status prompt, and the answer the module ignores is empty
+        let mut conversation = PasswordConversation {
+            password: CString::new("hunter2").unwrap(),
+        };
+        use pam_client2::ConversationHandler;
+        let finger = conversation
+            .prompt_echo_off(&std::ffi::CStr::from_bytes_with_nul(
+                b"Place your finger on the fingerprint reader\0",
+            )
+            .unwrap())
+            .unwrap();
+        assert_eq!(finger.to_string_lossy(), "");
+        // a real secret prompt still gets the password
+        let secret = conversation
+            .prompt_echo_off(&std::ffi::CStr::from_bytes_with_nul(b"Password: \0").unwrap())
+            .unwrap();
+        assert_eq!(secret.to_string_lossy(), "hunter2");
+        // and the echo-on refusal stands (a re-prompt is refused, not
+        // answered)
+        assert!(conversation
+            .prompt_echo_on(&std::ffi::CStr::from_bytes_with_nul(b"login: \0").unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn the_finger_conversation_relays_every_prompt_and_holds_no_secret() {
+        // its answers are empty whatever it is asked: the struct has no
+        // password to leak
+        let (note_tx, note_rx) = smol::channel::unbounded::<String>();
+        let mut conversation = FingerConversation { notes: note_tx };
+        use pam_client2::ConversationHandler;
+        let answer = conversation
+            .prompt_echo_off(&std::ffi::CStr::from_bytes_with_nul(
+                b"Verification timed out\0",
+            )
+            .unwrap())
+            .unwrap();
+        assert_eq!(answer.to_string_lossy(), "");
+        assert_eq!(
+            note_rx.try_recv().unwrap(),
+            "Verification timed out",
+            "the relay carried the module's line for the surface"
+        );
+        conversation.text_info(&std::ffi::CStr::from_bytes_with_nul(b"info line\0").unwrap());
+        assert_eq!(note_rx.try_recv().unwrap(), "info line");
+        // echo-on is refused like the password conversation's
+        assert!(conversation
+            .prompt_echo_on(&std::ffi::CStr::from_bytes_with_nul(b"login: \0").unwrap())
+            .is_err());
+    }
 
     #[test]
     fn a_pam_stack_counts_only_when_an_auth_rule_exists() {

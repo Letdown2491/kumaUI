@@ -1200,8 +1200,9 @@ fn run_pump(
     notes: &Sender<PumpNote>,
     cancel_tx: &Sender<HelperCancel>,
 ) -> PumpEnd {
-    let Ok(mut session) = helper_session(user, cookie) else {
-        return PumpEnd::Broke("no polkit agent helper is available".into());
+    let mut session = match helper_session(user, cookie) {
+        Ok(session) => session,
+        Err(reason) => return PumpEnd::Broke(reason),
     };
     // the card can supersede the exchange from here on
     let _ = cancel_tx.try_send(session.cancel.clone());
