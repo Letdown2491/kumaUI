@@ -441,7 +441,10 @@ pub struct ConfirmAction {
     /// The label at rest.
     pub label: &'static str,
     /// The label while armed: the question the second click answers.
-    pub confirm_label: &'static str,
+    /// None marks an immediate act, which runs on the first click: for
+    /// the reversible verbs, where the question is friction (suspend
+    /// protects nothing; wake is two seconds).
+    pub confirm_label: Option<&'static str>,
     pub icon: Option<&'static str>,
     /// Runs with the App, only on the confirm click.
     pub on_confirm: Arc<dyn Fn(&mut App) + 'static>,
@@ -458,7 +461,23 @@ impl ConfirmAction {
         Self {
             id,
             label,
-            confirm_label,
+            confirm_label: Some(confirm_label),
+            icon,
+            on_confirm: Arc::new(on_confirm),
+        }
+    }
+
+    /// An act that runs on the first click, no arming question.
+    pub fn immediate(
+        id: &'static str,
+        label: &'static str,
+        icon: Option<&'static str>,
+        on_confirm: impl Fn(&mut App) + 'static,
+    ) -> Self {
+        Self {
+            id,
+            label,
+            confirm_label: None,
             icon,
             on_confirm: Arc::new(on_confirm),
         }
@@ -523,7 +542,7 @@ impl Render for ConfirmActions {
                     // the armed act: fills the alarm, asks its question
                     Some(a) if a == index => button(
                         id,
-                        action.confirm_label,
+                        action.confirm_label.unwrap_or(action.label),
                         action.icon,
                         ButtonVariant::Destructive,
                         cx.listener(move |this, _, _, cx| {
@@ -541,14 +560,25 @@ impl Render for ConfirmActions {
                     })
                     .text_color(rgb(crate::theme::current().text_dim))
                     .bg(rgb(crate::theme::current().surface)),
-                    // at rest: quiet words that hover
-                    None => button(
-                        id,
-                        action.label,
-                        action.icon,
-                        ButtonVariant::Ghost,
-                        cx.listener(move |this, _, _, cx| this.arm(index, cx)),
-                    ),
+                    // at rest: quiet words that hover; an immediate act
+                    // answers on the first click instead of arming
+                    None => {
+                        let immediate = action.confirm_label.is_none();
+                        button(
+                            id,
+                            action.label,
+                            action.icon,
+                            ButtonVariant::Ghost,
+                            cx.listener(move |this, _, _, cx| {
+                                if immediate {
+                                    (this.actions[index].on_confirm.clone())(cx);
+                                    cx.notify();
+                                } else {
+                                    this.arm(index, cx);
+                                }
+                            }),
+                        )
+                    }
                 }
             }),
         )

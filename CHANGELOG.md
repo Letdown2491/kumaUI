@@ -6,6 +6,7 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ### Added
 
+- The settings power row offers Suspend: first in the list, no arming question (the verb is reversible, wake is two seconds), a moon icon, and `systemctl suspend` under it. Locking before suspend is unchanged and automatic: logind announces the sleep, and the shell locks first when lock_before_suspend is on, which is the default. The confirm-row kit gains the immediate-action shape for such reversible verbs.
 - kuma-shell's lock screen, polkit agent, and greeter authenticate with the fingerprint reader: the lock screen runs the fingerprint exchange while locked (a touch is enough), the polkit card opens the listener as soon as it appears, so the touch works with no enter first, and typing a password supersedes the listener instantly, and the greeter accepts enter on an empty password field as a fingerprint attempt. Typed passwords are unaffected: password attempts ride the authselect password-only stack when the distro ships it, so an enrolled finger never makes a wrong-or-right password wait out the reader's ~30 s no-touch timeout first.
 
 ## v0.10.1 (2026-11-21)

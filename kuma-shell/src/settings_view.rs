@@ -382,6 +382,16 @@ impl SettingsView {
         focus_handle.focus(window, cx);
         let power_row = kit::confirm_actions(
             vec![
+                // suspend needs no arming question: the verb is
+                // reversible, and logind's PrepareForSleep rides in
+                // front of it (the lock engages first when
+                // lock_before_suspend is on, which is the default)
+                kit::ConfirmAction::immediate(
+                    "power-suspend",
+                    "Suspend",
+                    Some("icons/moon.svg"),
+                    power_action("systemctl", &["suspend"]),
+                ),
                 kit::ConfirmAction::new(
                     "power-logout",
                     "Log out",
