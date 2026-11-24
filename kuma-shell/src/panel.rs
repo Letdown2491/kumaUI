@@ -6,8 +6,8 @@ use std::{
 use gpui::{
     AnyElement, App, Bounds, Context, Div, DisplayId, Element, ElementId, Global, GlobalElementId,
     InspectorElementId, KeyDownEvent, LayoutId, Pixels, Render, Size, Stateful, Style, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div,
-    layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
+    WindowOptions, div,
+    layer_shell::KeyboardInteractivity,
     point,
     prelude::*,
     px, rgba, size, svg,
@@ -1120,7 +1120,7 @@ pub fn chrome(
 }
 
 pub fn panel_window_options(
-    namespace: &str,
+    namespace: &'static str,
     keyboard: KeyboardInteractivity,
     display_id: Option<DisplayId>,
 ) -> WindowOptions {
@@ -1132,55 +1132,22 @@ pub fn panel_window_options(
     // the compositor's to assign, and niri kills set_size before the
     // first configure); the input region keeps clicks outside the
     // drawer passing through to the scrim.
-    //
-    // Client decorations, explicitly: the default is Server, and
-    // requesting server decorations on a layer surface makes the
-    // Wayland backend log its fallback warning (harmless but noisy on
-    // every panel open).
-    WindowOptions {
-        titlebar: None,
-        window_decorations: Some(gpui::WindowDecorations::Client),
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(0.), px(0.)),
-        })),
+    crate::surfaces::layer_shell_window(crate::surfaces::LayerSurfaceSpec {
+        namespace: namespace.to_string(),
+        app_id: format!("kuma-shell-{namespace}"),
+        keyboard,
         display_id,
-        app_id: Some(format!("kuma-shell-{namespace}")),
-        window_background: WindowBackgroundAppearance::Transparent,
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: namespace.to_string(),
-            layer: Layer::Overlay,
-            exclusive_zone: Some(px(-1.)),
-            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            keyboard_interactivity: keyboard,
-            ..Default::default()
-        }),
         ..Default::default()
-    }
+    })
 }
 
 pub fn scrim_options(display_id: Option<DisplayId>) -> WindowOptions {
-    WindowOptions {
-        titlebar: None,
-        // client decorations: same reason as panel_window_options
-        window_decorations: Some(gpui::WindowDecorations::Client),
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(0.), px(0.)),
-        })),
+    crate::surfaces::layer_shell_window(crate::surfaces::LayerSurfaceSpec {
+        namespace: "kuma-shell-scrim".into(),
+        app_id: "kuma-shell-scrim".into(),
         display_id,
-        app_id: Some("kuma-shell-scrim".into()),
-        window_background: WindowBackgroundAppearance::Transparent,
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-shell-scrim".into(),
-            layer: Layer::Overlay,
-            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            exclusive_zone: Some(px(-1.)),
-            keyboard_interactivity: KeyboardInteractivity::None,
-            ..Default::default()
-        }),
         ..Default::default()
-    }
+    })
 }
 
 /// Fullscreen transparent surface below an open panel: any click on it
@@ -1199,6 +1166,8 @@ impl Render for ScrimView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::layer_shell::{Anchor, Layer, LayerShellOptions};
+    use gpui::WindowKind;
 
     fn layer_of(options: &WindowOptions) -> &LayerShellOptions {
         match &options.kind {

@@ -26,13 +26,12 @@ use std::time::Duration;
 
 
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    Render, SharedString, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions, div,
-    layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
-    point,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton,
+    Render, SharedString, Window, WindowHandle,
+    WindowOptions, div,
+    layer_shell::KeyboardInteractivity,
     prelude::*,
-    px, rgb, rgba, size,
+    px, rgb, rgba,
 };
 use smol::channel::{Sender, bounded, unbounded};
 use zbus::zvariant::{OwnedValue, Value};
@@ -787,26 +786,12 @@ impl Render for PromptView {
 /// scrim div (the lock surfaces are opaque and wallpaper-backed; this is
 /// a momentary dialog, not a takeover).
 fn prompt_window_options() -> WindowOptions {
-    WindowOptions {
-        titlebar: None,
-        // client decorations: layer surfaces have no server side
-        window_decorations: Some(gpui::WindowDecorations::Client),
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(0.), px(0.)),
-        })),
-        app_id: Some("kuma-shell-polkit".into()),
-        window_background: WindowBackgroundAppearance::Transparent,
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-polkit".into(),
-            layer: Layer::Overlay,
-            exclusive_zone: Some(px(-1.)),
-            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            keyboard_interactivity: KeyboardInteractivity::Exclusive,
-            ..Default::default()
-        }),
+    crate::surfaces::layer_shell_window(crate::surfaces::LayerSurfaceSpec {
+        namespace: "kuma-polkit".into(),
+        app_id: "kuma-shell-polkit".into(),
+        keyboard: KeyboardInteractivity::Exclusive,
         ..Default::default()
-    }
+    })
 }
 
 /// The agent task: bring the connection up, register, hold it until it

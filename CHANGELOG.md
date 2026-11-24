@@ -9,6 +9,11 @@ Entries land with the change they describe; the next tag takes this section as i
 - The settings power row offers Suspend: first in the list, no arming question (the verb is reversible, wake is two seconds), a moon icon, and `systemctl suspend` under it. Locking before suspend is unchanged and automatic: logind announces the sleep, and the shell locks first when lock_before_suspend is on, which is the default. The confirm-row kit gains the immediate-action shape for such reversible verbs.
 - kuma-shell's lock screen, polkit agent, and greeter authenticate with the fingerprint reader: the lock screen runs the fingerprint exchange while locked (a touch is enough), the polkit card opens the listener as soon as it appears, so the touch works with no enter first, and typing a password supersedes the listener instantly, and the greeter accepts enter on an empty password field as a fingerprint attempt. Typed passwords are unaffected: password attempts ride the authselect password-only stack when the distro ships it, so an enrolled finger never makes a wrong-or-right password wait out the reader's ~30 s no-touch timeout first.
 
+### Changed
+
+- The audit's fold-later stragglers land (#161): every layer-shell window options builder is one `layer_shell_window` in surfaces.rs (ten sites rode the same skeleton), the greeter's duplicated wayland-sessions test and the launcher's hand-rolled XDG_STATE_HOME chain are gone, one INI walker serves both desktop-entry parsers, and the palette backstop is tied to the shell's built-ins with a test.
+- Koguma and Kamuy without a published shell palette (adaptive off, or standalone) show the shell's built-in colors (the Catppuccin-flavored defaults the bar shows) instead of an older gray scheme that matched nothing: the backstop palette had drifted from the shell's own defaults, and the tie test keeps them from drifting again.
+
 ## v0.10.1 (2026-11-21)
 
 kuma-shell 0.10.1

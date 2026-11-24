@@ -449,42 +449,6 @@ mod tests {
         assert_eq!(fake.sent(0)["type"], "start_session");
     }
 
-    #[test]
-    fn wayland_sessions_parses_and_sorts() {
-        let dir = std::env::temp_dir().join(format!("kuma-sessions-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("zshell.desktop"),
-            "[Desktop Entry]\nName=Z Shell\nExec=zshell --session\nType=Application\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("niri.desktop"),
-            "[Desktop Entry]\nName=Niri\nExec=niri-session\nType=Application\nDesktopNames=niri\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("hidden.desktop"),
-            "[Desktop Entry]\nName=Hidden\nExec=hidden\nNoDisplay=true\n",
-        )
-        .unwrap();
-        std::fs::write(dir.join("broken.desktop"), "garbage\n").unwrap();
-
-        let sessions = wayland_sessions(&dir);
-        assert_eq!(
-            sessions,
-            vec![
-                Session {
-                    name: "Niri".into(),
-                    exec: "niri-session".into()
-                },
-                Session {
-                    name: "Z Shell".into(),
-                    exec: "zshell --session".into()
-                },
-            ]
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
+    // wayland_sessions itself is tested where it lives
+    // (kuma-platform/src/desktop.rs); the greeter only consumes it.
 }

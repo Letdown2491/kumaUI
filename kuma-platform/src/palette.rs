@@ -46,18 +46,23 @@ pub struct Palette {
 }
 
 impl Default for Palette {
+    /// The shell's own built-ins (kuma-shell's theme consts, the alpha
+    /// carriers folded to RGB the way palette_text folds them): with
+    /// nothing published the followers show what the shell shows, not
+    /// a scheme of their own. The tie test in kuma-shell keeps the two
+    /// declarations honest.
     fn default() -> Self {
         Palette {
-            panel_bg: 0x181b21,
-            surface: 0x1d2129,
-            surface_hover: 0x272d38,
-            inset: 0x14161a,
-            divider: 0x2a2f3a,
-            divider_soft: 0x2a2f3a,
-            text: 0xd8dce3,
-            text_dim: 0x8a93a3,
-            accent: 0x4f8cc9,
-            accent_text: 0xffffff,
+            panel_bg: 0x181825,
+            surface: 0x313244,
+            surface_hover: 0x45475a,
+            inset: 0x11111b,
+            divider: 0x45475a,
+            divider_soft: 0x45475a,
+            text: 0xcdd6f4,
+            text_dim: 0x6c7086,
+            accent: 0x89b4fa,
+            accent_text: 0x11111b,
         }
     }
 }

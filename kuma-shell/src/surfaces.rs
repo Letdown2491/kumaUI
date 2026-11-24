@@ -24,7 +24,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    AnyWindowHandle, App, AppContext, Bounds, DisplayId, Entity, Global, PlatformDisplay,
+    AnyWindowHandle, App, AppContext, Bounds, DisplayId, Entity, Global, Pixels, PlatformDisplay,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
     layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
     point, px, size,
@@ -305,28 +305,85 @@ fn surface_error(message: &str, cx: &mut App) {
     }
 }
 
-fn wallpaper_options(display_id: DisplayId) -> WindowOptions {
+/// One layer surface's shape: the only things that vary across the
+/// shell's fullscreen and edge surfaces. Everything the ten call sites
+/// shared (no titlebar, client decorations, the layer-shell kind, the
+/// fullscreen anchor set) is pinned here in one place.
+pub struct LayerSurfaceSpec {
+    /// The compositor's namespace for rules and grouping.
+    pub namespace: String,
+    /// The wayland app id (the bar's "kuma-shell", the lock's
+    /// "kuma-shell-lock", panels derive "kuma-shell-{namespace}").
+    pub app_id: String,
+    pub layer: Layer,
+    pub anchor: Anchor,
+    pub exclusive_zone: Option<Pixels>,
+    pub keyboard: KeyboardInteractivity,
+    pub background: WindowBackgroundAppearance,
+    /// The surface's size. 0x0 (the default) hands an all-edge-anchored
+    /// surface's size to the compositor: a size on it makes niri kill
+    /// set_size before the first configure.
+    pub size: gpui::Size<Pixels>,
+    pub margin: Option<(Pixels, Pixels, Pixels, Pixels)>,
+    pub display_id: Option<DisplayId>,
+}
+
+impl Default for LayerSurfaceSpec {
+    fn default() -> Self {
+        Self {
+            namespace: "kuma-shell".into(),
+            app_id: "kuma-shell".into(),
+            layer: Layer::Overlay,
+            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+            exclusive_zone: Some(px(-1.)),
+            keyboard: KeyboardInteractivity::None,
+            background: WindowBackgroundAppearance::Transparent,
+            size: size(px(0.), px(0.)),
+            margin: None,
+            display_id: None,
+        }
+    }
+}
+
+/// The one layer-shell `WindowOptions` builder. Every shell surface
+/// (bar, drawers, scrim, wallpaper, dock, OSD, toasts, lock, polkit
+/// card, greeter) rides this; the spec names only what varies.
+pub fn layer_shell_window(spec: LayerSurfaceSpec) -> WindowOptions {
     WindowOptions {
         titlebar: None,
-        // client decorations: layer surfaces have no server side
+        // client decorations: layer surfaces have no server side, and
+        // requesting server decorations makes the Wayland backend log
+        // its fallback warning on every surface creation
         window_decorations: Some(gpui::WindowDecorations::Client),
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(0.), px(0.)),
-            size: size(px(0.), px(0.)),
+            size: spec.size,
         })),
-        display_id: Some(display_id),
-        app_id: Some("kuma-shell-wallpaper".into()),
-        window_background: WindowBackgroundAppearance::Opaque,
+        display_id: spec.display_id,
+        app_id: Some(spec.app_id),
+        window_background: spec.background,
         kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-shell-wallpaper".into(),
-            layer: Layer::Background,
-            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            exclusive_zone: Some(px(-1.)),
-            keyboard_interactivity: KeyboardInteractivity::None,
+            namespace: spec.namespace,
+            layer: spec.layer,
+            anchor: spec.anchor,
+            exclusive_zone: spec.exclusive_zone,
+            keyboard_interactivity: spec.keyboard,
+            margin: spec.margin,
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+fn wallpaper_options(display_id: DisplayId) -> WindowOptions {
+    layer_shell_window(LayerSurfaceSpec {
+        namespace: "kuma-shell-wallpaper".into(),
+        app_id: "kuma-shell-wallpaper".into(),
+        layer: Layer::Background,
+        background: WindowBackgroundAppearance::Opaque,
+        display_id: Some(display_id),
+        ..Default::default()
+    })
 }
 
 fn bar_window_options(config: &BarConfig, display_id: DisplayId) -> WindowOptions {
@@ -337,27 +394,16 @@ fn bar_window_options(config: &BarConfig, display_id: DisplayId) -> WindowOption
         BarPosition::Top => Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
         BarPosition::Bottom => Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
     };
-    WindowOptions {
-        titlebar: None,
-        // client decorations: layer surfaces have no server side
-        window_decorations: Some(gpui::WindowDecorations::Client),
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(0.), px(config.height + config.offset_top)),
-        })),
+    layer_shell_window(LayerSurfaceSpec {
+        namespace: "kuma-shell".into(),
+        app_id: "kuma-shell".into(),
+        layer: Layer::Top,
+        // always stretched full-width; width/align/offset are applied by the
+        // view's content div so every geometry setting can change live
+        anchor,
+        exclusive_zone: Some(px(config.height + config.offset_top)),
+        size: size(px(0.), px(config.height + config.offset_top)),
         display_id: Some(display_id),
-        app_id: Some("kuma-shell".into()),
-        window_background: WindowBackgroundAppearance::Transparent,
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-shell".into(),
-            layer: Layer::Top,
-            // always stretched full-width; width/align/offset are applied by the
-            // view's content div so every geometry setting can change live
-            anchor,
-            exclusive_zone: Some(px(config.height + config.offset_top)),
-            keyboard_interactivity: KeyboardInteractivity::None,
-            ..Default::default()
-        }),
         ..Default::default()
-    }
+    })
 }

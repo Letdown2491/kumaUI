@@ -140,6 +140,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn palette_backstop_matches_the_shell_builtins() {
+        // two declarations of one set of colors: the shell's consts and
+        // the followers' Palette::default (what kuma-files and the
+        // monitor show when nothing is published). The alpha carriers
+        // fold to RGB the way palette_text folds them.
+        let theme = Theme::default();
+        let palette = kuma_platform::palette::Palette::default();
+        let fold = |value: u32| {
+            if value > 0xFFFFFF {
+                value >> 8
+            } else {
+                value
+            }
+        };
+        assert_eq!(fold(theme.panel_bg), palette.panel_bg);
+        assert_eq!(theme.surface, palette.surface);
+        assert_eq!(theme.surface_hover, palette.surface_hover);
+        assert_eq!(theme.inset, palette.inset);
+        assert_eq!(theme.divider, palette.divider);
+        assert_eq!(fold(theme.divider_soft), palette.divider_soft);
+        assert_eq!(theme.text, palette.text);
+        assert_eq!(theme.text_dim, palette.text_dim);
+        assert_eq!(theme.accent, palette.accent);
+        assert_eq!(theme.accent_text, palette.accent_text);
+    }
+
+    #[test]
     fn palette_text_folds_alpha_carriers_to_rgb() {
         let theme = Theme {
             panel_bg: 0x16151EF2, // alpha-carrying

@@ -9,9 +9,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, Bounds, Context, Div, DisplayId, Entity, ImageSource, Render, SharedString,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
-    div, img,
-    layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
+    Window, WindowHandle, WindowOptions, div, img,
+    layer_shell::{Anchor, Layer},
     point,
     prelude::*,
     px, rgb, rgba, size, svg,
@@ -243,27 +242,16 @@ pub fn dock_window_options(position: DockPosition, display_id: DisplayId) -> Win
         DockPosition::Left => (Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM, STRIP, 0.),
         DockPosition::Right => (Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM, STRIP, 0.),
     };
-    WindowOptions {
-        titlebar: None,
-        // client decorations: layer surfaces have no server side
-        window_decorations: Some(gpui::WindowDecorations::Client),
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(width), px(height)),
-        })),
+    crate::surfaces::layer_shell_window(crate::surfaces::LayerSurfaceSpec {
+        namespace: "kuma-shell-dock".into(),
+        app_id: "kuma-shell-dock".into(),
+        layer: Layer::Top,
+        exclusive_zone: Some(px(STRIP)),
+        anchor,
+        size: size(px(width), px(height)),
         display_id: Some(display_id),
-        app_id: Some("kuma-shell-dock".into()),
-        window_background: WindowBackgroundAppearance::Transparent,
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-shell-dock".into(),
-            layer: Layer::Top,
-            exclusive_zone: Some(px(STRIP)),
-            anchor,
-            keyboard_interactivity: KeyboardInteractivity::None,
-            ..Default::default()
-        }),
         ..Default::default()
-    }
+    })
 }
 
 /// Owns the dock's windows' lifecycle: one per output (keyed by the

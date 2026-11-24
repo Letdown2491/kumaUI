@@ -10,11 +10,11 @@
 use std::io::BufRead;
 use std::sync::Arc;
 
-use gpui::layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions};
+use gpui::layer_shell::KeyboardInteractivity;
 use gpui::{
 
     prelude::*, div, px, rgba, rgb, App, AppContext, Context, Focusable, FocusHandle,
-    KeyDownEvent, Render, Window, WindowKind, WindowOptions,
+    KeyDownEvent, Render, Window, WindowOptions,
 };
 use kuma_shell::greeter::{self, GreetdClient, LoginOutcome};
 use kuma_shell::icons::KumaAssets;
@@ -137,24 +137,13 @@ fn window_options() -> WindowOptions {
     // exclusive keyboard. The shell's windows all ride this path; the
     // plain toplevel path dies on niri with a wp_viewport protocol
     // error (gpui's viewport gets a value niri rejects)
-    WindowOptions {
-        titlebar: None,
-        app_id: Some("kuma-greeter".into()),
-        window_background: gpui::WindowBackgroundAppearance::Opaque,
-        window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds {
-            origin: gpui::point(px(0.), px(0.)),
-            size: gpui::size(px(0.), px(0.)),
-        })),
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-greeter".into(),
-            layer: Layer::Overlay,
-            exclusive_zone: Some(px(-1.)),
-            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            keyboard_interactivity: KeyboardInteractivity::Exclusive,
-            ..Default::default()
-        }),
+    kuma_shell::surfaces::layer_shell_window(kuma_shell::surfaces::LayerSurfaceSpec {
+        namespace: "kuma-greeter".into(),
+        app_id: "kuma-greeter".into(),
+        background: gpui::WindowBackgroundAppearance::Opaque,
+        keyboard: KeyboardInteractivity::Exclusive,
         ..Default::default()
-    }
+    })
 }
 
 // ---------- state ----------

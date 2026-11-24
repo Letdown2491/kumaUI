@@ -4,10 +4,9 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Bounds, Context, Div, Entity, ImageSource, Render, SharedString, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, img,
-    layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
-    point,
+    Context, Div, Entity, ImageSource, Render, SharedString, Window,
+    WindowOptions, div, img,
+    layer_shell::Anchor,
     prelude::*,
     px, relative, rgb, rgba, size, svg,
 };
@@ -305,27 +304,14 @@ pub fn toast_window_options(edge: f32, position: crate::settings::BarPosition) -
             (px(0.), px(8.), px(edge), px(0.)),
         ),
     };
-    WindowOptions {
-        titlebar: None,
-        // client decorations: layer surfaces have no server side
-        window_decorations: Some(gpui::WindowDecorations::Client),
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(360.), px(TOAST_HEIGHT)),
-        })),
-        app_id: Some("kuma-shell-toast".into()),
-        window_background: WindowBackgroundAppearance::Transparent,
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-shell-toast".into(),
-            layer: Layer::Overlay,
-            exclusive_zone: Some(px(-1.)),
-            anchor,
-            keyboard_interactivity: KeyboardInteractivity::None,
-            margin: Some(margin),
-            ..Default::default()
-        }),
+    crate::surfaces::layer_shell_window(crate::surfaces::LayerSurfaceSpec {
+        namespace: "kuma-shell-toast".into(),
+        app_id: "kuma-shell-toast".into(),
+        anchor,
+        size: size(px(360.), px(TOAST_HEIGHT)),
+        margin: Some(margin),
         ..Default::default()
-    }
+    })
 }
 
 /// The history panel behind the bell: newest first, DND toggle, clear-all,

@@ -88,19 +88,17 @@ pub fn shows_in(only: Option<&[String]>, not: Option<&[String]>, desktop: Option
 /// for a visible entry); a missing Exec is None. The `desktop` name is
 /// the caller's XDG_CURRENT_DESKTOP (None when unset), so the parse is
 /// testable without env mutation.
-pub fn parse_entry(text: &str, desktop: Option<&str>) -> Option<Entry> {
-    let mut entry = Entry::default();
-    let mut hidden = false;
-    let mut only_show_in: Option<Vec<String>> = None;
-    let mut not_show_in: Option<Vec<String>> = None;
+/// Walk `text`'s `[Desktop Entry]` section: every `Key=Value` line
+/// inside it hands its trimmed key and value to `visit`. Section
+/// headers start or end the section (later sections must not
+/// overwrite the main keys), lines outside it and lines without `=`
+/// are skipped, not fatal. The one INI walker under parse_entry and
+/// parse_session.
+fn for_each_entry_line(text: &str, mut visit: impl FnMut(&str, &str)) {
     let mut in_entry = false;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') && line.ends_with(']') {
-            // a section header starts or ends the entry: later
-            // sections ([Desktop Action a], vendor extensions) must
-            // not overwrite the main keys (an action's Name=New
-            // Window is not the app's name)
             in_entry = line == "[Desktop Entry]";
             continue;
         }
@@ -108,28 +106,36 @@ pub fn parse_entry(text: &str, desktop: Option<&str>) -> Option<Entry> {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            // a stray line without '=' is skipped, not fatal: the
-            // entry should not vanish over one bad line
             continue;
         };
-        match key.trim() {
-            "Name" => entry.name = value.trim().to_string(),
-            "GenericName" => entry.generic = value.trim().to_string(),
-            "Keywords" => entry.keywords = value.trim().to_string(),
-            "Exec" => entry.exec = value.trim().to_string(),
-            "Icon" => entry.icon = value.trim().to_string(),
-            "Comment" => entry.comment = Some(value.trim().to_string()),
-            "Terminal" => entry.terminal = value.trim() == "true",
-            "Type" => entry.application = value.trim() == "Application",
+        visit(key.trim(), value.trim());
+    }
+}
+
+pub fn parse_entry(text: &str, desktop: Option<&str>) -> Option<Entry> {
+    let mut entry = Entry::default();
+    let mut hidden = false;
+    let mut only_show_in: Option<Vec<String>> = None;
+    let mut not_show_in: Option<Vec<String>> = None;
+    for_each_entry_line(text, |key, value| {
+        match key {
+            "Name" => entry.name = value.to_string(),
+            "GenericName" => entry.generic = value.to_string(),
+            "Keywords" => entry.keywords = value.to_string(),
+            "Exec" => entry.exec = value.to_string(),
+            "Icon" => entry.icon = value.to_string(),
+            "Comment" => entry.comment = Some(value.to_string()),
+            "Terminal" => entry.terminal = value == "true",
+            "Type" => entry.application = value == "Application",
             "MimeType" => {
                 entry.mimes = value.split(';').filter(|m| !m.is_empty()).map(str::to_string).collect()
             }
-            "NoDisplay" | "Hidden" => hidden = value.trim() == "true",
+            "NoDisplay" | "Hidden" => hidden = value == "true",
             "OnlyShowIn" => only_show_in = Some(show_in_list(value)),
             "NotShowIn" => not_show_in = Some(show_in_list(value)),
             _ => {}
         }
-    }
+    });
     if hidden || !shows_in(only_show_in.as_deref(), not_show_in.as_deref(), desktop) {
         return None;
     }
@@ -282,26 +288,14 @@ fn parse_session(path: &Path) -> Option<Session> {
     let mut name = None;
     let mut exec = None;
     let mut hidden = false;
-    let mut in_entry = false;
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            in_entry = line == "[Desktop Entry]";
-            continue;
-        }
-        if !in_entry {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key.trim() {
-            "Name" => name = Some(value.trim().to_string()),
-            "Exec" => exec = Some(value.trim().to_string()),
-            "NoDisplay" | "Hidden" if value.trim() == "true" => hidden = true,
+    for_each_entry_line(&raw, |key, value| {
+        match key {
+            "Name" => name = Some(value.to_string()),
+            "Exec" => exec = Some(value.to_string()),
+            "NoDisplay" | "Hidden" if value == "true" => hidden = true,
             _ => {}
         }
-    }
+    });
     if hidden {
         return None;
     }

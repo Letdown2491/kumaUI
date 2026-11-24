@@ -12,13 +12,12 @@ use chrono::Local;
 use futures_lite::StreamExt;
 use zeroize::Zeroize;
 use gpui::{
-    App, AppContext, Bounds, Context, DisplayId, Entity, FocusHandle, Focusable, KeyDownEvent,
-    ObjectFit, Render, RenderImage, SharedString, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, div, img,
-    layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
-    point,
+    App, AppContext, Context, DisplayId, Entity, FocusHandle, Focusable, KeyDownEvent,
+    ObjectFit, Render, RenderImage, SharedString, Window, WindowBackgroundAppearance,
+    WindowHandle, WindowOptions, div, img,
+    layer_shell::KeyboardInteractivity,
     prelude::*,
-    px, rgb, rgba, size,
+    px, rgb, rgba,
 };
 use smol::channel::{Receiver, Sender, unbounded};
 
@@ -690,27 +689,14 @@ impl Render for LockView {
 /// One lock surface: fullscreen on its display, above everything (overlay
 /// layer, created last), opaque, keyboard-exclusive.
 fn lock_window_options(display_id: DisplayId) -> WindowOptions {
-    WindowOptions {
-        titlebar: None,
-        // client decorations: layer surfaces have no server side
-        window_decorations: Some(gpui::WindowDecorations::Client),
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(0.), px(0.)),
-        })),
-        app_id: Some("kuma-shell-lock".into()),
-        window_background: WindowBackgroundAppearance::Opaque,
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-lock".into(),
-            layer: Layer::Overlay,
-            exclusive_zone: Some(px(-1.)),
-            anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
-            keyboard_interactivity: KeyboardInteractivity::Exclusive,
-            ..Default::default()
-        }),
+    crate::surfaces::layer_shell_window(crate::surfaces::LayerSurfaceSpec {
+        namespace: "kuma-lock".into(),
+        app_id: "kuma-shell-lock".into(),
+        background: WindowBackgroundAppearance::Opaque,
+        keyboard: KeyboardInteractivity::Exclusive,
         display_id: Some(display_id),
         ..Default::default()
-    }
+    })
 }
 
 /// What logind told us. Copy: both listeners may fire it repeatedly.

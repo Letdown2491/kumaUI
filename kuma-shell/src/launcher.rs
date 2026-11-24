@@ -66,16 +66,18 @@ pub fn load_apps() -> Vec<AppEntry> {
 }
 
 fn usage_file() -> Option<PathBuf> {
-    let base = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|home| PathBuf::from(home).join(".local/state"))
-        })?;
-    Some(base.join("kuma-shell").join("usage.json"))
+    // xdg::base_dir, not state_dir(): state_dir's relative last resort
+    // would scatter usage.json in whatever the cwd is; a homeless
+    // environment gives up instead
+    Some(
+        kuma_platform::xdg::base_dir(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+            ".local/state",
+        )?
+        .join("kuma-shell")
+        .join("usage.json"),
+    )
 }
 
 fn load_usage() -> HashMap<String, u64> {

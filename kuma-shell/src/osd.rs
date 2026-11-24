@@ -9,10 +9,9 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, Render, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions, div,
-    layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions},
-    point,
+    App, AppContext, Context, Entity, Render, Window,
+    WindowHandle, WindowOptions, div,
+    layer_shell::Anchor,
     prelude::*,
     px, relative, rgb, rgba, size, svg,
 };
@@ -474,27 +473,14 @@ fn osd_window_options(edge: f32, position: crate::settings::BarPosition) -> Wind
             (Anchor::BOTTOM, (px(0.), px(0.), px(edge), px(0.)))
         }
     };
-    WindowOptions {
-        titlebar: None,
-        // client decorations: layer surfaces have no server side
-        window_decorations: Some(gpui::WindowDecorations::Client),
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(0.), px(0.)),
-            size: size(px(OSD_WIDTH), px(OSD_HEIGHT)),
-        })),
-        app_id: Some("kuma-shell-osd".into()),
-        window_background: WindowBackgroundAppearance::Transparent,
-        kind: WindowKind::LayerShell(LayerShellOptions {
-            namespace: "kuma-shell-osd".into(),
-            layer: Layer::Overlay,
-            exclusive_zone: Some(px(-1.)),
-            anchor,
-            keyboard_interactivity: KeyboardInteractivity::None,
-            margin: Some(margin),
-            ..Default::default()
-        }),
+    crate::surfaces::layer_shell_window(crate::surfaces::LayerSurfaceSpec {
+        namespace: "kuma-shell-osd".into(),
+        app_id: "kuma-shell-osd".into(),
+        anchor,
+        size: size(px(OSD_WIDTH), px(OSD_HEIGHT)),
+        margin: Some(margin),
         ..Default::default()
-    }
+    })
 }
 
 #[cfg(test)]
