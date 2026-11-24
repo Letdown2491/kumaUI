@@ -6,7 +6,7 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ### Added
 
-- kuma-shell's lock screen, polkit agent, and greeter authenticate with the fingerprint reader: an enrolled finger unlocks (the lock screen runs the fingerprint exchange while locked, a touch is enough), the polkit card and the greeter accept enter on an empty password field as a fingerprint attempt, and the reader's prompts ("place your finger...", "timed out") show on the card instead of being refused. Typed passwords are unaffected: password attempts ride the authselect password-only stack when the distro ships it, so an enrolled finger never makes a wrong-or-right password wait out the reader's ~30 s no-touch timeout first.
+- kuma-shell's lock screen, polkit agent, and greeter authenticate with the fingerprint reader: the lock screen runs the fingerprint exchange while locked (a touch is enough), the polkit card opens the listener as soon as it appears, so the touch works with no enter first, and typing a password supersedes the listener instantly, and the greeter accepts enter on an empty password field as a fingerprint attempt. Typed passwords are unaffected: password attempts ride the authselect password-only stack when the distro ships it, so an enrolled finger never makes a wrong-or-right password wait out the reader's ~30 s no-touch timeout first.
 
 ## v0.10.1 (2026-11-21)
 

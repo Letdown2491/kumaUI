@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 
@@ -141,6 +142,20 @@ struct Prompt {
     password: String,
     /// set while a helper exchange is in flight
     busy: bool,
+    /// the in-flight exchange is a fingerprint attempt (empty field),
+    /// not a password one: its failures read differently on the card
+    finger: bool,
+    /// the availability probe came back positive: the card opened the
+    /// listener and the hint line says so
+    finger_ready: bool,
+    /// how to kill the in-flight exchange (socket shutdown, or the
+    /// setuid child): a typed password supersedes the listener
+    cancel: Option<HelperCancel>,
+    /// cancel was asked before the worker handed the handle over
+    cancel_requested: bool,
+    /// the generation that was superseded mid-exchange: its end is
+    /// silent, never an error card
+    cancelled: Option<u64>,
     /// PAM's info/error text, or our own status
     note: Option<SharedString>,
     /// bumped on every resubmit so stale pump events drop
@@ -157,6 +172,12 @@ impl Drop for Prompt {
         // the lock screen and the vault form leave no heap copy behind,
         // and neither does this one
         self.password.zeroize();
+        // and the fingerprint listener dies with the card: an exchange
+        // left running would hold the reader (and the worker) for the
+        // daemon's full no-touch timeout after the user moved on
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
     }
 }
 
@@ -214,12 +235,37 @@ impl PolkitState {
             chosen: 0,
             password: String::new(),
             busy: false,
+            finger: false,
+            finger_ready: false,
+            cancel: None,
+            cancel_requested: false,
+            cancelled: None,
             note: None,
             generation: 0,
             finished: None,
             reply: request.reply,
         });
         cx.notify();
+        // the fingerprint listener starts with the card: a touch should
+        // be enough, no enter first (GNOME's convention). Started only
+        // when the hardware can carry one, probed off the UI thread.
+        let user = self.prompt.as_ref().unwrap().candidates[0].name.clone();
+        cx.spawn(async move |this, cx| {
+            let ready = cx
+                .background_spawn(async move { fingerprint::available(&user) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(prompt) = this.prompt.as_mut() else {
+                    return;
+                };
+                prompt.finger_ready = ready;
+                let still_fresh = !prompt.busy && prompt.password.is_empty();
+                if ready && still_fresh {
+                    this.start_exchange(cx);
+                }
+            });
+        })
+        .detach();
         true
     }
 
@@ -281,6 +327,7 @@ impl PolkitState {
             // manager (the lock field's shape includes its paste arm)
             "v" if keystroke.modifiers.control || keystroke.modifiers.platform => {
                 if let Some(text) = crate::paste::pasted_text(cx) {
+                    self.supersede_finger(cx);
                     if let Some(prompt) = self.prompt.as_mut() {
                         prompt.password.push_str(&text);
                         prompt.note = None;
@@ -306,8 +353,11 @@ impl PolkitState {
                 && !keystroke.modifiers.platform
                 && !keystroke.modifiers.function =>
             {
-                if let Some(prompt) = self.prompt.as_mut() {
-                    if let Some(character) = keystroke.key_char.as_deref() {
+                if let Some(character) = keystroke.key_char.as_deref() {
+                    // typing supersedes the fingerprint listener: the
+                    // reader stops, the password path takes over
+                    self.supersede_finger(cx);
+                    if let Some(prompt) = self.prompt.as_mut() {
                         prompt.password.push_str(character);
                         prompt.note = None;
                         cx.notify();
@@ -330,29 +380,91 @@ impl PolkitState {
         }
     }
 
-    /// Enter pressed: run the helper exchange with the typed password.
-    /// An empty field is a fingerprint attempt: the stack asks
-    /// pam_fprintd first, the finger prompts relay to the card, and a
-    /// touch authenticates while the password field stays empty. Each
-    /// attempt is a fresh helper connection under the same polkitd
-    /// cookie, and the BeginAuthentication method stays open across
-    /// failures so the card can re-ask.
+    /// Enter pressed. The empty field is the fingerprint attempt: the
+    /// card auto-started a listener when it opened, so enter-on-empty
+    /// with the listener running is a no-op; a typed password supersedes
+    /// the listener (killing the in-flight exchange, so the submit is
+    /// not held for the reader's ~30 s no-touch timeout) and runs as
+    /// before. Each attempt is a fresh helper connection under the same
+    /// polkitd cookie, and the BeginAuthentication method stays open
+    /// across failures so the card can re-ask.
     fn attempt(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.prompt.as_ref() else {
+            return;
+        };
+        let empty = prompt.password.is_empty();
+        if prompt.busy {
+            if empty || !prompt.finger {
+                // the listener (or a password exchange) already runs;
+                // enter adds nothing
+                return;
+            }
+            // typed over the fingerprint attempt: kill it, then submit
+            self.supersede_finger(cx);
+        }
+        self.start_exchange(cx);
+    }
+
+    /// Kill the in-flight fingerprint exchange: the helper dies now, the
+    /// worker thread's blocked read ends in a moment, and the end is
+    /// marked cancelled so no error text flashes on the card.
+    fn supersede_finger(&mut self, cx: &mut Context<Self>) {
         let Some(prompt) = self.prompt.as_mut() else {
             return;
         };
-        if prompt.busy {
+        if !(prompt.busy && prompt.finger) {
             return;
         }
+        prompt.cancel_requested = true;
+        if let Some(cancel) = prompt.cancel.take() {
+            cancel.cancel();
+        }
+        prompt.busy = false;
+        prompt.cancelled = Some(prompt.generation);
+        prompt.note = None;
+        cx.notify();
+    }
+
+    /// Run one helper exchange with the field as it stands: empty is the
+    /// fingerprint attempt, anything typed is the password one. The
+    /// helper connection is made on the worker, and its cancel handle
+    /// rides back so the card can supersede the exchange mid-flight.
+    fn start_exchange(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
         let candidate = prompt.candidates[prompt.chosen].clone();
         let password = std::mem::take(&mut prompt.password);
+        let finger = password.is_empty();
         prompt.busy = true;
+        prompt.finger = finger;
         prompt.note = None;
         prompt.finished = None;
+        prompt.cancel_requested = false;
+        prompt.cancel = None;
         prompt.generation += 1;
         let generation = prompt.generation;
         let cookie = prompt.cookie.clone();
         cx.notify();
+
+        // the cancel handle comes back while the exchange runs
+        let (cancel_tx, cancel_rx) = unbounded::<HelperCancel>();
+        cx.spawn(async move |this, cx| {
+            while let Ok(cancel) = cancel_rx.recv().await {
+                let _ = this.update(cx, |this, _| {
+                    let Some(prompt) = this.prompt.as_mut() else {
+                        return;
+                    };
+                    if prompt.generation == generation {
+                        prompt.cancel = Some(cancel.clone());
+                        if prompt.cancel_requested {
+                            cancel.cancel();
+                        }
+                    }
+                });
+            }
+        })
+        .detach();
 
         // PAM's info and error lines land while the exchange runs
         let (note_tx, note_rx) = unbounded::<PumpNote>();
@@ -372,7 +484,7 @@ impl PolkitState {
                     // several failed attempts, each otherwise a
                     // residue copy)
                     let mut password = password;
-                    let end = run_pump(&cookie, &candidate.name, &password, &note_tx);
+                    let end = run_pump(&cookie, &candidate.name, &password, &note_tx, &cancel_tx);
                     password.zeroize();
                     end
                 })
@@ -417,14 +529,52 @@ impl PolkitState {
             PumpEnd::Failure => {
                 prompt.busy = false;
                 prompt.finished = Some(generation);
-                prompt.note = Some("authentication failed".into());
+                if prompt.finger {
+                    // a no-touch timeout is not a failed password: the
+                    // module's last relayed line ("Verification timed
+                    // out") already says what happened, and the listener
+                    // re-arms so the card stays live
+                    let rearm = prompt.password.is_empty() && prompt.cancelled != Some(generation);
+                    if rearm {
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_secs(2))
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                let Some(prompt) = this.prompt.as_ref() else {
+                                    return;
+                                };
+                                // same exchange: still empty, still
+                                // unanswered, not superseded meanwhile
+                                if prompt.generation == generation
+                                    && !prompt.busy
+                                    && prompt.password.is_empty()
+                                    && prompt.cancelled != Some(generation)
+                                {
+                                    this.start_exchange(cx);
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                } else {
+                    prompt.note = Some("authentication failed".into());
+                }
                 cx.notify();
             }
             PumpEnd::Broke(reason) => {
                 log::error!("polkit helper exchange failed: {reason}");
+                let was_cancelled = prompt.finger && prompt.cancelled == Some(generation);
                 prompt.busy = false;
                 prompt.finished = Some(generation);
-                prompt.note = Some("the authentication helper failed".into());
+                // a superseded fingerprint attempt is the user typing a
+                // password over it: no error, their keystrokes follow.
+                // Anything else is a machine to fix
+                if was_cancelled {
+                    prompt.note = None;
+                } else if !prompt.finger {
+                    prompt.note = Some("the authentication helper failed".into());
+                }
                 cx.notify();
             }
         }
@@ -462,7 +612,7 @@ impl Focusable for PromptView {
 impl Render for PromptView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::current();
-        let (message, busy, note, candidates, chosen, password_len) = self
+        let (message, busy, note, candidates, chosen, password_len, finger_ready) = self
             .state
             .read(cx)
             .prompt
@@ -475,9 +625,10 @@ impl Render for PromptView {
                     prompt.candidates.clone(),
                     prompt.chosen,
                     prompt.password.chars().count(),
+                    prompt.finger_ready,
                 )
             })
-            .unwrap_or((String::new(), false, None, Vec::new(), 0, 0));
+            .unwrap_or((String::new(), false, None, Vec::new(), 0, 0, false));
 
         let field: SharedString = if busy {
             "checking…".into()
@@ -584,12 +735,16 @@ impl Render for PromptView {
                             }))
                             .child(field),
                     )
-                    .when(note.is_none(), |el| {
+                    .when(note.is_none() && finger_ready, |el| {
                         el.child(
                             div()
                                 .text_size(px(11.))
                                 .text_color(rgb(theme.text_dim))
-                                .child("type a password, or press enter alone to try the fingerprint reader"),
+                                .child(if busy {
+                                    "listening to the fingerprint reader; type a password to use that instead"
+                                } else {
+                                    "the fingerprint reader is listening, or type a password"
+                                }),
                         )
                     })
                     .when_some(note, |el, note| {
@@ -905,30 +1060,96 @@ const HELPER_BINARIES: [&str; 2] = [
     "/usr/libexec/polkit-agent-helper-1",
 ];
 
-/// One helper exchange: the reference agent's two modes. The
-/// socket-activated helper (username line, then the cookie line over the
-/// socket) when the unit is up; otherwise the setuid spawn (username as
-/// argv[1], the cookie line on stdin), which is what kumaOS runs.
-/// Blocking on purpose: it runs on a background executor thread like
-/// every other subprocess read. Bounded too: a PAM stack that hangs
-/// (a wedged LDAP lookup) must not pin the thread forever, so the
-/// exchange rides `timeout` with a kill-after (a helper that hangs and
-/// ignores SIGTERM still ends) in spawn mode and socket timeouts in
-/// socket mode, like the bluetooth acts' `timeout` wrappers.
+/// How long one helper exchange may take before the wrapper ends it.
 const HELPER_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn run_pump(cookie: &str, user: &str, password: &str, notes: &Sender<PumpNote>) -> PumpEnd {
+/// How to kill an in-flight helper exchange. The pump thread blocks on
+/// its read; both arms end that read from outside it: the socket's
+/// clone shuts the shared connection down, the setuid child's death
+/// closes its pipes.
+#[derive(Clone)]
+enum HelperCancel {
+    Socket(Arc<UnixStream>),
+    Child(Arc<Mutex<Option<std::process::Child>>>),
+}
+
+impl HelperCancel {
+    /// Kill the exchange: the pump thread's next read fails and the
+    /// exchange ends as Broke (the card keeps that end silent).
+    fn cancel(&self) {
+        match self {
+            HelperCancel::Socket(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            HelperCancel::Child(slot) => {
+                if let Some(mut child) = slot.lock().unwrap().take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+
+    /// Reap the setuid child after a natural end (its stdout closed, or
+    /// the timeout wrapper fired): no zombie. The socket arm has
+    /// nothing to reap.
+    fn reap(&self) {
+        if let HelperCancel::Child(slot) = self
+            && let Some(mut child) = slot.lock().unwrap().take()
+        {
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for HelperCancel {
+    fn drop(&mut self) {
+        self.reap();
+    }
+}
+
+/// One connected helper session: the identify lines to send, the
+/// connected pipes, and the way to kill it.
+struct HelperSession {
+    identify: Vec<String>,
+    reader: Box<dyn std::io::Read + Send>,
+    writer: Box<dyn std::io::Write + Send>,
+    cancel: HelperCancel,
+}
+
+/// Connect to the helper: the socket-activated one (username line, then
+/// the cookie line over the socket) when the unit is up, else the
+/// setuid spawn (username as argv[1], the cookie line on stdin), which
+/// is what kumaOS runs. Blocking on purpose: it runs on a background
+/// executor thread like every other subprocess read. Bounded too: a
+/// PAM stack that hangs (a wedged LDAP lookup) must not pin the thread
+/// forever, so the exchange rides `timeout` with a kill-after (a helper
+/// that hangs and ignores SIGTERM still ends) in spawn mode and socket
+/// timeouts in socket mode, like the bluetooth acts' `timeout` wrappers.
+fn helper_session(user: &str, cookie: &str) -> Result<HelperSession, String> {
     if std::path::Path::new(HELPER_SOCKET).exists() {
         match UnixStream::connect(HELPER_SOCKET) {
             Ok(stream) => {
                 let _ = stream.set_read_timeout(Some(HELPER_EXCHANGE_TIMEOUT));
                 let _ = stream.set_write_timeout(Some(HELPER_EXCHANGE_TIMEOUT));
-                let mut writer = match stream.try_clone() {
+                let writer = match stream.try_clone() {
                     Ok(clone) => clone,
-                    Err(err) => return PumpEnd::Broke(err.to_string()),
+                    Err(err) => {
+                        return Err(format!("cannot clone the helper socket: {err}"));
+                    }
                 };
-                let reader = BufReader::new(stream);
-                return pump_conversation(reader, &mut writer, &[user, cookie], password, notes);
+                let cancel = match stream.try_clone() {
+                    Ok(clone) => clone,
+                    Err(err) => {
+                        return Err(format!("cannot clone the helper socket: {err}"));
+                    }
+                };
+                return Ok(HelperSession {
+                    identify: vec![user.to_string(), cookie.to_string()],
+                    reader: Box::new(stream),
+                    writer: Box::new(writer),
+                    cancel: HelperCancel::Socket(Arc::new(cancel)),
+                });
             }
             Err(err) => log::warn!(
                 "polkit: the helper socket exists but connect failed: {err}; spawning the setuid helper"
@@ -940,7 +1161,7 @@ fn run_pump(cookie: &str, user: &str, password: &str, notes: &Sender<PumpNote>) 
         .map(std::path::Path::new)
         .find(|path| path.exists())
     else {
-        return PumpEnd::Broke("no polkit agent helper is available".into());
+        return Err("no polkit agent helper is available".into());
     };
     let child = std::process::Command::new("timeout")
         .arg("-k")
@@ -953,21 +1174,50 @@ fn run_pump(cookie: &str, user: &str, password: &str, notes: &Sender<PumpNote>) 
         .spawn();
     let mut child = match child {
         Ok(child) => child,
-        Err(err) => return PumpEnd::Broke(format!("cannot start the helper: {err}")),
+        Err(err) => return Err(format!("cannot start the helper: {err}")),
     };
-    let mut writer = match child.stdin.take() {
+    let writer = match child.stdin.take() {
         Some(stdin) => stdin,
-        None => return PumpEnd::Broke("the helper has no stdin".into()),
+        None => return Err("the helper has no stdin".into()),
     };
-    let reader = BufReader::new(match child.stdout.take() {
+    let reader = match child.stdout.take() {
         Some(stdout) => stdout,
-        None => return PumpEnd::Broke("the helper has no stdout".into()),
-    });
-    // the setuid helper takes the cookie (and only the cookie) on stdin
-    let end = pump_conversation(reader, &mut writer, &[cookie], password, notes);
-    // EOF ends the helper; reap it so nothing lingers
-    drop(writer);
-    let _ = child.wait();
+        None => return Err("the helper has no stdout".into()),
+    };
+    Ok(HelperSession {
+        identify: vec![cookie.to_string()],
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        cancel: HelperCancel::Child(Arc::new(Mutex::new(Some(child)))),
+    })
+}
+
+/// One helper exchange: connect, hand the cancel handle back (the card
+/// holds it from this moment), then run the line protocol. Blocking on
+/// purpose: it runs on a background executor thread like every other
+/// subprocess read.
+fn run_pump(
+    cookie: &str,
+    user: &str,
+    password: &str,
+    notes: &Sender<PumpNote>,
+    cancel_tx: &Sender<HelperCancel>,
+) -> PumpEnd {
+    let Ok(mut session) = helper_session(user, cookie) else {
+        return PumpEnd::Broke("no polkit agent helper is available".into());
+    };
+    // the card can supersede the exchange from here on
+    let _ = cancel_tx.try_send(session.cancel.clone());
+    let identify: Vec<&str> = session.identify.iter().map(String::as_str).collect();
+    let end = pump_conversation(
+        BufReader::new(session.reader),
+        &mut session.writer,
+        &identify,
+        password,
+        notes,
+    );
+    // the setuid helper ends at EOF; reap it so nothing lingers
+    session.cancel.reap();
     end
 }
 
@@ -1389,6 +1639,34 @@ mod tests {
         assert!(!note.is_error);
         // and nothing else followed it
         assert!(notes_rx.recv_blocking().is_err());
+    }
+
+    #[test]
+    fn helper_cancel_kills_both_arms() {
+        // socket arm: shutdown on the held clone ends the peer's read
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let cancel = HelperCancel::Socket(Arc::new(ours.try_clone().unwrap()));
+        let reader = std::thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            let mut theirs = theirs;
+            std::io::Read::read_exact(&mut theirs, &mut byte)
+        });        let started = std::time::Instant::now();
+        cancel.cancel();
+        assert!(reader.join().unwrap().is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // child arm: the kill lands (a sleeper that ignores nothing
+        // dies at once, not at its own natural end)
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let cancel = HelperCancel::Child(Arc::new(Mutex::new(Some(child))));
+        let started = std::time::Instant::now();
+        cancel.cancel();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // a second cancel (or a drop) on a reaped slot is a no-op
+        cancel.cancel();
     }
 
     #[test]
