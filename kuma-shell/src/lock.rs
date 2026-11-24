@@ -260,6 +260,16 @@ fn classify_pam(err: &pam_client2::Error) -> AuthError {
     }
 }
 
+/// What an auth surface's message line carries: the exchange's status
+/// (the fingerprint reader talking: "place your finger...", "timed
+/// out") or a failure of the attempt itself. The styling differs on
+/// the lock screen and the polkit card: status never wears the red.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AuthNote {
+    Status(SharedString),
+    Failure(SharedString),
+}
+
 /// The whole lock state: locked or not, the shared password field, one
 /// surface per display, the decoded wallpaper. Views observe this; key
 /// events from whichever surface has the keyboard all feed into it.
@@ -268,8 +278,8 @@ pub struct LockState {
     password: String,
     /// Set while a PAM attempt is in flight: the field shows "checking".
     busy: bool,
-    /// The last attempt's failure message (shown under the field).
-    message: Option<SharedString>,
+    /// The last attempt's failure, or the fingerprint listener's status.
+    message: Option<AuthNote>,
     wallpaper: Option<Arc<RenderImage>>,
     wallpaper_path: Option<std::path::PathBuf>,
     surfaces: Vec<WindowHandle<LockView>>,
@@ -385,7 +395,7 @@ impl LockState {
                     while let Ok(text) = note_rx.recv().await {
                         let _ = relay_this.update(cx, |this, cx| {
                             if this.locked {
-                                this.message = Some(text.into());
+                                this.message = Some(AuthNote::Status(text.into()));
                                 cx.notify();
                             }
                         });
@@ -508,7 +518,7 @@ impl LockState {
             .or_else(|_| std::env::var("LOGNAME"))
             .unwrap_or_default();
         if user.is_empty() {
-            self.message = Some("no user to authenticate".into());
+            self.message = Some(AuthNote::Failure("no user to authenticate".into()));
             cx.notify();
             return;
         }
@@ -529,7 +539,7 @@ impl LockState {
                         // shows the honest line (a rejection reads as
                         // one, a machine failure says what broke)
                         log::info!("unlock attempt failed: {err:?}");
-                        this.message = Some(err.surface_text().into());
+                        this.message = Some(AuthNote::Failure(err.surface_text().into()));
                         this.password.zeroize();
                         cx.notify();
                     }
@@ -636,7 +646,11 @@ impl Render for LockView {
                             .rounded_xl()
                             .bg(rgba(crate::theme::current().panel_bg))
                             .border_1()
-                            .border_color(rgb(if message.is_some() { crate::theme::URGENT } else { crate::theme::current().divider }))
+                            .border_color(rgb(if matches!(message, Some(AuthNote::Failure(_))) {
+                                crate::theme::URGENT
+                            } else {
+                                crate::theme::current().divider
+                            }))
                             .text_size(px(13.))
                             .text_color(rgb(if busy || password_len == 0 {
                                 crate::theme::current().text_dim
@@ -654,11 +668,19 @@ impl Render for LockView {
                         )
                     })
                     .when_some(message, |el, message| {
+                        let (text, is_failure) = match &message {
+                            AuthNote::Status(text) => (text.clone(), false),
+                            AuthNote::Failure(text) => (text.clone(), true),
+                        };
                         el.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(crate::theme::URGENT))
-                                .child(message),
+                                .text_color(rgb(if is_failure {
+                                    crate::theme::URGENT
+                                } else {
+                                    crate::theme::current().text_dim
+                                }))
+                                .child(text),
                         )
                     }),
             )

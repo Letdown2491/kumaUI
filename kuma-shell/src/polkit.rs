@@ -39,7 +39,7 @@ use zbus::zvariant::{OwnedValue, Value};
 use zeroize::Zeroize;
 
 use crate::fingerprint;
-use crate::lock::LockState;
+use crate::lock::{AuthNote, LockState};
 
 const AUTHORITY_DEST: &str = "org.freedesktop.PolicyKit1";
 const AUTHORITY_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
@@ -156,8 +156,8 @@ struct Prompt {
     /// the generation that was superseded mid-exchange: its end is
     /// silent, never an error card
     cancelled: Option<u64>,
-    /// PAM's info/error text, or our own status
-    note: Option<SharedString>,
+    /// PAM's info/error text, our own status, or the failure line
+    note: Option<AuthNote>,
     /// bumped on every resubmit so stale pump events drop
     generation: u64,
     /// set once the exchange ended, so a late note cannot overwrite the
@@ -500,7 +500,13 @@ impl PolkitState {
             return;
         };
         if prompt.generation == generation && prompt.finished != Some(generation) {
-            prompt.note = Some(note_text(note));
+            let is_error = note.is_error;
+            let text = note_text(note);
+            prompt.note = Some(if is_error {
+                AuthNote::Failure(text)
+            } else {
+                AuthNote::Status(text)
+            });
             cx.notify();
         }
     }
@@ -558,7 +564,7 @@ impl PolkitState {
                         .detach();
                     }
                 } else {
-                    prompt.note = Some("authentication failed".into());
+                    prompt.note = Some(AuthNote::Failure("authentication failed".into()));
                 }
                 cx.notify();
             }
@@ -573,7 +579,7 @@ impl PolkitState {
                 if was_cancelled {
                     prompt.note = None;
                 } else if !prompt.finger {
-                    prompt.note = Some("the authentication helper failed".into());
+                    prompt.note = Some(AuthNote::Failure("the authentication helper failed".into()));
                 }
                 cx.notify();
             }
@@ -629,6 +635,9 @@ impl Render for PromptView {
                 )
             })
             .unwrap_or((String::new(), false, None, Vec::new(), 0, 0, false));
+        // the red border means the exchange failed: status text from
+        // the fingerprint reader never wears it
+        let failed = matches!(note, Some(AuthNote::Failure(_)));
 
         let field: SharedString = if busy {
             "checking…".into()
@@ -722,7 +731,7 @@ impl Render for PromptView {
                             .rounded_xl()
                             .bg(rgba(theme.inset))
                             .border_1()
-                            .border_color(rgb(if note.is_some() {
+                            .border_color(rgb(if failed {
                                 crate::theme::URGENT
                             } else {
                                 theme.divider
@@ -748,11 +757,14 @@ impl Render for PromptView {
                         )
                     })
                     .when_some(note, |el, note| {
+                        let text = match &note {
+                            AuthNote::Status(text) | AuthNote::Failure(text) => text.clone(),
+                        };
                         el.child(
                             div()
                                 .text_size(px(11.))
                                 .text_color(rgb(theme.text_dim))
-                                .child(note),
+                                .child(text),
                         )
                     })
                     .child({
