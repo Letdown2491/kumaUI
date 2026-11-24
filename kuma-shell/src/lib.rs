@@ -8,6 +8,7 @@ pub mod displays;
 pub mod dock;
 pub mod icons;
 pub mod idle;
+pub mod fingerprint;
 pub mod imaging;
 pub mod launcher;
 pub mod lock;

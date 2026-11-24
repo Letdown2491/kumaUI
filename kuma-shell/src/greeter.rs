@@ -143,13 +143,17 @@ pub enum LoginOutcome {
 /// every auth message on the way (the password goes to secret questions
 /// only; a visible question must never receive it, where a module could
 /// echo it or log it, matching the polkit agent's rule), then start
-/// `cmd`. A wrong password surfaces as `AuthFailed` and
+/// `cmd`. pam_fprintd's status prompts ("place your finger...") ride
+/// greetd as secret questions too: they take the empty string instead,
+/// and their text goes out on `notes` for the card to show. A wrong
+/// password surfaces as `AuthFailed` and
 /// the caller may simply try again: greetd ended that attempt.
 pub fn login(
     client: &mut GreetdClient,
     username: &str,
     password: &str,
     cmd: &[&str],
+    notes: &smol::channel::Sender<String>,
 ) -> anyhow::Result<LoginOutcome> {
     let mut response = client.request(&Request::CreateSession { username })?;
     let mut messages = 0;
@@ -165,17 +169,24 @@ pub fn login(
                 return Ok(LoginOutcome::AuthFailed(description));
             }
             Response::AuthMessage {
-                auth_message_type, ..
+                auth_message_type,
+                auth_message,
             } => {
                 // a question takes an answer: the password only for the
-                // secret one, an empty string for visible questions
-                // (a module asking echo-on wanted a username or a
-                // confirmation, never the password), and info and error
-                // statements only want an acknowledgement
+                // secret one that is not a fingerprint status prompt
+                // (pam_fprintd ignores those answers), an empty string
+                // for visible questions (a module asking echo-on wanted
+                // a username or a confirmation, never the password),
+                // and info and error statements only want an
+                // acknowledgement
+                let finger = crate::fingerprint::finger_prompt(&auth_message);
+                if finger {
+                    let _ = notes.try_send(auth_message.clone());
+                }
                 let answer = match auth_message_type {
-                    AuthMessageType::Secret => Some(password),
-                    AuthMessageType::Visible => Some(""),
+                    AuthMessageType::Secret if !finger => Some(password),
                     AuthMessageType::Info | AuthMessageType::Error => None,
+                    _ => Some(""),
                 };
                 response = client.request(&Request::PostAuthMessageResponse { response: answer })?;
             }
@@ -210,6 +221,12 @@ pub use kuma_platform::desktop::{Session, wayland_sessions};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A notes channel the tests never read: finger prompts land in it
+    /// and die with the channel when the attempt ends.
+    fn drop_channel() -> smol::channel::Sender<String> {
+        smol::channel::unbounded().0
+    }
 
     /// A fake greetd: one end of a socket pair, a scripted reply list
     /// served frame by frame, and the requests it received returned
@@ -288,7 +305,7 @@ mod tests {
         ];
         let (mut client, fake) = FakeGreetd::spawn(&script);
 
-        let outcome = login(&mut client, "martin", "hunter2", &["niri-session"]).unwrap();
+        let outcome = login(&mut client, "martin", "hunter2", &["niri-session"], &drop_channel()).unwrap();
         assert_eq!(outcome, LoginOutcome::Started);
 
         let create = fake.sent(0);
@@ -312,11 +329,44 @@ mod tests {
         ];
         let (mut client, _fake) = FakeGreetd::spawn(&script);
 
-        let outcome = login(&mut client, "martin", "nope", &["niri-session"]).unwrap();
+        let outcome = login(&mut client, "martin", "nope", &["niri-session"], &drop_channel()).unwrap();
         assert_eq!(
             outcome,
             LoginOutcome::AuthFailed("Authentication failure".into())
         );
+    }
+
+    #[test]
+    fn finger_prompts_get_an_empty_answer_and_a_note_password_is_saved() {
+        // the greetd transport of the fingerprint exchange: pam_fprintd
+        // (via the greetd service's stack) sends its status prompt as a
+        // secret question, then pam_unix asks for the password. The
+        // finger prompt must not learn the password, its text must go
+        // out on the note channel for the card, and the password must
+        // still reach the prompt that reads it.
+        let script = vec![
+            auth_message("secret", "Place your finger on the fingerprint reader"),
+            auth_message("secret", "Password: "),
+            serde_json::json!({ "type": "success" }),
+            serde_json::json!({ "type": "success" }),
+        ];
+        let (mut client, fake) = FakeGreetd::spawn(&script);
+        let (note_tx, note_rx) = smol::channel::unbounded::<String>();
+
+        let outcome = login(&mut client, "martin", "hunter2", &["niri-session"], &note_tx).unwrap();
+        assert_eq!(outcome, LoginOutcome::Started);
+
+        let requests: Vec<serde_json::Value> = (0..4).map(|i| fake.sent(i)).collect();
+        assert_eq!(
+            requests[1]["response"], "",
+            "the finger prompt must not get the password: {requests:?}"
+        );
+        assert_eq!(requests[2]["response"], "hunter2");
+
+        drop(note_tx);
+        let note = note_rx.recv_blocking().unwrap();
+        assert!(note.contains("finger"), "{note}");
+        assert!(note_rx.recv_blocking().is_err());
     }
 
     #[test]
@@ -329,7 +379,7 @@ mod tests {
         ];
         let (mut client, fake) = FakeGreetd::spawn(&script);
 
-        let outcome = login(&mut client, "martin", "hunter2", &["niri-session"]).unwrap();
+        let outcome = login(&mut client, "martin", "hunter2", &["niri-session"], &drop_channel()).unwrap();
         assert_eq!(outcome, LoginOutcome::Started);
 
         let create = fake.sent(0);
@@ -352,7 +402,7 @@ mod tests {
         ];
         let (mut client, fake) = FakeGreetd::spawn(&script);
 
-        let outcome = login(&mut client, "martin", "hunter2", &["niri-session"]).unwrap();
+        let outcome = login(&mut client, "martin", "hunter2", &["niri-session"], &drop_channel()).unwrap();
         assert_eq!(outcome, LoginOutcome::Started);
 
         let requests: Vec<serde_json::Value> = (0..4).map(|i| fake.sent(i)).collect();
@@ -375,7 +425,7 @@ mod tests {
         ];
         let (mut client, fake) = FakeGreetd::spawn(&script);
 
-        let outcome = login(&mut client, "martin", "hunter2", &["niri-session"]).unwrap();
+        let outcome = login(&mut client, "martin", "hunter2", &["niri-session"], &drop_channel()).unwrap();
         assert!(matches!(outcome, LoginOutcome::AuthFailed(_)));
         // the password went to the question, the error statement got
         // an acknowledgement with no password in it

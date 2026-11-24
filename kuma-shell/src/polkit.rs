@@ -37,6 +37,7 @@ use smol::channel::{Sender, bounded, unbounded};
 use zbus::zvariant::{OwnedValue, Value};
 use zeroize::Zeroize;
 
+use crate::fingerprint;
 use crate::lock::LockState;
 
 const AUTHORITY_DEST: &str = "org.freedesktop.PolicyKit1";
@@ -330,14 +331,17 @@ impl PolkitState {
     }
 
     /// Enter pressed: run the helper exchange with the typed password.
-    /// Each attempt is a fresh helper connection under the same polkitd
+    /// An empty field is a fingerprint attempt: the stack asks
+    /// pam_fprintd first, the finger prompts relay to the card, and a
+    /// touch authenticates while the password field stays empty. Each
+    /// attempt is a fresh helper connection under the same polkitd
     /// cookie, and the BeginAuthentication method stays open across
     /// failures so the card can re-ask.
     fn attempt(&mut self, cx: &mut Context<Self>) {
         let Some(prompt) = self.prompt.as_mut() else {
             return;
         };
-        if prompt.busy || prompt.password.is_empty() {
+        if prompt.busy {
             return;
         }
         let candidate = prompt.candidates[prompt.chosen].clone();
@@ -580,6 +584,14 @@ impl Render for PromptView {
                             }))
                             .child(field),
                     )
+                    .when(note.is_none(), |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(theme.text_dim))
+                                .child("type a password, or press enter alone to try the fingerprint reader"),
+                        )
+                    })
                     .when_some(note, |el, note| {
                         el.child(
                             div()
@@ -973,10 +985,14 @@ fn pump_conversation<R: std::io::Read, W: std::io::Write>(
             return PumpEnd::Broke(format!("cannot identify to the helper: {err}"));
         }
     }
-    // the typed password answers the first secret prompt; a re-ask
-    // (second factor, forced rotation) and a plain-text (echo) prompt
-    // have no pre-typed answer: an empty line goes out and PAM fails
-    // honestly: v1 is password-only, like the lock screen
+    // the typed password answers the first secret prompt that is not a
+    // pam_fprintd status line: the fingerprint module's "place your
+    // finger" prompts arrive as secret questions too, but they ignore
+    // their answers, so an empty line goes out, the text rides to the
+    // card as a note, and the password is saved for the real secret
+    // prompt behind it. A re-ask (second factor, forced rotation) and a
+    // plain-text (echo) prompt have no pre-typed answer: an empty line
+    // goes out and PAM fails honestly.
     let mut answered = false;
     loop {
         let mut line = String::new();
@@ -988,15 +1004,21 @@ fn pump_conversation<R: std::io::Read, W: std::io::Write>(
         // the reference agent compresses the whole line, then matches
         // the token: the separator space is real, the value was escaped
         match parse_helper_line(&unescape_line(line.trim_end_matches('\n'))) {
-            HelperLine::Prompt { echo, .. } => {
-                let answer: &str = if echo {
+            HelperLine::Prompt { text, echo } => {
+                let answer: &str = if fingerprint::finger_prompt(&text) {
+                    let _ = notes.try_send(PumpNote {
+                        text: text.clone(),
+                        is_error: false,
+                    });
+                    ""
+                } else if echo {
                     ""
                 } else if answered {
                     ""
                 } else {
+                    answered = true;
                     password
                 };
-                answered = true;
                 if let Err(err) = write_line(writer, answer) {
                     return PumpEnd::Broke(err.to_string());
                 }
@@ -1321,6 +1343,52 @@ mod tests {
             parse_identity("unix-netgroup", &HashMap::new()),
             Identity::Other("unix-netgroup".into())
         );
+    }
+
+    #[test]
+    fn pump_finger_prompt_takes_empty_then_password() {
+        // the fingerprint exchange on this machine's stack: pam_fprintd
+        // asks first (its status line is a secret prompt whose answer
+        // is ignored), then pam_unix asks for the real password. The
+        // finger prompt must get an empty line (never the password)
+        // and a note on the card, and the password must be saved for
+        // the prompt that actually reads it.
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let helper = std::thread::spawn(move || {
+            let mut writer = theirs.try_clone().unwrap();
+            let mut reader = BufReader::new(theirs);
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+            }
+            writeln!(writer, "PAM_PROMPT_ECHO_OFF Place your finger on the fingerprint reader")
+                .unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "\n", "the finger prompt must get an empty answer");
+            writeln!(writer, "PAM_PROMPT_ECHO_OFF Password: ").unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "opensesame\n", "the password goes to the real prompt");
+            writeln!(writer, "SUCCESS").unwrap();
+        });
+        let (notes_tx, notes_rx) = unbounded();
+        let mut writer = ours.try_clone().unwrap();
+        let end = pump_conversation(
+            BufReader::new(ours),
+            &mut writer,
+            &["martin", "cookie-1"],
+            "opensesame",
+            &notes_tx,
+        );
+        assert_eq!(end, PumpEnd::Success);
+        helper.join().unwrap();
+        drop(notes_tx);
+        let note = notes_rx.recv_blocking().unwrap();
+        assert!(note.text.contains("finger"));
+        assert!(!note.is_error);
+        // and nothing else followed it
+        assert!(notes_rx.recv_blocking().is_err());
     }
 
     #[test]

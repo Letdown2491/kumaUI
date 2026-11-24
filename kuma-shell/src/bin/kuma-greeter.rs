@@ -115,7 +115,8 @@ fn headless(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match greeter::login(&mut client, &username, password, &cmd) {
+    let (note_tx, _note_rx) = smol::channel::unbounded::<String>();
+    match greeter::login(&mut client, &username, password, &cmd, &note_tx) {
         Ok(LoginOutcome::Started) => {
             println!("session started: {cmd:?}");
             0
@@ -173,6 +174,10 @@ struct GreeterState {
     sessions: Vec<greeter::Session>,
     session_index: usize,
     session_open: bool,
+    /// Whether a fingerprint reader with enrolled prints serves this
+    /// user: an empty password field plus enter becomes a fingerprint
+    /// attempt instead of a no-op.
+    fingerprint_ready: bool,
     /// The clock, redrawn on a tick.
     clock: String,
 }
@@ -224,6 +229,25 @@ impl GreeterState {
         })
         .detach();
 
+        // fingerprint availability, off the UI thread: the username
+        // field starts empty, so the probe runs for the greeter user's
+        // own enrollment (the reader is machine-wide; prints are per
+        // user, and the login target is typed before the attempt, so a
+        // wrong-user mismatch fails honestly in the exchange)
+        let user = kuma_shell::fingerprint::current_user();
+        if !user.is_empty() {
+            cx.spawn(async move |this, cx| {
+                let ready = cx
+                    .background_spawn(async move { kuma_shell::fingerprint::available(&user) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.fingerprint_ready = ready;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
         Self {
             wallpaper: None,
             username: String::new(),
@@ -234,6 +258,7 @@ impl GreeterState {
             sessions,
             session_index: 0,
             session_open: false,
+            fingerprint_ready: false,
             clock,
         }
     }
@@ -309,7 +334,15 @@ impl GreeterState {
     }
 
     fn attempt(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.password.is_empty() {
+        if self.busy {
+            return;
+        }
+        // an empty field is a fingerprint attempt when the hardware can
+        // carry one (a reader, prints enrolled): the greetd service's
+        // stack asks pam_fprintd first and the touch answers. Without
+        // the hardware the gate stays, so enter on an empty field does
+        // nothing, as before.
+        if self.password.is_empty() && !self.fingerprint_ready {
             return;
         }
         let username = self.username.trim().to_string();
@@ -331,20 +364,40 @@ impl GreeterState {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
+            // finger prompts from the exchange land on the card while
+            // the attempt runs; the relay ends when the sender drops
+            let (note_tx, note_rx) = smol::channel::unbounded::<String>();
+            let relay = cx.spawn({
+                let this = this.clone();
+                async move |cx| {
+                    while let Ok(text) = note_rx.recv().await {
+                        let _ = this.update(cx, |this, cx| {
+                            this.message = Some(text.into());
+                            cx.notify();
+                        });
+                    }
+                }
+            });
             let result = cx
-                .background_spawn(async move {
-                    let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
-                    let mut client = GreetdClient::connect()?;
-                    // the attempt's last consumer is here: scrub the
-                    // heap copy before the String frees (the lock
-                    // screen's discipline; a greeter runs pre-auth,
-                    // where freed heap is the exposure)
-                    let mut password = password;
-                    let result = greeter::login(&mut client, &username, &password, &cmd);
-                    password.zeroize();
-                    result
+                .background_spawn({
+                    let note_tx = note_tx.clone();
+                    async move {
+                        let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
+                        let mut client = GreetdClient::connect()?;
+                        // the attempt's last consumer is here: scrub the
+                        // heap copy before the String frees (the lock
+                        // screen's discipline; a greeter runs pre-auth,
+                        // where freed heap is the exposure)
+                        let mut password = password;
+                        let result =
+                            greeter::login(&mut client, &username, &password, &cmd, &note_tx);
+                        password.zeroize();
+                        result
+                    }
                 })
                 .await;
+            drop(note_tx);
+            let _ = relay.await;
             let _ = this.update(cx, |this, cx| match result {
                 Ok(LoginOutcome::Started) => {
                     log::info!("greeter: session started, handing back to greetd");
@@ -494,6 +547,8 @@ impl Render for GreeterView {
         let focus = state.focus;
         let busy = state.busy;
         let message = state.message.clone();
+        let has_message = message.is_some();
+        let fingerprint_ready = state.fingerprint_ready;
         let session_open = state.session_open;
         let session_index = state.session_index;
         let session_names: Vec<String> = state
@@ -611,6 +666,13 @@ impl Render for GreeterView {
                                 .text_size(px(11.))
                                 .text_color(rgb(theme::URGENT))
                                 .child(message),
+                        )
+                    })
+                    .when(!busy && !has_message && fingerprint_ready, |el| {                        el.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(theme.text_dim))
+                                .child("or press enter alone to try the fingerprint reader"),
                         )
                     })
                     .when(busy, |el| {

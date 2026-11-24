@@ -22,6 +22,7 @@ use gpui::{
 };
 use smol::channel::{Receiver, Sender, unbounded};
 
+use crate::fingerprint;
 use crate::imaging;
 use crate::settings::Settings;
 
@@ -32,9 +33,11 @@ use crate::settings::Settings;
 const PAM_SERVICES: [&str; 3] = ["kuma-lock", "swaylock", "vlock"];
 
 /// The PAM conversation for an unlock attempt: the pre-typed password
-/// answers the password prompt. Anything PAM wants to ask interactively
-/// (a second factor, a re-prompt) is refused; v1 is password-only, and
-/// fingerprint hardware that consults the user directly doesn't need us.
+/// answers the password prompt. pam_fprintd's finger prompts (which
+/// arrive as secret questions and ignore their answers) get an empty
+/// string instead, so the typed password never rides into a prompt
+/// nobody reads. Anything PAM wants asked interactively (a re-prompt)
+/// is refused; a second secret factor is not carried.
 struct PasswordConversation {
     /// The typed password as PAM wants it: scrubbed when the
     /// conversation drops, not left in freed heap (see Drop).
@@ -46,7 +49,12 @@ impl pam_client2::ConversationHandler for PasswordConversation {
         Err(pam_client2::ErrorCode::CONV_ERR)
     }
 
-    fn prompt_echo_off(&mut self, _prompt: &CStr) -> Result<CString, pam_client2::ErrorCode> {
+    fn prompt_echo_off(&mut self, prompt: &CStr) -> Result<CString, pam_client2::ErrorCode> {
+        if fingerprint::finger_prompt(&prompt.to_string_lossy()) {
+            // pam_fprintd's status prompt: the answer is ignored, so
+            // nothing of the password goes along
+            return Ok(CString::default());
+        }
         Ok(self.password.clone())
     }
 
@@ -75,10 +83,28 @@ impl Drop for PasswordConversation {
 /// from a failed swap, an editor saving only comments) must read as
 /// missing, never as a chain that unlocks on anything.
 fn service_has_auth_stack(service: &str) -> bool {
-    match std::fs::read_to_string(std::path::Path::new("/etc/pam.d").join(service)) {
-        Ok(text) => has_auth_stack(&text),
-        Err(_) => false,
+    ["/etc/pam.d", "/usr/lib/pam.d"]
+        .iter()
+        .any(|dir| match std::fs::read_to_string(std::path::Path::new(dir).join(service)) {
+            Ok(text) => has_auth_stack(&text),
+            Err(_) => false,
+        })
+}
+
+/// The PAM chain for a password attempt. The authselect password-only
+/// stack (`password-auth`: pam_unix and friends, no pam_fprintd) is the
+/// whole chain when the distro ships it: an enrollment puts
+/// pam_fprintd first in system-auth, which kuma-lock includes, and a
+/// typed password would then hold for the sensor's ~30 s no-touch
+/// timeout before the password prompt ever ran. password-auth carries
+/// the same policy minus the fingerprint module, so the password path
+/// stays instant whether or not a finger is enrolled. Without it, the
+/// distro chain stands, unchanged.
+fn password_chain() -> Vec<&'static str> {
+    if service_has_auth_stack("password-auth") {
+        return vec!["password-auth"];
     }
+    PAM_SERVICES.to_vec()
 }
 
 /// Whether any line names an `auth` rule: a non-comment line whose first
@@ -103,7 +129,7 @@ fn authenticate(user: &str, mut password: String) -> Result<(), AuthError> {
 
 fn authenticate_chain(user: &str, password: &str) -> Result<(), AuthError> {
     let mut last = None;
-    for service in PAM_SERVICES {
+    for service in password_chain() {
         // Linux-PAM defers reading a service's stack to the first call and,
         // when /etc/pam.d/<service> is missing, answers from the `other`
         // policy (pam_deny here). That rejects every password exactly like
@@ -137,6 +163,56 @@ fn authenticate_chain(user: &str, password: &str) -> Result<(), AuthError> {
         Some(err) => format!("no PAM service in the chain starts: {err}"),
         None => "no PAM service in the chain is installed".to_string(),
     }))
+}
+
+/// The fingerprint attempt's conversation: the fingerprint-only stack's
+/// only auth module is pam_fprintd, so every secret question is a
+/// finger status prompt. Each one is relayed to the surface ("place
+/// your finger...") and answered empty; the module ignores the answers
+/// either way.
+struct FingerConversation {
+    notes: smol::channel::Sender<String>,
+}
+
+impl pam_client2::ConversationHandler for FingerConversation {
+    fn prompt_echo_on(&mut self, _prompt: &CStr) -> Result<CString, pam_client2::ErrorCode> {
+        Err(pam_client2::ErrorCode::CONV_ERR)
+    }
+
+    fn prompt_echo_off(&mut self, prompt: &CStr) -> Result<CString, pam_client2::ErrorCode> {
+        let text = prompt.to_string_lossy().into_owned();
+        let _ = self.notes.try_send(text);
+        Ok(CString::default())
+    }
+
+    fn text_info(&mut self, msg: &CStr) {
+        let _ = self.notes.try_send(msg.to_string_lossy().into_owned());
+    }
+
+    fn error_msg(&mut self, msg: &CStr) {
+        let _ = self.notes.try_send(msg.to_string_lossy().into_owned());
+    }
+}
+
+/// One fingerprint attempt, on the fingerprint-only stack: a touch
+/// succeeds, a no-touch ends at the daemon's ~30 s timeout, and both
+/// validate the account like a password attempt would. The service is
+/// authselect's `fingerprint-auth`, which is this exact shape; without
+/// it there is no fingerprint path.
+fn authenticate_fingerprint(user: &str, notes: smol::channel::Sender<String>) -> Result<(), AuthError> {
+    if !service_has_auth_stack("fingerprint-auth") {
+        return Err(AuthError::Systemic("no fingerprint PAM service".into()));
+    }
+    let conversation = FingerConversation { notes };
+    let mut context = pam_client2::Context::new("fingerprint-auth", Some(user), conversation)
+        .map_err(|err| classify_pam(&err))?;
+    context
+        .authenticate(pam_client2::Flag::NONE)
+        .map_err(|err| classify_pam(&err))?;
+    context
+        .acct_mgmt(pam_client2::Flag::NONE)
+        .map_err(|err| classify_pam(&err))?;
+    Ok(())
 }
 
 /// What a failed attempt means: the two read differently on the lock
@@ -267,6 +343,76 @@ impl LockState {
                     })
                     .unwrap_or(false);
                 if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // the fingerprint loop: while locked, keep a verify running on
+        // the fingerprint-only stack so a touch unlocks, the way a
+        // typed password does beside it (separate services, separate
+        // conversations, first success wins; the loser's thread ends on
+        // its own). Started only when a reader exists and prints are
+        // enrolled for this user; each failed attempt ended at the
+        // daemon's ~30 s no-touch timeout, and the loop re-arms after a
+        // pause. Without this loop, the pre-fingerprint behavior is
+        // unchanged everywhere.
+        cx.spawn(async move |this, cx| {
+            let user = fingerprint::current_user();
+            if user.is_empty() {
+                return;
+            }
+            let user_for_probe = user.clone();
+            let usable = cx
+                .background_spawn(async move { fingerprint::available(&user_for_probe) })
+                .await;
+            if !usable {
+                return;
+            }
+            loop {
+                let user = user.clone();
+                let (note_tx, note_rx) = smol::channel::unbounded::<String>();
+                let attempt = cx
+                    .background_spawn(async move { authenticate_fingerprint(&user, note_tx) });
+                // the module's finger prompts land on the surface while
+                // the attempt runs ("place your finger on the
+                // fingerprint reader"); only while locked, so a password
+                // win mid-attempt leaves nothing stale behind. The relay
+                // ends when the attempt drops its sender.
+                let relay_this = this.clone();
+                cx.spawn(async move |cx| {
+                    while let Ok(text) = note_rx.recv().await {
+                        let _ = relay_this.update(cx, |this, cx| {
+                            if this.locked {
+                                this.message = Some(text.into());
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .detach();
+                let result = attempt.await;
+                let (still_locked, verified) = this
+                    .update(cx, |this, _| (this.locked, result.is_ok()))
+                    .unwrap_or((false, false));
+                if verified && still_locked {
+                    // the finger verified: same road a typed password
+                    // takes home
+                    this.update(cx, |this, cx| this.unlock(cx)).ok();
+                    break;
+                }
+                if !still_locked {
+                    break;
+                }
+                // a rejection (timed out, or the prints vanished under
+                // us): the last relayed note stays honest on the
+                // surface; pause, then guard again
+                log::info!("fingerprint attempt ended: {result:?}");
+                cx.background_executor()
+                    .timer(Duration::from_secs(5))
+                    .await;
+                if !this.update(cx, |this, _| this.locked).unwrap_or(false) {
                     break;
                 }
             }
