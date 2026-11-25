@@ -736,7 +736,7 @@ fn reconcile(
             .expect("tray watched poisoned")
             .insert(service.clone());
         if fresh {
-            let task = watch_item(
+                let task = watch_item(
                 connection.clone(),
                 service,
                 items.clone(),
@@ -744,7 +744,10 @@ fn reconcile(
                 watched.clone(),
                 updates.clone(),
             );
-            connection.executor().spawn(task, "tray item");
+            // detach: a dropped zbus Task cancels its future, and the
+            // dropped handle here would cancel the watcher before its
+            // first poll
+            connection.executor().spawn(task, "tray item").detach();
         }
     }
 }
@@ -947,7 +950,7 @@ async fn handle_request(
                 menu_gen.clone(),
                 updates.clone(),
             );
-            connection.executor().spawn(task, "tray menu");
+            connection.executor().spawn(task, "tray menu").detach();
         }
         TrayRequest::MenuEvent { service, id } => {
             let Some(menu_path) = items
