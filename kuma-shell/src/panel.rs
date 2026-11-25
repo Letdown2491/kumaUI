@@ -210,7 +210,7 @@ pub struct PanelGeometry {
 /// view's job: fire only on a real delta.
 pub struct MeasureHeight {
     child: AnyElement,
-    on_measure: Box<dyn Fn(f32, &mut Window, &mut App) + 'static>,
+    on_measure: std::sync::Arc<dyn Fn(f32, &mut Window, &mut App) + 'static>,
 }
 
 impl MeasureHeight {
@@ -220,7 +220,7 @@ impl MeasureHeight {
     ) -> Self {
         Self {
             child: child.into_any_element(),
-            on_measure: Box::new(on_measure),
+            on_measure: std::sync::Arc::new(on_measure),
         }
     }
 }
@@ -268,7 +268,20 @@ impl Element for MeasureHeight {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let child_height = f32::from(window.layout_bounds(*child_layout_id).size.height);
-        (self.on_measure)(child_height, window, cx);
+        // The measured height applies after this frame completes, not
+        // during prepaint: a view update that notifies mid-frame was
+        // losing the drawer silhouette's sprite upload, so freshly
+        // opened measured panels (the tray menu's transparent rows
+        // made it obvious) rendered with no card at all until a
+        // later repaint happened to refill the atlas.
+        let handle = window.window_handle();
+        let on_measure = self.on_measure.clone();
+        cx.spawn(async move |cx| {
+            handle
+                .update(cx, |_, window, cx| (on_measure)(child_height, window, cx))
+                .ok();
+        })
+        .detach();
         self.child.prepaint(window, cx);
     }
 

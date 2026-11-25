@@ -10,6 +10,7 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ### Fixed
 
+- Measured panels could open with no card behind them: MeasureHeight applied the measured height (and its notify) during prepaint, which dropped the drawer silhouette's sprite upload for that frame, leaving the panel's rows floating on the desktop with no background until some later repaint happened to refill the atlas. The tray menu made it obvious (its menu rows are transparent, unlike every other panel's opaque content). The height now applies after the frame completes.
 - The system tray widget showed no icons at all: the per-item watcher task was cancelled the moment it was spawned (a dropped zbus task handle cancels its future, and the handle was discarded), so no item ever published. Icons appear now, the moment an item registers; live updates (icon, tooltip, status) ride its signals again.
 
 ## v0.11.0 (2026-11-23)
