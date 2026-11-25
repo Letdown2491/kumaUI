@@ -142,6 +142,19 @@ impl ShellBar {
     fn toggle_panel_anchored(&self, kind: crate::panel::PanelKind, anchor_x: f32, cx: &mut App) {
         crate::panel::toggle_panel_anchored_on(&self.output, kind, anchor_x, cx);
     }
+
+    /// A tray item's menu: toggle the tray-menu panel (a clean close
+    /// retires the previous menu's session first), then ask the dbus
+    /// task for the item's tree. The open panel renders the loading
+    /// state until the snapshot lands; both calls land in one frame,
+    /// so the pending flag is what the view ever sees.
+    fn toggle_tray_menu(&self, service: &str, anchor_x: f32, cx: &mut App) {
+        self.toggle_panel_anchored(crate::panel::PanelKind::TrayMenu, anchor_x, cx);
+        self.tray.update(cx, |state, cx| {
+            state.open_menu(service);
+            cx.notify();
+        });
+    }
 }
 
 impl Render for ShellBar {
@@ -1498,7 +1511,11 @@ impl ShellBar {
     }
 }
 
-/// One tray item: its icon, tooltip, and click-through to dbus Activate.
+/// One tray item: its icon, tooltip, and clicks. An item with a menu
+/// (the DBusMenu most SNI apps actually present) opens the tray menu
+/// panel; `ItemIsMenu` marks the menu-first applets whose left click
+/// IS the menu. Menuless items keep the classic pair: Activate on the
+/// left, SecondaryActivate on the right.
 fn tray_icon(
     item: &crate::tray::TrayItem,
     cx: &Context<ShellBar>,
@@ -1506,6 +1523,8 @@ fn tray_icon(
 ) -> gpui::Stateful<Div> {
     let service = item.service.clone();
     let service_secondary = item.service.clone();
+    let has_menu = item.menu_path.is_some();
+    let item_is_menu = item.is_menu;
     let tooltip = item.tooltip.clone().into();
     div()
         .id(gpui::SharedString::from(format!("tray-{}", item.service)))
@@ -1515,23 +1534,32 @@ fn tray_icon(
         .cursor_pointer()
         .when(tooltips_on, |el| el.tooltip(text_tooltip(tooltip)))
         .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-            let x = f32::from(event.position().x) as i32;
-            let y = f32::from(event.position().y) as i32;
-            this.tray.read(cx).activate(&service, x, y);
+            let x = f32::from(event.position().x);
+            if has_menu && item_is_menu {
+                this.toggle_tray_menu(&service, x, cx);
+            } else {
+                let y = f32::from(event.position().y) as i32;
+                this.tray.read(cx).activate(&service, x as i32, y);
+            }
         }))
         .on_aux_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-            // aux clicks cover middle and right; only right means SecondaryActivate
+            // aux clicks cover middle and right; only right means
+            // SecondaryActivate (or the item's menu, when it has one)
             if !matches!(
                 event,
                 gpui::ClickEvent::Mouse(event) if event.down.button == gpui::MouseButton::Right
             ) {
                 return;
             }
-            let x = f32::from(event.position().x) as i32;
-            let y = f32::from(event.position().y) as i32;
-            this.tray
-                .read(cx)
-                .secondary_activate(&service_secondary, x, y);
+            let x = f32::from(event.position().x);
+            let (ix, y) = (x as i32, f32::from(event.position().y) as i32);
+            if has_menu {
+                this.toggle_tray_menu(&service_secondary, x, cx);
+            } else {
+                this.tray
+                    .read(cx)
+                    .secondary_activate(&service_secondary, ix, y);
+            }
         }))
         .child(match &item.icon {
             Some(crate::imaging::IconImage::Raster(raster)) => {

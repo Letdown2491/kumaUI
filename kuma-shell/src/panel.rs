@@ -315,6 +315,7 @@ pub enum PanelKind {
     Disk,
     Battery,
     DockMenu,
+    TrayMenu,
     Nostr,
     Weather,
     Wifi,
@@ -340,6 +341,9 @@ impl PanelKind {
             }
             PanelKind::Battery => (320., 220., KeyboardInteractivity::OnDemand),
             PanelKind::DockMenu => (180., 96., KeyboardInteractivity::OnDemand),
+            // the tray menu's height is measured content: the bound is
+            // the scroll cap for a long menu
+            PanelKind::TrayMenu => (280., 480., KeyboardInteractivity::OnDemand),
             PanelKind::Nostr => (560., 520., KeyboardInteractivity::OnDemand),
             // measured height refines this: the forecast strip sets it
             PanelKind::Weather => (320., 240., KeyboardInteractivity::OnDemand),
@@ -365,6 +369,7 @@ impl PanelKind {
             PanelKind::Disk => "disk",
             PanelKind::Battery => "battery",
             PanelKind::DockMenu => "dock-menu",
+            PanelKind::TrayMenu => "tray-menu",
             PanelKind::Nostr => "nostr",
             PanelKind::Weather => "weather",
             PanelKind::Wifi => "wifi",
@@ -516,6 +521,10 @@ impl PanelKind {
                 cx.new(|cx| crate::dock::DockMenuView::new(context, settings, window, cx, geometry))
                     .into()
             }
+            PanelKind::TrayMenu => {
+                let tray = cx.global::<PanelHost>().tray.clone();
+                cx.new(|cx| crate::tray_menu::TrayMenuView::new(tray, window, cx, geometry)).into()
+            }
             PanelKind::Nostr => cx
                 .new(|cx| crate::nostr_panel::NostrSignerView::new(nostr, window, cx, geometry))
                 .into(),
@@ -581,6 +590,9 @@ pub struct PanelHost {
     /// The context menu target a dock cell right-clicked: consumed by the
     /// `DockMenuView` construction.
     dock_menu: Option<crate::dock::DockMenuContext>,
+    /// The tray's state: the tray menu's panel reads the open menu's
+    /// tree from it.
+    tray: Option<gpui::Entity<crate::tray::TrayState>>,
 }
 
 struct OpenPanel {
@@ -630,6 +642,7 @@ impl PanelHost {
             open: None,
             placement: PanelPlacement::Bar,
             dock_menu: None,
+            tray: None,
         }
     }
 
@@ -681,6 +694,12 @@ impl PanelHost {
 
     pub fn dock_menu(&self) -> Option<crate::dock::DockMenuContext> {
         self.dock_menu.clone()
+    }
+
+    /// The tray's state, handed over at startup: the tray menu's panel
+    /// construction reads it.
+    pub fn set_tray(&mut self, tray: Option<gpui::Entity<crate::tray::TrayState>>) {
+        self.tray = tray;
     }
 
     fn take_close(&mut self) -> Option<Box<dyn Fn(&mut App)>> {
@@ -781,6 +800,7 @@ fn open_panel(kind: PanelKind, target: Option<String>, cx: &mut App) {
             (closed_kind, host.take_close())
         }
     };
+    panel_closed(closed.0, cx);
     if let (Some(closed_kind), Some(close)) = closed {
         defer_close(close, cx);
         if closed_kind == kind {
@@ -925,7 +945,10 @@ pub(crate) fn refresh_open_panels(cx: &mut App) {
 
 /// Dismiss whatever panel is open, if any.
 pub fn close_panels(cx: &mut App) {
-    let close = cx.global_mut::<PanelHost>().take_close();
+    let (closed_kind, close) = match cx.global_mut::<PanelHost>().open.take() {
+        Some(session) => (Some(session.kind), Some(session.close)),
+        None => (None, None),
+    };
     log::info!(
         "close_panels: {}",
         if close.is_some() {
@@ -935,8 +958,19 @@ pub fn close_panels(cx: &mut App) {
         }
     );
     notify_bar(cx);
+    panel_closed(closed_kind, cx);
     if let Some(close) = close {
         defer_close(close, cx);
+    }
+}
+
+/// A panel's close bookkeeping beyond the surfaces: the tray menu's
+/// session retires with its panel (every close path funnels here).
+fn panel_closed(kind: Option<PanelKind>, cx: &mut App) {
+    if kind == Some(PanelKind::TrayMenu)
+        && let Some(tray) = cx.global::<PanelHost>().tray.clone()
+    {
+        tray.update(cx, |state, _| state.close_menu());
     }
 }
 

@@ -39,6 +39,7 @@ pub mod greeter;
 pub mod widgets;
 pub mod theme;
 pub mod tray;
+pub mod tray_menu;
 pub mod updates;
 pub mod updates_panel;
 pub mod wallpaper;

@@ -79,6 +79,8 @@ fn main() {
                 widgets.clone(),
                 updates.clone(),
             ));
+            cx.global_mut::<kuma_shell::panel::PanelHost>()
+                .set_tray(Some(tray.clone()));
 
             // the dock: its own layer-shell surface, synced to the dock settings
             kuma_shell::dock::run(niri.clone(), settings.clone(), cx);

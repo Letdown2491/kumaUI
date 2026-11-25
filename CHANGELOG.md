@@ -4,6 +4,10 @@ Entries land with the change they describe; the next tag takes this section as i
 
 ## Unreleased
 
+### Added
+
+- The tray speaks DBusMenu (#136): an item's real menu opens as a panel now instead of every click firing Activate. Separators, checkmark and radio toggles, submenus (entered in place, a Back row returns), entry icons, and disabled entries render; ItemIsMenu applets open the menu on left click, any menu on right click, and menuless items keep the classic Activate/SecondaryActivate pair. The tree refetches on the item's AboutToShow and LayoutUpdated, so toggles repaint and silent menu changes land. Menu tooltips still show on hover.
+
 ## v0.11.0 (2026-11-23)
 
 kuma-shell 0.11.0
